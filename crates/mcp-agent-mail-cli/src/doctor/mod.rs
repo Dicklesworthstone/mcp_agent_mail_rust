@@ -304,21 +304,54 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
                     )
                 }
             }
-            Err(error) => (
-                serde_json::json!({
-                    "status": "error",
-                    "detail": error.to_string(),
-                    "probe_target": probe_source,
-                }),
-                Some(serde_json::json!({
-                    "id": "live-mailbox-probe-failed",
-                    "severity": "P0",
-                    "source": "live_probe",
-                    "summary": format!("live mailbox health probe failed: {error}"),
-                    "remediation": "am doctor health",
-                })),
-                Some("am doctor health".to_string()),
-            ),
+            Err(error) => {
+                let detail = error.to_string();
+                let classification = mcp_agent_mail_db::classify_db_error_message(&detail);
+                if classification.class == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption
+                {
+                    let guidance = mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE;
+                    let policy = mcp_agent_mail_db::error::DbFailurePolicy::from(classification);
+                    (
+                        serde_json::json!({
+                            "status": "error",
+                            "detail": detail,
+                            "probe_target": probe_source,
+                            "class": classification.class.as_str(),
+                            "policy": policy,
+                            "recovery_guidance": guidance,
+                        }),
+                        Some(serde_json::json!({
+                            "id": "live-mailbox-wal-certificate-invalid",
+                            "severity": classification.severity.as_str(),
+                            "source": "live_probe",
+                            "class": classification.class.as_str(),
+                            "summary": format!("WAL commit certificate validation failed: {error}"),
+                            "remediation": classification.recommended_command,
+                            "recovery_guidance": guidance,
+                            "policy": policy,
+                            "blocked": true,
+                            "blocked_reason": "Automatic repair is not authorized by a WAL commit certificate failure; preserve the complete SQLite family.",
+                        })),
+                        Some(classification.recommended_command.to_string()),
+                    )
+                } else {
+                    (
+                        serde_json::json!({
+                            "status": "error",
+                            "detail": detail,
+                            "probe_target": probe_source,
+                        }),
+                        Some(serde_json::json!({
+                            "id": "live-mailbox-probe-failed",
+                            "severity": "P0",
+                            "source": "live_probe",
+                            "summary": format!("live mailbox health probe failed: {error}"),
+                            "remediation": "am doctor health",
+                        })),
+                        Some("am doctor health".to_string()),
+                    )
+                }
+            }
         };
     if let Some(finding) = live_finding {
         if let Some(arr) = findings.as_array_mut() {
@@ -364,6 +397,17 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
                             "fix_command": remediation,
                             "explain_command": "am doctor health",
                         });
+                        if f.get("class").and_then(|class| class.as_str())
+                            == Some(
+                                mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption.as_str(),
+                            )
+                        {
+                            // Backup inventory is a safe diagnostic, not a
+                            // repair or permission to replace newer commits.
+                            action["fix_command"] = serde_json::Value::Null;
+                            action["diagnostic_command"] = serde_json::json!(remediation);
+                            action["explain_command"] = serde_json::json!(remediation);
+                        }
                         // GH#287: carry the breaker-blocked annotation onto the
                         // planned action, so an agent branching on
                         // `actions_planned` sees the block without re-joining
@@ -5854,6 +5898,184 @@ mod tests {
         if let Err(err) = crate::Cli::try_parse_from(&argv) {
             panic!("`{command}` does not parse: {err}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_certificate_failure_preserves_family_and_gives_actionable_triage() {
+        use std::io::Write as _;
+
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let source_root = tempfile::tempdir().expect("source mailbox");
+        let source = source_root.path().join("storage.sqlite3");
+        seed_healthy_live_mailbox(&source);
+        {
+            let settle =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(source.display().to_string())
+                    .expect("settle source journal mode");
+            settle.execute_raw("PRAGMA journal_mode = DELETE").unwrap();
+        }
+        let writer = mcp_agent_mail_db::DbConn::open_file(source.display().to_string())
+            .expect("open native mailbox writer");
+        writer.execute_raw("PRAGMA journal_mode = WAL").unwrap();
+        writer.execute_raw("PRAGMA wal_autocheckpoint = 0").unwrap();
+        writer
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'certificate-commit', '/certificate-commit', 0)",
+            )
+            .expect("commit data that must stay in the WAL");
+
+        // A real native-engine control proves that the staged family includes
+        // the committed row before injecting GH#387's zero-filled extension.
+        let control = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(&source)
+            .unwrap()
+            .expect("stage healthy control");
+        let control_reader =
+            mcp_agent_mail_db::DbConn::open_file(control.path().display().to_string())
+                .expect("open complete certificate family");
+        let rows = control_reader
+            .query_sync("SELECT slug FROM projects WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(
+            rows[0].get_named::<String>("slug").unwrap(),
+            "certificate-commit"
+        );
+        mcp_agent_mail_db::close_db_conn(control_reader, "close certificate test control");
+
+        for fill in [0_u8, 0xa5] {
+            let family = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(&source)
+                .unwrap()
+                .expect("stage crash image");
+            let db_path = family.path();
+            let storage_root = db_path.parent().unwrap();
+            let cert_path = crate::sqlite_sidecar_path(db_path, "-wal-cert");
+            let certificate = fs::read(&cert_path).expect("native commit certificate");
+            let record_len =
+                u32::from_le_bytes(certificate[certificate.len() - 4..].try_into().unwrap())
+                    as usize;
+            assert!(record_len >= 8 && record_len <= certificate.len());
+            let wal_path = crate::sqlite_sidecar_path(db_path, "-wal");
+            assert!(
+                fs::metadata(wal_path).unwrap().len()
+                    > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
+            );
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&cert_path)
+                .unwrap()
+                .write_all(&vec![fill; record_len])
+                .expect("append unrecognized certificate suffix");
+
+            let snapshot = || {
+                [
+                    "",
+                    "-journal",
+                    "-wal",
+                    "-shm",
+                    "-wal-cert",
+                    "-wal-cert-head",
+                    "-fsqlite-ns-gate",
+                    "-fsqlite-ns-use",
+                ]
+                .into_iter()
+                .map(|suffix| fs::read(crate::sqlite_sidecar_path(db_path, suffix)).ok())
+                .collect::<Vec<_>>()
+            };
+            let entries = || {
+                let mut names = fs::read_dir(storage_root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            };
+            let before = snapshot();
+            let entries_before = entries();
+            let breaker = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path);
+            assert!(!breaker.exists());
+            let repairs = std::cell::Cell::new(0);
+            let reconstructs = std::cell::Cell::new(0);
+            let database_url = format!("sqlite:///{}", db_path.display());
+            let storage_root_s = storage_root.display().to_string();
+            let target = tempfile::tempdir().unwrap();
+            let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", &database_url),
+                    ("STORAGE_ROOT", &storage_root_s),
+                    ("HTTP_PORT", "47351"),
+                ],
+                || {
+                    for _ in 0..2 {
+                        let error = crate::run_startup_database_self_heal_with(
+                            &database_url,
+                            storage_root,
+                            || {
+                                repairs.set(repairs.get() + 1);
+                                Ok(())
+                            },
+                            |_| {
+                                reconstructs.set(reconstructs.get() + 1);
+                                Ok(())
+                            },
+                        )
+                        .expect_err("certificate failure must refuse automatic startup recovery");
+                        let detail = error.to_string();
+                        assert!(
+                            detail
+                                .contains("certificate suffix does not start at a record boundary"),
+                            "{detail}"
+                        );
+                        assert!(
+                            detail.contains(
+                                mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE
+                            ),
+                            "{detail}"
+                        );
+                        assert!(!crate::is_sqlite_recovery_error_message(&detail));
+                        let refusal = crate::doctor_require_recoverable_probe_error(&error)
+                            .expect_err("a certificate refusal does not authorize reconstruction");
+                        assert!(refusal.to_string().contains("not authorized"));
+                    }
+                    triage_envelope(target.path(), false).expect("triage still produces a report")
+                },
+            );
+            assert_eq!(repairs.get(), 0);
+            assert_eq!(reconstructs.get(), 0);
+            assert_eq!(report["live_health"]["class"], "wal_certificate_corruption");
+            assert_eq!(report["live_health"]["policy"]["repairable"], false);
+            assert_eq!(report["live_health"]["policy"]["safe_to_retry"], false);
+            assert_eq!(
+                report["live_health"]["policy"]["safe_to_continue_read_only"],
+                false
+            );
+            assert_eq!(report["live_health"]["policy"]["blocks_edits"], true);
+            assert_eq!(report["recommended_command"], "am doctor backups --json");
+            assert_doctor_command_parses(report["recommended_command"].as_str().unwrap());
+            assert!(report["actions_planned"][0]["fix_command"].is_null());
+            assert_eq!(
+                report["actions_planned"][0]["diagnostic_command"],
+                "am doctor backups --json"
+            );
+            assert_eq!(report["actions_planned"][0]["blocked"], true);
+            assert_eq!(
+                snapshot(),
+                before,
+                "all source family bytes must be preserved"
+            );
+            assert_eq!(
+                entries(),
+                entries_before,
+                "no live recovery artifacts may be published"
+            );
+            assert!(
+                !breaker.exists(),
+                "read-only refusal must not enter recovery admission"
+            );
+        }
+        mcp_agent_mail_db::close_db_conn(writer, "close source certificate fixture");
     }
 
     #[test]

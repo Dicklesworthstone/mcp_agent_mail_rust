@@ -18,7 +18,8 @@ use mcp_agent_mail_core::{AgentHealthInputs, compute_agent_health};
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::guard_db_conn;
 use mcp_agent_mail_db::is_sqlite_recovery_error_message;
-use mcp_agent_mail_db::pool::DbPoolConfig;
+use mcp_agent_mail_db::mail_explorer::ExplorerQuery;
+use mcp_agent_mail_db::pool::{DbPoolConfig, SyncQuery};
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
 
@@ -47,6 +48,9 @@ const NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS: i64 = 30_000_000;
 const MAX_AGENTS: usize = 500;
 const AGENT_HEALTH_WINDOW_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
 const ACK_ON_TIME_THRESHOLD_MICROS: i64 = 30 * 60 * 1_000_000;
+/// Bound shared delivery joins independently of mailbox history and fleet size.
+const SHARED_ACK_MESSAGE_PAGE: usize = 128;
+const SHARED_ACK_VIEWER_PAGE: usize = 32;
 
 /// Maximum projects to fetch per poll cycle.  Raised from 100 to 500 to avoid
 /// silently truncating the project list in large deployments (B5 truthfulness).
@@ -317,18 +321,39 @@ impl<'a> DbStatQueryBatcher<'a> {
     }
 
     fn fetch_ack_pending_count(&self) -> Option<u64> {
-        self.run_count_query(
-            "SELECT COALESCE(SUM(ack_pending_count), 0) AS c FROM inbox_stats",
-            &[],
-        )
-        .or_else(|| {
-            self.run_count_query(
-                "SELECT COUNT(*) AS c FROM message_recipients \
-                 WHERE ack_ts IS NULL \
-                   AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)",
-                &[],
-            )
+        // This counter has always counted recipient obligations, not distinct
+        // messages. A shared delivery contributes one obligation per eligible
+        // unacknowledged viewer; its direct recipients retain precedence.
+        with_ack_read_snapshot(self.conn, || {
+            let shared = ExplorerQuery::shared_mailbox_schema_available(self.conn)
+                .map_err(|error| error.to_string())?;
+            let direct = self
+                .run_count_query(
+                    "SELECT COALESCE(SUM(ack_pending_count), 0) AS c FROM inbox_stats",
+                    &[],
+                )
+                .or_else(|| {
+                    self.run_count_query(
+                        "SELECT COUNT(*) AS c FROM message_recipients \
+                         WHERE ack_ts IS NULL \
+                           AND message_id IN (SELECT id FROM messages WHERE ack_required = 1)",
+                        &[],
+                    )
+                })
+                .ok_or_else(|| "direct acknowledgement count is unavailable".to_string())?;
+            let shared = if shared {
+                shared_ack_pending_count(self.conn)?
+            } else {
+                0
+            };
+            direct
+                .checked_add(shared)
+                .ok_or_else(|| "acknowledgement count overflow".to_string())
         })
+        .map_err(|error| {
+            tracing::warn!(%error, "tui poller acknowledgement count unavailable");
+        })
+        .ok()
     }
 
     fn run_count_query(&self, sql: &str, params: &[Value]) -> Option<u64> {
@@ -1876,6 +1901,292 @@ fn agent_health_source_availability(conn: &DbConn) -> AgentHealthSourceAvailabil
     }
 }
 
+struct AckReadSnapshot<'a, C: SyncQuery> {
+    conn: &'a C,
+    active: bool,
+}
+
+impl<C: SyncQuery> Drop for AckReadSnapshot<'_, C> {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = self.conn.execute_raw("RELEASE SAVEPOINT am_tui_ack_stats")
+        {
+            tracing::warn!(%error, "tui acknowledgement snapshot cleanup failed");
+        }
+    }
+}
+
+fn with_ack_read_snapshot<C: SyncQuery, T>(
+    conn: &C,
+    read: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    conn.execute_raw("SAVEPOINT am_tui_ack_stats")
+        .map_err(|error| error.to_string())?;
+    let mut snapshot = AckReadSnapshot { conn, active: true };
+    let result = read();
+    conn.execute_raw("RELEASE SAVEPOINT am_tui_ack_stats")
+        .map_err(|error| error.to_string())?;
+    snapshot.active = false;
+    result
+}
+
+/// Page stored deliveries before expanding their eligible audience. Selection
+/// comes from typed caller values; neither global counters nor health scores
+/// impose a result limit on the mailbox. The caller owns one read snapshot.
+fn visit_shared_ack_message_pages(
+    conn: &impl SyncQuery,
+    selection: &str,
+    selection_params: &[Value],
+    mut visit: impl FnMut(&[i64]) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut after = None;
+    loop {
+        let mut params = selection_params.to_vec();
+        let continuation = if let Some(id) = after {
+            params.push(Value::BigInt(id));
+            " AND d.message_id > ?"
+        } else {
+            ""
+        };
+        let rows = conn
+            .query_sync(
+                &format!(
+                    "SELECT d.message_id FROM project_mailbox_deliveries d \
+                     JOIN messages m ON m.id = d.message_id AND m.project_id = d.project_id \
+                     WHERE {selection}{continuation} \
+                     ORDER BY d.message_id LIMIT {SHARED_ACK_MESSAGE_PAGE}"
+                ),
+                &params,
+            )
+            .map_err(|error| error.to_string())?;
+        if rows.len() > SHARED_ACK_MESSAGE_PAGE {
+            return Err("shared acknowledgement page exceeded its bound".to_string());
+        }
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row
+                .get_named::<i64>("message_id")
+                .map_err(|error| error.to_string())?;
+            if after.is_some_and(|previous| id <= previous) {
+                return Err("shared acknowledgement cursor did not advance".to_string());
+            }
+            after = Some(id);
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        visit(&ids)?;
+        if ids.len() < SHARED_ACK_MESSAGE_PAGE {
+            return Ok(());
+        }
+    }
+}
+
+fn shared_ack_pending_count(conn: &impl SyncQuery) -> Result<u64, String> {
+    let visible = ExplorerQuery::shared_delivery_visibility_sql();
+    let mut total = 0_u64;
+    visit_shared_ack_message_pages(conn, "m.ack_required = 1", &[], |ids| {
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let params: Vec<_> = ids.iter().copied().map(Value::BigInt).collect();
+        let rows = conn
+            .query_sync(
+                &format!(
+                    "SELECT COUNT(*) AS c FROM project_mailbox_deliveries d \
+                     JOIN messages m ON m.id = d.message_id \
+                     JOIN agents viewer ON viewer.project_id = d.project_id \
+                     LEFT JOIN project_mailbox_receipts pr \
+                            ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+                     WHERE d.message_id IN ({placeholders}) AND m.ack_required = 1 \
+                       AND pr.ack_ts IS NULL AND {visible}"
+                ),
+                &params,
+            )
+            .map_err(|error| error.to_string())?;
+        let [row] = rows.as_slice() else {
+            return Err("shared acknowledgement count returned no aggregate".to_string());
+        };
+        let count = row
+            .get_named::<i64>("c")
+            .map_err(|error| error.to_string())?;
+        let count = u64::try_from(count)
+            .map_err(|_| "shared acknowledgement count is negative".to_string())?;
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| "shared acknowledgement count overflow".to_string())?;
+        Ok(())
+    })?;
+    Ok(total)
+}
+
+/// Count missing shared receipts in SQL instead of allocating one Rust row
+/// for every virtual recipient. A non-null latency bucket represents real
+/// acknowledgements and carries its exact sample multiplicity for the p50.
+fn append_shared_ack_stats(
+    conn: &impl SyncQuery,
+    agent_ids_sql: &str,
+    window_start: i64,
+    stats: &mut HashMap<i64, AgentAckStats>,
+    latencies: &mut HashMap<i64, Vec<u64>>,
+) -> Result<(), String> {
+    let mut viewers = agent_ids_sql
+        .split(',')
+        .map(|value| {
+            value
+                .trim()
+                .parse::<i64>()
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    viewers.sort_unstable();
+    viewers.dedup();
+    let project_rows = conn
+        .query_sync(
+            &format!(
+                "SELECT DISTINCT project_id FROM agents \
+                 WHERE id IN ({agent_ids_sql}) LIMIT {}",
+                viewers.len() + 1
+            ),
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+    if project_rows.len() > viewers.len() {
+        return Err("shared acknowledgement project scope exceeded its bound".to_string());
+    }
+    let projects = project_rows
+        .iter()
+        .map(|row| {
+            row.get_named::<i64>("project_id")
+                .map(|id| id.to_string())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if projects.is_empty() {
+        return Ok(());
+    }
+    let created_expr = timestamp_sort_expr("m.created_ts");
+    let ack_expr = timestamp_sort_expr("pr.ack_ts");
+    let delta = format!(
+        "CASE WHEN {ack_expr} > {created_expr} THEN ({ack_expr} - {created_expr}) ELSE 0 END"
+    );
+    let latency = format!("CASE WHEN {ack_expr} > 0 THEN {delta} ELSE NULL END");
+    let visible = ExplorerQuery::shared_delivery_visibility_sql();
+    let selection = format!(
+        "m.ack_required != 0 AND {created_expr} >= ? \
+         AND d.project_id IN ({})",
+        projects.join(",")
+    );
+    visit_shared_ack_message_pages(conn, &selection, &[Value::BigInt(window_start)], |ids| {
+        let messages = vec!["?"; ids.len()].join(",");
+        for viewers in viewers.chunks(SHARED_ACK_VIEWER_PAGE) {
+            let agents = vec!["?"; viewers.len()].join(",");
+            let mut params: Vec<_> = ids.iter().copied().map(Value::BigInt).collect();
+            params.extend(viewers.iter().copied().map(Value::BigInt));
+            let max_rows = ids.len() * viewers.len();
+            let rows = conn
+                    .query_sync(
+                        &format!(
+                            "SELECT viewer.id AS agent_id, {latency} AS ack_latency_micros, \
+                             SUM(CASE WHEN {ack_expr} > 0 AND {delta} <= {ACK_ON_TIME_THRESHOLD_MICROS} \
+                                      THEN 1 ELSE 0 END) AS ack_on_time, \
+                             SUM(CASE WHEN {ack_expr} > 0 AND {delta} > {ACK_ON_TIME_THRESHOLD_MICROS} \
+                                      THEN 1 ELSE 0 END) AS ack_late, \
+                             SUM(CASE WHEN {ack_expr} <= 0 THEN 1 ELSE 0 END) AS ack_pending \
+                             FROM project_mailbox_deliveries d \
+                             JOIN messages m ON m.id = d.message_id \
+                             JOIN agents viewer ON viewer.project_id = d.project_id \
+                             LEFT JOIN project_mailbox_receipts pr \
+                                    ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+                             WHERE d.message_id IN ({messages}) AND viewer.id IN ({agents}) \
+                               AND {visible} \
+                             GROUP BY viewer.id, {latency} LIMIT {}",
+                            max_rows + 1
+                        ),
+                        &params,
+                    )
+                    .map_err(|error| error.to_string())?;
+            if rows.len() > max_rows {
+                return Err("shared acknowledgement groups exceeded their bound".to_string());
+            }
+            let mut observed = HashMap::<i64, u64>::new();
+            for row in &rows {
+                let id = row
+                    .get_named::<i64>("agent_id")
+                    .map_err(|error| error.to_string())?;
+                if viewers.binary_search(&id).is_err() {
+                    return Err("shared acknowledgement returned an unexpected viewer".to_string());
+                }
+                let count = ack_observation_counts(row)?
+                    .into_iter()
+                    .try_fold(0_u64, u64::checked_add)
+                    .ok_or_else(|| "shared acknowledgement count overflow".to_string())?;
+                let total = observed.entry(id).or_default();
+                *total = total
+                    .checked_add(count)
+                    .ok_or_else(|| "shared acknowledgement count overflow".to_string())?;
+                if *total > ids.len() as u64 {
+                    return Err("shared acknowledgement duplicated an obligation".to_string());
+                }
+            }
+            append_ack_observations(rows, stats, latencies)?;
+        }
+        Ok(())
+    })
+}
+
+fn ack_observation_counts(row: &Row) -> Result<[u64; 3], String> {
+    let count = |column| {
+        let raw = row
+            .get_named::<i64>(column)
+            .map_err(|error| error.to_string())?;
+        u64::try_from(raw).map_err(|_| "acknowledgement observation is negative".to_string())
+    };
+    Ok([
+        count("ack_on_time")?,
+        count("ack_late")?,
+        count("ack_pending")?,
+    ])
+}
+
+fn append_ack_observations(
+    rows: Vec<Row>,
+    stats: &mut HashMap<i64, AgentAckStats>,
+    latencies: &mut HashMap<i64, Vec<u64>>,
+) -> Result<(), String> {
+    for row in rows {
+        let agent_id = row
+            .get_named::<i64>("agent_id")
+            .map_err(|error| error.to_string())?;
+        let [on_time, late, pending] = ack_observation_counts(&row)?;
+        let entry = stats.entry(agent_id).or_default();
+        for (total, count) in [
+            (&mut entry.on_time_count, on_time),
+            (&mut entry.late_count, late),
+            (&mut entry.pending_count, pending),
+        ] {
+            *total = total
+                .checked_add(count)
+                .ok_or_else(|| "acknowledgement observation overflow".to_string())?;
+        }
+        if let Some(latency) = row
+            .get_named::<Option<i64>>("ack_latency_micros")
+            .map_err(|error| error.to_string())?
+        {
+            let samples = on_time
+                .checked_add(late)
+                .and_then(|samples| usize::try_from(samples).ok())
+                .ok_or_else(|| "acknowledgement sample count overflow".to_string())?;
+            let latency = u64::try_from(latency)
+                .map_err(|_| "acknowledgement latency is negative".to_string())?;
+            latencies
+                .entry(agent_id)
+                .or_default()
+                .extend(std::iter::repeat_n(latency, samples));
+        }
+    }
+    Ok(())
+}
+
 fn fetch_agent_ack_stats(
     conn: &DbConn,
     agent_ids_sql: &str,
@@ -1913,36 +2224,35 @@ fn fetch_agent_ack_stats(
            AND m.ack_required != 0 \
            AND {created_expr} >= {window_start}"
     );
-    conn.query_sync(&sql, &[])
-        .ok()
-        .map(|rows| {
-            let mut stats: HashMap<i64, AgentAckStats> = HashMap::new();
-            let mut latencies: HashMap<i64, Vec<u64>> = HashMap::new();
-            for row in rows {
-                let Some(agent_id) = parse_raw_i64(&row, "agent_id") else {
-                    continue;
-                };
-                let entry = stats.entry(agent_id).or_default();
-                entry.on_time_count +=
-                    nonnegative_i64_to_u64(parse_raw_i64(&row, "ack_on_time").unwrap_or(0));
-                entry.late_count +=
-                    nonnegative_i64_to_u64(parse_raw_i64(&row, "ack_late").unwrap_or(0));
-                entry.pending_count +=
-                    nonnegative_i64_to_u64(parse_raw_i64(&row, "ack_pending").unwrap_or(0));
-                if let Some(latency) = parse_raw_i64(&row, "ack_latency_micros")
-                    .and_then(|value| u64::try_from(value.max(0)).ok())
-                {
-                    latencies.entry(agent_id).or_default().push(latency);
-                }
+    with_ack_read_snapshot(conn, || {
+        let shared = ExplorerQuery::shared_mailbox_schema_available(conn)
+            .map_err(|error| error.to_string())?;
+        let rows = conn
+            .query_sync(&sql, &[])
+            .map_err(|error| error.to_string())?;
+        let mut stats = HashMap::new();
+        let mut latencies = HashMap::new();
+        append_ack_observations(rows, &mut stats, &mut latencies)?;
+        if shared {
+            append_shared_ack_stats(
+                conn,
+                agent_ids_sql,
+                window_start,
+                &mut stats,
+                &mut latencies,
+            )?;
+        }
+        for (agent_id, mut values) in latencies {
+            if let Some(entry) = stats.get_mut(&agent_id) {
+                entry.p50_latency_micros = Some(median_micros(&mut values));
             }
-            for (agent_id, mut values) in latencies {
-                if let Some(entry) = stats.get_mut(&agent_id) {
-                    entry.p50_latency_micros = Some(median_micros(&mut values));
-                }
-            }
-            stats
-        })
-        .unwrap_or_default()
+        }
+        Ok(stats)
+    })
+    .map_err(|error| {
+        tracing::warn!(%error, "tui poller agent acknowledgement statistics unavailable");
+    })
+    .unwrap_or_default()
 }
 
 fn median_micros(values: &mut [u64]) -> u64 {
@@ -6670,6 +6980,284 @@ first body
         assert_eq!(agent.late_count, 1);
         assert_eq!(agent.pending_count, 1);
         assert_eq!(agent.p50_latency_micros, Some(1_800_000_000));
+    }
+
+    fn shared_ack_stats_db() -> DbConn {
+        let conn = DbConn::open_memory().expect("shared acknowledgement fixture");
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT); \
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, inception_ts INTEGER, \
+                 retired_at INTEGER, contact_policy TEXT); \
+             CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY); \
+             CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+                 created_ts INTEGER, ack_required INTEGER); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, ack_ts INTEGER, \
+                 PRIMARY KEY(message_id, agent_id)); \
+             CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY, project_id INTEGER); \
+             CREATE TABLE project_mailbox_receipts (message_id INTEGER, agent_id INTEGER, ack_ts INTEGER, \
+                 PRIMARY KEY(message_id, agent_id));",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn seed_shared_ack_obligations(conn: &DbConn) {
+        conn.execute_raw(
+            "INSERT INTO projects VALUES (1,'alpha'),(2,'beta'); \
+             INSERT INTO agents VALUES \
+                 (1,1,0,NULL,'auto'),(2,1,1000000,NULL,'auto'),(3,1,0,NULL,'open'), \
+                 (4,1,10000000,NULL,'open'),(5,1,0,NULL,'BLOCK_ALL'), \
+                 (6,1,0,500,'open'),(7,1,0,NULL,'open'), \
+                 (8,2,0,NULL,'auto'),(9,2,0,NULL,'auto'); \
+             INSERT INTO agent_deregistrations VALUES (7); \
+             INSERT INTO messages VALUES \
+                 (10,1,1,1000000,1),(11,1,1,2000000,1),(12,1,1,3000000,1), \
+                 (13,1,1,999999,1),(14,2,8,1000000,1),(15,2,8,1000000,1), \
+                 (16,1,1,1000000,0); \
+             INSERT INTO message_recipients VALUES (11,2,NULL),(12,2,63000000); \
+             INSERT INTO project_mailbox_deliveries VALUES \
+                 (10,1),(11,1),(12,1),(13,1),(14,2),(15,1),(16,1); \
+             INSERT INTO project_mailbox_receipts VALUES \
+                 (11,2,3000000),(11,3,1802001000),(12,2,NULL),(12,3,123000000),(14,2,9);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shared_ack_counts_and_health_follow_effective_recipient_obligations() {
+        let conn = shared_ack_stats_db();
+        seed_shared_ack_obligations(&conn);
+        let batcher = DbStatQueryBatcher::new(&conn);
+        // Two current shared viewers, one direct pending recipient, one older
+        // obligation (the boundary-registered viewer was not eligible), and
+        // one obligation in a project outside the selected health viewers.
+        assert_eq!(batcher.fetch_ack_pending_count(), Some(5));
+        let stats = fetch_agent_ack_stats(&conn, "2,3", 1_000_000);
+        let blue = &stats[&2];
+        assert_eq!(
+            (blue.on_time_count, blue.late_count, blue.pending_count),
+            (1, 0, 2)
+        );
+        assert_eq!(blue.p50_latency_micros, Some(60_000_000));
+        let red = &stats[&3];
+        assert_eq!(
+            (red.on_time_count, red.late_count, red.pending_count),
+            (1, 1, 1)
+        );
+        assert_eq!(red.p50_latency_micros, Some(960_000_500));
+        assert_eq!(stats.len(), 2);
+        let all = fetch_agent_ack_stats(&conn, "1,2,3,4,5,6,7,8,9", 1_000_000);
+        assert_eq!(
+            all.len(),
+            3,
+            "sender and ineligible viewers have no shared obligations"
+        );
+        assert_eq!(all[&9].pending_count, 1);
+
+        // The existing materialized direct fast path stays usable. Shared
+        // receipts do not update this direct-only table or create its rows.
+        conn.execute_raw(
+            "CREATE TABLE inbox_stats (agent_id INTEGER PRIMARY KEY, ack_pending_count INTEGER); \
+             INSERT INTO inbox_stats VALUES (2,1);",
+        )
+        .unwrap();
+        assert_eq!(batcher.fetch_ack_pending_count(), Some(5));
+        for (table, expected) in [
+            ("message_recipients", 2),
+            ("project_mailbox_receipts", 5),
+            ("inbox_stats", 1),
+        ] {
+            assert_eq!(
+                conn.query_sync(&format!("SELECT COUNT(*) AS c FROM {table}"), &[])
+                    .unwrap()[0]
+                    .get_named::<i64>("c")
+                    .unwrap(),
+                expected,
+                "read-only counters must preserve {table}"
+            );
+        }
+        conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (10,2,1000001)")
+            .unwrap();
+        assert_eq!(batcher.fetch_ack_pending_count(), Some(4));
+        assert_eq!(
+            fetch_agent_ack_stats(&conn, "2", 1_000_000)[&2].pending_count,
+            1
+        );
+    }
+
+    #[test]
+    fn shared_ack_stats_preserve_receipt_sentinels_and_outer_read_transactions() {
+        let conn = shared_ack_stats_db();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (1,1,0,NULL,'auto'),(2,1,0,NULL,'auto'),(3,1,0,NULL,'auto'); \
+             INSERT INTO messages VALUES (1,1,1,1000000,1); \
+             INSERT INTO message_recipients VALUES (1,2,0); \
+             INSERT INTO project_mailbox_deliveries VALUES (1,1); \
+             INSERT INTO project_mailbox_receipts VALUES (1,3,0); \
+             BEGIN;",
+        )
+        .unwrap();
+        assert_eq!(
+            DbStatQueryBatcher::new(&conn).fetch_ack_pending_count(),
+            Some(0)
+        );
+        let stats = fetch_agent_ack_stats(&conn, "2,3", 0);
+        for id in [2, 3] {
+            assert_eq!(stats[&id].pending_count, 1);
+            assert_eq!(stats[&id].on_time_count, 0);
+            assert_eq!(stats[&id].p50_latency_micros, None);
+        }
+        // Savepoint release must not commit an outer caller's transaction.
+        conn.execute_raw("ROLLBACK")
+            .expect("outer transaction remains active");
+    }
+
+    #[test]
+    fn shared_ack_schema_errors_preserve_previous_backlog_and_discard_partial_health() {
+        let conn = shared_ack_stats_db();
+        seed_shared_ack_obligations(&conn);
+        conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts")
+            .unwrap();
+        let batcher = DbStatQueryBatcher::new(&conn);
+        assert_eq!(batcher.fetch_ack_pending_count(), None);
+        assert!(fetch_agent_ack_stats(&conn, "2,3", 0).is_empty());
+        let previous = DbStatSnapshot {
+            ack_pending: 77,
+            ..DbStatSnapshot::default()
+        };
+        assert_eq!(
+            batcher
+                .fetch_counts_with_reservation_count(0, Some(&previous))
+                .ack_pending,
+            77
+        );
+        conn.execute_raw(
+            "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries; \
+             CREATE TABLE inbox_delivery_cursor_state (agent_id INTEGER);",
+        )
+        .unwrap();
+        assert_eq!(
+            batcher.fetch_ack_pending_count(),
+            None,
+            "durable shared authority forbids a false legacy fallback"
+        );
+        assert!(fetch_agent_ack_stats(&conn, "2,3", 0).is_empty());
+        // An unsuccessful observation cleans up its own read transaction.
+        conn.execute_raw("BEGIN; ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn shared_ack_legacy_schema_keeps_direct_counts_and_health() {
+        let conn = DbConn::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, created_ts INTEGER, ack_required INTEGER); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, ack_ts INTEGER); \
+             INSERT INTO messages VALUES (1,1000000,1),(2,2000000,1); \
+             INSERT INTO message_recipients VALUES (1,7,NULL),(2,7,3000000);",
+        )
+        .unwrap();
+        assert_eq!(
+            DbStatQueryBatcher::new(&conn).fetch_ack_pending_count(),
+            Some(1)
+        );
+        let stats = fetch_agent_ack_stats(&conn, "7", 0);
+        assert_eq!(stats[&7].pending_count, 1);
+        assert_eq!(stats[&7].on_time_count, 1);
+        assert_eq!(stats[&7].p50_latency_micros, Some(1_000_000));
+    }
+
+    #[test]
+    fn shared_ack_pages_cross_message_and_viewer_boundaries_without_truncation() {
+        let conn = shared_ack_stats_db();
+        conn.execute_raw("BEGIN; INSERT INTO agents VALUES (1,1,0,NULL,'auto');")
+            .unwrap();
+        let viewer_count = SHARED_ACK_VIEWER_PAGE + 1;
+        for offset in 0..viewer_count {
+            let id = i64::try_from(offset + 2).unwrap();
+            conn.execute_sync(
+                "INSERT INTO agents VALUES (?,1,0,NULL,'auto')",
+                &[Value::BigInt(id)],
+            )
+            .unwrap();
+        }
+        let count = SHARED_ACK_MESSAGE_PAGE + 1;
+        for offset in 0..count {
+            let id = i64::try_from(offset + 1).unwrap();
+            conn.execute_sync(
+                "INSERT INTO messages VALUES (?,1,1,1000000,1)",
+                &[Value::BigInt(id)],
+            )
+            .unwrap();
+            conn.execute_sync(
+                "INSERT INTO project_mailbox_deliveries VALUES (?,1)",
+                &[Value::BigInt(id)],
+            )
+            .unwrap();
+        }
+        // A settled first page must not hide the final pending page. Identical
+        // acknowledged latency buckets retain all samples in the exact p50.
+        conn.execute_raw(&format!(
+            "INSERT INTO project_mailbox_receipts \
+             SELECT d.message_id,a.id,2000000 FROM project_mailbox_deliveries d \
+             JOIN agents a ON a.id <> 1 WHERE d.message_id <= {SHARED_ACK_MESSAGE_PAGE}; \
+             INSERT INTO project_mailbox_receipts VALUES ({count},2,10000000); \
+             COMMIT;"
+        ))
+        .unwrap();
+        assert_eq!(
+            DbStatQueryBatcher::new(&conn).fetch_ack_pending_count(),
+            Some((viewer_count - 1) as u64)
+        );
+        let ids = (2..=viewer_count + 1)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let stats = fetch_agent_ack_stats(&conn, &ids, 0);
+        assert_eq!(stats.len(), viewer_count);
+        for (id, entry) in &stats {
+            let final_ack = u64::from(*id == 2);
+            assert_eq!(
+                entry.on_time_count,
+                SHARED_ACK_MESSAGE_PAGE as u64 + final_ack
+            );
+            assert_eq!(entry.pending_count, 1 - final_ack);
+            assert_eq!(entry.p50_latency_micros, Some(1_000_000));
+        }
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) AS c FROM message_recipients", &[])
+                .unwrap()[0]
+                .get_named::<i64>("c")
+                .unwrap(),
+            0,
+            "observing a large virtual audience never materializes direct delivery rows"
+        );
+    }
+
+    #[test]
+    fn shared_ack_global_backlog_is_not_limited_to_health_viewers_or_window() {
+        let conn = shared_ack_stats_db();
+        conn.execute_raw(
+            "BEGIN; INSERT INTO agents VALUES (1,1,0,NULL,'auto'); \
+             INSERT INTO messages VALUES (1,1,1,1,1); \
+             INSERT INTO project_mailbox_deliveries VALUES (1,1);",
+        )
+        .unwrap();
+        for id in 2..=MAX_AGENTS + 2 {
+            conn.execute_sync(
+                "INSERT INTO agents VALUES (?,1,0,NULL,'auto')",
+                &[Value::BigInt(i64::try_from(id).unwrap())],
+            )
+            .unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        assert_eq!(
+            DbStatQueryBatcher::new(&conn).fetch_ack_pending_count(),
+            Some((MAX_AGENTS + 1) as u64)
+        );
+        assert!(fetch_agent_ack_stats(&conn, "2", 2).is_empty());
+        let selected = fetch_agent_ack_stats(&conn, "2", 0);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[&2].pending_count, 1);
     }
 
     #[test]

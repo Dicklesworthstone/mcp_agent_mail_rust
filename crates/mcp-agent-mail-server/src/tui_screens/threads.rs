@@ -31,14 +31,15 @@ use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::mail_explorer::ExplorerQuery;
 use mcp_agent_mail_db::sqlmodel::{Row, Value};
 use mcp_agent_mail_db::timestamps::micros_to_iso;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::tui_action_menu::{ActionEntry, threads_actions};
 use crate::tui_bridge::{
     KeyboardMoveSnapshot, MessageDragSnapshot, ScreenDiagnosticSnapshot, TuiSharedState,
 };
 use crate::tui_screens::{
-    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, operator_result, operator_tool_context,
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg, OperatorTaskResult,
+    operator_result, operator_task, operator_tool_context,
 };
 use crate::tui_widgets::{MermaidThreadMessage, generate_thread_flow_mermaid};
 use fastmcp_core::block_on;
@@ -300,8 +301,10 @@ struct RawThreadSummaryRow {
 }
 
 /// Key points and action items `summarize_thread` extracted from one thread.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct ThreadDigest {
+    request_id: u64,
+    project_slug: String,
     thread_id: String,
     key_points: Vec<String>,
     action_items: Vec<String>,
@@ -555,6 +558,8 @@ pub struct ThreadExplorerScreen {
     threads: Vec<ThreadSummary>,
     /// The last "Summarize" result, shown while its thread is selected.
     digest: Option<ThreadDigest>,
+    /// Identifies the latest requested digest so late tasks cannot replace it.
+    summary_request_id: u64,
     /// Cursor position in the thread list.
     cursor: usize,
     /// Messages in the currently selected thread.
@@ -649,6 +654,7 @@ impl ThreadExplorerScreen {
         Self {
             threads: Vec::new(),
             digest: None,
+            summary_request_id: 0,
             cursor: 0,
             detail_messages: Vec::new(),
             detail_scroll: 0,
@@ -1541,43 +1547,77 @@ impl ThreadExplorerScreen {
     /// The "Summarize" result for the selected thread, if it has one.
     fn selected_digest(&self) -> Option<&ThreadDigest> {
         let thread = self.threads.get(self.cursor)?;
-        self.digest
-            .as_ref()
-            .filter(|digest| digest.thread_id == thread.thread_id)
+        self.digest.as_ref().filter(|digest| {
+            digest.thread_id == thread.thread_id && digest.project_slug == thread.project_slug
+        })
     }
 
-    /// Summarize a listed thread with the `summarize_thread` tool and keep the
-    /// result for the detail pane. No LLM: the UI loop waits on the call.
-    fn summarize(&mut self, thread_id: &str) -> Result<String, String> {
-        let project = self
+    /// Resolve the selected project before dispatching the summary worker.
+    /// A thread id alone cannot disambiguate the same id in two projects.
+    fn summary_project(&self, thread_id: &str) -> Result<String, String> {
+        if let Some(thread) = self
+            .threads
+            .get(self.cursor)
+            .filter(|thread| thread.thread_id == thread_id)
+        {
+            return Ok(thread.project_slug.clone());
+        }
+        let mut matches = self
             .threads
             .iter()
-            .find(|thread| thread.thread_id == thread_id)
-            .map(|thread| thread.project_slug.clone())
+            .filter(|thread| thread.thread_id == thread_id);
+        let thread = matches
+            .next()
             .ok_or_else(|| format!("thread {thread_id} is no longer listed"))?;
-        let raw = block_on(mcp_agent_mail_tools::summarize_thread(
-            &operator_tool_context(),
-            project,
-            thread_id.to_string(),
-            Some(false),
-            Some(false),
-            None,
-            None,
-        ))
-        .map_err(|err| err.to_string())?;
-        let response: mcp_agent_mail_tools::SingleThreadResponse =
-            serde_json::from_str(&raw).map_err(|err| format!("unexpected summary: {err}"))?;
-        let summary = format!(
-            "{} key point(s), {} action item(s)",
-            response.summary.key_points.len(),
-            response.summary.action_items.len()
-        );
-        self.digest = Some(ThreadDigest {
-            thread_id: thread_id.to_string(),
-            key_points: response.summary.key_points,
-            action_items: response.summary.action_items,
-        });
-        Ok(summary)
+        if matches.any(|other| other.project_slug != thread.project_slug) {
+            return Err(format!(
+                "thread {thread_id} appears in more than one project; select its project row first"
+            ));
+        }
+        Ok(thread.project_slug.clone())
+    }
+
+    /// Run the tool off the UI loop; completion applies the owned result.
+    fn summarize(&mut self, thread_id: &str) -> Cmd<MailScreenMsg> {
+        let project_slug = match self.summary_project(thread_id) {
+            Ok(project) => project,
+            Err(error) => return operator_result("summarize", Err(error)),
+        };
+        self.summary_request_id = self.summary_request_id.wrapping_add(1).max(1);
+        let request_id = self.summary_request_id;
+        let thread_id = thread_id.to_string();
+        operator_task(MailScreenId::Threads, "summarize", move || {
+            let raw = block_on(mcp_agent_mail_tools::summarize_thread(
+                &operator_tool_context(),
+                project_slug.clone(),
+                thread_id.clone(),
+                Some(false),
+                Some(false),
+                None,
+                None,
+            ))
+            .map_err(|err| err.to_string())?;
+            let response: mcp_agent_mail_tools::SingleThreadResponse =
+                serde_json::from_str(&raw).map_err(|err| format!("unexpected summary: {err}"))?;
+            if response.thread_id != thread_id {
+                return Err("summary returned a different thread identity".to_string());
+            }
+            let summary = format!(
+                "{} key point(s), {} action item(s)",
+                response.summary.key_points.len(),
+                response.summary.action_items.len()
+            );
+            let digest = ThreadDigest {
+                request_id,
+                project_slug,
+                thread_id,
+                key_points: response.summary.key_points,
+                action_items: response.summary.action_items,
+            };
+            let data = serde_json::to_value(digest)
+                .map_err(|err| format!("could not encode thread summary: {err}"))?;
+            Ok(OperatorTaskResult { summary, data })
+        })
     }
 }
 
@@ -2387,7 +2427,30 @@ impl MailScreen for ThreadExplorerScreen {
         let Some(thread_id) = operation.strip_prefix("summarize:") else {
             return Cmd::None;
         };
-        operator_result("summarize", self.summarize(thread_id))
+        self.summarize(thread_id)
+    }
+
+    fn handle_operator_result(
+        &mut self,
+        operation: &str,
+        result: &Result<OperatorTaskResult, String>,
+    ) {
+        if operation != "summarize" {
+            return;
+        }
+        let Ok(result) = result else {
+            return;
+        };
+        let Ok(digest) = serde_json::from_value::<ThreadDigest>(result.data.clone()) else {
+            return;
+        };
+        if digest.request_id == self.summary_request_id
+            && self.threads.iter().any(|thread| {
+                thread.thread_id == digest.thread_id && thread.project_slug == digest.project_slug
+            })
+        {
+            self.digest = Some(digest);
+        }
     }
 
     fn title(&self) -> &'static str {
@@ -5876,8 +5939,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn summarize_action_shows_key_points_and_actions_for_the_selected_thread() {
-        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        use crate::tui_screens::{
+            complete_operator_task, expect_operator_result, seed_operator_test_project,
+        };
         crate::tui_screens::with_operator_test_mailbox(|project_key| {
             let slug = seed_operator_test_project(project_key, &["GreenCastle", "BlueLake"]);
             for body in ["- ship the parser first", "- [ ] write the migration"] {
@@ -5906,16 +5972,30 @@ mod tests {
             let mut screen = ThreadExplorerScreen::new();
             let mut plan = make_thread("th-plan", 2, 2);
             plan.project_slug = slug;
+            let mut other_project = make_thread("th-plan", 1, 1);
+            other_project.project_slug = "another-project".to_string();
+            screen.threads.push(other_project);
             screen.threads.push(plan.clone());
             screen.threads.push(make_thread("th-other", 1, 1));
+            screen.cursor = 1;
 
-            let (status, op, text) =
-                expect_operator_result(screen.handle_action("summarize:th-plan", ""));
+            let command = screen.handle_action("summarize:th-plan", "");
+            assert!(
+                screen.digest.is_none(),
+                "dispatch must not run the summary inline"
+            );
+            screen.cursor = 0;
+            let (status, op, text) = complete_operator_task(&mut screen, command);
             assert_eq!(
                 (status.as_str(), op.as_str()),
                 ("ok", "summarize"),
                 "{text}"
             );
+            assert!(
+                screen.selected_digest().is_none(),
+                "completion must not attach to the same thread id in another project"
+            );
+            screen.cursor = 1;
             let digest = screen
                 .selected_digest()
                 .expect("digest for the selected thread");
@@ -5963,7 +6043,7 @@ mod tests {
                 "{text}"
             );
 
-            screen.cursor = 1;
+            screen.cursor = 2;
             assert!(
                 screen.selected_digest().is_none(),
                 "another thread does not show this summary"
@@ -5973,6 +6053,52 @@ mod tests {
             assert_eq!(status, "error");
             assert!(text.contains("no longer listed"), "{text}");
         });
+    }
+
+    #[test]
+    fn summary_completion_is_bound_to_the_latest_request_and_project() {
+        let mut screen = ThreadExplorerScreen::new();
+        let mut alpha = make_thread("shared-thread", 1, 1);
+        alpha.project_slug = "alpha".to_string();
+        let mut beta = alpha.clone();
+        beta.project_slug = "beta".to_string();
+        screen.threads = vec![alpha, beta, make_thread("other-thread", 1, 1)];
+        let first = screen.handle_action("summarize:shared-thread", "");
+        let first_id = screen.summary_request_id;
+        screen.cursor = 1;
+        let second = screen.handle_action("summarize:shared-thread", "");
+        let second_id = screen.summary_request_id;
+        assert_ne!(first_id, second_id);
+
+        let completion = |request_id, project_slug: &str| {
+            Ok(OperatorTaskResult {
+                summary: "one key point".to_string(),
+                data: serde_json::to_value(ThreadDigest {
+                    request_id,
+                    project_slug: project_slug.to_string(),
+                    thread_id: "shared-thread".to_string(),
+                    key_points: vec![format!("for {project_slug}")],
+                    action_items: Vec::new(),
+                })
+                .unwrap(),
+            })
+        };
+        screen.handle_operator_result("summarize", &completion(first_id, "alpha"));
+        assert!(
+            screen.digest.is_none(),
+            "late older work cannot replace newer work"
+        );
+        screen.handle_operator_result("summarize", &completion(second_id, "beta"));
+        assert_eq!(screen.selected_digest().unwrap().project_slug, "beta");
+        screen.cursor = 0;
+        assert!(screen.selected_digest().is_none());
+        screen.cursor = 2;
+        assert!(
+            screen.summary_project("shared-thread").is_err(),
+            "an unselected ambiguous thread id must not choose an arbitrary project"
+        );
+        drop(first);
+        drop(second);
     }
 
     #[test]

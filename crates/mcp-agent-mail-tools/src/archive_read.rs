@@ -606,7 +606,7 @@ fn validate_inventory(
 ) -> Result<(), AcquireError> {
     if inventory.parse_errors != 0 {
         return Err(AcquireError::Failed(format!(
-            "archive inventory found {} malformed canonical message artifact(s); refusing partial publication",
+            "archive inventory found {} unreadable or malformed artifacts or directory entries; refusing partial publication",
             inventory.parse_errors
         )));
     }
@@ -800,6 +800,7 @@ fn snapshot_required(
     database_url: &str,
     inventory: &mcp_agent_mail_db::ArchiveMessageInventory,
 ) -> Result<bool, AcquireError> {
+    validate_inventory(inventory)?;
     let archive_has_state = crate::tool_util::read_archive_inventory_has_state(inventory);
     match live_probe(&scope.sqlite_path) {
         Ok(conn) => {
@@ -1936,15 +1937,34 @@ mod tests {
     }
 
     fn add_second_archive_message(storage_root: &Path) {
-        mcp_agent_mail_storage::with_archive_mutation_for_test(storage_root, || {
-            fs::write(
-                storage_root.join(
-                    "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-01Z__later__2.md",
-                ),
-                "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[],\"cc\":[],\"bcc\":[],\"subject\":\"later\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-07-19T00:00:01Z\",\"attachments\":[]}\n---\n\narchive-only body\n",
-            )
-            .expect("publish a later canonical archive message");
-        });
+        let config = mcp_agent_mail_core::Config {
+            storage_root: storage_root.to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let archive = mcp_agent_mail_storage::ensure_archive(&config, "single-flight-project")
+            .expect("open the existing project archive");
+        mcp_agent_mail_storage::write_message_bundle(
+            &archive,
+            &config,
+            &serde_json::json!({
+                "id": 2,
+                "from": "Alice",
+                "to": [],
+                "cc": [],
+                "bcc": [],
+                "subject": "later",
+                "importance": "normal",
+                "ack_required": false,
+                "created_ts": "2026-07-19T00:00:01Z",
+                "attachments": [],
+            }),
+            "archive-only body",
+            "Alice",
+            &[],
+            &[],
+            None,
+        )
+        .expect("publish a later canonical archive message");
     }
 
     #[test]
@@ -1999,6 +2019,61 @@ mod tests {
 
     #[test]
     fn live_read_decision_retries_after_physical_archive_contention() {
+        if isolated_retirement_test() {
+            return;
+        }
+        let (_directory, slot, database_url) = live_read_fixture();
+        let writer = WriteGuard::begin(&slot.scope.storage_root, Some(&slot.scope.sqlite_path));
+        let index_lock = slot.scope.storage_root.join(".git").join("index.lock");
+        let lock_file = File::create_new(&index_lock).expect("hold a real Git index lock");
+        let cx = Cx::for_testing();
+        let reader_cx = cx.clone();
+        let reader_scope = slot.scope.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = acquire_if_needed(
+                &reader_scope.storage_root,
+                &reader_scope.sqlite_path,
+                &database_url,
+                &reader_cx,
+            );
+            let _ = result_tx.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TEST_LIVE_DECISION_ATTEMPTS.load(Ordering::Acquire) == 0 && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let attempted_while_archive_busy = TEST_LIVE_DECISION_ATTEMPTS.load(Ordering::Acquire) != 0;
+        let premature = result_rx.try_recv();
+        drop(lock_file);
+        fs::rename(
+            &index_lock,
+            index_lock.with_file_name("retained-index-lock"),
+        )
+        .expect("release the Git index lock without deleting its evidence");
+        let result = result_rx.recv_timeout(Duration::from_secs(10));
+        cx.set_cancel_requested(true);
+        reader.join().expect("join live decision reader");
+        let returned_while_writer_active = WRITERS_ACTIVE.load(Ordering::Acquire) != 0;
+        drop(writer);
+        assert!(attempted_while_archive_busy);
+        assert!(
+            premature.is_err(),
+            "physical archive ambiguity must not certify Live"
+        );
+        assert!(returned_while_writer_active);
+        assert!(
+            matches!(result, Ok(Ok(None))),
+            "the live read must complete before the durable writer releases its lease"
+        );
+        assert!(TEST_LIVE_DECISION_ATTEMPTS.load(Ordering::Acquire) >= 2);
+        assert_eq!(slot.reconstructions.load(Ordering::Acquire), 0);
+        reset_for_test();
+    }
+
+    #[test]
+    fn live_read_decision_retries_after_physical_mutation_window() {
         if isolated_retirement_test() {
             return;
         }
@@ -2169,17 +2244,23 @@ mod tests {
             return;
         }
         let (_directory, slot, database_url) = live_read_fixture();
-        mcp_agent_mail_storage::with_archive_mutation_for_test(&slot.scope.storage_root, || {
-            fs::write(
-                slot.scope.storage_root.join(
-                    "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-02Z__malformed__3.md",
-                ),
-                "---json\n{malformed\n---\n\nretained evidence\n",
-            )
-            .unwrap();
-        });
+        fs::write(
+            slot.scope.storage_root.join(
+                "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-02Z__malformed__3.md",
+            ),
+            "---json\n{malformed\n---\n\nretained evidence\n",
+        )
+        .unwrap();
         let cx = Cx::for_testing();
         assert!(!live_read_is_sufficient(&slot.scope, &database_url, &cx).unwrap());
+        let inventory = crate::tool_util::read_archive_inventory(&slot.scope.storage_root);
+        assert!(
+            matches!(
+                snapshot_required(&slot.scope, &database_url, &inventory),
+                Err(AcquireError::Failed(_))
+            ),
+            "the fallback path must not admit a partial archive inventory either"
+        );
         reset_for_test();
 
         // A readable SQLite file with no message table is not a positive Live

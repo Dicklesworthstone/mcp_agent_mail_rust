@@ -30,8 +30,8 @@ use crate::tui_persist::{
     load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
 };
 use crate::tui_screens::{
-    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState, operator_result,
-    operator_tool_context,
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg, OperatorTaskResult,
+    PendingOperatorTask, SelectionState, operator_result, operator_task, operator_tool_context,
 };
 use crate::tui_widgets::fancy::SummaryFooter;
 use crate::tui_widgets::{MetricTile, MetricTrend};
@@ -147,6 +147,7 @@ struct ReservationCreateFormState {
     ttl_idx: usize,
     focus: ReservationCreateField,
     errors: ReservationCreateValidationErrors,
+    pending_request: Option<PendingOperatorTask>,
 }
 
 impl ReservationCreateFormState {
@@ -162,6 +163,7 @@ impl ReservationCreateFormState {
             ttl_idx: 0,
             focus: ReservationCreateField::Paths,
             errors: ReservationCreateValidationErrors::default(),
+            pending_request: None,
         };
         form.update_focus();
         form
@@ -169,6 +171,12 @@ impl ReservationCreateFormState {
 
     const fn custom_ttl_enabled(&self) -> bool {
         self.ttl_idx == RESERVATION_TTL_CUSTOM_INDEX
+    }
+
+    fn request_pending(&self) -> bool {
+        self.pending_request
+            .as_ref()
+            .is_some_and(PendingOperatorTask::is_active)
     }
 
     fn update_focus(&mut self) {
@@ -344,6 +352,8 @@ pub struct ReservationsScreen {
     prev_counts: (u64, u64, u64, u64),
     /// Reservation create modal form state.
     create_form: Option<ReservationCreateFormState>,
+    /// Distinguish late completions from a dismissed or replaced create form.
+    next_create_request_id: u64,
     /// On-disk path for persisted screen filter presets.
     filter_presets_path: PathBuf,
     /// Preset store loaded from `filter_presets_path`.
@@ -394,6 +404,7 @@ impl ReservationsScreen {
             last_fallback_probe_tick: 0,
             prev_counts: (0, 0, 0, 0),
             create_form: None,
+            next_create_request_id: 0,
             filter_presets_path,
             filter_presets,
             preset_dialog_mode: PresetDialogMode::None,
@@ -1362,6 +1373,7 @@ impl ReservationsScreen {
 
     fn submit_create_form(&mut self) -> Cmd<MailScreenMsg> {
         let (payload, errors) = match self.create_form.as_ref() {
+            Some(form) if form.request_pending() => return Cmd::None,
             Some(form) => match Self::validate_create_form(form) {
                 Ok(payload) => (Some(payload), ReservationCreateValidationErrors::default()),
                 Err(errors) => (None, errors),
@@ -1380,61 +1392,94 @@ impl ReservationsScreen {
             return Cmd::None;
         };
 
+        let Some(request_id) = self.next_create_request_id.checked_add(1) else {
+            if let Some(form) = self.create_form.as_mut() {
+                form.errors.general =
+                    Some("Unable to allocate another reservation request.".into());
+            }
+            return Cmd::None;
+        };
+        self.next_create_request_id = request_id;
+        let (pending, mut start_guard) = PendingOperatorTask::new(request_id);
+        if let Some(form) = self.create_form.as_mut() {
+            form.errors = ReservationCreateValidationErrors::default();
+            form.pending_request = Some(pending);
+        }
+        operator_task(
+            MailScreenId::Reservations,
+            &format!("reservation_create:{request_id}"),
+            move || {
+                start_guard.started();
+                Self::create_reservation(payload)
+            },
+        )
+    }
+
+    fn create_reservation(payload: ReservationCreatePayload) -> Result<OperatorTaskResult, String> {
         // The operator reserves in the agent's name; that is not the agent's
         // own activity.
         let ctx = operator_tool_context();
-        let result = block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
+        let raw_json = block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
             &ctx,
-            payload.project_key.clone(),
-            payload.agent_name.clone(),
-            payload.paths.clone(),
+            payload.project_key,
+            payload.agent_name,
+            payload.paths,
             Some(payload.ttl_seconds),
             Some(payload.exclusive),
             payload.reason,
             None,
-        ));
+        ))
+        .map_err(|err| err.to_string())?;
 
-        match result {
-            Ok(raw_json) => {
-                self.create_form = None;
-                let parsed = serde_json::from_str::<ReservationCreateToolResponse>(&raw_json).ok();
-                let (status, summary) = if let Some(resp) = parsed {
-                    let granted_count = resp.granted.len();
-                    let conflict_count = resp.conflicts.len();
-                    let granted_hint = resp.granted.first().map_or(String::new(), |row| {
-                        format!(" (e.g., {})", row.path_pattern)
-                    });
-                    let conflict_hint = resp
-                        .conflicts
-                        .first()
-                        .map_or(String::new(), |row| format!(" (first: {})", row.path));
-                    if conflict_count > 0 {
-                        (
-                            "warn",
-                            format!(
-                                "{granted_count} granted{granted_hint}, {conflict_count} conflicts{conflict_hint}"
-                            ),
-                        )
-                    } else {
-                        ("ok", format!("{granted_count} granted{granted_hint}"))
-                    }
-                } else {
-                    ("ok", "Reservation request completed.".to_string())
-                };
-                Cmd::msg(MailScreenMsg::ActionExecute(
-                    format!("reservation_create_result:{status}"),
-                    summary,
-                ))
+        let parsed = serde_json::from_str::<ReservationCreateToolResponse>(&raw_json).ok();
+        let (status, summary) = if let Some(resp) = parsed {
+            let granted_count = resp.granted.len();
+            let conflict_count = resp.conflicts.len();
+            let granted_hint = resp.granted.first().map_or(String::new(), |row| {
+                format!(" (e.g., {})", row.path_pattern)
+            });
+            let conflict_hint = resp
+                .conflicts
+                .first()
+                .map_or(String::new(), |row| format!(" (first: {})", row.path));
+            if conflict_count > 0 {
+                (
+                    "warn",
+                    format!(
+                        "{granted_count} granted{granted_hint}, {conflict_count} conflicts{conflict_hint}"
+                    ),
+                )
+            } else {
+                ("ok", format!("{granted_count} granted{granted_hint}"))
             }
-            Err(err) => {
-                let message = err.to_string();
-                if let Some(form) = self.create_form.as_mut() {
-                    form.errors.general = Some(message.clone());
-                }
-                Cmd::msg(MailScreenMsg::ActionExecute(
-                    "reservation_create_result:error".to_string(),
-                    message,
-                ))
+        } else {
+            ("ok", "Reservation request completed.".to_string())
+        };
+        Ok(OperatorTaskResult {
+            summary,
+            data: serde_json::json!({ "status": status }),
+        })
+    }
+
+    fn finish_create_request(
+        &mut self,
+        request_id: u64,
+        result: &Result<OperatorTaskResult, String>,
+    ) {
+        let Some(form) = self.create_form.as_mut().filter(|form| {
+            form.pending_request
+                .as_ref()
+                .is_some_and(|pending| pending.request_id() == request_id)
+        }) else {
+            // Dismissal does not cancel an admitted write. Its result must
+            // not close or overwrite a newer form, even on the same screen.
+            return;
+        };
+        match result {
+            Ok(_) => self.create_form = None,
+            Err(error) => {
+                form.pending_request = None;
+                form.errors.general = Some(error.clone());
             }
         }
     }
@@ -1447,13 +1492,20 @@ impl ReservationsScreen {
             return Cmd::None;
         }
 
-        let ctrl_enter = key.modifiers.contains(Modifiers::CTRL) && key.code == KeyCode::Enter;
-        if ctrl_enter || key.code == KeyCode::F(5) {
-            return self.submit_create_form();
-        }
         if key.code == KeyCode::Escape {
             self.create_form = None;
             return Cmd::None;
+        }
+        if self
+            .create_form
+            .as_ref()
+            .is_some_and(ReservationCreateFormState::request_pending)
+        {
+            return Cmd::None;
+        }
+        let ctrl_enter = key.modifiers.contains(Modifiers::CTRL) && key.code == KeyCode::Enter;
+        if ctrl_enter || key.code == KeyCode::F(5) {
+            return self.submit_create_form();
         }
         if key.code == KeyCode::Tab {
             if let Some(form) = self.create_form.as_mut() {
@@ -1558,14 +1610,32 @@ impl ReservationsScreen {
                 row.released = true;
             }
         }
-        self.clear_reservation_selection();
+        self.clear_completed_reservation_selection(ids);
         self.rebuild_sorted();
     }
 
+    fn clear_completed_reservation_selection(&mut self, ids: &[i64]) {
+        // The operator may have selected other rows while the task ran. Only
+        // retire selections belonging to the completed request.
+        let reservations = &self.reservations;
+        self.selected_reservation_keys.retain(|key| {
+            !reservations
+                .get(key)
+                .and_then(|row| row.reservation_id)
+                .is_some_and(|id| ids.contains(&id))
+        });
+        if self.selected_reservation_keys.is_empty() {
+            self.clear_reservation_selection();
+        }
+    }
+
     /// Renew (`release == false`) or release the named reservations on their
-    /// holders' behalf.
-    fn renew_or_release(&mut self, ids_csv: &str, release: bool) -> Result<String, String> {
-        let groups = self.reservation_ids_by_holder(ids_csv)?;
+    /// holders' behalf. All tool waits run in the operator task, using the
+    /// project, holder and ids captured when the action was selected.
+    fn renew_or_release(
+        groups: BTreeMap<(String, String), Vec<i64>>,
+        release: bool,
+    ) -> Result<OperatorTaskResult, String> {
         let ctx = operator_tool_context();
         let mut done = 0_i64;
         let mut done_ids = Vec::new();
@@ -1591,31 +1661,55 @@ impl ReservationsScreen {
                 ))
             };
             let raw = result.map_err(|err| format!("{agent}: {err}"))?;
-            let response: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            let response: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|err| format!("{agent}: invalid reservation response: {err}"))?;
             if response["queued"].as_bool() == Some(true) {
                 return Err(format!(
                     "{agent}: the database is unavailable; the release is queued and replays on the next release"
                 ));
             }
-            done += response[if release { "released" } else { "renewed" }]
-                .as_i64()
-                .unwrap_or(0);
-            done_ids.extend(ids);
+            if release {
+                let response: mcp_agent_mail_tools::reservations::ReleaseResult =
+                    serde_json::from_value(response)
+                        .map_err(|err| format!("{agent}: invalid release response: {err}"))?;
+                done += i64::from(response.released);
+                done_ids.extend(
+                    response
+                        .released_ids
+                        .into_iter()
+                        .filter(|id| ids.contains(id)),
+                );
+            } else {
+                let response: mcp_agent_mail_tools::reservations::RenewalResult =
+                    serde_json::from_value(response)
+                        .map_err(|err| format!("{agent}: invalid renewal response: {err}"))?;
+                done += i64::from(response.renewed);
+                done_ids.extend(
+                    response
+                        .file_reservations
+                        .into_iter()
+                        .map(|row| row.id)
+                        .filter(|id| ids.contains(id)),
+                );
+            }
         }
-        if release {
-            self.mark_rows_released(&done_ids);
-            Ok(format!("released {done} reservation(s)"))
+        let summary = if release {
+            format!("released {done} reservation(s)")
         } else {
-            self.clear_reservation_selection();
-            Ok(format!("renewed {done} reservation(s) by 30 minutes"))
-        }
+            format!("renewed {done} reservation(s) by 30 minutes")
+        };
+        Ok(OperatorTaskResult {
+            summary,
+            data: serde_json::json!({ "reservation_ids": done_ids }),
+        })
     }
 
     /// Force-release one reservation as the operator (`HumanOverseer`). The
     /// tool still refuses a holder that shows recent activity, and tells the
     /// holder its reservation was taken.
-    fn force_release(&mut self, id_arg: &str) -> Result<String, String> {
-        let groups = self.reservation_ids_by_holder(id_arg)?;
+    fn force_release(
+        groups: BTreeMap<(String, String), Vec<i64>>,
+    ) -> Result<OperatorTaskResult, String> {
         let Some(((project, holder), id)) = groups
             .into_iter()
             .next()
@@ -1636,8 +1730,10 @@ impl ReservationsScreen {
             ),
         )
         .map_err(|err| err.to_string())?;
-        self.mark_rows_released(&[id]);
-        Ok(format!("released {holder}'s reservation #{id}"))
+        Ok(OperatorTaskResult {
+            summary: format!("released {holder}'s reservation #{id}"),
+            data: serde_json::json!({ "reservation_ids": [id] }),
+        })
     }
 }
 
@@ -1871,13 +1967,55 @@ impl MailScreen for ReservationsScreen {
 
     fn handle_action(&mut self, operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
         let (name, ids) = operation.split_once(':').unwrap_or((operation, ""));
-        let result = match name {
-            "renew" => self.renew_or_release(ids, false),
-            "release" => self.renew_or_release(ids, true),
-            "force_release" => self.force_release(ids),
-            _ => return Cmd::None,
+        if !matches!(name, "renew" | "release" | "force_release") {
+            return Cmd::None;
+        }
+        let groups = match self.reservation_ids_by_holder(ids) {
+            Ok(groups) => groups,
+            Err(error) => return operator_result(name, Err(error)),
         };
-        operator_result(name, result)
+        if name == "force_release" {
+            operator_task(MailScreenId::Reservations, name, move || {
+                Self::force_release(groups)
+            })
+        } else {
+            let release = name == "release";
+            operator_task(MailScreenId::Reservations, name, move || {
+                Self::renew_or_release(groups, release)
+            })
+        }
+    }
+
+    fn handle_operator_result(
+        &mut self,
+        operation: &str,
+        result: &Result<OperatorTaskResult, String>,
+    ) {
+        if let Some(request_id) = operation.strip_prefix("reservation_create:") {
+            if let Ok(request_id) = request_id.parse() {
+                self.finish_create_request(request_id, result);
+            }
+            return;
+        }
+        if !matches!(operation, "renew" | "release" | "force_release") {
+            return;
+        }
+        let Ok(result) = result else {
+            // A later group may fail after earlier writes committed. Leave
+            // those observations to the authoritative poller; an error must
+            // never optimistically release the remaining selected rows.
+            return;
+        };
+        let Some(ids) = result.data["reservation_ids"].as_array() else {
+            return;
+        };
+        let ids: Vec<i64> = ids.iter().filter_map(serde_json::Value::as_i64).collect();
+        if operation == "renew" {
+            self.clear_completed_reservation_selection(&ids);
+        } else {
+            self.mark_rows_released(&ids);
+        }
+        self.sync_focused_event();
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
@@ -2708,7 +2846,11 @@ fn render_reservation_create_modal(
     );
 
     let footer_y = bottom.saturating_sub(1);
-    let footer = "Tab/Shift+Tab fields • ←/→ TTL • Space toggle exclusive • F5/Ctrl+Enter submit • Esc cancel";
+    let footer = if form.request_pending() {
+        "Submitting… Esc dismisses; the request continues."
+    } else {
+        "Tab/Shift+Tab fields • ←/→ TTL • Space toggle exclusive • F5/Ctrl+Enter submit • Esc cancel"
+    };
     Paragraph::new(footer)
         .style(crate::tui_theme::text_hint(&tp))
         .render(Rect::new(inner.x, footer_y, inner.width, 1), frame);
@@ -3197,6 +3339,232 @@ mod tests {
             .expect("validation failure should keep create form open");
         assert!(form.errors.paths.is_some());
         assert!(form.errors.general.is_some());
+    }
+
+    fn operator_create_form(project: &str, agent: &str, paths: &str) -> ReservationCreateFormState {
+        let mut form = ReservationCreateFormState::new(project.to_string(), agent.to_string());
+        form.paths_input.set_text(paths);
+        form.reason_input.set_value("operator create test");
+        form
+    }
+
+    fn operator_reservation_count() -> i64 {
+        crate::tui_screens::with_operator_test_conn(|conn| {
+            conn.query_sync("SELECT COUNT(*) AS count FROM file_reservations", &[])
+                .expect("reservation count")[0]
+                .get_named("count")
+                .expect("reservation count value")
+        })
+    }
+
+    #[test]
+    fn reservation_create_defers_writes_suppresses_duplicates_and_recovers_dropped_tasks() {
+        use crate::tui_screens::{complete_operator_task, seed_operator_test_project};
+
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["BlueLake"]);
+            let state = test_state();
+            let mut screen = ReservationsScreen::new();
+            screen.create_form = Some(operator_create_form(&slug, "BlueLake", "src/**"));
+            let command = screen.submit_create_form();
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            let first = screen
+                .create_form
+                .as_ref()
+                .unwrap()
+                .pending_request
+                .clone()
+                .unwrap();
+            assert!(first.is_active());
+            assert!(matches!(screen.submit_create_form(), Cmd::None));
+            assert!(matches!(
+                screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::F(5))), &state),
+                Cmd::None
+            ));
+            let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('x'))), &state);
+            let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Tab)), &state);
+            let form = screen.create_form.as_ref().unwrap();
+            assert_eq!(form.paths(), vec!["src/**"]);
+            assert_eq!(form.focus, ReservationCreateField::Paths);
+            assert_eq!(
+                operator_reservation_count(),
+                0,
+                "dispatch must not acquire a lease"
+            );
+
+            // Executor rejection before the task starts must not strand a
+            // disabled form forever or run the dropped request later.
+            drop(command);
+            assert!(!first.is_active());
+            let retry = screen.submit_create_form();
+            let second = screen
+                .create_form
+                .as_ref()
+                .unwrap()
+                .pending_request
+                .as_ref()
+                .unwrap();
+            assert!(second.is_active());
+            assert_ne!(first.request_id(), second.request_id());
+            let (status, operation, summary) = complete_operator_task(&mut screen, retry);
+            assert_eq!(status, "ok", "{summary}");
+            assert!(operation.starts_with("reservation_create:"));
+            assert!(summary.contains("1 granted"), "{summary}");
+            assert!(screen.create_form.is_none());
+            assert_eq!(operator_reservation_count(), 1);
+        });
+    }
+
+    #[test]
+    fn reservation_create_late_success_keeps_a_new_pending_form() {
+        use crate::tui_screens::{complete_operator_task, seed_operator_test_project};
+
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["BlueLake"]);
+            let state = test_state();
+            let mut screen = ReservationsScreen::new();
+            screen.create_form = Some(operator_create_form(&slug, "BlueLake", "src/**"));
+            let old_request = screen.submit_create_form();
+            let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
+            assert!(screen.create_form.is_none());
+
+            screen.create_form = Some(operator_create_form(&slug, "BlueLake", "docs/**"));
+            let new_request = screen.submit_create_form();
+            let new_id = screen
+                .create_form
+                .as_ref()
+                .unwrap()
+                .pending_request
+                .as_ref()
+                .unwrap()
+                .request_id();
+            let (status, _, summary) = complete_operator_task(&mut screen, old_request);
+            assert_eq!(status, "ok", "{summary}");
+            let form = screen
+                .create_form
+                .as_ref()
+                .expect("new form survives old success");
+            assert_eq!(form.paths(), vec!["docs/**"]);
+            assert_eq!(form.pending_request.as_ref().unwrap().request_id(), new_id);
+            assert!(form.request_pending());
+            assert!(form.errors.general.is_none());
+            assert_eq!(operator_reservation_count(), 1);
+
+            let (status, _, summary) = complete_operator_task(&mut screen, new_request);
+            assert_eq!(status, "ok", "{summary}");
+            assert!(screen.create_form.is_none());
+            assert_eq!(operator_reservation_count(), 2);
+        });
+    }
+
+    #[test]
+    fn reservation_create_errors_preserve_the_draft_and_ignore_replaced_forms() {
+        use crate::tui_screens::{complete_operator_task, seed_operator_test_project};
+
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["BlueLake"]);
+            let state = test_state();
+            let mut screen = ReservationsScreen::new();
+            screen.create_form = Some(operator_create_form(&slug, "RedStone", "src/**"));
+            let request = screen.submit_create_form();
+            let (status, _, error) = complete_operator_task(&mut screen, request);
+            assert_eq!(status, "error", "the absent actor must be refused");
+            let form = screen.create_form.as_ref().expect("failed draft retained");
+            assert_eq!(form.paths(), vec!["src/**"]);
+            assert_eq!(form.reason_input.value(), "operator create test");
+            assert_eq!(form.errors.general.as_deref(), Some(error.as_str()));
+            assert!(form.pending_request.is_none());
+            assert_eq!(operator_reservation_count(), 0);
+
+            let old_request = screen.submit_create_form();
+            let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
+            screen.create_form = Some(operator_create_form(&slug, "BlueLake", "docs/**"));
+            let new_request = screen.submit_create_form();
+            let new_id = screen
+                .create_form
+                .as_ref()
+                .unwrap()
+                .pending_request
+                .as_ref()
+                .unwrap()
+                .request_id();
+            let (status, _, _) = complete_operator_task(&mut screen, old_request);
+            assert_eq!(status, "error");
+            let form = screen
+                .create_form
+                .as_ref()
+                .expect("new form survives old failure");
+            assert_eq!(form.paths(), vec!["docs/**"]);
+            assert_eq!(form.pending_request.as_ref().unwrap().request_id(), new_id);
+            assert!(form.request_pending());
+            assert!(form.errors.general.is_none());
+
+            let (status, _, summary) = complete_operator_task(&mut screen, new_request);
+            assert_eq!(status, "ok", "{summary}");
+            assert!(screen.create_form.is_none());
+            assert_eq!(operator_reservation_count(), 1);
+        });
+    }
+
+    #[test]
+    fn reservation_create_task_preserves_partial_grant_conflict_warning() {
+        use crate::tui_screens::seed_operator_test_project;
+
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["BlueLake", "GoldFox"]);
+            block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
+                &operator_tool_context(),
+                project_key.to_string(),
+                "GoldFox".to_string(),
+                vec!["src/**".to_string()],
+                Some(3600),
+                Some(true),
+                None,
+                None,
+            ))
+            .expect("peer reservation");
+            let mut screen = ReservationsScreen::new();
+            screen.create_form = Some(operator_create_form(&slug, "BlueLake", "src/**\ndocs/**"));
+            let Cmd::Task(_, run) = screen.submit_create_form() else {
+                panic!("expected deferred reservation create");
+            };
+            assert_eq!(operator_reservation_count(), 1);
+            let MailScreenMsg::OperatorCompleted {
+                operation, result, ..
+            } = run()
+            else {
+                panic!("expected reservation create completion");
+            };
+            let completed = result
+                .as_ref()
+                .expect("partial grant remains a successful tool result");
+            assert_eq!(completed.data["status"], "warn");
+            assert!(
+                completed.summary.contains("1 granted"),
+                "{}",
+                completed.summary
+            );
+            assert!(
+                completed.summary.contains("1 conflicts"),
+                "{}",
+                completed.summary
+            );
+            screen.handle_operator_result(&operation, &result);
+            assert!(screen.create_form.is_none());
+            assert_eq!(operator_reservation_count(), 2);
+        });
+    }
+
+    #[test]
+    fn reservation_create_request_counter_never_reuses_an_exhausted_id() {
+        let mut screen = ReservationsScreen::new();
+        screen.create_form = Some(operator_create_form("proj", "BlueLake", "src/**"));
+        screen.next_create_request_id = u64::MAX;
+        assert!(matches!(screen.submit_create_form(), Cmd::None));
+        let form = screen.create_form.as_ref().unwrap();
+        assert!(form.pending_request.is_none());
+        assert!(form.errors.general.is_some());
+        assert_eq!(screen.next_create_request_id, u64::MAX);
     }
 
     #[test]
@@ -3811,7 +4179,9 @@ mod tests {
 
     #[test]
     fn action_menu_reservation_writes_reach_the_mailbox() {
-        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        use crate::tui_screens::{
+            complete_operator_task, expect_operator_result, seed_operator_test_project,
+        };
         crate::tui_screens::with_operator_test_mailbox(|project_key| {
             let slug = seed_operator_test_project(project_key, &["BlueLake"]);
             let granted: serde_json::Value = serde_json::from_str(
@@ -3834,15 +4204,17 @@ mod tests {
             list_reservation(&mut screen, src, &slug, "src/**");
             list_reservation(&mut screen, docs, &slug, "docs/**");
 
-            let (status, op, text) =
-                expect_operator_result(screen.handle_action(&format!("renew:{src}"), ""));
+            let command = screen.handle_action(&format!("renew:{src}"), "");
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            let (status, op, text) = complete_operator_task(&mut screen, command);
             assert_eq!((status.as_str(), op.as_str()), ("ok", "renew"), "{text}");
             assert!(text.contains("renewed 1"), "{text}");
 
             // BlueLake just registered, so the tool refuses to force-release
             // its lock, and the row stays listed.
-            let (status, _, text) =
-                expect_operator_result(screen.handle_action(&format!("force_release:{src}"), ""));
+            let command = screen.handle_action(&format!("force_release:{src}"), "");
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            let (status, _, text) = complete_operator_task(&mut screen, command);
             assert_eq!(status, "error");
             assert!(text.contains("refusing forced release"), "{text}");
             assert!(!released_in_db(src));
@@ -3856,8 +4228,13 @@ mod tests {
                 )
                 .expect("expire docs reservation");
             });
-            let (status, op, text) =
-                expect_operator_result(screen.handle_action(&format!("force_release:{docs}"), ""));
+            let command = screen.handle_action(&format!("force_release:{docs}"), "");
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            assert!(
+                !released_in_db(docs),
+                "scheduling must not execute the tool"
+            );
+            let (status, op, text) = complete_operator_task(&mut screen, command);
             assert_eq!(
                 (status.as_str(), op.as_str()),
                 ("ok", "force_release"),
@@ -3865,8 +4242,10 @@ mod tests {
             );
             assert!(released_in_db(docs));
 
-            let (status, op, text) =
-                expect_operator_result(screen.handle_action(&format!("release:{src}"), ""));
+            let command = screen.handle_action(&format!("release:{src}"), "");
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            assert!(!released_in_db(src), "scheduling must not execute the tool");
+            let (status, op, text) = complete_operator_task(&mut screen, command);
             assert_eq!((status.as_str(), op.as_str()), ("ok", "release"), "{text}");
             assert!(text.contains("released 1"), "{text}");
             assert!(released_in_db(src));
@@ -3880,6 +4259,66 @@ mod tests {
                 expect_operator_result(screen.handle_action("release:999999", ""));
             assert_eq!(status, "error");
             assert!(text.contains("no longer listed"), "{text}");
+        });
+    }
+
+    #[test]
+    fn reservation_release_task_defers_writes_and_keeps_new_selection() {
+        use crate::tui_screens::{complete_operator_task, seed_operator_test_project};
+
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["BlueLake"]);
+            let granted: serde_json::Value = serde_json::from_str(
+                &block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
+                    &operator_tool_context(),
+                    project_key.to_string(),
+                    "BlueLake".to_string(),
+                    vec!["src/**".to_string(), "docs/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                    None,
+                ))
+                .expect("file_reservation_paths"),
+            )
+            .expect("grant JSON");
+            let src = granted["granted"][0]["id"].as_i64().expect("src id");
+            let docs = granted["granted"][1]["id"].as_i64().expect("docs id");
+            let mut screen = ReservationsScreen::new();
+            list_reservation(&mut screen, src, &slug, "src/**");
+            list_reservation(&mut screen, docs, &slug, "docs/**");
+            let src_key = reservation_key(&slug, "BlueLake", "src/**");
+            let docs_key = reservation_key(&slug, "BlueLake", "docs/**");
+            screen.selected_reservation_keys.select(src_key.clone());
+
+            let command = screen.handle_action(&format!("release:{src}"), "");
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            assert!(!released_in_db(src));
+            assert!(!screen.reservations[&src_key].released);
+
+            // A queued write must not hold the screen borrow or freeze input.
+            // Select a different row before the captured task completes.
+            let state = test_state();
+            let detail_before = screen.detail_visible;
+            let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('i'))), &state);
+            assert_ne!(screen.detail_visible, detail_before);
+            screen.selected_reservation_keys.select(docs_key.clone());
+
+            let (status, operation, text) = complete_operator_task(&mut screen, command);
+            assert_eq!(
+                (status.as_str(), operation.as_str()),
+                ("ok", "release"),
+                "{text}"
+            );
+            assert!(released_in_db(src));
+            assert!(
+                !released_in_db(docs),
+                "completion must keep the captured ids"
+            );
+            assert!(screen.reservations[&src_key].released);
+            assert!(!screen.reservations[&docs_key].released);
+            assert!(!screen.selected_reservation_keys.contains(&src_key));
+            assert!(screen.selected_reservation_keys.contains(&docs_key));
         });
     }
 

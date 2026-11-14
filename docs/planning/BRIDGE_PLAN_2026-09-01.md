@@ -1,5 +1,32 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 Review29 overlapping integration — EmeraldEagle, 22:45 UTC
+
+- [x] Commit reviewed fixture/lint work in5d6cb92f. Normal pull discovers
+  incoming8de2a7cf (four more async TUI commits after b4) and an archive-read
+  fixture conflict. Import Beads0; preserve both histories without rewriting.
+- [x] Resolve manually: use incoming public archive writer and raw malformed
+  artifact/fallback refusal. Preserve incoming Git-index-lock contention;
+  keep the qualified in-process mutation-window case independently, using
+  the real private guard's test-only scope. Neither busy signal masks the other.
+- [x] Preserve all original assertions and10s bounds, retain five typed empty
+  receipt expectations while integrating async TUI task completions.
+- [x] Predeclare22 native cases: original20 plus retained physical-mutation
+  window and real shared-receipt TUI case. Freeze8de2a7cf plus the same five
+  overlay paths; retain source manifest. Direct fmt2=0, initial wrap fmt1 kept.
+- [x] Release metadata2070/2071 before long qualification; keep source leases.
+- [ ] Execute the22-case merged-input native cohort and verify exact census.
+- [ ] Check merged-input workspace/all-targets.
+- [ ] Check separate merged-input production workspace/lib+bins.
+- [ ] Run merged-input strict workspace/all-target Clippy.
+- [x] Scan both merged Rust files: terminal0/statusok/no failed modules;
+  archive_read critical0/warning314/info80, messages0/916/264. Reread the
+  resolution against incoming8de: only explicit drop, equivalent receipt
+  assertions and independent mutation-window coverage are added to its code.
+- [ ] Record final scoped Bead evidence with original acceptance still open;
+  finish normal merge, flush/import/cycles, publish and verify both refs,
+  release only owned leases. Earlier8e results remain bound to their inputs.
+
 ## November 14 Review29 integration continuation — EmeraldEagle, 20:22 UTC
 
 - [x] Preserve source24e252aa and qualification62bc874d. Normal push raced

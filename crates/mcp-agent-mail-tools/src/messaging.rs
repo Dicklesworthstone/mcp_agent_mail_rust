@@ -6022,7 +6022,9 @@ async fn replay_single_ack_intent(
     intent: &crate::degraded_intents::QueuedAckIntent,
 ) -> Result<(), (String, bool)> {
     ensure_request_live(ctx).map_err(ack_intent_replay_error)?;
-    let project = resolve_project(ctx, pool, &intent.project_key)
+    // Replay may acknowledge only an existing mailbox. A queued absolute key
+    // is not permission to recreate a project removed since the outage.
+    let project = resolve_existing_project(ctx, pool, &intent.project_key)
         .await
         .map_err(ack_intent_replay_error)?;
     ensure_request_live(ctx).map_err(ack_intent_replay_error)?;
@@ -10282,6 +10284,97 @@ mod tests {
                     .is_empty(),
                 "permanently-unreplayable ack intent should be abandoned, not retried forever"
             );
+        });
+    }
+
+    #[test]
+    fn replay_abandons_missing_project_without_creating_it_and_continues_valid_acks() {
+        run_thread_validation_test("ack-intent-missing-project.db", |cx, pool| async move {
+            let project = ensure_project_row(&cx, &pool, "/ack-intent-existing-project").await;
+            let project_id = project.id.unwrap();
+            let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+            let recipient = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+            let recipient_id = recipient.id.unwrap();
+            let message_id = create_ack_test_message(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.unwrap(),
+                &[(recipient_id, "to")],
+            )
+            .await;
+            let intent_dir = tempfile::tempdir().unwrap();
+            let mut config = Config::get();
+            config.storage_root = intent_dir.path().to_path_buf();
+            let missing = crate::degraded_intents::append_ack_intent(
+                &config,
+                "/ack-intent-missing-project",
+                &recipient.name,
+                message_id,
+                "get_db_pool",
+                "database unavailable",
+                None,
+            )
+            .unwrap();
+            let valid = crate::degraded_intents::append_ack_intent(
+                &config,
+                &project.human_key,
+                &recipient.name,
+                message_id,
+                "get_db_pool",
+                "database unavailable",
+                None,
+            )
+            .unwrap();
+            let ctx = McpContext::new(cx.clone(), 1);
+            replay_queued_ack_intents(&ctx, &pool, &config).await;
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let projects = conn
+                .query_sync("SELECT human_key FROM projects", &[])
+                .unwrap();
+            assert_eq!(projects.len(), 1, "ACK replay must never create a mailbox");
+            assert_eq!(
+                projects[0].get_named::<String>("human_key").unwrap(),
+                project.human_key
+            );
+            let receipts = conn
+                .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert!(
+                receipts[0]
+                    .get_named::<Option<i64>>("read_ts")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                receipts[0]
+                    .get_named::<Option<i64>>("ack_ts")
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                Vec::<crate::degraded_intents::QueuedAckIntent>::new()
+            );
+            let records: Vec<Value> = std::fs::read_to_string(&valid.intent_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            for (receipt, status) in [
+                (&missing, crate::degraded_intents::REPLAY_STATUS_ABANDONED),
+                (&valid, crate::degraded_intents::REPLAY_STATUS_REPLAYED),
+            ] {
+                let replay = records
+                    .iter()
+                    .find(|record| {
+                        record["kind"] == crate::degraded_intents::ACK_INTENT_REPLAY_KIND
+                            && record["intent_id"] == receipt.intent_id
+                    })
+                    .expect("each accepted intent receives its terminal disposition");
+                assert_eq!(replay["status"], status);
+            }
         });
     }
 

@@ -526,19 +526,42 @@ pub fn ack_intent_hash_payload(record: &Value) -> Value {
     payload
 }
 
-fn ack_intent_has_supported_schema(record: &Value) -> bool {
-    match record["schema_version"].as_u64() {
-        Some(version) if version == u64::from(ACK_INTENT_SCHEMA_VERSION) => {
-            // Reject an attached claim even when it was omitted from a v1
-            // hash. It must never be accepted as an unkeyed instruction.
-            record.get("idempotency").is_none()
-        }
-        Some(version) if version == u64::from(KEYED_ACK_INTENT_SCHEMA_VERSION) => record
-            .get("idempotency")
-            .and_then(|value| serde_json::from_value::<AckIntentIdempotency>(value.clone()).ok())
-            .is_some_and(|claim| claim.is_valid()),
-        _ => false,
+/// An unreadable instruction or completion marker makes the whole queue
+/// unknown. Preserve that error for foreground replay and diagnostics, just
+/// as the bounded background scanner does, instead of claiming an empty or
+/// partially understood queue is safe to replay.
+fn ensure_supported_ack_schema(record: &Value) -> std::io::Result<()> {
+    let kind = record.get("kind").and_then(Value::as_str);
+    if !matches!(kind, Some(ACK_INTENT_KIND | ACK_INTENT_REPLAY_KIND)) {
+        return Ok(());
     }
+    let is_intent = kind == Some(ACK_INTENT_KIND);
+    let version = record.get("schema_version").and_then(Value::as_u64);
+    let keyed = is_intent && version == Some(u64::from(KEYED_ACK_INTENT_SCHEMA_VERSION));
+    if version != Some(u64::from(ACK_INTENT_SCHEMA_VERSION)) && !keyed {
+        // Do not echo arbitrary journal values: even a malformed version can
+        // carry private request data. A supported hash is not schema authority.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "acknowledgement journal has an unsupported schema_version; replay stopped and journal preserved",
+        ));
+    }
+    if is_intent
+        && ((!keyed && record.get("idempotency").is_some())
+            || (keyed
+                && !record
+                    .get("idempotency")
+                    .and_then(|value| {
+                        serde_json::from_value::<AckIntentIdempotency>(value.clone()).ok()
+                    })
+                    .is_some_and(|claim| claim.is_valid())))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "acknowledgement journal has an unsupported retry claim; replay stopped and journal preserved",
+        ));
+    }
+    Ok(())
 }
 
 /// The hashed fields of an acknowledgement replay marker, in writer order.
@@ -678,12 +701,15 @@ pub fn append_ack_replay_record(
 }
 
 /// Read all outstanding (un-replayed) ack intents in first-append order.
+/// Unknown record semantics refuse the complete snapshot, never return a
+/// partial queue that another replay path would reject.
 pub fn read_queued_ack_intents(config: &Config) -> std::io::Result<Vec<QueuedAckIntent>> {
     let Some(mut reader) = IntentLogReader::open(config, ACK_INTENT_LOG_FILE)? else {
         return Ok(Vec::new());
     };
     let mut outstanding = OutstandingIntents::new();
     while let Some(value) = reader.next_record()? {
+        ensure_supported_ack_schema(&value)?;
         match value.get("kind").and_then(Value::as_str) {
             Some(ACK_INTENT_REPLAY_KIND)
                 if value
@@ -704,20 +730,20 @@ pub fn read_queued_ack_intents(config: &Config) -> std::io::Result<Vec<QueuedAck
                 }
             }
             Some(ACK_INTENT_KIND) => {
-                if !ack_intent_has_supported_schema(&value) {
-                    tracing::warn!("skipping ack intent with unsupported schema or retry claim");
-                    continue;
-                }
                 if !record_has_valid_intent_hash(&value, ack_intent_hash_payload) {
                     tracing::warn!("skipping ack intent with invalid content hash");
                     continue;
                 }
-                if let Ok(intent) = serde_json::from_value::<QueuedAckIntent>(value) {
-                    outstanding.insert(
-                        (intent.intent_id.clone(), intent.content_sha256.clone()),
-                        intent,
-                    )?;
-                }
+                let intent = serde_json::from_value::<QueuedAckIntent>(value).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "verified acknowledgement has an invalid payload; replay stopped and journal preserved",
+                    )
+                })?;
+                outstanding.insert(
+                    (intent.intent_id.clone(), intent.content_sha256.clone()),
+                    intent,
+                )?;
             }
             _ => {}
         }
@@ -963,8 +989,6 @@ mod tests {
 
     #[test]
     fn ack_intent_reader_rejects_partial_claims_downgrades_and_unknown_schemas() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let config = test_config(tmp.path());
         let valid_claim = json!({"key": "private-retry-key", "fingerprint": "a".repeat(64)});
         for (version, claim) in [
             (1, Some(valid_claim.clone())),
@@ -976,6 +1000,10 @@ mod tests {
             (2, Some(json!({"key": "key", "fingerprint": "invalid"}))),
             (3, Some(valid_claim)),
         ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let config = test_config(tmp.path());
+            append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None)
+                .expect("known pending intent before unknown record");
             let mut record = json!({
                 "schema_version": version,
                 "kind": ACK_INTENT_KIND,
@@ -991,10 +1019,105 @@ mod tests {
             let hash = hash_json_value(&ack_intent_hash_payload(&record));
             record["intent_id"] = json!(&hash[..16]);
             record["content_sha256"] = json!(hash);
-            append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &record)
+            let path = append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &record)
                 .expect("unsupported record fixture");
+            append_ack_intent(&config, "/p", "BlueLake", 2, "ack", "busy", None)
+                .expect("known pending intent after unknown record");
+            let before = std::fs::read(&path).unwrap();
+            let error = read_queued_ack_intents(&config)
+                .expect_err("unknown instructions must not become a partial successful queue");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(!error.to_string().contains("private-retry-key"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
         }
-        assert_eq!(read_queued_ack_intents(&config).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn ack_intent_reader_rejects_unsupported_completion_schemas() {
+        for version in [
+            None,
+            Some(Value::Null),
+            Some(json!("1")),
+            Some(json!(1.0)),
+            Some(json!(true)),
+            Some(json!(-1)),
+            Some(json!(0)),
+            Some(json!(2)),
+            Some(json!(u64::MAX)),
+        ] {
+            for status in [
+                REPLAY_STATUS_REPLAYED,
+                REPLAY_STATUS_ABANDONED,
+                REPLAY_STATUS_FAILED,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let config = test_config(tmp.path());
+                let receipt =
+                    append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).unwrap();
+                let mut marker = json!({
+                    "kind": ACK_INTENT_REPLAY_KIND,
+                    "intent_id": receipt.intent_id,
+                    "intent_content_sha256": receipt.content_sha256,
+                    "replayed_ts": 2,
+                    "status": status,
+                    "error_detail": null,
+                });
+                if let Some(version) = &version {
+                    marker["schema_version"] = version.clone();
+                }
+                marker["content_sha256"] =
+                    json!(hash_json_value(&ack_replay_hash_payload(&marker)));
+                let path =
+                    append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &marker)
+                        .unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let error = read_queued_ack_intents(&config)
+                    .expect_err("unknown completion semantics cannot authorize replay");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("unsupported schema_version"));
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn ack_intent_reader_refuses_hash_verified_malformed_payloads() {
+        for (field, value) in [
+            ("created_ts", json!("private malformed timestamp")),
+            ("project_key", json!(["private project"])),
+            ("agent_name", Value::Null),
+            ("message_id", json!("42")),
+            ("failure", Value::Null),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = test_config(tmp.path());
+            let receipt =
+                append_ack_intent(&config, "/p", "BlueLake", 1, "ack", "busy", None).unwrap();
+            let mut malformed: Value =
+                serde_json::from_slice(&std::fs::read(&receipt.intent_path).unwrap()).unwrap();
+            malformed[field] = value;
+            let hash = hash_json_value(&ack_intent_hash_payload(&malformed));
+            malformed["intent_id"] = json!(&hash[..16]);
+            malformed["content_sha256"] = json!(hash);
+            assert!(record_has_valid_intent_hash(
+                &malformed,
+                ack_intent_hash_payload,
+            ));
+            append_jsonl(
+                &config,
+                ACK_INTENT_LOG_FILE,
+                ACK_INTENT_LOCK_FILE,
+                &malformed,
+            )
+            .unwrap();
+            let before = std::fs::read(&receipt.intent_path).unwrap();
+            let error = read_queued_ack_intents(&config)
+                .expect_err("verified malformed work must not disappear from the queue");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("invalid payload"));
+            assert!(!error.to_string().contains("private"));
+            assert_eq!(std::fs::read(&receipt.intent_path).unwrap(), before);
+        }
     }
 
     #[test]

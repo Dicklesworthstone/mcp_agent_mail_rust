@@ -946,6 +946,27 @@ pub mod tool_util {
             DbError::Sqlite(ref message)
             | DbError::Schema(ref message)
             | DbError::Pool(ref message)
+            | DbError::Internal(ref message)
+                if classification.class
+                    == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption =>
+            {
+                legacy_tool_error(
+                    "DATABASE_ERROR",
+                    format!(
+                        "WAL certificate validation failed: {message}. {}",
+                        mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE
+                    ),
+                    false,
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({ "error_detail": message }),
+                    ),
+                )
+            }
+            DbError::Sqlite(ref message)
+            | DbError::Schema(ref message)
+            | DbError::Pool(ref message)
                 if e.is_corruption() =>
             {
                 let message = message.clone();
@@ -1179,6 +1200,27 @@ pub mod tool_util {
                     }),
                 ),
             ),
+            DbError::IntegrityCorruption { message, details }
+                if classification.class
+                    == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption =>
+            {
+                legacy_tool_error(
+                    "DATABASE_ERROR",
+                    format!(
+                        "WAL certificate validation failed: {message}. {}",
+                        mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE
+                    ),
+                    false,
+                    db_error_data(
+                        classification,
+                        &failure_envelope,
+                        json!({
+                            "error_detail": message,
+                            "corruption_details": details,
+                        }),
+                    ),
+                )
+            }
             DbError::IntegrityCorruption { message, details }
                 if classification.class == mcp_agent_mail_db::DbErrorClass::FtsIndexCorruption =>
             {
@@ -2036,7 +2078,9 @@ pub mod tool_util {
         // uncached behavior on this and subsequent reads.
         let inventory = scan_read_archive_inventory(storage_root);
         // ubs:ignore — archive generation metadata detects concurrent changes; it is not a cryptographic signature.
-        if clean_read_archive_signature(storage_root).as_ref() == Some(&signature_before) {
+        if inventory.parse_errors == 0
+            && clean_read_archive_signature(storage_root).as_ref() == Some(&signature_before)
+        {
             cache_read_archive_inventory(signature_before, &inventory);
         }
         inventory
@@ -2164,6 +2208,12 @@ pub mod tool_util {
             return Ok(false);
         }
 
+        if archive.parse_errors != 0 {
+            return Err(format!(
+                "archive inventory is incomplete: {} unreadable or malformed artifacts or directory entries",
+                archive.parse_errors
+            ));
+        }
         if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
             return Ok(false);
         }
@@ -3020,6 +3070,34 @@ body
             reset_read_archive_inventory_cache();
         }
 
+        #[test]
+        fn read_archive_inventory_does_not_cache_incomplete_scans() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+            write_inventory_message(&storage_root, 1, 1);
+            let malformed = storage_root.join("projects/demo/messages/2026/02/bad.md");
+            std::fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+            std::fs::write(&malformed, "---json\n{broken\n---\n").unwrap();
+            commit_archive_tree(&repo, "retain malformed archive evidence");
+
+            assert_eq!(read_archive_inventory(&storage_root).parse_errors, 1);
+            assert_eq!(read_archive_inventory(&storage_root).parse_errors, 1);
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                2,
+                "an unchanged archive token does not prove a failed scan is complete"
+            );
+            assert_eq!(read_archive_inventory_cache_len(), 0);
+            reset_read_archive_inventory_cache();
+        }
+
         /// Seed the persisted per-repo mutation epoch token (GH#235) exactly
         /// as a storage-crate mutation window would leave it on disk.
         fn seed_epoch_token(storage_root: &Path, token_hex: &str) {
@@ -3558,6 +3636,39 @@ body
                 counter.load() > before,
                 "main_db_btree_corruption counter should increment on a classified corruption error"
             );
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_preserves_wal_certificate_authority() {
+            let diagnostic = "WAL file is corrupt: parallel WAL certificate suffix does not start at a record boundary";
+            for error in [
+                DbError::Sqlite(diagnostic.into()),
+                DbError::Schema(diagnostic.into()),
+                DbError::Pool(diagnostic.into()),
+                DbError::Internal(format!("internal error: {diagnostic}")),
+                DbError::IntegrityCorruption {
+                    message: "integrity probe failed".into(),
+                    details: vec![diagnostic.into()],
+                },
+            ] {
+                let err = db_error_to_mcp_error(error);
+                let data = err.data.expect("expected data payload");
+                assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+                assert_eq!(data["error"]["recoverable"], false);
+                let classification = &data["error"]["data"]["db_error_classification"];
+                assert_eq!(classification["class"], "wal_certificate_corruption");
+                assert_eq!(classification["repairable"], false);
+                assert_eq!(classification["safe_to_retry"], false);
+                assert_eq!(classification["safe_to_continue_read_only"], false);
+                assert_eq!(classification["blocks_edits"], true);
+                let message = data["error"]["message"].as_str().unwrap();
+                assert!(
+                    message.contains(mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE)
+                );
+                assert!(!message.contains("consider restoring from backup"));
+                assert!(!message.contains("Run 'am doctor repair'"));
+                assert!(data["error"]["data"]["failure_envelope"].is_object());
+            }
         }
 
         #[test]

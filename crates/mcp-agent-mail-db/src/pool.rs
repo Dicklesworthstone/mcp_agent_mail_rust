@@ -8398,6 +8398,13 @@ pub fn is_checkout_validation_failure(message: &str) -> bool {
 
 #[must_use]
 pub fn is_sqlite_recovery_error_message(message: &str) -> bool {
+    // A certificate validation refusal cannot authorize generic recovery,
+    // even when an outer adapter adds the broad "internal error" wrapper.
+    if crate::error::classify_db_error_message(message).class
+        == crate::error::DbErrorClass::WalCertificateCorruption
+    {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
     // FrankenSQLite reports coordinator-launch contention with the generic
     // "internal error" prefix. It is a transient busy condition, not evidence
@@ -8717,10 +8724,6 @@ fn reconcile_archive_state_before_init_with_owner(
         return Ok(false);
     }
 
-    if !archive_has_real_projects(storage_root) {
-        return Ok(false);
-    }
-
     // #126(a): A read-only caller must not trigger an archive-driven
     // reconstruction (reconstruction is a mutation that contends with the
     // owning daemon's WAL). When the primary file is missing under read
@@ -8728,6 +8731,22 @@ fn reconcile_archive_state_before_init_with_owner(
     // error (the larger #126(b) daemon-proxy work) — short-circuit here so
     // the open path can proceed for a present-and-healthy primary.
     if read_only_intent_is_active() {
+        return Ok(false);
+    }
+
+    // An incomplete walk cannot prove an empty archive, clear pending drift,
+    // or authorize rebuilding a missing primary from a partial observation.
+    let archive = crate::reconstruct::scan_archive_message_inventory(storage_root);
+    if archive.parse_errors > 0 {
+        record_pending_archive_drift(primary_path);
+        return Err(SqlError::Custom(format!(
+            "archive inventory is incomplete at {}: {} unreadable or unparseable entries; no reconciliation attempted",
+            storage_root.display(),
+            archive.parse_errors
+        )));
+    }
+
+    if !archive_has_real_projects(storage_root) {
         return Ok(false);
     }
 
@@ -8754,7 +8773,6 @@ fn reconcile_archive_state_before_init_with_owner(
         return Ok(false);
     }
 
-    let archive = crate::reconstruct::scan_archive_message_inventory(storage_root);
     if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
         // An empty archive cannot be ahead of anything: converge any stale
         // pending-drift record for this path.
@@ -10768,6 +10786,11 @@ async fn initialize_sqlite_file_once_with_authorities(
 /// restoration or reinitialization.
 #[must_use]
 pub fn is_corruption_error_message(message: &str) -> bool {
+    if crate::error::classify_db_error_message(message).class
+        == crate::error::DbErrorClass::WalCertificateCorruption
+    {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
     // NOTE: "wal file too small" intentionally NOT listed here.
     //
@@ -10824,6 +10847,7 @@ pub fn private_copy_integrity_probe_failure_is_verdict(message: &str) -> bool {
             | crate::error::DbErrorClass::PoolExhaustion
             | crate::error::DbErrorClass::BusyRetryable
             | crate::error::DbErrorClass::LiveOwnerNoActivityLock
+            | crate::error::DbErrorClass::WalCertificateCorruption
     )
 }
 
@@ -20013,8 +20037,14 @@ fn recent_reconstruct_lookup(
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     cache.retain(|_, entry| {
-        now.saturating_duration_since(entry.completed_at) <= RECONSTRUCT_COALESCE_WINDOW
+        entry.archive_inventory.parse_errors == 0
+            && now.saturating_duration_since(entry.completed_at) <= RECONSTRUCT_COALESCE_WINDOW
     });
+    if archive_inventory.parse_errors > 0 {
+        // Partial counters cannot establish that the archive is unchanged.
+        cache.remove(primary_path);
+        return None;
+    }
     cache
         .get(primary_path)
         .filter(|entry| entry.archive_inventory == *archive_inventory)
@@ -20036,8 +20066,15 @@ fn recent_reconstruct_store(
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     cache.retain(|_, entry| {
-        now.saturating_duration_since(entry.completed_at) <= RECONSTRUCT_COALESCE_WINDOW
+        entry.archive_inventory.parse_errors == 0
+            && now.saturating_duration_since(entry.completed_at) <= RECONSTRUCT_COALESCE_WINDOW
     });
+    if archive_inventory.parse_errors > 0 {
+        // A successful rebuild with an incomplete post-scan is not reusable
+        // evidence, and must invalidate any older success for the same path.
+        cache.remove(primary_path);
+        return;
+    }
     cache.insert(
         primary_path.to_path_buf(),
         RecentReconstructEntry {
@@ -22123,6 +22160,67 @@ mod tests {
         assert_eq!(hit.1.messages, 342);
         assert!(hit.0 <= Duration::from_millis(10));
         reset_recent_reconstruct_cache_for_test();
+    }
+
+    #[test]
+    fn recent_reconstruct_cache_does_not_store_incomplete_inventory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("incomplete-store.sqlite3");
+        let stats = crate::reconstruct::ReconstructStats::default();
+        let complete = reconstruct_cache_inventory(1, 1, 1, Some(1));
+        let mut incomplete = complete.clone();
+        incomplete.parse_errors = 1;
+        let now = Instant::now();
+
+        recent_reconstruct_store(&path, now, &complete, &stats);
+        recent_reconstruct_store(&path, now, &incomplete, &stats);
+        assert!(
+            recent_reconstruct_lookup(&path, &incomplete, now).is_none(),
+            "a partial post-reconstruct scan must never be cached as a success"
+        );
+        assert!(
+            recent_reconstruct_lookup(&path, &complete, now).is_none(),
+            "an incomplete scan must also invalidate the older success"
+        );
+        assert!(
+            !recent_reconstruct_cache()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&path)
+        );
+    }
+
+    #[test]
+    fn recent_reconstruct_cache_does_not_accept_incomplete_inventory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("incomplete-lookup.sqlite3");
+        let stats = crate::reconstruct::ReconstructStats::default();
+        let complete = reconstruct_cache_inventory(1, 1, 1, Some(1));
+        let mut incomplete = complete.clone();
+        incomplete.parse_errors = 1;
+        let now = Instant::now();
+
+        // Model an entry retained by an earlier implementation: matching
+        // partial counters still cannot authorize reconstruction coalescing.
+        recent_reconstruct_cache()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                path.clone(),
+                RecentReconstructEntry {
+                    completed_at: now,
+                    archive_inventory: incomplete.clone(),
+                    stats: stats.clone(),
+                },
+            );
+        assert!(recent_reconstruct_lookup(&path, &incomplete, now).is_none());
+
+        recent_reconstruct_store(&path, now, &complete, &stats);
+        assert!(recent_reconstruct_lookup(&path, &incomplete, now).is_none());
+        assert!(
+            recent_reconstruct_lookup(&path, &complete, now).is_none(),
+            "an incomplete lookup must invalidate earlier complete evidence"
+        );
     }
 
     #[test]
@@ -34807,6 +34905,107 @@ mod tests {
         assert!(
             reconciled,
             "with pending drift recorded, the reconcile must actually run"
+        );
+    }
+
+    #[test]
+    fn reconcile_archive_state_refuses_incomplete_inventory_without_changing_primary() {
+        for existing_primary in [false, true] {
+            for projects_obstructed in [false, true] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let primary = dir.path().join("storage.sqlite3");
+                let storage_root = dir.path().join("storage");
+                std::fs::create_dir_all(&storage_root).expect("create archive root");
+                let obstruction = if projects_obstructed {
+                    storage_root.join("projects")
+                } else {
+                    let project = storage_root.join("projects").join("test-proj");
+                    std::fs::create_dir_all(&project).expect("create project directory");
+                    std::fs::write(
+                        project.join("project.json"),
+                        r#"{"slug":"test-proj","human_key":"/tmp/test-proj"}"#,
+                    )
+                    .expect("write project metadata");
+                    project.join("messages")
+                };
+                std::fs::write(&obstruction, b"retained directory obstruction")
+                    .expect("obstruct archive directory");
+
+                let before = if existing_primary {
+                    let conn =
+                        crate::CanonicalDbConn::open_file(primary.to_string_lossy().as_ref())
+                            .expect("create healthy primary");
+                    conn.execute_raw(&crate::schema::init_schema_sql_base())
+                        .expect("initialize primary schema");
+                    drop(conn);
+                    record_pending_archive_drift(&primary);
+                    Some(std::fs::read(&primary).expect("read primary before reconcile"))
+                } else {
+                    None
+                };
+                let inventory = crate::reconstruct::scan_archive_message_inventory(&storage_root);
+                assert_eq!(inventory.parse_errors, 1);
+
+                let error = reconcile_archive_state_before_init(&primary, &storage_root)
+                    .expect_err("a partial inventory must not authorize reconciliation");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("archive inventory is incomplete")
+                );
+                assert!(
+                    has_pending_archive_drift(&primary),
+                    "incomplete observations must preserve drift for a later retry"
+                );
+                if let Some(before) = before {
+                    assert_eq!(
+                        std::fs::read(&primary).expect("read primary after refusal"),
+                        before
+                    );
+                } else {
+                    assert!(
+                        !primary.exists(),
+                        "partial archive must not create a primary"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(&obstruction).expect("read retained obstruction"),
+                    b"retained directory obstruction"
+                );
+                clear_pending_archive_drift(&primary);
+            }
+        }
+    }
+
+    #[test]
+    fn reconcile_archive_state_ignores_incomplete_unrelated_default_archive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("custom.sqlite3");
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(
+            |_isolated_default_root| {
+                let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+                std::fs::create_dir_all(&storage_root).expect("create unrelated archive root");
+                let obstruction = storage_root.join("projects");
+                std::fs::write(&obstruction, b"unrelated directory obstruction")
+                    .expect("obstruct unrelated archive");
+                assert_eq!(
+                    crate::reconstruct::scan_archive_message_inventory(&storage_root).parse_errors,
+                    1
+                );
+
+                record_pending_archive_drift(&primary);
+                assert!(
+                    !reconcile_archive_state_before_init(&primary, &storage_root)
+                        .expect("unrelated default archive cannot govern the custom database")
+                );
+                assert!(has_pending_archive_drift(&primary));
+                assert!(!primary.exists());
+                assert_eq!(
+                    std::fs::read(&obstruction).expect("retained unrelated obstruction"),
+                    b"unrelated directory obstruction"
+                );
+                clear_pending_archive_drift(&primary);
+            },
         );
     }
 

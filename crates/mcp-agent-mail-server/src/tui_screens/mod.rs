@@ -89,13 +89,91 @@ pub fn contains_ci(text: &str, query_lower: &str) -> bool {
 /// Borrows the runtime-backed ambient `Cx` installed by `Runtime::block_on`,
 /// as the compose and reservation-create forms do, and marks the call as the
 /// operator's so the agent is not recorded as active
-/// (`tool_util::operator_context`). A tool call made with it blocks the UI
-/// loop for its duration, like those forms.
+/// (`tool_util::operator_context`). Create this context inside an
+/// [`operator_task`] so tool admission and database waits stay off the UI loop.
 pub(crate) fn operator_tool_context() -> McpContext {
     let cx = block_on(async {
         Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
     });
     mcp_agent_mail_tools::tool_util::operator_context(cx)
+}
+
+/// An operator task's human-readable outcome and screen-specific result data.
+#[derive(Debug, Clone)]
+pub struct OperatorTaskResult {
+    pub summary: String,
+    pub data: serde_json::Value,
+}
+
+/// Admission for one submitted form. A dropped, unstarted command releases
+/// the form; a started command stays pending until its completion is handled.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingOperatorTask {
+    request_id: u64,
+    active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PendingOperatorTask {
+    pub(crate) fn new(request_id: u64) -> (Self, OperatorTaskStartGuard) {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let guard = OperatorTaskStartGuard {
+            queued: Some(std::sync::Arc::clone(&active)),
+        };
+        (Self { request_id, active }, guard)
+    }
+
+    pub(crate) const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Move this guard into the task closure before enqueueing it, then call
+/// `started` as its first instruction. This distinguishes a discarded task
+/// from a write whose result is still on its way to the UI.
+pub(crate) struct OperatorTaskStartGuard {
+    queued: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl OperatorTaskStartGuard {
+    pub(crate) fn started(&mut self) {
+        drop(self.queued.take());
+    }
+}
+
+impl Drop for OperatorTaskStartGuard {
+    fn drop(&mut self) {
+        if let Some(active) = self.queued.take() {
+            active.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// Run blocking operator work on the TUI runtime's task executor. The task
+/// owns its target identity; completion is delivered to the originating
+/// screen even when the operator has navigated elsewhere in the meantime.
+pub(crate) fn operator_task(
+    screen: MailScreenId,
+    operation: &str,
+    run: impl FnOnce() -> Result<OperatorTaskResult, String> + Send + 'static,
+) -> Cmd<MailScreenMsg> {
+    let operation = operation.to_string();
+    Cmd::task_named(format!("operator:{operation}"), move || {
+        // The runtime cannot construct an application completion message for
+        // a panicking closure. Settle pending UI state even in that case;
+        // writes may already have succeeded, so never promise a safe retry.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| {
+            Err("Operator task stopped unexpectedly; refresh and check mailbox state before retrying".to_string())
+        });
+        MailScreenMsg::OperatorCompleted {
+            screen,
+            operation,
+            result,
+        }
+    })
 }
 
 /// Hand the outcome of an action-menu write to the app, which shows it as a
@@ -201,6 +279,30 @@ pub(crate) fn expect_operator_result(cmd: Cmd<MailScreenMsg>) -> (String, String
         .unwrap_or_else(|| panic!("expected operator_result, got {op}"));
     let (status, operation) = rest.split_once(':').expect("status:operation");
     (status.to_string(), operation.to_string(), text)
+}
+
+/// Execute a deferred operator command and deliver its result to its screen.
+/// Tests can inspect the mailbox and interact with the screen before calling
+/// this helper to prove the action handler did not run blocking work inline.
+#[cfg(test)]
+pub(crate) fn complete_operator_task(
+    screen: &mut dyn MailScreen,
+    cmd: Cmd<MailScreenMsg>,
+) -> (String, String, String) {
+    let Cmd::Task(_, run) = cmd else {
+        return expect_operator_result(cmd);
+    };
+    let MailScreenMsg::OperatorCompleted {
+        operation, result, ..
+    } = run()
+    else {
+        panic!("expected an operator task completion");
+    };
+    screen.handle_operator_result(&operation, &result);
+    match result {
+        Ok(result) => ("ok".to_string(), operation, result.summary),
+        Err(error) => ("error".to_string(), operation, error),
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -417,6 +519,15 @@ pub trait MailScreen {
         Cmd::None
     }
 
+    /// Apply a completed operator task to this screen, including while it is
+    /// inactive. The app handles the toast and in-flight marker separately.
+    fn handle_operator_result(
+        &mut self,
+        _operation: &str,
+        _result: &Result<OperatorTaskResult, String>,
+    ) {
+    }
+
     /// Title shown in the help overlay header.
     fn title(&self) -> &'static str;
 
@@ -571,6 +682,12 @@ pub enum MailScreenMsg {
     /// Execute an action-menu operation on the active screen.
     /// Contains `(operation, context_id)`.
     ActionExecute(String, String),
+    /// A background action completed for its originating screen.
+    OperatorCompleted {
+        screen: MailScreenId,
+        operation: String,
+        result: Result<OperatorTaskResult, String>,
+    },
 }
 
 /// Context for deep-link navigation between screens.
@@ -671,6 +788,106 @@ mod tests {
     use super::*;
     use mcp_agent_mail_core::Config;
     use std::collections::HashSet;
+
+    #[test]
+    fn operator_task_defers_work_and_preserves_origin() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let worker_ran = Arc::clone(&ran);
+        let cmd = operator_task(MailScreenId::Messages, "acknowledge", move || {
+            worker_ran.store(true, Ordering::Release);
+            Ok(OperatorTaskResult {
+                summary: "receipt recorded".to_string(),
+                data: serde_json::json!({ "message_id": 42 }),
+            })
+        });
+        assert!(
+            !ran.load(Ordering::Acquire),
+            "dispatch must return before work starts"
+        );
+        let Cmd::Task(_, run) = cmd else {
+            panic!("operator work must use the runtime task executor");
+        };
+        let MailScreenMsg::OperatorCompleted {
+            screen,
+            operation,
+            result,
+        } = run()
+        else {
+            panic!("operator completion");
+        };
+        assert!(ran.load(Ordering::Acquire));
+        assert_eq!(screen, MailScreenId::Messages);
+        assert_eq!(operation, "acknowledge");
+        assert_eq!(result.unwrap().data["message_id"], 42);
+    }
+
+    #[test]
+    fn operator_task_panic_returns_a_failure_completion() {
+        let cmd = operator_task(MailScreenId::Reservations, "release", || {
+            panic!("failure after a possible partial write")
+        });
+        let Cmd::Task(_, run) = cmd else {
+            panic!("operator task");
+        };
+        let MailScreenMsg::OperatorCompleted {
+            screen,
+            operation,
+            result,
+        } = run()
+        else {
+            panic!("a panic must still settle the action");
+        };
+        assert_eq!(screen, MailScreenId::Reservations);
+        assert_eq!(operation, "release");
+        assert!(
+            result
+                .unwrap_err()
+                .contains("check mailbox state before retrying")
+        );
+    }
+
+    #[test]
+    fn a_dropped_operator_command_releases_form_admission() {
+        let (pending, mut guard) = PendingOperatorTask::new(7);
+        let cmd = operator_task(MailScreenId::Messages, "compose:7", move || {
+            guard.started();
+            Ok(OperatorTaskResult {
+                summary: "sent".to_string(),
+                data: serde_json::Value::Null,
+            })
+        });
+        assert_eq!(pending.request_id(), 7);
+        assert!(pending.is_active());
+        drop(cmd);
+        assert!(
+            !pending.is_active(),
+            "a rejected command must allow form retry"
+        );
+    }
+
+    #[test]
+    fn a_started_operator_command_stays_pending_until_completion_is_delivered() {
+        let (pending, mut guard) = PendingOperatorTask::new(8);
+        let cmd = operator_task(MailScreenId::Messages, "compose:8", move || {
+            guard.started();
+            Err("send failed".to_string())
+        });
+        let Cmd::Task(_, run) = cmd else {
+            panic!("operator task");
+        };
+        let completion = run();
+        assert!(matches!(
+            completion,
+            MailScreenMsg::OperatorCompleted { result: Err(_), .. }
+        ));
+        assert!(
+            pending.is_active(),
+            "do not admit another submit ahead of the queued result"
+        );
+    }
 
     #[test]
     fn selection_state_toggle_and_clear() {
