@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
@@ -48,7 +49,7 @@ use crate::tui_persist::{
 };
 use crate::tui_screens::{
     DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg, OperatorTaskResult,
-    SelectionState, operator_result, operator_task, operator_tool_context,
+    PendingOperatorTask, SelectionState, operator_result, operator_task, operator_tool_context,
 };
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1081,6 +1082,7 @@ fn require_active_compose_recipient(agents: &[ComposeAgent], name: &str) -> Resu
 #[derive(Debug, Clone)]
 struct ComposeFormState {
     project_slug: String,
+    mailbox_source: Option<(String, PathBuf)>,
     to_input: TextInput,
     cc_input: TextInput,
     subject_input: TextInput,
@@ -1093,6 +1095,13 @@ struct ComposeFormState {
     suggestions: Vec<String>,
     suggestion_cursor: usize,
     errors: ComposeValidationErrors,
+    pending: Option<PendingOperatorTask>,
+    submit_feedback: Option<Arc<OnceLock<ComposeSubmitFeedback>>>,
+}
+
+#[derive(Debug)]
+struct ComposeSubmitFeedback {
+    available_agents: Vec<String>,
 }
 
 impl ComposeFormState {
@@ -1103,6 +1112,7 @@ impl ComposeFormState {
     ) -> Self {
         let mut form = Self {
             project_slug,
+            mailbox_source: None,
             to_input: TextInput::new()
                 .with_placeholder("Recipient agent (comma-separated)")
                 .with_focused(true),
@@ -1121,6 +1131,8 @@ impl ComposeFormState {
             suggestions: Vec::new(),
             suggestion_cursor: 0,
             errors: ComposeValidationErrors::default(),
+            pending: None,
+            submit_feedback: None,
         };
         if let Some(to) = prefill_to {
             form.to_input.set_value(&to);
@@ -1132,6 +1144,12 @@ impl ComposeFormState {
 
     const fn importance(&self) -> &'static str {
         COMPOSE_IMPORTANCE_LEVELS[self.importance_idx]
+    }
+
+    fn is_submitting(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(PendingOperatorTask::is_active)
     }
 
     fn update_focus(&mut self) {
@@ -1251,10 +1269,13 @@ impl ComposeFormState {
 #[derive(Debug, Clone)]
 struct QuickReplyFormState {
     context: QuickReplyContext,
+    mailbox_source: Option<(String, PathBuf)>,
+    from_archive_snapshot: bool,
     body_input: TextArea,
     ack_required: bool,
     focus: QuickReplyField,
     errors: QuickReplyValidationErrors,
+    pending: Option<PendingOperatorTask>,
 }
 
 impl QuickReplyFormState {
@@ -1262,6 +1283,8 @@ impl QuickReplyFormState {
         let context = QuickReplyContext::from_entry(entry)?;
         let mut form = Self {
             context,
+            mailbox_source: None,
+            from_archive_snapshot: false,
             body_input: TextArea::new()
                 .with_placeholder("Reply body (Markdown)...")
                 .with_soft_wrap(true)
@@ -1269,9 +1292,16 @@ impl QuickReplyFormState {
             ack_required: entry.ack_required,
             focus: QuickReplyField::Body,
             errors: QuickReplyValidationErrors::default(),
+            pending: None,
         };
         form.update_focus();
         Some(form)
+    }
+
+    fn is_submitting(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(PendingOperatorTask::is_active)
     }
 
     fn update_focus(&mut self) {
@@ -1388,6 +1418,8 @@ pub struct MessageBrowserScreen {
     quick_reply_form: Option<QuickReplyFormState>,
     /// Message compose modal state (when active).
     compose_form: Option<ComposeFormState>,
+    /// Shared by compose and reply so a late completion cannot own a new form.
+    form_request_id: u64,
     /// Cache for rendered message body with inline images:
     detail_cache: RefCell<Option<MessageDetailRenderCache>>,
     /// Per-selection collapsible JSON tree interaction state.
@@ -1467,6 +1499,7 @@ impl MessageBrowserScreen {
             last_data_gen: super::DataGeneration::stale(),
             quick_reply_form: None,
             compose_form: None,
+            form_request_id: 0,
             detail_cache: RefCell::new(None),
             json_tree_state: RefCell::new(crate::tui_markdown::JsonTreeViewState::default()),
             focused_sync_cursor: usize::MAX,
@@ -1605,9 +1638,9 @@ impl MessageBrowserScreen {
     fn live_compose_agents(
         project_slug: &str,
         name: Option<&str>,
-        state: Option<&TuiSharedState>,
+        config: &mcp_agent_mail_core::Config,
     ) -> Result<Vec<ComposeAgent>, String> {
-        let conn = Self::open_live_recipient_connection(state)?;
+        let conn = Self::open_live_recipient_connection(config)?;
         query_compose_agents(
             |sql, params| conn.query_sync(sql, params),
             project_slug,
@@ -1617,9 +1650,9 @@ impl MessageBrowserScreen {
 
     fn live_quick_reply_recipient(
         context: &QuickReplyContext,
-        state: Option<&TuiSharedState>,
+        config: &mcp_agent_mail_core::Config,
     ) -> Result<ComposeAgent, String> {
-        let conn = Self::open_live_recipient_connection(state)?;
+        let conn = Self::open_live_recipient_connection(config)?;
         query_quick_reply_recipient(
             |sql, params| conn.query_sync(sql, params),
             &context.project_slug,
@@ -1628,9 +1661,8 @@ impl MessageBrowserScreen {
     }
 
     fn open_live_recipient_connection(
-        state: Option<&TuiSharedState>,
+        config: &mcp_agent_mail_core::Config,
     ) -> Result<mcp_agent_mail_db::GuardedReadOnlyConn, String> {
-        let config = Self::runtime_config_from_state(state);
         let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
             .ok_or_else(|| "Database connection unavailable".to_string())?;
         crate::open_read_only_sync_db_connection_with_busy_timeout(
@@ -1648,6 +1680,7 @@ impl MessageBrowserScreen {
         error: String,
     ) {
         let mut form = ComposeFormState::new(project_slug, prefill_to, Vec::new());
+        form.mailbox_source.clone_from(&self.mailbox_source);
         form.errors.general = Some(error);
         self.quick_reply_form = None;
         self.compose_form = Some(form);
@@ -1699,6 +1732,7 @@ impl MessageBrowserScreen {
             }
         };
         let mut form = ComposeFormState::new(project_slug, prefill_to, agents);
+        form.mailbox_source.clone_from(&self.mailbox_source);
         if form.available_agents.is_empty() {
             form.errors.general = Some(
                 "No active agents found in this project. Register or unretire an agent before composing."
@@ -1738,8 +1772,9 @@ impl MessageBrowserScreen {
         })
     }
 
-    fn open_live_mutation_db_connection(state: Option<&TuiSharedState>) -> Result<DbConn, String> {
-        let config = Self::runtime_config_from_state(state);
+    fn open_live_mutation_db_connection(
+        config: &mcp_agent_mail_core::Config,
+    ) -> Result<DbConn, String> {
         let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
             .ok_or_else(|| "Database connection unavailable".to_string())?;
         if !sqlite_path.exists() {
@@ -1779,6 +1814,10 @@ impl MessageBrowserScreen {
         let Some(mut form) = QuickReplyFormState::from_entry(entry) else {
             return Err("Selected message is missing required reply context".to_string());
         };
+        // Numeric message IDs only identify the database that produced them.
+        // Preserve that provenance even if the browser rebinds while drafting.
+        form.mailbox_source.clone_from(&self.mailbox_source);
+        form.from_archive_snapshot = self._db_snapshot_dir.is_some();
         if let Some(conn) = &self.db_conn {
             form.errors.general = query_quick_reply_recipient(
                 |sql, params| conn.query_sync(sql, params),
@@ -1810,15 +1849,14 @@ impl MessageBrowserScreen {
     }
 
     fn ensure_compose_sender(
-        &self,
         project_slug: &str,
-        state: Option<&TuiSharedState>,
+        config: &mcp_agent_mail_core::Config,
     ) -> Result<(), String> {
         // This helper can create/update both the live agent row and its archive
         // profile. Freeze recovery promotion before opening the raw live fd and
         // retain the lease until both durable representations are complete.
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-        let conn = Self::open_live_mutation_db_connection(state)?;
+        let conn = Self::open_live_mutation_db_connection(config)?;
         let project_id = if let Some(project_id) = synthetic_project_id(project_slug) {
             ensure_synthetic_project_row(&conn, project_id, project_slug)?
         } else {
@@ -1879,8 +1917,7 @@ impl MessageBrowserScreen {
         )
         .map_err(|e| format!("Failed to create compose sender: {e}"))?;
 
-        let config = Self::runtime_config_from_state(state);
-        if let Ok(Some(archive)) = mcp_agent_mail_storage::open_archive(&config, project_slug) {
+        if let Ok(Some(archive)) = mcp_agent_mail_storage::open_archive(config, project_slug) {
             let agent_json = serde_json::json!({
                 "name": COMPOSE_SENDER_NAME,
                 "program": "am-tui",
@@ -1896,45 +1933,52 @@ impl MessageBrowserScreen {
             });
             let _ = mcp_agent_mail_storage::write_agent_profile_with_config(
                 &archive,
-                &config,
+                config,
                 &agent_json,
             );
         }
         Ok(())
     }
 
+    fn next_form_request_id(&mut self) -> Result<u64, String> {
+        self.form_request_id = self.form_request_id.checked_add(1).ok_or_else(|| {
+            "Form request limit reached; restart the console before submitting again".to_string()
+        })?;
+        Ok(self.form_request_id)
+    }
+
+    fn verify_form_mailbox_source(
+        config: &mcp_agent_mail_core::Config,
+        displayed_source: Option<&(String, PathBuf)>,
+    ) -> Result<(), String> {
+        // Send/reply use the cached tool configuration. Re-reading only the
+        // environment here could approve a mailbox the tools have not adopted.
+        let current = mcp_agent_mail_core::Config::get();
+        let captured_path = crate::resolve_server_database_url_sqlite_path(&config.database_url);
+        let current_path = crate::resolve_server_database_url_sqlite_path(&current.database_url);
+        let source_matches = displayed_source.is_none_or(|(url, root)| {
+            crate::resolve_server_database_url_sqlite_path(url) == captured_path
+                && root == &config.storage_root
+        });
+        if captured_path.is_none()
+            || captured_path != current_path
+            || config.storage_root != current.storage_root
+            || !source_matches
+        {
+            return Err(
+                "This draft belongs to a different mailbox than the sending tools; refresh with the same database and storage configuration before sending".to_string(),
+            );
+        }
+        Ok(())
+    }
+
     fn submit_compose_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
-        let Some(project_slug) = self
+        if self
             .compose_form
             .as_ref()
-            .map(|form| form.project_slug.clone())
-        else {
+            .is_some_and(ComposeFormState::is_submitting)
+        {
             return Cmd::None;
-        };
-        // The browser can be showing a retained archive snapshot. New mail
-        // must consult the live mailbox before creating or touching its sender.
-        let refreshed = Self::live_compose_agents(&project_slug, None, state).and_then(|agents| {
-            let Some(form) = self.compose_form.as_mut() else {
-                return Ok(());
-            };
-            form.available_agents = active_compose_agent_names(&agents);
-            form.refresh_suggestions();
-            for name in parse_recipient_list(form.to_input.value())
-                .into_iter()
-                .chain(parse_recipient_list(form.cc_input.value()))
-            {
-                require_active_compose_recipient(&agents, &name)?;
-            }
-            Ok(())
-        });
-        if let Err(error) = refreshed {
-            if let Some(form) = self.compose_form.as_mut() {
-                form.errors.general = Some(error.clone());
-            }
-            return Cmd::msg(MailScreenMsg::ActionExecute(
-                "compose_result:error".to_string(),
-                error,
-            ));
         }
         let (payload, errors) = match self.compose_form.as_ref() {
             Some(form) => match validate_compose_form(form) {
@@ -1952,57 +1996,81 @@ impl MessageBrowserScreen {
         let Some(mut payload) = payload else {
             return Cmd::None;
         };
-        if payload.thread_id.is_none() {
-            let micros = unix_epoch_micros_now().unwrap_or(0);
-            payload.thread_id = Some(format!("tui-{micros}"));
-        }
-
-        if let Err(err) = self.ensure_compose_sender(&payload.project_slug, state) {
-            if let Some(form) = self.compose_form.as_mut() {
-                form.errors.general = Some(err.clone());
+        let request_id = match self.next_form_request_id() {
+            Ok(id) => id,
+            Err(error) => {
+                if let Some(form) = self.compose_form.as_mut() {
+                    form.errors.general = Some(error.clone());
+                }
+                return Cmd::msg(MailScreenMsg::ActionExecute(
+                    "compose_result:error".to_string(),
+                    error,
+                ));
             }
-            return Cmd::msg(MailScreenMsg::ActionExecute(
-                "compose_result:error".to_string(),
-                err,
-            ));
+        };
+        let config = Self::runtime_config_from_state(state);
+        let displayed_source = self
+            .compose_form
+            .as_ref()
+            .and_then(|form| form.mailbox_source.clone());
+        let feedback = Arc::new(OnceLock::new());
+        let (pending, mut start_guard) = PendingOperatorTask::new(request_id);
+        if let Some(form) = self.compose_form.as_mut() {
+            form.pending = Some(pending);
+            form.submit_feedback = Some(Arc::clone(&feedback));
+            form.errors = ComposeValidationErrors::default();
         }
+        operator_task(
+            MailScreenId::Messages,
+            &format!("compose:{request_id}"),
+            move || {
+                start_guard.started();
+                // An archive-backed browser is only a draft source. Resolve the
+                // live roster before touching the sender or attempting delivery.
+                let agents = Self::live_compose_agents(&payload.project_slug, None, &config)?;
+                let _ = feedback.set(ComposeSubmitFeedback {
+                    available_agents: active_compose_agent_names(&agents),
+                });
+                for name in payload.to.iter().chain(&payload.cc) {
+                    require_active_compose_recipient(&agents, name)?;
+                }
+                Self::verify_form_mailbox_source(&config, displayed_source.as_ref())?;
+                Self::ensure_compose_sender(&payload.project_slug, &config)?;
+                if payload.thread_id.is_none() {
+                    let micros = unix_epoch_micros_now().unwrap_or(0);
+                    payload.thread_id = Some(format!("tui-{micros}"));
+                }
 
-        // Borrow the runtime-backed ambient Cx<cap::All> installed by
-        // `Runtime::block_on` (INFINITE budget) instead of the test-only
-        // `Cx::for_testing()` constructor, which is gated behind
-        // `test-internals`. The Cx is Arc-backed and remains valid for the
-        // McpContext used by the send below.
-        let cx = block_on(async {
-            Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
-        });
-        let ctx = McpContext::new(cx, 1);
-        let result = block_on(mcp_agent_mail_tools::messaging::send_message(
-            &ctx,
-            payload.project_slug.clone(),
-            COMPOSE_SENDER_NAME.to_string(),
-            payload.to.clone(),
-            payload.subject.clone(),
-            payload.body_md.clone(),
-            if payload.cc.is_empty() {
-                None
-            } else {
-                Some(payload.cc.clone())
-            },
-            None,
-            None,
-            None,
-            Some(payload.importance.clone()),
-            Some(payload.ack_required),
-            payload.thread_id.clone(),
-            None,
-            None,
-            None,
-            None,
-            None, // idempotency_key
-        ));
-
-        match result {
-            Ok(_) => {
+                let cx = block_on(async {
+                    Cx::current()
+                        .expect("Runtime::block_on installs an ambient Cx for the polled future")
+                });
+                let ctx = McpContext::new(cx, 1);
+                block_on(mcp_agent_mail_tools::messaging::send_message(
+                    &ctx,
+                    payload.project_slug.clone(),
+                    COMPOSE_SENDER_NAME.to_string(),
+                    payload.to.clone(),
+                    payload.subject.clone(),
+                    payload.body_md.clone(),
+                    if payload.cc.is_empty() {
+                        None
+                    } else {
+                        Some(payload.cc.clone())
+                    },
+                    None,
+                    None,
+                    None,
+                    Some(payload.importance.clone()),
+                    Some(payload.ack_required),
+                    payload.thread_id.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None, // idempotency_key
+                ))
+                .map_err(|error| error.to_string())?;
                 let to_summary = if payload.to.is_empty() {
                     if let Some(first) = payload.cc.first() {
                         if payload.cc.len() == 1 {
@@ -2018,26 +2086,13 @@ impl MessageBrowserScreen {
                 } else {
                     format!("{} (+{})", payload.to[0], payload.to.len() - 1)
                 };
-                let thread = payload.thread_id.unwrap_or_else(|| "n/a".to_string());
-                self.compose_form = None;
-                self.search_dirty = true;
-                self.debounce_remaining = 0;
-                Cmd::msg(MailScreenMsg::ActionExecute(
-                    "compose_result:ok".to_string(),
-                    format!("to {to_summary} · thread {thread}"),
-                ))
-            }
-            Err(err) => {
-                let message = err.to_string();
-                if let Some(form) = self.compose_form.as_mut() {
-                    form.errors.general = Some(message.clone());
-                }
-                Cmd::msg(MailScreenMsg::ActionExecute(
-                    "compose_result:error".to_string(),
-                    message,
-                ))
-            }
-        }
+                let thread = payload.thread_id.as_deref().unwrap_or("n/a");
+                Ok(OperatorTaskResult {
+                    summary: format!("to {to_summary} · thread {thread}"),
+                    data: serde_json::Value::Null,
+                })
+            },
+        )
     }
 
     /// Acknowledge (or mark read) each listed message for every one of its
@@ -2075,11 +2130,12 @@ impl MessageBrowserScreen {
             move || {
                 // Configuration may have changed while this task was queued.
                 // Display names and snapshot-local IDs never authorize writes.
-                Self::verify_receipt_mailbox_source(&mailbox_source)?;
+                let config = mcp_agent_mail_core::Config::get();
+                Self::verify_receipt_mailbox_source(&mailbox_source, &config)?;
                 // Resolve every selected delivery before the first write, then
                 // drop the read connection before entering tool write admission.
                 let plans = {
-                    let conn = Self::open_live_recipient_connection(None)?;
+                    let conn = Self::open_live_recipient_connection(&config)?;
                     with_message_delivery_snapshot(&conn, || {
                         selected
                             .iter()
@@ -2139,8 +2195,8 @@ impl MessageBrowserScreen {
 
     fn verify_receipt_mailbox_source(
         (database_url, storage_root): &(String, PathBuf),
+        config: &mcp_agent_mail_core::Config,
     ) -> Result<(), String> {
-        let config = Self::runtime_config_from_state(None);
         let displayed = crate::resolve_server_database_url_sqlite_path(database_url);
         let current = crate::resolve_server_database_url_sqlite_path(&config.database_url);
         if displayed.is_none() || displayed != current || storage_root != &config.storage_root {
@@ -2152,6 +2208,13 @@ impl MessageBrowserScreen {
     }
 
     fn submit_quick_reply_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
+        if self
+            .quick_reply_form
+            .as_ref()
+            .is_some_and(QuickReplyFormState::is_submitting)
+        {
+            return Cmd::None;
+        }
         let (body_md, errors) = match self.quick_reply_form.as_ref() {
             Some(form) => match validate_quick_reply_form(form) {
                 Ok(body) => (Some(body), QuickReplyValidationErrors::default()),
@@ -2168,84 +2231,120 @@ impl MessageBrowserScreen {
         let Some(body_md) = body_md else {
             return Cmd::None;
         };
-        let Some(context) = self
-            .quick_reply_form
-            .as_ref()
-            .map(|form| form.context.clone())
+        let Some((context, displayed_source, from_snapshot)) =
+            self.quick_reply_form.as_ref().map(|form| {
+                (
+                    form.context.clone(),
+                    form.mailbox_source.clone(),
+                    form.from_archive_snapshot,
+                )
+            })
         else {
             return Cmd::None;
         };
 
-        self.ensure_modal_db_conn(state);
-        let admission = Self::live_quick_reply_recipient(&context, state)
-            .and_then(|_| self.ensure_compose_sender(&context.project_slug, state));
-        if let Err(err) = admission {
-            if let Some(form) = self.quick_reply_form.as_mut() {
-                form.errors.general = Some(err.clone());
+        let request_id = match self.next_form_request_id() {
+            Ok(id) => id,
+            Err(error) => {
+                if let Some(form) = self.quick_reply_form.as_mut() {
+                    form.errors.general = Some(error.clone());
+                }
+                return Cmd::msg(MailScreenMsg::ActionExecute(
+                    "quick_reply_result:error".to_string(),
+                    error,
+                ));
             }
-            return Cmd::msg(MailScreenMsg::ActionExecute(
-                "quick_reply_result:error".to_string(),
-                err,
-            ));
-        }
-
+        };
         let ack_required = self.quick_reply_form.as_ref().map(|form| form.ack_required);
+        let config = Self::runtime_config_from_state(state);
+        let (pending, mut start_guard) = PendingOperatorTask::new(request_id);
+        if let Some(form) = self.quick_reply_form.as_mut() {
+            form.pending = Some(pending);
+            form.errors = QuickReplyValidationErrors::default();
+        }
+        operator_task(
+            MailScreenId::Messages,
+            &format!("quick_reply:{request_id}"),
+            move || {
+                start_guard.started();
+                if from_snapshot {
+                    return Err(
+                        "This message comes from an archive snapshot whose message IDs may differ from the live mailbox; recover the live mailbox and reload before replying".to_string(),
+                    );
+                }
+                let displayed_source = displayed_source.as_ref().ok_or_else(|| {
+                    "This message has no verified live mailbox source; reload the mailbox before replying".to_string()
+                })?;
+                Self::live_quick_reply_recipient(&context, &config)?;
+                Self::verify_form_mailbox_source(&config, Some(displayed_source))?;
+                Self::ensure_compose_sender(&context.project_slug, &config)?;
 
-        // Borrow the runtime-backed ambient Cx<cap::All> installed by
-        // `Runtime::block_on` instead of the test-only `Cx::for_testing()`
-        // constructor (gated behind `test-internals`).
-        let cx = block_on(async {
-            Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
-        });
-        let ctx = McpContext::new(cx, 1);
-        let result = block_on(mcp_agent_mail_tools::messaging::reply_message(
-            &ctx,
-            context.project_slug.clone(),
-            context.message_id,
-            COMPOSE_SENDER_NAME.to_string(),
-            body_md,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ack_required,
-            None,
-            None,
-            None, // sender_token
-            None, // idempotency_key
-        ));
-
-        match result {
-            Ok(_) => {
+                let cx = block_on(async {
+                    Cx::current()
+                        .expect("Runtime::block_on installs an ambient Cx for the polled future")
+                });
+                let ctx = McpContext::new(cx, 1);
+                block_on(mcp_agent_mail_tools::messaging::reply_message(
+                    &ctx,
+                    context.project_slug.clone(),
+                    context.message_id,
+                    COMPOSE_SENDER_NAME.to_string(),
+                    body_md,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    ack_required,
+                    None,
+                    None,
+                    None, // sender_token
+                    None, // idempotency_key
+                ))
+                .map_err(|error| error.to_string())?;
                 let thread = context.thread_id.as_deref().unwrap_or("derived");
-                let ack = if self
-                    .quick_reply_form
-                    .as_ref()
-                    .is_some_and(|form| form.ack_required)
-                {
+                let ack = if ack_required == Some(true) {
                     "required"
                 } else {
                     "optional"
                 };
-                self.quick_reply_form = None;
-                self.search_dirty = true;
-                self.debounce_remaining = 0;
-                Cmd::msg(MailScreenMsg::ActionExecute(
-                    "quick_reply_result:ok".to_string(),
-                    format!("to {} · thread {thread} · ack {ack}", context.to_agent),
-                ))
-            }
-            Err(err) => {
-                let message = err.to_string();
-                if let Some(form) = self.quick_reply_form.as_mut() {
-                    form.errors.general = Some(message.clone());
-                }
-                Cmd::msg(MailScreenMsg::ActionExecute(
-                    "quick_reply_result:error".to_string(),
-                    message,
-                ))
-            }
+                Ok(OperatorTaskResult {
+                    summary: format!("to {} · thread {thread} · ack {ack}", context.to_agent),
+                    data: serde_json::Value::Null,
+                })
+            },
+        )
+    }
+
+    fn dismiss_quick_reply_form(&mut self) -> Cmd<MailScreenMsg> {
+        let pending = self
+            .quick_reply_form
+            .take()
+            .is_some_and(|form| form.is_submitting());
+        if pending {
+            Cmd::msg(MailScreenMsg::ActionExecute(
+                "quick_reply_result:pending".to_string(),
+                "Reply continues in the background; dismissing the form does not cancel it"
+                    .to_string(),
+            ))
+        } else {
+            Cmd::None
+        }
+    }
+
+    fn dismiss_compose_form(&mut self) -> Cmd<MailScreenMsg> {
+        let pending = self
+            .compose_form
+            .take()
+            .is_some_and(|form| form.is_submitting());
+        if pending {
+            Cmd::msg(MailScreenMsg::ActionExecute(
+                "compose_result:pending".to_string(),
+                "Send continues in the background; dismissing the form does not cancel it"
+                    .to_string(),
+            ))
+        } else {
+            Cmd::None
         }
     }
 
@@ -2261,7 +2360,7 @@ impl MessageBrowserScreen {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 let modal_area = quick_reply_modal_rect(self.screen_area());
                 if !point_in_rect(modal_area, mouse.x, mouse.y) {
-                    self.quick_reply_form = None;
+                    return self.dismiss_quick_reply_form();
                 }
             }
             // Quick reply modal traps pointer input.
@@ -2277,7 +2376,13 @@ impl MessageBrowserScreen {
         let ctrl_enter =
             key.modifiers.contains(Modifiers::CTRL) && matches!(key.code, KeyCode::Enter);
         if matches!(key.code, KeyCode::Escape) {
-            self.quick_reply_form = None;
+            return self.dismiss_quick_reply_form();
+        }
+        if self
+            .quick_reply_form
+            .as_ref()
+            .is_some_and(QuickReplyFormState::is_submitting)
+        {
             return Cmd::None;
         }
         if ctrl_enter || matches!(key.code, KeyCode::F(5)) {
@@ -2326,7 +2431,7 @@ impl MessageBrowserScreen {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 let modal_area = compose_modal_rect(self.screen_area());
                 if !point_in_rect(modal_area, mouse.x, mouse.y) {
-                    self.compose_form = None;
+                    return self.dismiss_compose_form();
                 }
             }
             // Compose modal traps pointer input.
@@ -2342,7 +2447,13 @@ impl MessageBrowserScreen {
         let ctrl_enter =
             key.modifiers.contains(Modifiers::CTRL) && matches!(key.code, KeyCode::Enter);
         if matches!(key.code, KeyCode::Escape) {
-            self.compose_form = None;
+            return self.dismiss_compose_form();
+        }
+        if self
+            .compose_form
+            .as_ref()
+            .is_some_and(ComposeFormState::is_submitting)
+        {
             return Cmd::None;
         }
         if ctrl_enter || matches!(key.code, KeyCode::F(5)) {
@@ -3896,8 +4007,50 @@ impl MailScreen for MessageBrowserScreen {
     fn handle_operator_result(
         &mut self,
         operation: &str,
-        _result: &Result<OperatorTaskResult, String>,
+        result: &Result<OperatorTaskResult, String>,
     ) {
+        if let Some((kind @ ("compose" | "quick_reply"), request_id)) = operation.split_once(':')
+            && let Ok(request_id) = request_id.parse::<u64>()
+        {
+            // A failed send can still have committed mailbox state. Refresh
+            // results on either outcome, even if its original form was closed.
+            self.search_dirty = true;
+            self.debounce_remaining = 0;
+            if kind == "compose" {
+                let Some(form) = self.compose_form.as_mut().filter(|form| {
+                    form.pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.request_id() == request_id)
+                }) else {
+                    return;
+                };
+                form.pending = None;
+                if let Some(feedback) = form.submit_feedback.take()
+                    && let Some(feedback) = feedback.get()
+                {
+                    form.available_agents.clone_from(&feedback.available_agents);
+                    form.refresh_suggestions();
+                }
+                match result {
+                    Ok(_) => self.compose_form = None,
+                    Err(error) => form.errors.general = Some(error.clone()),
+                }
+            } else {
+                let Some(form) = self.quick_reply_form.as_mut().filter(|form| {
+                    form.pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.request_id() == request_id)
+                }) else {
+                    return;
+                };
+                form.pending = None;
+                match result {
+                    Ok(_) => self.quick_reply_form = None,
+                    Err(error) => form.errors.general = Some(error.clone()),
+                }
+            }
+            return;
+        }
         if matches!(
             operation,
             "acknowledge" | "mark_read" | "batch_acknowledge" | "batch_mark_read"
@@ -6352,7 +6505,11 @@ fn render_compose_modal(frame: &mut Frame<'_>, area: Rect, form: &ComposeFormSta
     }
 
     let footer_y = bottom.saturating_sub(1);
-    let footer = "Tab/Shift+Tab fields • ↑/↓ suggestions • F5 or Ctrl+Enter submit • Esc cancel";
+    let footer = if form.is_submitting() {
+        "Sending… editing paused • Esc dismisses; send continues in background"
+    } else {
+        "Tab/Shift+Tab fields • ↑/↓ suggestions • F5 or Ctrl+Enter submit • Esc cancel"
+    };
     Paragraph::new(truncate_str(footer, inner.width as usize))
         .style(crate::tui_theme::text_hint(&tp))
         .render(Rect::new(inner.x, footer_y, inner.width, 1), frame);
@@ -6547,7 +6704,11 @@ fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReply
     }
 
     let footer_y = bottom.saturating_sub(1);
-    let footer = "Tab/Shift+Tab field • Space/Enter toggles Ack • Ctrl+Enter submits • Esc cancel";
+    let footer = if form.is_submitting() {
+        "Sending reply… editing paused • Esc dismisses; reply continues in background"
+    } else {
+        "Tab/Shift+Tab field • Space/Enter toggles Ack • Ctrl+Enter submits • Esc cancel"
+    };
     Paragraph::new(truncate_str(footer, inner.width as usize))
         .style(crate::tui_theme::text_hint(&tp))
         .render(Rect::new(inner.x, footer_y, inner.width, 1), frame);
@@ -6659,24 +6820,10 @@ fn validate_compose_form(
     let mut errors = ComposeValidationErrors::default();
     let to = parse_recipient_list(form.to_input.value());
     let cc = parse_recipient_list(form.cc_input.value());
-    let known_agents: HashSet<String> = form
-        .available_agents
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect();
+    // Suggestions can be stale while the draft is open. Membership and
+    // lifecycle are checked against the live roster inside the submit task.
     if to.is_empty() {
         errors.to = Some("At least one recipient is required.".to_string());
-    } else if let Some(invalid) = to
-        .iter()
-        .find(|name| !known_agents.contains(&name.to_ascii_lowercase()))
-    {
-        errors.to = Some(format!("Unknown recipient: {invalid}"));
-    }
-    if let Some(invalid) = cc
-        .iter()
-        .find(|name| !known_agents.contains(&name.to_ascii_lowercase()))
-    {
-        errors.cc = Some(format!("Unknown CC recipient: {invalid}"));
     }
 
     let subject = form.subject_input.value().trim().to_string();
@@ -7089,9 +7236,11 @@ first body
             "screen should be in archive-snapshot mode for this regression"
         );
 
-        screen
-            .ensure_compose_sender("ahead-project", Some(&state))
-            .expect("ensure compose sender");
+        MessageBrowserScreen::ensure_compose_sender(
+            "ahead-project",
+            &MessageBrowserScreen::runtime_config_from_state(Some(&state)),
+        )
+        .expect("ensure compose sender");
 
         let live_conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
         let sender_count = live_conn
@@ -7157,11 +7306,11 @@ first body
             storage_root,
             ..Default::default()
         });
-        let screen = MessageBrowserScreen::new();
-
-        screen
-            .ensure_compose_sender("[unknown-project-77]", Some(&state))
-            .expect("ensure compose sender");
+        MessageBrowserScreen::ensure_compose_sender(
+            "[unknown-project-77]",
+            &MessageBrowserScreen::runtime_config_from_state(Some(&state)),
+        )
+        .expect("ensure compose sender");
 
         let live_conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
         let sender_count = live_conn
@@ -7207,11 +7356,11 @@ first body
             storage_root,
             ..Default::default()
         });
-        let screen = MessageBrowserScreen::new();
-
-        let err = screen
-            .ensure_compose_sender("[unknown-project-77]", Some(&state))
-            .expect_err("placeholder id must not attach to the wrong project");
+        let err = MessageBrowserScreen::ensure_compose_sender(
+            "[unknown-project-77]",
+            &MessageBrowserScreen::runtime_config_from_state(Some(&state)),
+        )
+        .expect_err("placeholder id must not attach to the wrong project");
         assert_eq!(
             err,
             "Placeholder project id 77 belongs to project 'real-project', not '[unknown-project-77]'"
@@ -7747,6 +7896,413 @@ first body
         assert!(matches!(cmd, Cmd::None));
         let form = screen.quick_reply_form.as_ref().expect("quick reply form");
         assert_eq!(form.errors.body.as_deref(), Some("Reply body is required."));
+    }
+
+    fn valid_compose_draft(project: &str, body: &str) -> ComposeFormState {
+        // Suggestions deliberately omit the recipient: only the worker's
+        // current live roster may decide whether a recipient is admissible.
+        let mut form =
+            ComposeFormState::new(project.to_string(), Some("BlueLake".into()), Vec::new());
+        form.subject_input.set_value("Operator follow-up");
+        form.body_input.set_text(body);
+        form
+    }
+
+    #[test]
+    fn dropped_form_tasks_allow_retry_and_stale_errors_do_not_replace_new_drafts() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.compose_form = Some(valid_compose_draft("proj", "First compose draft"));
+        let queued = screen.submit_compose_form(Some(&state));
+        assert!(matches!(&queued, Cmd::Task(..)));
+        assert!(screen.compose_form.as_ref().unwrap().is_submitting());
+        drop(queued);
+        assert!(!screen.compose_form.as_ref().unwrap().is_submitting());
+
+        let retry = screen.submit_compose_form(Some(&state));
+        assert_eq!(screen.form_request_id, 2);
+        let dismissed =
+            screen.handle_compose_event(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
+        assert!(
+            matches!(dismissed, Cmd::Msg(MailScreenMsg::ActionExecute(ref op, ref text))
+            if op == "compose_result:pending" && text.contains("does not cancel"))
+        );
+        screen.compose_form = Some(valid_compose_draft("proj", "Replacement compose draft"));
+        screen.handle_operator_result("compose:2", &Err("Late send failure".into()));
+        let form = screen.compose_form.as_ref().unwrap();
+        assert_eq!(form.body_input.text(), "Replacement compose draft");
+        assert!(form.errors.general.is_none());
+        drop(retry);
+
+        let entry = test_message_entry(41, "thread-41", "Reply target");
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+        screen
+            .quick_reply_form
+            .as_mut()
+            .unwrap()
+            .body_input
+            .set_text("First reply draft");
+        let queued = screen.submit_quick_reply_form(Some(&state));
+        assert!(matches!(&queued, Cmd::Task(..)));
+        drop(queued);
+        assert!(!screen.quick_reply_form.as_ref().unwrap().is_submitting());
+        let retry = screen.submit_quick_reply_form(Some(&state));
+        assert_eq!(
+            screen.form_request_id, 4,
+            "compose and reply share one request sequence"
+        );
+        let dismissed = screen
+            .handle_quick_reply_event(&Event::Key(ftui::KeyEvent::new(KeyCode::Escape)), &state);
+        assert!(
+            matches!(dismissed, Cmd::Msg(MailScreenMsg::ActionExecute(ref op, ref text))
+            if op == "quick_reply_result:pending" && text.contains("does not cancel"))
+        );
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+        screen
+            .quick_reply_form
+            .as_mut()
+            .unwrap()
+            .body_input
+            .set_text("Replacement reply draft");
+        for result in [
+            Err("Late reply failure".into()),
+            Ok(OperatorTaskResult {
+                summary: "Late reply success".into(),
+                data: serde_json::Value::Null,
+            }),
+        ] {
+            screen.handle_operator_result("quick_reply:4", &result);
+            let form = screen.quick_reply_form.as_ref().unwrap();
+            assert_eq!(form.body_input.text(), "Replacement reply draft");
+            assert!(form.errors.general.is_none());
+        }
+        drop(retry);
+    }
+
+    #[test]
+    fn compose_submission_defers_delivery_preserves_payload_and_protects_reopened_form() {
+        use crate::tui_screens::{
+            complete_operator_task, seed_operator_test_project, with_operator_test_conn,
+        };
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["BlueLake", "RedFox"]);
+            let config = MessageBrowserScreen::runtime_config_from_state(None);
+            let state = TuiSharedState::new(&config);
+            let mut screen = MessageBrowserScreen::new();
+            let mut form = valid_compose_draft(&slug, "Complete\noperator message");
+            form.mailbox_source = Some((config.database_url.clone(), config.storage_root.clone()));
+            form.cc_input.set_value("RedFox");
+            form.thread_id_input.set_value("operator-thread");
+            form.importance_idx = 2;
+            form.ack_required = true;
+            form.set_focus(ComposeField::Body);
+            screen.compose_form = Some(form);
+            let queued = screen.submit_compose_form(Some(&state));
+            assert!(matches!(&queued, Cmd::Task(..)));
+            assert!(matches!(
+                screen.submit_compose_form(Some(&state)),
+                Cmd::None
+            ));
+            let _ = screen
+                .handle_compose_event(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('x'))), &state);
+            assert_eq!(
+                screen.compose_form.as_ref().unwrap().body_input.text(),
+                "Complete\noperator message"
+            );
+            assert_eq!(screen.form_request_id, 1);
+            with_operator_test_conn(|conn| {
+                assert!(
+                    conn.query_sync("SELECT id FROM messages", &[])
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    conn.query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                        .unwrap()
+                        .is_empty()
+                );
+            });
+
+            let _ = screen.dismiss_compose_form();
+            screen.compose_form = Some(valid_compose_draft(&slug, "New unsent draft"));
+            let replacement = screen.submit_compose_form(Some(&state));
+            let (status, operation, text) = complete_operator_task(&mut screen, queued);
+            assert_eq!(
+                (status.as_str(), operation.as_str()),
+                ("ok", "compose:1"),
+                "{text}"
+            );
+            let form = screen
+                .compose_form
+                .as_ref()
+                .expect("late success retains the new form");
+            assert_eq!(form.body_input.text(), "New unsent draft");
+            assert!(
+                form.is_submitting(),
+                "late success retains the newer pending request"
+            );
+            assert_eq!(form.pending.as_ref().unwrap().request_id(), 2);
+            drop(replacement);
+            with_operator_test_conn(|conn| {
+                let rows = conn.query_sync(
+                    "SELECT m.id, m.subject, m.body_md, m.thread_id, m.importance, m.ack_required, a.name \
+                     FROM messages m JOIN agents a ON a.id = m.sender_id", &[],
+                ).unwrap();
+                assert_eq!(rows.len(), 1);
+                let row = &rows[0];
+                assert_eq!(
+                    row.get_named::<String>("subject").unwrap(),
+                    "Operator follow-up"
+                );
+                assert_eq!(
+                    row.get_named::<String>("body_md").unwrap(),
+                    "Complete\noperator message"
+                );
+                assert_eq!(
+                    row.get_named::<String>("thread_id").unwrap(),
+                    "operator-thread"
+                );
+                assert_eq!(row.get_named::<String>("importance").unwrap(), "urgent");
+                assert_eq!(row.get_named::<i64>("ack_required").unwrap(), 1);
+                assert_eq!(
+                    row.get_named::<String>("name").unwrap(),
+                    COMPOSE_SENDER_NAME
+                );
+                let recipients = conn.query_sync(
+                    "SELECT a.name, r.kind FROM message_recipients r JOIN agents a ON a.id = r.agent_id \
+                     WHERE r.message_id = ? ORDER BY a.name",
+                    &[Value::BigInt(row.get_named::<i64>("id").unwrap())],
+                ).unwrap();
+                let recipients: Vec<_> = recipients
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.get_named::<String>("name").unwrap(),
+                            row.get_named::<String>("kind").unwrap(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    recipients,
+                    [
+                        ("BlueLake".to_string(), "to".to_string()),
+                        ("RedFox".to_string(), "cc".to_string())
+                    ]
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn quick_reply_submission_defers_delivery_and_keeps_default_direct_and_shared_routing() {
+        use crate::tui_screens::{
+            complete_operator_task, seed_operator_test_project, with_operator_test_conn,
+        };
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug =
+                seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
+            let direct = send_to_bluelake_cc_redfox(project_key, "Direct original");
+            let shared = send_to_shared_mailbox(project_key, &slug, "Shared original", false);
+            let config = MessageBrowserScreen::runtime_config_from_state(None);
+            let state = TuiSharedState::new(&config);
+            for id in [direct, shared] {
+                let mut screen = MessageBrowserScreen::new();
+                let entry = screen.fetch_message_entry_by_id(id, Some(&state)).unwrap();
+                assert!(
+                    screen._db_snapshot_dir.is_none(),
+                    "fixture must use live IDs"
+                );
+                screen.open_quick_reply_modal_for_entry(&entry).unwrap();
+                let body = format!("Operator reply to {id}");
+                let form = screen.quick_reply_form.as_mut().unwrap();
+                form.body_input.set_text(&body);
+                form.ack_required = false;
+                let queued = screen.submit_quick_reply_form(Some(&state));
+                assert!(matches!(&queued, Cmd::Task(..)));
+                assert!(matches!(
+                    screen.submit_quick_reply_form(Some(&state)),
+                    Cmd::None
+                ));
+                let _ = screen.handle_quick_reply_event(
+                    &Event::Key(ftui::KeyEvent::new(KeyCode::Char('x'))),
+                    &state,
+                );
+                assert_eq!(
+                    screen.quick_reply_form.as_ref().unwrap().body_input.text(),
+                    body
+                );
+                with_operator_test_conn(|conn| {
+                    assert!(
+                        conn.query_sync(
+                            "SELECT id FROM messages WHERE body_md = ?",
+                            &[Value::Text(body.clone())]
+                        )
+                        .unwrap()
+                        .is_empty()
+                    );
+                });
+                let (status, operation, text) = complete_operator_task(&mut screen, queued);
+                assert_eq!(
+                    (status.as_str(), operation.as_str()),
+                    ("ok", "quick_reply:1"),
+                    "{text}"
+                );
+                assert!(screen.quick_reply_form.is_none());
+                let reply_id = with_operator_test_conn(|conn| {
+                    let rows = conn.query_sync(
+                        "SELECT id, subject, thread_id, importance, ack_required FROM messages WHERE body_md = ?",
+                        &[Value::Text(body.clone())],
+                    ).unwrap();
+                    assert_eq!(rows.len(), 1);
+                    let row = &rows[0];
+                    assert_eq!(
+                        row.get_named::<String>("subject").unwrap(),
+                        prefixed_reply_subject(&entry.subject)
+                    );
+                    assert_eq!(
+                        row.get_named::<String>("thread_id").unwrap(),
+                        if entry.thread_id.is_empty() {
+                            id.to_string()
+                        } else {
+                            entry.thread_id.clone()
+                        }
+                    );
+                    assert_eq!(
+                        row.get_named::<String>("importance").unwrap(),
+                        entry.importance
+                    );
+                    assert_eq!(row.get_named::<i64>("ack_required").unwrap(), 0);
+                    let reply_id = row.get_named::<i64>("id").unwrap();
+                    assert!(conn.query_sync("SELECT message_id FROM project_mailbox_deliveries WHERE message_id = ?", &[Value::BigInt(reply_id)]).unwrap().is_empty(), "default reply does not turn into a shared delivery");
+                    reply_id
+                });
+                assert_eq!(
+                    recipient_receipts(reply_id),
+                    [("GreenCastle".to_string(), false, false)]
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn form_submission_keeps_origin_mailbox_authority_after_screen_rebind() {
+        use crate::tui_screens::{
+            complete_operator_task, seed_operator_test_project, with_operator_test_conn,
+        };
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug =
+                seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
+            let id = send_to_bluelake_cc_redfox(project_key, "Original mailbox");
+            let config = MessageBrowserScreen::runtime_config_from_state(None);
+            let state = TuiSharedState::new(&config);
+            let live_source = Some((config.database_url.clone(), config.storage_root.clone()));
+            let other_source = Some((
+                "sqlite:///different-mailbox.sqlite3".to_string(),
+                config.storage_root.clone(),
+            ));
+            let mut screen = MessageBrowserScreen::new();
+            let entry = screen.fetch_message_entry_by_id(id, Some(&state)).unwrap();
+            for source in [None, other_source.clone()] {
+                screen.mailbox_source = source;
+                screen.open_quick_reply_modal_for_entry(&entry).unwrap();
+                screen
+                    .quick_reply_form
+                    .as_mut()
+                    .unwrap()
+                    .body_input
+                    .set_text("Keep source-bound reply");
+                screen.mailbox_source.clone_from(&live_source);
+                let queued = screen.submit_quick_reply_form(Some(&state));
+                let (status, _, error) = complete_operator_task(&mut screen, queued);
+                assert_eq!(status, "error");
+                assert!(error.contains("mailbox"), "{error}");
+                let form = screen.quick_reply_form.as_ref().unwrap();
+                assert_eq!(form.body_input.text(), "Keep source-bound reply");
+                assert!(!form.is_submitting());
+            }
+            screen.quick_reply_form = None;
+            let mut form = valid_compose_draft(&slug, "Keep source-bound compose");
+            form.mailbox_source = other_source;
+            screen.compose_form = Some(form);
+            let queued = screen.submit_compose_form(Some(&state));
+            let (status, _, error) = complete_operator_task(&mut screen, queued);
+            assert_eq!(status, "error");
+            assert!(error.contains("different mailbox"), "{error}");
+            assert_eq!(
+                screen.compose_form.as_ref().unwrap().body_input.text(),
+                "Keep source-bound compose"
+            );
+            with_operator_test_conn(|conn| {
+                assert_eq!(
+                    conn.query_sync("SELECT id FROM messages", &[])
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert!(
+                    conn.query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                        .unwrap()
+                        .is_empty()
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn quick_reply_snapshot_draft_stays_untrusted_after_browser_returns_to_live_database() {
+        let snapshot_root = tempdir().unwrap();
+        let (storage_root, db_path) = write_archive_ahead_fixture(snapshot_root.path());
+        let snapshot_state = TuiSharedState::new(&mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            ..Default::default()
+        });
+        let mut screen = MessageBrowserScreen::new();
+        let entry = screen
+            .fetch_message_entry_by_id(1, Some(&snapshot_state))
+            .unwrap();
+        assert!(screen._db_snapshot_dir.is_some());
+        screen.open_quick_reply_modal_for_entry(&entry).unwrap();
+        screen
+            .quick_reply_form
+            .as_mut()
+            .unwrap()
+            .body_input
+            .set_text("Keep snapshot reply draft");
+
+        let (_live_root, live_config, live_conn) = compose_lifecycle_fixture();
+        let before = compose_history_values(&live_conn);
+        let live_state = TuiSharedState::new(&live_config);
+        screen.bind_observability_db(
+            &live_config.database_url,
+            &live_config.storage_root,
+            "snapshot reply rebind regression",
+        );
+        assert!(
+            screen._db_snapshot_dir.is_none(),
+            "browser has a live connection again"
+        );
+        assert_eq!(
+            screen.mailbox_source.as_ref().unwrap().0,
+            live_config.database_url
+        );
+        let queued = screen.submit_quick_reply_form(Some(&live_state));
+        let (status, _, error) = crate::tui_screens::complete_operator_task(&mut screen, queued);
+        assert_eq!(status, "error");
+        assert!(error.contains("archive snapshot"), "{error}");
+        let form = screen
+            .quick_reply_form
+            .as_ref()
+            .expect("snapshot draft remains available");
+        assert_eq!(form.body_input.text(), "Keep snapshot reply draft");
+        assert!(!form.is_submitting());
+        assert_eq!(compose_history_values(&live_conn), before);
+        assert!(
+            live_conn
+                .query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8915,7 +9471,19 @@ first body
             ["BlueLake", "GreenStone"]
         );
 
-        let _ = screen.submit_compose_form(Some(&state));
+        let cmd = screen.submit_compose_form(Some(&state));
+        assert!(screen.compose_form.as_ref().unwrap().is_submitting());
+        assert!(
+            screen
+                .compose_form
+                .as_ref()
+                .unwrap()
+                .errors
+                .general
+                .is_none()
+        );
+        let (status, _, _) = crate::tui_screens::complete_operator_task(&mut screen, cmd);
+        assert_eq!(status, "error");
         let form = screen
             .compose_form
             .as_ref()
@@ -8938,7 +9506,9 @@ first body
              CREATE TABLE agent_deregistrations (unexpected TEXT);",
         )
         .unwrap();
-        let _ = screen.submit_compose_form(Some(&state));
+        let cmd = screen.submit_compose_form(Some(&state));
+        let (status, _, _) = crate::tui_screens::complete_operator_task(&mut screen, cmd);
+        assert_eq!(status, "error");
         let form = screen
             .compose_form
             .as_ref()
@@ -8970,6 +9540,7 @@ first body
         let history = compose_history_values(&conn);
         let mut screen = MessageBrowserScreen::new();
         screen.db_conn = Some(conn);
+        screen.mailbox_source = Some((config.database_url.clone(), config.storage_root.clone()));
         let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
         screen.open_quick_reply_modal_for_entry(&entry).unwrap();
         screen
@@ -8985,7 +9556,19 @@ first body
             .execute_raw("INSERT INTO agent_deregistrations VALUES (1, 30)")
             .unwrap();
 
-        let _ = screen.submit_quick_reply_form(Some(&state));
+        let cmd = screen.submit_quick_reply_form(Some(&state));
+        assert!(screen.quick_reply_form.as_ref().unwrap().is_submitting());
+        assert!(
+            screen
+                .quick_reply_form
+                .as_ref()
+                .unwrap()
+                .errors
+                .general
+                .is_none()
+        );
+        let (status, _, _) = crate::tui_screens::complete_operator_task(&mut screen, cmd);
+        assert_eq!(status, "error");
         let form = screen
             .quick_reply_form
             .as_ref()
@@ -9030,6 +9613,7 @@ first body
         let state = TuiSharedState::new(&config);
         let mut screen = MessageBrowserScreen::new();
         screen.db_conn = Some(conn);
+        screen.mailbox_source = Some((config.database_url.clone(), config.storage_root.clone()));
         let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
         screen.open_quick_reply_modal_for_entry(&entry).unwrap();
         let form = screen.quick_reply_form.as_mut().unwrap();
@@ -9042,7 +9626,7 @@ first body
         form.body_input.set_text("Reply to the remote sender.");
         let context = form.context.clone();
         assert_eq!(
-            MessageBrowserScreen::live_quick_reply_recipient(&context, Some(&state))
+            MessageBrowserScreen::live_quick_reply_recipient(&context, &config)
                 .unwrap()
                 .id,
             4
@@ -9058,7 +9642,7 @@ first body
             )
             .unwrap();
         assert_eq!(
-            MessageBrowserScreen::live_quick_reply_recipient(&context, Some(&state))
+            MessageBrowserScreen::live_quick_reply_recipient(&context, &config)
                 .unwrap()
                 .id,
             4,
@@ -9096,11 +9680,12 @@ first body
                 .unwrap()
                 .execute_raw(transition)
                 .unwrap();
-            let admission =
-                MessageBrowserScreen::live_quick_reply_recipient(&context, Some(&state));
+            let admission = MessageBrowserScreen::live_quick_reply_recipient(&context, &config);
             if let Some(reason) = refusal {
                 assert!(admission.unwrap_err().contains(reason));
-                let _ = screen.submit_quick_reply_form(Some(&state));
+                let cmd = screen.submit_quick_reply_form(Some(&state));
+                let (status, _, _) = crate::tui_screens::complete_operator_task(&mut screen, cmd);
+                assert_eq!(status, "error");
                 let form = screen
                     .quick_reply_form
                     .as_ref()
@@ -9132,6 +9717,7 @@ first body
         let state = TuiSharedState::new(&config);
         let mut screen = MessageBrowserScreen::new();
         screen.db_conn = Some(conn);
+        screen.mailbox_source = Some((config.database_url.clone(), config.storage_root.clone()));
         let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
         screen.open_quick_reply_modal_for_entry(&entry).unwrap();
         screen
@@ -9152,7 +9738,9 @@ first body
                 .execute_raw(change)
                 .unwrap();
             let before = compose_history_values(screen.db_conn.as_ref().unwrap());
-            let _ = screen.submit_quick_reply_form(Some(&state));
+            let cmd = screen.submit_quick_reply_form(Some(&state));
+            let (status, _, _) = crate::tui_screens::complete_operator_task(&mut screen, cmd);
+            assert_eq!(status, "error");
             let form = screen
                 .quick_reply_form
                 .as_ref()
@@ -9249,8 +9837,6 @@ first body
             &[Value::Text(token.into())],
         )
         .unwrap();
-        let state = TuiSharedState::new(&config);
-        let screen = MessageBrowserScreen::new();
         let repo = git2::Repository::init(&config.storage_root).unwrap();
         let relative = Path::new("projects/proj/agents/HumanOverseer/profile.json");
         let mut profile = serde_json::json!({
@@ -9312,7 +9898,7 @@ first body
                 .unwrap()[0]
                 .get_named::<i64>("last_active_ts")
                 .unwrap();
-            let result = screen.ensure_compose_sender("proj", Some(&state));
+            let result = MessageBrowserScreen::ensure_compose_sender("proj", &config);
             if let Some(reason) = refusal {
                 assert!(result.unwrap_err().contains(reason));
                 assert_eq!(
