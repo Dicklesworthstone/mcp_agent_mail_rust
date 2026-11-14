@@ -1312,6 +1312,18 @@ fn reconcile_message_batch_at(
     stop: &AtomicBool,
     now_us: i64,
 ) -> Result<ReconcileReport, String> {
+    reconcile_message_batch_with_clock(cx, pool, config, cursor, stop, now_us, Instant::now)
+}
+
+fn reconcile_message_batch_with_clock(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ReconcileCursor,
+    stop: &AtomicBool,
+    now_us: i64,
+    mut clock: impl FnMut() -> Instant,
+) -> Result<ReconcileReport, String> {
     let mut report = ReconcileReport::default();
     if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         report.interrupted = true;
@@ -1349,7 +1361,7 @@ fn reconcile_message_batch_at(
     let tail_next_id = selected.tail_next_id;
     let history_started_at = cursor.backfill_ceiling;
     let startup_started_at = cursor.startup_tail.as_ref().map(|range| range.ceiling);
-    let now = Instant::now();
+    let now = clock();
     let mut retries = cursor
         .retries
         .iter()
@@ -1380,7 +1392,7 @@ fn reconcile_message_batch_at(
         }
         if report.repaired >= MAX_REPAIRS_PER_BATCH
             || report.scanned >= MAX_IDS_PER_PASS
-            || (report.scanned > 0 && now.elapsed() >= MAX_BATCH_TURN)
+            || (report.scanned > 0 && clock().saturating_duration_since(now) >= MAX_BATCH_TURN)
         {
             report.budget_exhausted = true;
             break;
@@ -1491,7 +1503,10 @@ fn reconcile_message_batch_at(
                 report.unchanged += 1;
                 cursor.forget_retry(id);
             }
-            Err(error) => record_failure(id, error, cursor, &mut report, now),
+            // Source, filesystem or Git work can outlast the batch quantum.
+            // Cooldown starts when that attempt fails, not before the work
+            // that caused it; otherwise a slow refusal consumes its own rest.
+            Err(error) => record_failure(id, error, cursor, &mut report, clock()),
         }
         if let Some(lane) = lane {
             cursor.advance_scan(id, lane);
