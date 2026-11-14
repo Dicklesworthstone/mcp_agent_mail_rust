@@ -10592,15 +10592,32 @@ fn reservation_publication_conflict(id: i64, message: impl Into<String>) -> Stor
 // the guard itself) cannot read.
 const MAX_RESERVATION_PUBLICATION_BYTES: u64 = 1024 * 1024;
 
+/// Legacy artifacts precede the durable row revision and therefore occupy
+/// revision zero. A malformed explicit value is uncertainty, never permission
+/// to replace a newer guard-visible lease with an older snapshot.
+fn reservation_publication_revision(id: i64, record: &serde_json::Value) -> Result<i64> {
+    match record.get("revision") {
+        None => Ok(0),
+        Some(value) => value
+            .as_i64()
+            .filter(|revision| *revision >= 0)
+            .ok_or_else(|| {
+                reservation_publication_conflict(id, "reservation revision is invalid; retained")
+            }),
+    }
+}
+
 /// A generation-stamped row has an immutable owner and creation identity.
-/// Expiry only increases; release is terminal. Reacquisition can change the
-/// reason and exclusive mode without increasing expiry, so neither field can
-/// serve as an immutable identity or a revision number here.
+/// Expiry only increases; release is terminal. The database revision orders
+/// reacquisitions even when their expiry is unchanged and their reason or
+/// exclusive mode changes. It never substitutes for generation or identity.
 fn validate_reservation_publication_version(
     id: i64,
     incoming: &serde_json::Value,
     published: &serde_json::Value,
 ) -> Result<()> {
+    let incoming_revision = reservation_publication_revision(id, incoming)?;
+    let published_revision = reservation_publication_revision(id, published)?;
     for field in ["id", "project", "agent", "path_pattern", "db_generation"] {
         if let (Some(before), Some(after)) = (published.get(field), incoming.get(field)) {
             if !before.is_null() && !after.is_null() && before != after {
@@ -10658,6 +10675,33 @@ fn validate_reservation_publication_version(
             "a terminal release is already published; refusing the stale active snapshot",
         ));
     }
+    if !incoming_released {
+        if incoming_revision < published_revision {
+            return Err(reservation_publication_conflict(
+                id,
+                "a later reservation revision is already published; refusing the stale active snapshot",
+            ));
+        }
+        if incoming_revision > 0 && incoming_revision == published_revision {
+            for field in ["exclusive", "reason"] {
+                if incoming.get(field) != published.get(field) {
+                    return Err(reservation_publication_conflict(
+                        id,
+                        format!("equal reservation revision has conflicting {field}; retained"),
+                    ));
+                }
+            }
+            if archive_publication_timestamp(&incoming["expires_ts"])
+                != archive_publication_timestamp(&published["expires_ts"])
+                || archive_publication_timestamp(&incoming["expires_ts"]).is_none()
+            {
+                return Err(reservation_publication_conflict(
+                    id,
+                    "equal reservation revision has conflicting expiry; retained",
+                ));
+            }
+        }
+    }
     // A terminal release must win even if its captured expiry predates a
     // concurrent renewal. Only two ACTIVE versions are ordered by expiry.
     if !incoming_released
@@ -10681,6 +10725,7 @@ fn validate_reservation_publication_version(
 fn validate_reservation_publications(checks: &[(PathBuf, i64, serde_json::Value)]) -> Result<()> {
     let mut previous: HashMap<&Path, &serde_json::Value> = HashMap::new();
     for (path, id, incoming) in checks {
+        reservation_publication_revision(*id, incoming)?;
         if let Some(published) = previous.get(path.as_path()) {
             validate_reservation_publication_version(*id, incoming, published)?;
         } else {
@@ -10840,9 +10885,9 @@ fn publish_reservation_writes(
 /// exactly as `atomic_write_bytes` does it.
 /// Canonical generation-stamped working artifacts are checked under the
 /// project lock as well: a delayed ACTIVE snapshot cannot erase a terminal
-/// release or shorten a published renewal. This does not order equal-expiry
-/// intent changes, reconstruct missing working artifacts from Git, or make
-/// the separate database mutation atomic with publication.
+/// release, shorten a published renewal, or overwrite a newer intent revision.
+/// This does not reconstruct missing working artifacts from Git or make the
+/// separate database mutation atomic with publication.
 pub fn write_file_reservation_records(
     archive: &ProjectArchive,
     config: &Config,
@@ -19651,8 +19696,8 @@ mod tests {
         assert_eq!(fs::read(&stable).unwrap(), latest);
         assert_eq!(fs::read(&alias).unwrap(), latest);
 
-        // Reacquisition can change intent with the same expiry. No revision
-        // number exists for ordering those changes, so they remain supported.
+        // Legacy revision-zero artifacts retain their historical semantics.
+        // Versioned reacquisitions are ordered independently of expiry below.
         renewed["exclusive"] = serde_json::json!(false);
         renewed["reason"] = serde_json::json!("observe");
         renewed["created_ts"] = serde_json::json!(
@@ -19694,6 +19739,90 @@ mod tests {
         assert!(!fresh_stable.exists());
         assert!(!fresh_alias.exists());
         assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn reservation_revisions_order_intent_changes_without_extending_the_lease() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-revision").unwrap();
+        let mut shared = publication_test_reservation(18, "aabbccdd");
+        shared["revision"] = serde_json::json!(1);
+        shared["exclusive"] = serde_json::json!(false);
+        shared["reason"] = serde_json::json!("observing");
+        write_file_reservation_record(&archive, &config, &shared).unwrap();
+        let mut exclusive = shared.clone();
+        exclusive["revision"] = serde_json::json!(2);
+        exclusive["exclusive"] = serde_json::json!(true);
+        exclusive["reason"] = serde_json::json!("editing");
+        assert_eq!(exclusive["expires_ts"], shared["expires_ts"]);
+        write_file_reservation_record(&archive, &config, &exclusive).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &shared);
+        let protected = fs::read(&stable).unwrap();
+
+        // An older DB grant reaches publication after a newer exclusive grant.
+        // It must not make the guard lose the newer exclusive protection.
+        let error = write_file_reservation_record(&archive, &config, &shared).unwrap_err();
+        assert!(error.to_string().contains("later reservation revision"));
+        assert_eq!(fs::read(&stable).unwrap(), protected);
+        assert_eq!(fs::read(&alias).unwrap(), protected);
+        let mut legacy = shared.clone();
+        legacy.as_object_mut().unwrap().remove("revision");
+        assert!(write_file_reservation_record(&archive, &config, &legacy).is_err());
+        assert_eq!(fs::read(&stable).unwrap(), protected);
+
+        for field in ["exclusive", "reason", "expires_ts"] {
+            let mut conflicting = exclusive.clone();
+            conflicting[field] = match field {
+                "exclusive" => serde_json::json!(false),
+                "reason" => serde_json::json!("different intent"),
+                "expires_ts" => serde_json::json!("2031-10-01T00:00:00Z"),
+                _ => unreachable!(),
+            };
+            assert!(write_file_reservation_record(&archive, &config, &conflicting).is_err());
+            assert_eq!(fs::read(&stable).unwrap(), protected, "{field}");
+            assert_eq!(fs::read(&alias).unwrap(), protected, "{field}");
+        }
+
+        // A newer downgrade is valid; a delayed exclusive snapshot cannot undo
+        // it. Terminal release still dominates every ACTIVE revision, even
+        // when the terminal payload was captured before a concurrent renewal.
+        shared["revision"] = serde_json::json!(3);
+        write_file_reservation_record(&archive, &config, &shared).unwrap();
+        let downgraded = fs::read(&stable).unwrap();
+        assert!(write_file_reservation_record(&archive, &config, &exclusive).is_err());
+        assert_eq!(fs::read(&stable).unwrap(), downgraded);
+        exclusive["released_ts"] = serde_json::json!(42);
+        write_file_reservation_record(&archive, &config, &exclusive).unwrap();
+        let terminal = fs::read(&stable).unwrap();
+        shared["revision"] = serde_json::json!(4);
+        assert!(write_file_reservation_record(&archive, &config, &shared).is_err());
+        assert_eq!(fs::read(&stable).unwrap(), terminal);
+        assert_eq!(fs::read(&alias).unwrap(), terminal);
+    }
+
+    #[test]
+    fn reservation_publication_refuses_malformed_revisions_before_first_publication() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-invalid-revision").unwrap();
+        let mut value = publication_test_reservation(19, "aabbccdd");
+        let (stable, alias) = publication_test_paths(&archive, &value);
+        for revision in [
+            serde_json::Value::Null,
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("2"),
+            serde_json::json!(true),
+            serde_json::json!(u64::MAX),
+        ] {
+            value["revision"] = revision;
+            let error = write_file_reservation_record(&archive, &config, &value).unwrap_err();
+            assert!(error.to_string().contains("revision is invalid"));
+            assert!(!stable.exists());
+            assert!(!alias.exists());
+            assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+        }
     }
 
     #[test]
