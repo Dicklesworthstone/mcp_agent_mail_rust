@@ -6,30 +6,55 @@
   established there. Triage ready work and claim br-kp1in.19 (comment4394).
 - [x] Identify stale post-commit producer: force-release reads the current
   row for released_ts but serializes the old reservation's intent/revision.
-- [ ] Add a real competing intent transaction preserving the expired expiry;
+- [x] Add a real competing intent transaction preserving the expired expiry;
   execute old source with the new regression and two existing release controls.
+  Run d6738e51-e172-45f5-ad19-482c758de166: 2 PASS/1 FAIL, 1285 skipped,
+  9.959s after Cargo78m35s. The real DB commits revision2 while the archive
+  has revision1; the failure is at the intended archive-revision assertion.
+  Existing committed-timestamp and seven-interleaving refusal controls pass.
+  Exact three-name census matches; expected exit100 and executable hash
+  8791335d3bc2358c6a13fa7664d47a5212607d709132703d4c9d85d1282fa303 retained.
 - [x] Use the committed row and existing canonical released-artifact serializer.
 - [x] Reread authorization, expiry/revision, notification and response paths;
   release guards and wire keys remain unchanged. Terminal releases cannot
   be renewed through the public mutation path; the readback row supplies
   all emitted intent fields, revision and committed release timestamp.
-- [ ] Execute the 13 force-release cases (all 12 existing plus the regression)
+- [x] Execute the 13 force_release_* cases (12 existing plus the regression)
   and the existing released-heal artifact roundtrip, 14 exact functions
   predeclared in the retained review29-positive-cases.txt before execution.
-  Verify exact names, nonzero execution and source-bound remote receipts.
+  Run cd732819-1b86-4b4f-b342-a9d93e526eec: 14 PASS/1274 skipped,
+  35.654s after Cargo5m23s; exact first-report unique-name census matches.
+  No existing assertion, ignore, profile, feature or Nextest timeout changed.
 - [x] Check workspace/all-targets: terminal0 on vmi1156319, Cargo13m08s;
   strict RCH base8a92ae4c/overlayf6221722/tree dd6dfeda.
 - [x] Check production workspace/lib+bins as its separate feature graph:
   terminal0/Cargo7m25s, same base/overlay/tree on vmi1156319.
 - [x] Run strict workspace/all-target Clippy with warnings denied:
-  terminal0 on the same frozen source/lock/toolchain and strict RCH overlay.
+  terminal0/Cargo3m35s on the same frozen input and strict RCH overlay.
 - [x] Check formatting after manual corrections: terminal0; retain the
   initial formatting diff (its wrapper returned cat's status, not fmt's).
 - [x] Scan the whole changed Rust file: UBS terminal0/statusok/no failed
   modules, critical0/warning1316/info557. No scanner suppression; warnings
   stay visible. Final source/lock/toolchain manifest remains unchanged.
-- [ ] Record scoped Bead evidence with original acceptance unchanged, verify
-  tracker preservation/cycles, publish coherent changes and release owned leases.
+- [x] Bind native and static results to base8a92ae4c/overlayf6221722/tree
+  dd6dfeda; reservations.rs SHA256 faf61e95418de10f2e71f42f6f4ea9efdfb661f5109c219e6df791a9148ad39c.
+  Native executable SHA256 f92b78c97d689fa367d9d7518c753b4902e444020dd13972066f8c525d36fc16.
+  The shared checkout committed exactly this Rust blob in24e252aa during
+  verification. Preserve that commit; its only other path is this plan,
+  and lock/toolchain/dependency sources are unchanged. The run remains
+  overlay-qualified input, not a no-overlay binary built from commit24e.
+- [x] Reread the final source and test again; retain realistic evidence scope:
+  native Linux component tests with real FrankenSQLite and archive files,
+  not full-workspace tests, HTTP/restart/background/platform qualification.
+  This was self-review, with no independent verifier or release claim.
+  Fresh installed health1 still reports one orphan page and stale backup;
+  no live repair, restart or installation performed.
+- [x] Record scoped Bead evidence (comment4395), keep original acceptance and
+  in_progress status, preserve all2871 tracker records and every prior comment
+  in both exports; only this Bead's status/assignee/comments/updated_at change.
+  Flush0/cycles0; prepare one final qualification/tracker commit while retaining
+  the already-created source commit24e252aa. Actual publication/ref and owned-
+  lease-release receipts are finalized after execution in review-audit.md.
 
 ## November 14 legacy rollback quarantine review — EmeraldEagle, 17:08 UTC
 
