@@ -3,6 +3,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use fastmcp_core::block_on;
@@ -19,6 +21,7 @@ use ftui_extras::canvas::{CanvasRef, Mode, Painter};
 use ftui_extras::mermaid::{self, MermaidCompatibilityMatrix, MermaidFallbackPolicy};
 use ftui_extras::{mermaid_layout, mermaid_render};
 use ftui_runtime::program::Cmd;
+use serde::{Deserialize, Serialize};
 
 use ftui::PackedRgba;
 
@@ -26,7 +29,8 @@ use crate::tui_action_menu::{ActionEntry, contacts_actions};
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{ContactSummary, MailEvent};
 use crate::tui_screens::{
-    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, operator_result, operator_tool_context,
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg, OperatorTaskResult,
+    operator_result, operator_task, operator_tool_context,
 };
 use crate::tui_widgets::fancy::SummaryFooter;
 use crate::tui_widgets::generate_contact_graph_mermaid;
@@ -192,6 +196,43 @@ pub struct ContactsScreen {
     applied_db_stats_gen: u64,
     /// Tracks the last query/view inputs that produced the current contacts list.
     last_query_signature: Option<ContactsQuerySignature>,
+    /// Serialize responses while the worker owns an authorization change.
+    pending_response: Option<PendingContactResponse>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingContactResponse {
+    operation: String,
+    link: ContactSummary,
+    accept: bool,
+    active: Arc<AtomicBool>,
+}
+
+/// A rejected or dropped queued command never produces a completion. Release
+/// its admission on drop, but let an executed task remain pending until the
+/// UI receives its completion so an older result cannot settle a newer task.
+struct ContactResponseTaskGuard {
+    queued: Option<Arc<AtomicBool>>,
+}
+
+impl ContactResponseTaskGuard {
+    fn started(&mut self) {
+        drop(self.queued.take());
+    }
+}
+
+impl Drop for ContactResponseTaskGuard {
+    fn drop(&mut self) {
+        if let Some(active) = self.queued.take() {
+            active.store(false, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ContactResponseUpdate {
+    link: ContactSummary,
+    accept: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +276,7 @@ impl ContactsScreen {
             db_context_banner: super::POLLER_DB_WAITING_BANNER,
             applied_db_stats_gen: 0,
             last_query_signature: None,
+            pending_response: None,
         }
     }
 
@@ -548,37 +590,85 @@ impl ContactsScreen {
         Cmd::None
     }
 
-    /// Answer the listed link `"From:To"` on the recipient's behalf: approve
-    /// it (`accept`) or block it. The selected row wins when two projects
-    /// list the same pair of names.
-    fn respond_to_contact(&mut self, pair: &str, accept: bool) -> Result<String, String> {
+    /// Resolve the selected link before dispatching a worker. A name pair
+    /// alone cannot disambiguate the same agents in different projects.
+    fn contact_for_pair(&self, pair: &str) -> Result<ContactSummary, String> {
         let (from, to) = pair
             .split_once(':')
             .ok_or_else(|| format!("not a contact pair: {pair:?}"))?;
         let is_pair = |c: &&ContactSummary| c.from_agent == from && c.to_agent == to;
-        let link = self
+        if let Some(link) = self
             .table_state
             .selected
             .and_then(|idx| self.contacts.get(idx))
             .filter(is_pair)
-            .or_else(|| self.contacts.iter().find(is_pair))
-            .ok_or_else(|| format!("the link {from} → {to} is no longer listed"))?
-            .clone();
-        block_on(mcp_agent_mail_tools::respond_contact(
-            &operator_tool_context(),
-            link.to_project_slug.clone(),
-            link.to_agent.clone(),
-            link.from_agent.clone(),
-            (!link.from_project_slug.is_empty()).then(|| link.from_project_slug.clone()),
-            accept,
-            None,
-        ))
-        .map_err(|err| err.to_string())?;
-        let status = if accept { "approved" } else { "blocked" };
-        if let Some(row) = self.contacts.iter_mut().find(|row| **row == link) {
-            row.status = status.to_string();
+        {
+            return Ok(link.clone());
         }
-        Ok(format!("{from} → {to} {status}"))
+        let mut matches = self.contacts.iter().filter(is_pair);
+        let link = matches
+            .next()
+            .ok_or_else(|| format!("the link {from} → {to} is no longer listed"))?;
+        if matches.any(|other| {
+            other.from_project_slug != link.from_project_slug
+                || other.to_project_slug != link.to_project_slug
+        }) {
+            return Err(format!(
+                "the link {from} → {to} appears in more than one project; select its row first"
+            ));
+        }
+        Ok(link.clone())
+    }
+
+    /// Answer on the recipient's behalf without blocking the terminal loop.
+    fn respond_to_contact(
+        &mut self,
+        operation: &str,
+        pair: &str,
+        accept: bool,
+    ) -> Cmd<MailScreenMsg> {
+        if self
+            .pending_response
+            .as_ref()
+            .is_some_and(|pending| pending.active.load(Ordering::Acquire))
+        {
+            return operator_result(
+                operation,
+                Err("a contact response is still running; wait for its result".to_string()),
+            );
+        }
+        let link = match self.contact_for_pair(pair) {
+            Ok(link) => link,
+            Err(error) => return operator_result(operation, Err(error)),
+        };
+        let active = Arc::new(AtomicBool::new(true));
+        let mut task_guard = ContactResponseTaskGuard {
+            queued: Some(Arc::clone(&active)),
+        };
+        self.pending_response = Some(PendingContactResponse {
+            operation: operation.to_string(),
+            link: link.clone(),
+            accept,
+            active,
+        });
+        operator_task(MailScreenId::Contacts, operation, move || {
+            task_guard.started();
+            block_on(mcp_agent_mail_tools::respond_contact(
+                &operator_tool_context(),
+                link.to_project_slug.clone(),
+                link.to_agent.clone(),
+                link.from_agent.clone(),
+                (!link.from_project_slug.is_empty()).then(|| link.from_project_slug.clone()),
+                accept,
+                None,
+            ))
+            .map_err(|err| err.to_string())?;
+            let status = if accept { "approved" } else { "blocked" };
+            let summary = format!("{} → {} {status}", link.from_agent, link.to_agent);
+            let data = serde_json::to_value(ContactResponseUpdate { link, accept })
+                .map_err(|err| format!("could not encode contact response: {err}"))?;
+            Ok(OperatorTaskResult { summary, data })
+        })
     }
 }
 
@@ -856,12 +946,44 @@ impl MailScreen for ContactsScreen {
 
     fn handle_action(&mut self, operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
         let (name, pair) = operation.split_once(':').unwrap_or((operation, ""));
-        let result = match name {
-            "approve_contact" => self.respond_to_contact(pair, true),
-            "deny_contact" | "block_contact" => self.respond_to_contact(pair, false),
-            _ => return Cmd::None,
+        match name {
+            "approve_contact" => self.respond_to_contact(name, pair, true),
+            "deny_contact" | "block_contact" => self.respond_to_contact(name, pair, false),
+            _ => Cmd::None,
+        }
+    }
+
+    fn handle_operator_result(
+        &mut self,
+        operation: &str,
+        result: &Result<OperatorTaskResult, String>,
+    ) {
+        if self
+            .pending_response
+            .as_ref()
+            .is_none_or(|pending| pending.operation != operation)
+        {
+            return;
+        }
+        let Some(pending) = self.pending_response.take() else {
+            return;
         };
-        operator_result(name, result)
+        pending.active.store(false, Ordering::Release);
+        let Ok(result) = result else {
+            // An error may follow a committed mutation. The DB poller will
+            // refresh authoritative state; never invent a successful status.
+            return;
+        };
+        let Ok(update) = serde_json::from_value::<ContactResponseUpdate>(result.data.clone())
+        else {
+            return;
+        };
+        if update.link != pending.link || update.accept != pending.accept {
+            return;
+        }
+        if let Some(row) = self.contacts.iter_mut().find(|row| **row == update.link) {
+            row.status = if update.accept { "approved" } else { "blocked" }.to_string();
+        }
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
@@ -1835,7 +1957,9 @@ mod tests {
 
     #[test]
     fn action_menu_contact_answers_reach_the_mailbox() {
-        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        use crate::tui_screens::{
+            complete_operator_task, expect_operator_result, seed_operator_test_project,
+        };
         crate::tui_screens::with_operator_test_mailbox(|project_key| {
             let slug = seed_operator_test_project(project_key, &["BlueLake", "GreenCastle"]);
             block_on(mcp_agent_mail_tools::request_contact(
@@ -1878,9 +2002,18 @@ mod tests {
             ];
             screen.table_state.selected = Some(0);
 
-            let (status, op, text) = expect_operator_result(
-                screen.handle_action("approve_contact:GreenCastle:BlueLake", ""),
+            let command = screen.handle_action("approve_contact:GreenCastle:BlueLake", "");
+            assert_eq!(
+                link_status(),
+                ["pending"],
+                "dispatch must not run the tool inline"
             );
+            screen.table_state.selected = Some(1);
+            let (status, _, _) = expect_operator_result(
+                screen.handle_action("block_contact:GreenCastle:BlueLake", ""),
+            );
+            assert_eq!(status, "error", "conflicting responses must not overlap");
+            let (status, op, text) = complete_operator_task(&mut screen, command);
             assert_eq!(
                 (status.as_str(), op.as_str()),
                 ("ok", "approve_contact"),
@@ -1888,10 +2021,12 @@ mod tests {
             );
             assert_eq!(link_status(), ["approved"]);
             assert_eq!(screen.contacts[0].status, "approved");
+            assert_eq!(screen.contacts[1].status, "pending");
+            assert!(screen.pending_response.is_none());
 
-            let (status, op, text) = expect_operator_result(
-                screen.handle_action("block_contact:GreenCastle:BlueLake", ""),
-            );
+            let command = screen.handle_action("block_contact:GreenCastle:BlueLake", "");
+            assert_eq!(link_status(), ["approved"]);
+            let (status, op, text) = complete_operator_task(&mut screen, command);
             assert_eq!(
                 (status.as_str(), op.as_str()),
                 ("ok", "block_contact"),
@@ -1899,20 +2034,91 @@ mod tests {
             );
             assert_eq!(link_status(), ["blocked"]);
 
-            let (status, _, _) = expect_operator_result(
-                screen.handle_action("approve_contact:BlueLake:GreenCastle", ""),
-            );
+            let command = screen.handle_action("approve_contact:BlueLake:GreenCastle", "");
+            let (status, _, _) = complete_operator_task(&mut screen, command);
             assert_eq!(
                 status, "error",
                 "no link exists for the operator to approve"
             );
             assert_eq!(link_status(), ["blocked"], "and none is invented");
+            assert!(
+                screen.pending_response.is_none(),
+                "failure releases response admission"
+            );
 
             let (status, _, text) =
                 expect_operator_result(screen.handle_action("deny_contact:RedFox:BlueLake", ""));
             assert_eq!(status, "error");
             assert!(text.contains("no longer listed"), "{text}");
         });
+    }
+
+    #[test]
+    fn dropped_contact_task_releases_admission_without_mutating_the_row() {
+        let mut screen = ContactsScreen::new();
+        screen.contacts.push(ContactSummary {
+            from_agent: "GreenCastle".to_string(),
+            to_agent: "BlueLake".to_string(),
+            from_project_slug: "alpha".to_string(),
+            to_project_slug: "alpha".to_string(),
+            status: "pending".to_string(),
+            ..ContactSummary::default()
+        });
+        screen.table_state.selected = Some(0);
+        let command = screen.handle_action("approve_contact:GreenCastle:BlueLake", "");
+        let active = Arc::clone(&screen.pending_response.as_ref().unwrap().active);
+        assert!(active.load(Ordering::Acquire));
+        drop(command);
+        assert!(!active.load(Ordering::Acquire));
+        assert_eq!(screen.contacts[0].status, "pending");
+
+        let retry = screen.handle_action("block_contact:GreenCastle:BlueLake", "");
+        assert!(
+            matches!(&retry, Cmd::Task(..)),
+            "a rejected task must not wedge the screen"
+        );
+        drop(retry);
+    }
+
+    #[test]
+    fn contact_completion_preserves_refreshed_rows_and_project_identity() {
+        let mut screen = ContactsScreen::new();
+        let original = ContactSummary {
+            from_agent: "GreenCastle".to_string(),
+            to_agent: "BlueLake".to_string(),
+            from_project_slug: "alpha".to_string(),
+            to_project_slug: "alpha".to_string(),
+            status: "pending".to_string(),
+            ..ContactSummary::default()
+        };
+        let mut other_project = original.clone();
+        other_project.from_project_slug = "beta".to_string();
+        other_project.to_project_slug = "beta".to_string();
+        screen.contacts = vec![other_project, original.clone()];
+        screen.table_state.selected = Some(1);
+        let command = screen.handle_action("approve_contact:GreenCastle:BlueLake", "");
+        assert_eq!(screen.pending_response.as_ref().unwrap().link, original);
+
+        // A poller refresh can arrive before the task completion. Keep its
+        // newer version rather than rewriting it from the captured row.
+        screen.contacts[1].status = "blocked".to_string();
+        screen.contacts[1].updated_ts = 1;
+        let result = Ok(OperatorTaskResult {
+            summary: "approved".to_string(),
+            data: serde_json::to_value(ContactResponseUpdate {
+                link: original,
+                accept: true,
+            })
+            .unwrap(),
+        });
+        screen.handle_operator_result("approve_contact", &result);
+        assert!(screen.pending_response.is_none());
+        assert_eq!(screen.contacts[0].status, "pending");
+        assert_eq!(screen.contacts[1].status, "blocked");
+        assert_eq!(screen.contacts[1].updated_ts, 1);
+        drop(command);
+        screen.table_state.selected = None;
+        assert!(screen.contact_for_pair("GreenCastle:BlueLake").is_err());
     }
 
     #[test]

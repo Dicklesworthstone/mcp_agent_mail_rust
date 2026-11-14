@@ -30,8 +30,8 @@ use crate::tui_persist::{
     load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
 };
 use crate::tui_screens::{
-    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState, operator_result,
-    operator_tool_context,
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg, OperatorTaskResult,
+    SelectionState, operator_result, operator_task, operator_tool_context,
 };
 use crate::tui_widgets::fancy::SummaryFooter;
 use crate::tui_widgets::{MetricTile, MetricTrend};
@@ -1558,14 +1558,32 @@ impl ReservationsScreen {
                 row.released = true;
             }
         }
-        self.clear_reservation_selection();
+        self.clear_completed_reservation_selection(ids);
         self.rebuild_sorted();
     }
 
+    fn clear_completed_reservation_selection(&mut self, ids: &[i64]) {
+        // The operator may have selected other rows while the task ran. Only
+        // retire selections belonging to the completed request.
+        let reservations = &self.reservations;
+        self.selected_reservation_keys.retain(|key| {
+            !reservations
+                .get(key)
+                .and_then(|row| row.reservation_id)
+                .is_some_and(|id| ids.contains(&id))
+        });
+        if self.selected_reservation_keys.is_empty() {
+            self.clear_reservation_selection();
+        }
+    }
+
     /// Renew (`release == false`) or release the named reservations on their
-    /// holders' behalf.
-    fn renew_or_release(&mut self, ids_csv: &str, release: bool) -> Result<String, String> {
-        let groups = self.reservation_ids_by_holder(ids_csv)?;
+    /// holders' behalf. All tool waits run in the operator task, using the
+    /// project, holder and ids captured when the action was selected.
+    fn renew_or_release(
+        groups: BTreeMap<(String, String), Vec<i64>>,
+        release: bool,
+    ) -> Result<OperatorTaskResult, String> {
         let ctx = operator_tool_context();
         let mut done = 0_i64;
         let mut done_ids = Vec::new();
@@ -1591,31 +1609,55 @@ impl ReservationsScreen {
                 ))
             };
             let raw = result.map_err(|err| format!("{agent}: {err}"))?;
-            let response: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            let response: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|err| format!("{agent}: invalid reservation response: {err}"))?;
             if response["queued"].as_bool() == Some(true) {
                 return Err(format!(
                     "{agent}: the database is unavailable; the release is queued and replays on the next release"
                 ));
             }
-            done += response[if release { "released" } else { "renewed" }]
-                .as_i64()
-                .unwrap_or(0);
-            done_ids.extend(ids);
+            if release {
+                let response: mcp_agent_mail_tools::reservations::ReleaseResult =
+                    serde_json::from_value(response)
+                        .map_err(|err| format!("{agent}: invalid release response: {err}"))?;
+                done += i64::from(response.released);
+                done_ids.extend(
+                    response
+                        .released_ids
+                        .into_iter()
+                        .filter(|id| ids.contains(id)),
+                );
+            } else {
+                let response: mcp_agent_mail_tools::reservations::RenewalResult =
+                    serde_json::from_value(response)
+                        .map_err(|err| format!("{agent}: invalid renewal response: {err}"))?;
+                done += i64::from(response.renewed);
+                done_ids.extend(
+                    response
+                        .file_reservations
+                        .into_iter()
+                        .map(|row| row.id)
+                        .filter(|id| ids.contains(id)),
+                );
+            }
         }
-        if release {
-            self.mark_rows_released(&done_ids);
-            Ok(format!("released {done} reservation(s)"))
+        let summary = if release {
+            format!("released {done} reservation(s)")
         } else {
-            self.clear_reservation_selection();
-            Ok(format!("renewed {done} reservation(s) by 30 minutes"))
-        }
+            format!("renewed {done} reservation(s) by 30 minutes")
+        };
+        Ok(OperatorTaskResult {
+            summary,
+            data: serde_json::json!({ "reservation_ids": done_ids }),
+        })
     }
 
     /// Force-release one reservation as the operator (`HumanOverseer`). The
     /// tool still refuses a holder that shows recent activity, and tells the
     /// holder its reservation was taken.
-    fn force_release(&mut self, id_arg: &str) -> Result<String, String> {
-        let groups = self.reservation_ids_by_holder(id_arg)?;
+    fn force_release(
+        groups: BTreeMap<(String, String), Vec<i64>>,
+    ) -> Result<OperatorTaskResult, String> {
         let Some(((project, holder), id)) = groups
             .into_iter()
             .next()
@@ -1636,8 +1678,10 @@ impl ReservationsScreen {
             ),
         )
         .map_err(|err| err.to_string())?;
-        self.mark_rows_released(&[id]);
-        Ok(format!("released {holder}'s reservation #{id}"))
+        Ok(OperatorTaskResult {
+            summary: format!("released {holder}'s reservation #{id}"),
+            data: serde_json::json!({ "reservation_ids": [id] }),
+        })
     }
 }
 
@@ -1871,13 +1915,49 @@ impl MailScreen for ReservationsScreen {
 
     fn handle_action(&mut self, operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
         let (name, ids) = operation.split_once(':').unwrap_or((operation, ""));
-        let result = match name {
-            "renew" => self.renew_or_release(ids, false),
-            "release" => self.renew_or_release(ids, true),
-            "force_release" => self.force_release(ids),
-            _ => return Cmd::None,
+        if !matches!(name, "renew" | "release" | "force_release") {
+            return Cmd::None;
+        }
+        let groups = match self.reservation_ids_by_holder(ids) {
+            Ok(groups) => groups,
+            Err(error) => return operator_result(name, Err(error)),
         };
-        operator_result(name, result)
+        if name == "force_release" {
+            operator_task(MailScreenId::Reservations, name, move || {
+                Self::force_release(groups)
+            })
+        } else {
+            let release = name == "release";
+            operator_task(MailScreenId::Reservations, name, move || {
+                Self::renew_or_release(groups, release)
+            })
+        }
+    }
+
+    fn handle_operator_result(
+        &mut self,
+        operation: &str,
+        result: &Result<OperatorTaskResult, String>,
+    ) {
+        if !matches!(operation, "renew" | "release" | "force_release") {
+            return;
+        }
+        let Ok(result) = result else {
+            // A later group may fail after earlier writes committed. Leave
+            // those observations to the authoritative poller; an error must
+            // never optimistically release the remaining selected rows.
+            return;
+        };
+        let Some(ids) = result.data["reservation_ids"].as_array() else {
+            return;
+        };
+        let ids: Vec<i64> = ids.iter().filter_map(serde_json::Value::as_i64).collect();
+        if operation == "renew" {
+            self.clear_completed_reservation_selection(&ids);
+        } else {
+            self.mark_rows_released(&ids);
+        }
+        self.sync_focused_event();
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
@@ -3811,7 +3891,9 @@ mod tests {
 
     #[test]
     fn action_menu_reservation_writes_reach_the_mailbox() {
-        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        use crate::tui_screens::{
+            complete_operator_task, expect_operator_result, seed_operator_test_project,
+        };
         crate::tui_screens::with_operator_test_mailbox(|project_key| {
             let slug = seed_operator_test_project(project_key, &["BlueLake"]);
             let granted: serde_json::Value = serde_json::from_str(
@@ -3834,15 +3916,17 @@ mod tests {
             list_reservation(&mut screen, src, &slug, "src/**");
             list_reservation(&mut screen, docs, &slug, "docs/**");
 
-            let (status, op, text) =
-                expect_operator_result(screen.handle_action(&format!("renew:{src}"), ""));
+            let command = screen.handle_action(&format!("renew:{src}"), "");
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            let (status, op, text) = complete_operator_task(&mut screen, command);
             assert_eq!((status.as_str(), op.as_str()), ("ok", "renew"), "{text}");
             assert!(text.contains("renewed 1"), "{text}");
 
             // BlueLake just registered, so the tool refuses to force-release
             // its lock, and the row stays listed.
-            let (status, _, text) =
-                expect_operator_result(screen.handle_action(&format!("force_release:{src}"), ""));
+            let command = screen.handle_action(&format!("force_release:{src}"), "");
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            let (status, _, text) = complete_operator_task(&mut screen, command);
             assert_eq!(status, "error");
             assert!(text.contains("refusing forced release"), "{text}");
             assert!(!released_in_db(src));
@@ -3856,8 +3940,13 @@ mod tests {
                 )
                 .expect("expire docs reservation");
             });
-            let (status, op, text) =
-                expect_operator_result(screen.handle_action(&format!("force_release:{docs}"), ""));
+            let command = screen.handle_action(&format!("force_release:{docs}"), "");
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            assert!(
+                !released_in_db(docs),
+                "scheduling must not execute the tool"
+            );
+            let (status, op, text) = complete_operator_task(&mut screen, command);
             assert_eq!(
                 (status.as_str(), op.as_str()),
                 ("ok", "force_release"),
@@ -3865,8 +3954,10 @@ mod tests {
             );
             assert!(released_in_db(docs));
 
-            let (status, op, text) =
-                expect_operator_result(screen.handle_action(&format!("release:{src}"), ""));
+            let command = screen.handle_action(&format!("release:{src}"), "");
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            assert!(!released_in_db(src), "scheduling must not execute the tool");
+            let (status, op, text) = complete_operator_task(&mut screen, command);
             assert_eq!((status.as_str(), op.as_str()), ("ok", "release"), "{text}");
             assert!(text.contains("released 1"), "{text}");
             assert!(released_in_db(src));
@@ -3880,6 +3971,66 @@ mod tests {
                 expect_operator_result(screen.handle_action("release:999999", ""));
             assert_eq!(status, "error");
             assert!(text.contains("no longer listed"), "{text}");
+        });
+    }
+
+    #[test]
+    fn reservation_release_task_defers_writes_and_keeps_new_selection() {
+        use crate::tui_screens::{complete_operator_task, seed_operator_test_project};
+
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["BlueLake"]);
+            let granted: serde_json::Value = serde_json::from_str(
+                &block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
+                    &operator_tool_context(),
+                    project_key.to_string(),
+                    "BlueLake".to_string(),
+                    vec!["src/**".to_string(), "docs/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                    None,
+                ))
+                .expect("file_reservation_paths"),
+            )
+            .expect("grant JSON");
+            let src = granted["granted"][0]["id"].as_i64().expect("src id");
+            let docs = granted["granted"][1]["id"].as_i64().expect("docs id");
+            let mut screen = ReservationsScreen::new();
+            list_reservation(&mut screen, src, &slug, "src/**");
+            list_reservation(&mut screen, docs, &slug, "docs/**");
+            let src_key = reservation_key(&slug, "BlueLake", "src/**");
+            let docs_key = reservation_key(&slug, "BlueLake", "docs/**");
+            screen.selected_reservation_keys.select(src_key.clone());
+
+            let command = screen.handle_action(&format!("release:{src}"), "");
+            assert!(matches!(&command, Cmd::Task(_, _)));
+            assert!(!released_in_db(src));
+            assert!(!screen.reservations[&src_key].released);
+
+            // A queued write must not hold the screen borrow or freeze input.
+            // Select a different row before the captured task completes.
+            let state = test_state();
+            let detail_before = screen.detail_visible;
+            let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('i'))), &state);
+            assert_ne!(screen.detail_visible, detail_before);
+            screen.selected_reservation_keys.select(docs_key.clone());
+
+            let (status, operation, text) = complete_operator_task(&mut screen, command);
+            assert_eq!(
+                (status.as_str(), operation.as_str()),
+                ("ok", "release"),
+                "{text}"
+            );
+            assert!(released_in_db(src));
+            assert!(
+                !released_in_db(docs),
+                "completion must keep the captured ids"
+            );
+            assert!(screen.reservations[&src_key].released);
+            assert!(!screen.reservations[&docs_key].released);
+            assert!(!screen.selected_reservation_keys.contains(&src_key));
+            assert!(screen.selected_reservation_keys.contains(&docs_key));
         });
     }
 
