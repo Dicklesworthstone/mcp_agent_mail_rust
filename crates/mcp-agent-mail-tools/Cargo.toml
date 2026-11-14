@@ -43,6 +43,9 @@ fs2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+same-file = { workspace = true }
+
 [features]
 default = ["mcp-agent-mail-db/default", "mcp-agent-mail-storage/default"]
 portable = ["mcp-agent-mail-db/portable", "mcp-agent-mail-storage/portable"]

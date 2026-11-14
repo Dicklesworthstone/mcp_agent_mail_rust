@@ -5389,6 +5389,7 @@ dependencies = [
  "mcp-agent-mail-storage",
  "mcp-agent-mail-test-helpers",
  "proptest",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.11.1",
