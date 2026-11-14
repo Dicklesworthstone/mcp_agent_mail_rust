@@ -53,14 +53,24 @@
   infos replacing three old-pin infos; none are suppressed. Static inspection
   finds all34 paths in13 workspace manifests inside the checkout. The optional
   remote resolved-graph probe is blocked by DCG and earns no evidence credit.
-- [ ] Pair upstream publication with the canonical ACFS checksum refresh;
-  current consumer exactly pins old installer16c12f59. Preserve other entries
+- [x] Pair upstream publication with the canonical ACFS checksum refresh;
+  prior consumer exactly pinned old installer16c12f59. Preserve other entries
   and run its required external checker; no Actions enablement or dispatch.
   External checker built through strict RCH; current-policy validate/list/
   check--dry-run--local all0,48 planned installers and zero executed. ACFS
   clean checkout fast-forwarded to da040b35; JSONL import completed after pull.
-- [ ] Flush/preserve tracker exports, check cycles and exact staged diff,
-  publish one coherent change, verify remote refs and release only own leases.
+  MCP source b9df0023 published to both refs; canonical full refresh/report
+  finds target df93f144 and five unrelated external drifts. Existing bound
+  candidate builder/validator both0 with explicit five-tool deferrals; only
+  target hash/timestamp change across48 unchanged keys/URLs. ACFS eef0f152
+  published to both refs. New-policy checker validate/list/local-dry-run0;
+  strong live check4:48/48 URLs reachable,43 hashes match including MCP,
+  five deferred mismatches remain visible. Canonical target re-fetch agrees.
+  UBS YAML attempt3/no supported language/zero files; no scanner-pass claim.
+- [x] Flush/preserve tracker exports, check cycles and exact staged diff;
+  only own br-ku0kl changes across2871 existing IDs, no additions/removals.
+  Record cross-repository publication receipts in final handoff; retain all
+  original real source-install/platform/container/DSR acceptance as open.
 
 ## November 14 nested-directory activity review — EmeraldEagle, 09:30 UTC
 
