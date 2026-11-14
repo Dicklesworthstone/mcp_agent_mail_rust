@@ -1,5 +1,32 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 legacy rollback quarantine review — EmeraldEagle, 17:08 UTC
+
+- [x] Reread latest source changes and callers; no new defect established in
+  the destination-parent repair. Reread ready Beads and graph triage.
+- [x] Verify TUI contact-query and recovery-fingerprint implementations are
+  already present; retain their outstanding qualification, avoid duplication.
+- [x] Identify concrete br-cxsgx gap: legacy rollback quarantine bypasses the
+  existing anchored main-file rename and does not sync successful family moves.
+  Its reason-specific sidecar names differ from the newer helper; preserve them.
+- [ ] Add and execute a real symlink-parent regression against old source,
+  alongside the three existing successful-family/collision/rollback controls.
+- [x] Connect existing AnchoredRecoveryParent quarantine_self_to and parent
+  validation/sync, preserving namespace refusal and ordinary rollback behavior.
+- [ ] Reread error paths, source identity, sidecar naming and restore callers.
+- [ ] Execute 29 recovery cases: initial 27 (previous 17 plus legacy family,
+  collision, rollback, namespace and restore controls and the new regression)
+  plus two existing anchored-rename delegate controls identified on reread.
+  Expanded before positive execution; the old-source four-case set stays fixed.
+- [ ] Check workspace/all-targets and production workspace/lib+bins.
+- [ ] Run strict workspace/all-target Clippy and formatting checks.
+- [ ] Scan the whole changed Rust file and retain warning/error counts.
+- [ ] Bind every result to exact source/lock/toolchain and strict remote receipt;
+  retain initial failures and exclude pending or empty runs from passing claims.
+- [ ] Record scoped Bead progress, preserve original acceptance and peer records,
+  export, verify cycles and prepare one coherent publication. Final publication
+  and lease-release receipts go in the existing retained review-audit.md.
+
 ## November 14 quarantine destination review — EmeraldEagle, 15:55 UTC
 
 - [x] Reread both recovery repairs and their callers/delegates; no regression
