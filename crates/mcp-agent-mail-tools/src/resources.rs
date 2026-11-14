@@ -6479,13 +6479,8 @@ mod reservation_activity_tests {
             "cold.rs".to_string(),
             "never.rs".to_string(),
         ];
-        let bounded = reservation_git_latest_activity_micros_batch(
-            &repo,
-            &specs,
-            i64::MIN,
-            1,
-            &mut || true,
-        );
+        let bounded =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 1, &mut || true);
         assert_eq!(bounded.scanned_commits, 1);
         assert_eq!(bounded.activities[0].micros, Some(1_700_000_300_000_000));
         assert!(!bounded.activities[0].incomplete);
@@ -6495,15 +6490,15 @@ mod reservation_activity_tests {
         }
 
         // Real history exhaustion, not a cutoff, proves no matching commit.
-        let complete = reservation_git_latest_activity_micros_batch(
-            &repo,
-            &specs,
-            i64::MIN,
-            8,
-            &mut || true,
-        );
+        let complete =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || true);
         assert_eq!(complete.scanned_commits, 4);
-        assert!(complete.activities.iter().all(|activity| !activity.incomplete));
+        assert!(
+            complete
+                .activities
+                .iter()
+                .all(|activity| !activity.incomplete)
+        );
         assert_eq!(complete.activities[0].micros, bounded.activities[0].micros);
         assert_eq!(complete.activities[1].micros, Some(1_700_000_000_000_000));
         assert_eq!(complete.activities[2].micros, None);
@@ -6517,35 +6512,31 @@ mod reservation_activity_tests {
         // Establish the checkpoints needed for one completed commit, rather
         // than coupling cancellation to a hardcoded number of object loads.
         let mut first_commit_checkpoints = 0;
-        let first_commit = reservation_git_latest_activity_micros_batch(
-            &repo,
-            &specs,
-            i64::MIN,
-            1,
-            &mut || {
+        let first_commit =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 1, &mut || {
                 first_commit_checkpoints += 1;
                 true
-            },
-        );
+            });
         assert_eq!(first_commit.scanned_commits, 1);
-        assert_eq!(first_commit.activities[0].micros, Some(1_700_000_300_000_000));
+        assert_eq!(
+            first_commit.activities[0].micros,
+            Some(1_700_000_300_000_000)
+        );
         assert!(!first_commit.activities[0].incomplete);
         assert!(first_commit.activities[1].incomplete);
 
         let mut checkpoints = 0;
-        let interrupted = reservation_git_latest_activity_micros_batch(
-            &repo,
-            &specs,
-            i64::MIN,
-            8,
-            &mut || {
+        let interrupted =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || {
                 checkpoints += 1;
                 checkpoints <= first_commit_checkpoints
-            },
-        );
+            });
         assert!(checkpoints > first_commit_checkpoints);
         assert_eq!(interrupted.scanned_commits, 1);
-        assert_eq!(interrupted.activities[0].micros, Some(1_700_000_300_000_000));
+        assert_eq!(
+            interrupted.activities[0].micros,
+            Some(1_700_000_300_000_000)
+        );
         assert!(!interrupted.activities[0].incomplete);
         assert_eq!(interrupted.activities[1].micros, None);
         assert!(interrupted.activities[1].incomplete);
@@ -6557,13 +6548,10 @@ mod reservation_activity_tests {
         let repo = git2::Repository::open(tmp.path()).expect("open");
         let specs = vec!["cold.rs".to_string()];
         let deadline = Instant::now();
-        let expired = reservation_git_latest_activity_micros_batch(
-            &repo,
-            &specs,
-            i64::MIN,
-            8,
-            &mut || Instant::now() < deadline,
-        );
+        let expired =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || {
+                Instant::now() < deadline
+            });
         assert_eq!(expired.scanned_commits, 0);
         assert_eq!(expired.activities[0].micros, None);
         assert!(expired.activities[0].incomplete);
@@ -6571,13 +6559,10 @@ mod reservation_activity_tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let awaiting_request = ReservationActivityCancelOnDrop(Arc::clone(&cancelled));
         drop(awaiting_request);
-        let dropped = reservation_git_latest_activity_micros_batch(
-            &repo,
-            &specs,
-            i64::MIN,
-            8,
-            &mut || !cancelled.load(Ordering::Acquire),
-        );
+        let dropped =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || {
+                !cancelled.load(Ordering::Acquire)
+            });
         assert_eq!(dropped.scanned_commits, 0);
         assert_eq!(dropped.activities[0].micros, None);
         assert!(dropped.activities[0].incomplete);
@@ -6588,13 +6573,8 @@ mod reservation_activity_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = reservation_scan_repo(tmp.path());
         let specs = vec!["cold.rs".to_string()];
-        let unborn = reservation_git_latest_activity_micros_batch(
-            &repo,
-            &specs,
-            i64::MIN,
-            8,
-            &mut || true,
-        );
+        let unborn =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || true);
         assert_eq!(unborn.scanned_commits, 0);
         assert_eq!(unborn.activities[0].micros, None);
         assert!(!unborn.activities[0].incomplete);
@@ -6612,13 +6592,8 @@ mod reservation_activity_tests {
         repo.reference("refs/heads/main", commit, true, "missing tree fixture")
             .expect("reference");
         repo.set_head("refs/heads/main").expect("head");
-        let broken = reservation_git_latest_activity_micros_batch(
-            &repo,
-            &specs,
-            i64::MIN,
-            8,
-            &mut || true,
-        );
+        let broken =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || true);
         assert_eq!(broken.scanned_commits, 1);
         assert_eq!(broken.activities[0].micros, None);
         assert!(broken.activities[0].incomplete);
@@ -11606,6 +11581,8 @@ mod resource_shape_tests {
     fn file_reservations_deep_git_history_is_bounded_without_false_staleness() {
         with_serialized_resources_env(
             &[
+                // This fixture registers a real tempdir in its private mailbox.
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
                 ("FILE_RESERVATION_INACTIVITY_SECONDS", "1800"),
                 ("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", "900"),
             ],
@@ -11763,8 +11740,7 @@ mod resource_shape_tests {
                         } else {
                             assert!(entry["last_git_activity_ts"].is_null(), "{path}");
                             assert!(
-                                reasons
-                                    .contains(&serde_json::json!("git_activity_unknown")),
+                                reasons.contains(&serde_json::json!("git_activity_unknown")),
                                 "{path}: {reasons:?}"
                             );
                         }

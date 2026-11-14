@@ -52921,11 +52921,12 @@ http_headers = { Authorization = "Bearer secret" }
         .expect("failed to parse trace-qualified atc explain");
         match cli.command.expect("expected command") {
             Commands::Atc {
-                action: AtcCommand::Explain {
-                    decision_id,
-                    trace_id,
-                    json,
-                },
+                action:
+                    AtcCommand::Explain {
+                        decision_id,
+                        trace_id,
+                        json,
+                    },
             } => {
                 assert_eq!(decision_id, 77);
                 assert_eq!(trace_id.as_deref(), Some("trc-atc-explain-77"));
@@ -53045,7 +53046,9 @@ http_headers = { Authorization = "Bearer secret" }
             &database_url,
             &storage_root_text,
         );
-        let error = result.expect_err("numeric ID alone is ambiguous").to_string();
+        let error = result
+            .expect_err("numeric ID alone is ambiguous")
+            .to_string();
         assert!(error.contains("--trace-id"));
         assert!(error.contains(first_trace));
         assert!(error.contains(second_trace));

@@ -1106,7 +1106,10 @@ mod tests {
             let first = record_at(1_000_000);
             let restarted = record_at(2_000_000);
             let replayed = record_at(1_000_000);
-            assert_eq!(first.id, restarted.id, "numeric IDs restart with the ledger");
+            assert_eq!(
+                first.id, restarted.id,
+                "numeric IDs restart with the ledger"
+            );
             assert_ne!(first.trace_id, restarted.trace_id);
             assert_eq!(first.trace_id, replayed.trace_id);
         }

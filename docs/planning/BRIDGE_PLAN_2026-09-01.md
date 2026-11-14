@@ -11,20 +11,130 @@
 - [x] Submit a frozen3722a6b6 workspace all-target check after a fresh healthy
   worker probe and complete unchanged30GiB/10GiB disk guard. Submission alone
   earns no execution or passing result.
-- [ ] Finish the check, inspect actual diagnostics and fix concrete defects.
-- [ ] Execute32 predeclared unique consumer controls:19 existing reservation
+- [x] Preserve three all-target and one native queue_timeout103 outcomes,
+  each zero cases. Later fresh guards admit actual all-target compilation on
+  hz2 and32-case native preparation on122. Both active38-file captures match
+  frozen3722a6b6, clean core4314 and nightly908501772; no cases run yet.
+- [x] Find the merged source's real formatting failure, remote1. Manually
+  apply rustfmt's requested changes to three existing test sections without
+  changing expressions, assertion values or production behavior. Corrected
+  workspace fmt passes0 on overlay143d38bb. Receipt tree335a204b is the Git
+  base tree, not the applied overlay tree. Initial compiler and native inputs
+  remain the distinct pre-format snapshot.
+- [x] Preserve the combined UBS scan and direct CLI scan's300s timeouts,
+  exit2/partial/zero files credited. Individual resource and ATC scans
+  complete0, no failed modules, respectively0critical/1491warnings/512info
+  and0critical/1322warnings/284info. Their input predates the format-only fix.
+- [x] Finish the whole corrected CLI scan with the documented1200s tool
+  allowance:736s,0critical/10407warnings/5058info, exit0/no failed modules.
+  Resource and ATC full-file rescans on corrected bytes also finish0 with
+  unchanged counts above. No rule, exit policy or product/test bound changes.
+  Preserve an unsupported --single-file invocation as0files/exit2; corrected
+  positional-file commands actually scan the full files. No exclusions added.
+- [x] Initial all-target check completes0 (Cargo28m15s, RCH1734.4s) on the
+  pre-format input; inspect diagnostics and retain the dependency's
+  proc-macro-error2 future-compatibility warning without suppression.
+- [x] Separate production lib/bins check completes0 on corrected overlay143d
+  (Cargo5m39s, RCH375.9s). Active capture matches39 source/config hashes,
+  clean core4314 and nightly908501772. No dev-only feature proof substituted.
+- [x] Execute32 predeclared unique consumer controls:19 existing reservation
   activity tests, deep-history resource/database read, two ATC restart tests,
   three trace-qualified CLI tests, six DB warmup/initializer controls and the
   unchanged GH374 HTTP cancellation test. Require every selected identity to
   execute; retain failures and unchanged original assertions and deadlines.
-- [ ] Check the separate production graph, strict workspace Clippy and format
-  on the reviewed source. Any source fix also needs focused real regression
-  coverage and stock UBS, then a fresh source/caller reread.
-- [ ] Record actual outcomes and the anti-ceremony disposition in the existing
+  Corrected input5d962da6 actually executes32/32PASS,14148skipped,38.852s,
+  runacf76f2b-fead-4f21-b145-ecb54b58efe9 on ordinary-user hz2. Actual
+  required-name set equals the32 passing identities; no absent/ignored credit.
+- [x] Correct all three selector mistakes using actual executable catalogs:
+  deep history is under resources::resource_shape_tests, and both ATC cases
+  are under atc::engine. The earlier31-case prediction missed the facade's
+  engine module; the original invocation could select29. No test ran in it.
+- [x] Execute the correctly qualified deep-history identity within the
+  corrected frozen32-case cohort. Keep the earlier25/1 cohort separate;
+  the one-case old-image setup diagnostic is not qualification credit.
+- [x] Query completed tools and CLI executables' actual test lists:20/20
+  required tools identities (including corrected deep-history) and3/3 CLI
+  identities exist. Listings execute0tests and earn no behavioral credit.
+- [x] Preserve native preparation's real failure: remote101 after8387.735s,
+  DB test linking cannot find at least20 dependency rlibs. Zero tests ran.
+  The removal cause is unproved; source/compiler gates are separate evidence.
+- [x] Retain the three completed tools/CLI/server executables under worker122
+  /data/tmp/am-review23-retained-hsvua3e3. Copies match stable producers and
+  actual catalogs contain all26 corrected required identities. Initial
+  collector fails only its incorrect ATC marker checks after copying all3;
+  recover metadata from those same copies without overwriting or recopying.
+  Narrow SBH protection covers only this owned artifact directory.
+- [x] Execute the26 controls from those images through nextest's documented
+  build reuse, preserving its watchdogs/leak handling and original assertions.
+- [x] Actual ordinary-user replay executes26 unique controls:25PASS/1FAIL,
+  nextest100, run31c5200c-a195-481a-b98a-61044db24658,36.150s. Deep-history
+  fails before its history assertions because its private fixture registers
+  a tempfile path without the required opt-in. Original real HTTP30s/5s
+  cancellation,19 reservation controls, two ATC and three CLI controls pass.
+  Preserve the failure; do not call this26/26 or diagnose original .87 failures.
+- [x] Correct only that fixture's scoped overrides with the documented
+  AM_ALLOW_EPHEMERAL_PROJECT_ROOTS=1 opt-in. The existing harness supplies
+  a private SQLite file and storage root. Production registration guard and
+  every original history/staleness/reservation assertion remain unchanged.
+- [x] Execute the corrected fixture and all32 intended controls on the new
+  frozen input. Keep the original25/1 result and default-guard refusal.
+- [x] Re-run all four mandatory compiler/production/Clippy/fmt gates after
+  the fixture correction. Earlier0 results
+  qualify the preceding143d formatting input, not this new source hash5fd4.
+- [x] Corrected-source formatting completes0, RCH38.3s, input5d962da6.
+  All-target check completes0 (Cargo12m36s/RCH796.9s), separate production
+  lib/bins0 (Cargo5m27s/RCH368.5s), strict Clippy -D warnings0
+  (Cargo4m33s/RCH311.2s). All three active captures match39 current hashes,
+  clean core4314/nightly908. Existing dependency future warning retained.
+- [x] Full changed resources UBS scan on5fd4 completes0/statusok, no failed
+  modules,0critical/1491warnings/512info, stock300s watchdog, actual13s.
+  Prior changed-range triage remains applicable; the scoped fixture opt-in
+  adds no new scanner finding or source suppression.
+- [x] Transfer the same hash-verified images tohz2 and populate an owned raw
+  source snapshot matching all39 original source/config hashes. Corrected
+  real Cargo/binary metadata and actual nextest discovery select exactly26
+  nonignored identities, set-equal to the intended cohort. Discovery runs0
+  tests. Retain failed offline metadata/parse attempts and122 reuse queue103;
+  neither earns execution credit. No source, lock or test policy changes.
+- [x] Recover the DB test build and execute its six original controls. Verify
+  its effective dependency/feature/profile graph; all32 behaviors stay required.
+  All six execute and pass in the corrected full32 cohort. The100ms warmup
+  returns100.472367ms, pending0, held foreign lease remains active, committed42
+  reads back. Original HTTP times out30002ms, permit drains before held lease
+  release, pending0/0, pool1/0/1 and followup27/11ms; original assertions intact.
+- [x] Retain all four corrected-input images byte-for-byte in the already
+  protected hz2 /data/tmp/am-review23-replay-649_i195 directory, with distinct
+  fixture-test names. Producer/copy hashes and actual catalogs verify tools
+  bca66d93/20 controls, CLIec068063/3, server6d020c59/3 and DB09207fd2/6.
+  Catalog discovery itself runs0tests; native credit comes from runacf76f2b.
+- [x] Compare actual unit graphs: DB-only closure608 differs from original
+  four-package closure631, including transitive/core features. Keep the
+  original four packages/default features/profile rather than narrowing.
+- [x] After the fixture defect is established, stop only owned raw-source
+  dependency build30097323753213763 before any workspace test compilation
+  or test execution. Exact wrapper cancellation returns cancelled; local143,
+  identity-bound remote120 and no live scoped compiler/test processes.
+  Preserve it as0tests. Submit the corrected full32-case input only after a
+  new healthy pressure probe and complete unchanged disk guard0. Future
+  orchestration stops immediately on either failed preflight; an earlier
+  diagnostic submitted despite warning is retained as diagnostic-only.
+- [x] Strict workspace all-target Clippy -D warnings finishes0 on corrected
+  overlay143d (Cargo4m36s, RCH312.8s). Final plain all-target check also
+  finishes0 on143d (Cargo2m18s, RCH176.2s). Both active39-file captures
+  match current bytes, core4314 and nightly908501772. No gate weakened.
+- [x] Reread the final formatting diff and production callers; review changed
+  scanner findings. Bounded vector indices and necessary owned clones are
+  valid; test setup/assertion findings establish no new concrete runtime bug.
+- [x] Record actual outcomes and the anti-ceremony disposition in the existing
   audit and owned Bead comments; preserve any unmet original acceptance.
+  Comment4377 keeps .87/.90 in_progress and all original acceptance intact.
+  Verdict DRIFTING: useful integration/fixture maintenance, zero new production
+  feature or release-readiness credit. First25/1, failed link101, invocation
+  mistakes and improperly admitted diagnostic remain on record. Newer incoming
+  origin86c peer code is outside this frozen3722+5d962da6 qualification.
 - [ ] Flush/validate tracker changes and empty dependency cycles; publish only
   scoped changes while preserving peer work, verify both required remote refs,
-  and release only this review's own lease1844.
+  and release only this review's own leases1844/1851/1852/1853.
 
 ## November 13 warmup deadline review — EmeraldEagle, 23:20 UTC
 
