@@ -1098,6 +1098,20 @@ bounds. Resources without `context=true` keep their existing response formats.
 
 ### Complete Reservation Reads Through the Server
 
+Ordinary `resource://file_reservations/<slug>` pages include optional activity
+hints. Filesystem and Git enrichment share a 100 ms cooperative time budget;
+Git history is also capped at 1,000 commits per page and diffs are restricted
+to the reserved paths. `last_git_activity_ts` reports a recent touch found
+within `FILE_RESERVATION_ACTIVITY_GRACE_SECONDS`, not an exhaustive historical
+last-touch lookup. It is null if no recent touch was established. When the
+scan is incomplete, `stale_reasons` includes `git_activity_unknown`
+and `stale` remains false. Cancelling or abandoning a read stops its worker
+at the next checkpoint; a single filesystem or libgit2 call cannot be
+interrupted. Bounded reads always use libgit2, independently of the legacy
+`AM_GIT_LS_FILES_SHELL` and `AM_GIT_RESERVATION_ACTIVITY_SHELL` escape hatches
+for the single-pattern force-release probe. Snapshot modes omit activity
+enrichment entirely.
+
 Use `--server` to read reservations through the configured authenticated MCP
 endpoint while the server owns the mailbox:
 
