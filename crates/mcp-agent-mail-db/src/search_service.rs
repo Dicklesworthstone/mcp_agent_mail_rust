@@ -5829,6 +5829,9 @@ pub async fn execute_search(
             Ok(results) => results,
             Err(error) => return lexical_failure(cx, map_bridge_bootstrap_error(&error)),
         };
+        // Continuation follows the examined index page, including candidates
+        // that disappear or leave the query's scope before canonical hydration.
+        let next_cursor = compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
         let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
             Outcome::Ok(results) => results,
             Outcome::Err(error) => return Outcome::Err(error),
@@ -5844,7 +5847,11 @@ pub async fn execute_search(
             record_query("search_service_private_tantivy", latency_us);
         }
         global_metrics().search.record_v3_query(latency_us, false);
-        return finish_scoped_response(raw_results, query, options, assistance, explain);
+        let mut response = finish_scoped_response(raw_results, query, options, assistance, explain);
+        if let Outcome::Ok(ref mut response) = response {
+            response.next_cursor = next_cursor;
+        }
+        return response;
     }
 
     // Builds without Tantivy retain the GH#162 SQL fallback for a foreign
@@ -5957,6 +5964,11 @@ pub async fn execute_search(
                     }
                 }
             }
+            // A full candidate page may hydrate to a short or empty page.
+            // Keep its continuation so a concurrent deletion or filter change
+            // cannot hide later matches by falsely reporting exhaustion.
+            let next_cursor =
+                compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
             let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await
             {
                 Outcome::Ok(results) => results,
@@ -5977,8 +5989,11 @@ pub async fn execute_search(
             }
             // Record V3 metrics
             global_metrics().search.record_v3_query(latency_us, false);
-            let resp =
+            let mut resp =
                 finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
+            if let Outcome::Ok(ref mut response) = resp {
+                response.next_cursor = next_cursor;
+            }
             if cache_allowed && let Outcome::Ok(ref val) = resp {
                 cache.put(cache_key, val.clone());
             }
@@ -9894,6 +9909,159 @@ mod tests {
                 let wire = serde_json::to_string(&response).unwrap();
                 assert!(!wire.contains("deleted-body-canary"));
                 assert!(!wire.contains("previous-body-canary"));
+            }
+        });
+    }
+
+    #[cfg(feature = "tantivy-engine")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn lexical_search_continues_after_candidates_disappear() {
+        if !run_semantic_enabled_search_test_in_child(
+            "search_service::tests::lexical_search_continues_after_candidates_disappear",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "lexical-continuation.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context for real mailbox operations");
+            let foreign = crate::queries::ensure_project(&cx, &pool, "/continuation-foreign")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            for (engine_case, search_engine) in [Some(SearchEngine::Lexical), None]
+                .into_iter()
+                .enumerate()
+            {
+                for hide_entire_page in [false, true] {
+                    let token = format!("continuation{engine_case}{hide_entire_page}");
+                    let project = crate::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        &format!("/{token}"),
+                    )
+                    .await
+                    .into_result()
+                    .unwrap();
+                    let project_id = project.id.unwrap();
+                    let sender = crate::queries::register_agent(
+                        &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+                    )
+                    .await
+                    .into_result()
+                    .unwrap();
+                    let first_id = 10 * i64::try_from(engine_case).unwrap()
+                        + if hide_entire_page { 6 } else { 1 };
+                    // Deletion leaves a partial final page. Moving the whole
+                    // first page leaves exactly one full page, followed by an
+                    // empty terminal page. Both must remain traversable.
+                    let count = if hide_entire_page { 4 } else { 5 };
+                    let conn = crate::guard_db_conn(
+                        crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+                        "seed lexical continuation regression",
+                    );
+                    for id in first_id..first_id + count {
+                        conn.execute_sync(
+                            "INSERT INTO messages \
+                             (id, project_id, sender_id, subject, body_md, created_ts) \
+                             VALUES (?, ?, ?, ?, ?, 1000000)",
+                            &[
+                                Value::BigInt(id),
+                                Value::BigInt(project_id),
+                                Value::BigInt(sender.id.unwrap()),
+                                Value::Text(token.clone()),
+                                Value::Text(format!("{token} canonical body")),
+                            ],
+                        )
+                        .unwrap();
+                    }
+                    drop(conn);
+                    let mut query = SearchQuery {
+                        limit: Some(2),
+                        ..SearchQuery::messages(&token, project_id)
+                    };
+                    ensure_lexical_bridge_initialized(Some(&cx), &pool).unwrap();
+                    let candidates = try_tantivy_search(&cx, &pool, &query).unwrap().unwrap();
+                    assert_eq!(
+                        candidates.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+                        vec![first_id, first_id + 1],
+                        "the real index must select the rows changed at hydration"
+                    );
+                    let database_path = pool.sqlite_path().to_string();
+                    LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            let conn = crate::guard_db_conn(
+                                crate::DbConn::open_file(&database_path).unwrap(),
+                                "commit lexical continuation race",
+                            );
+                            if hide_entire_page {
+                                conn.execute_sync(
+                                    "UPDATE messages SET project_id = ? WHERE id IN (?, ?)",
+                                    &[
+                                        Value::BigInt(foreign),
+                                        Value::BigInt(first_id),
+                                        Value::BigInt(first_id + 1),
+                                    ],
+                                )
+                                .unwrap();
+                            } else {
+                                conn.execute_sync(
+                                    "DELETE FROM messages WHERE id = ?",
+                                    &[Value::BigInt(first_id)],
+                                )
+                                .unwrap();
+                            }
+                        }));
+                    });
+                    let options = SearchOptions {
+                        search_engine,
+                        ..Default::default()
+                    };
+                    let first = execute_search(&cx, &pool, &query, &options)
+                        .await
+                        .into_result()
+                        .unwrap();
+                    assert!(
+                        LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| hook.borrow_mut().take().is_none())
+                    );
+                    assert_eq!(first.results.len(), usize::from(!hide_entire_page));
+                    assert!(
+                        first.next_cursor.is_some(),
+                        "a shortened or empty hydrated page must not claim exhaustion"
+                    );
+                    let mut ids: Vec<_> =
+                        first.results.iter().map(|hit| hit.result.id).collect();
+                    let mut cursor = first.next_cursor;
+                    let mut cursors = HashSet::new();
+                    let mut pages = 0;
+                    while let Some(next) = cursor {
+                        assert!(cursors.insert(next.clone()), "continuation must advance");
+                        assert!(pages < 4, "a finite corpus must reach its final page");
+                        query.cursor = Some(next);
+                        let page = execute_search(&cx, &pool, &query, &options)
+                            .await
+                            .into_result()
+                            .unwrap();
+                        for hit in page.results {
+                            assert_eq!(hit.result.project_id, Some(project_id));
+                            assert_eq!(hit.result.body, format!("{token} canonical body"));
+                            ids.push(hit.result.id);
+                        }
+                        cursor = page.next_cursor;
+                        pages += 1;
+                    }
+                    let hidden = if hide_entire_page { 2 } else { 1 };
+                    assert_eq!(
+                        ids,
+                        (first_id + hidden..first_id + count).collect::<Vec<_>>()
+                    );
+                }
             }
         });
     }
