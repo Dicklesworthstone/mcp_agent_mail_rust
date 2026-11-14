@@ -375,6 +375,121 @@ mod tests {
     }
 
     #[test]
+    fn direct_publication_cannot_barge_after_a_busy_repair_probe_races_release() {
+        if isolated() {
+            return;
+        }
+        let root = archive_root();
+        let before = tracking();
+        let stamp = token(root.path());
+        let (owner_ready_tx, owner_ready_rx) = mpsc::channel();
+        let (owner_release_tx, owner_release_rx) = mpsc::channel();
+        let (owner_dropped_tx, owner_dropped_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let fence = FenceLease::acquire();
+            owner_ready_tx.send(()).unwrap();
+            owner_release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            drop(fence);
+            owner_dropped_tx.send(()).unwrap();
+        });
+        owner_ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (repair_waiting_tx, repair_waiting_rx) = mpsc::channel();
+        let (repair_resume_tx, repair_resume_rx) = mpsc::channel();
+        let (repair_finished_tx, repair_finished_rx) = mpsc::channel();
+        let repair_root = root.path().to_path_buf();
+        let order = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repair_order = std::sync::Arc::clone(&order);
+        let repair = std::thread::spawn(move || {
+            let mut paused = false;
+            let admitted = ArchiveMutationGuard::begin_message_repair(&repair_root, || {
+                if !paused && crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0 {
+                    paused = true;
+                    repair_waiting_tx.send(()).unwrap();
+                    repair_resume_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                false
+            })
+            .expect("the waiting repair must retain its native admission");
+            let position = repair_order.fetch_add(1, Ordering::AcqRel);
+            drop(admitted);
+            repair_finished_tx.send(position).unwrap();
+        });
+        repair_waiting_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(tracking(), before);
+        assert_eq!(token(root.path()), stamp);
+
+        // Release the actual owner only after the direct writer has observed
+        // a busy fence. The repair is already waiting but has not retried yet,
+        // making the probe-to-acquisition race independent of thread timing.
+        crate::DIRECT_PUBLICATION_AFTER_REPAIR_PROBE_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |available| {
+                assert!(!available, "the controlled probe must see the owner");
+                owner_release_tx.send(()).unwrap();
+                owner_dropped_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }));
+        });
+        let mut resume_repair = Some(repair_resume_tx);
+        let mut repaired_at = None;
+        let direct = crate::admit_direct_publication(
+            root.path(),
+            Instant::now() + Duration::from_secs(1),
+            &mut || {
+                // Once the direct writer follows its normal contention path,
+                // let the ready repair execute before its next attempt. A
+                // barging acquisition never registers that wait and therefore
+                // completes before the repair is allowed to resume.
+                if crate::DIRECT_FENCE_WAITERS.load(Ordering::Acquire) != 0
+                    && let Some(resume) = resume_repair.take()
+                {
+                    resume.send(()).unwrap();
+                    repaired_at = Some(
+                        repair_finished_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap(),
+                    );
+                }
+                false
+            },
+        );
+        let published_at = order.fetch_add(1, Ordering::AcqRel);
+        let admitted = direct.is_ok();
+        drop(direct);
+        // Complete both peers even when the incumbent implementation barges;
+        // the assertion below must report ordering, not a cleanup timeout.
+        if let Some(resume) = resume_repair {
+            resume.send(()).unwrap();
+            repaired_at = Some(
+                repair_finished_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap(),
+            );
+        }
+        owner.join().unwrap();
+        repair.join().unwrap();
+        assert!(admitted, "ordinary direct publication must still complete");
+        assert!(
+            repaired_at.unwrap() < published_at,
+            "the repair must run before a direct writer racing the owner's release"
+        );
+        assert_eq!(
+            tracking(),
+            (0, 0, before.2 + 4),
+            "only the repair and direct publication open mutation windows"
+        );
+        assert_eq!(crate::REPAIR_FENCE_WAITERS.load(Ordering::Acquire), 0);
+        assert_eq!(crate::DIRECT_FENCE_WAITERS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn direct_repair_give_way_is_bounded_cancellable_and_respects_request_deadline() {
         if isolated() {
             return;

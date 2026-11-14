@@ -992,7 +992,18 @@ fn prepare_periodic_publication(
                 policy.keep,
             )
         }
-        result => result,
+        Err(error) => {
+            // An oversized historical inventory can consist entirely of
+            // empty native batches. Rotation can safely drain a bounded
+            // portion before requiring a complete payload inventory; waiting
+            // for admission first would permanently strand that backlog.
+            // Preserve this attempt's refusal: independent cleanup does not
+            // turn an incomplete inventory into a repair-export allowance.
+            #[cfg(unix)]
+            rotate_after_backup_admission_refusal(primary, Some(policy), admission);
+            Err(error)
+        }
+        Ok(()) => Ok(()),
     };
     if let Some(admission) = admission {
         admission.revalidate_for(primary)?;
@@ -2259,6 +2270,145 @@ mod tests {
         })
         .expect("create real backup pool");
         (primary, pool)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn refused_periodic_inventory_drains_empty_batches_without_export() {
+        use mcp_agent_mail_db::snapshot::{
+            SnapshotRetentionGuard, record_snapshot_metadata, snapshot_bak_path, snapshot_meta_path,
+        };
+
+        const EMPTY_BATCHES: usize = 16_641;
+        const MAX_REMOVED_PER_PASS: usize = 128;
+
+        if !isolated_default_retention_child() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let (primary, _pool) = retention_mailbox(&root);
+        let live = std::fs::read(&primary).unwrap();
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        record_snapshot_metadata(&primary, 2_000_000_000_000_000).unwrap();
+        let metadata = std::fs::read(snapshot_meta_path(&primary)).unwrap();
+        let reclaimable = root.join("doctor/reclaimable");
+        std::fs::create_dir_all(&reclaimable).unwrap();
+        let unknown = reclaimable.join("operator-empty-evidence");
+        let recorded = reclaimable.join("rotation-20000101T000000Z");
+        let nested = reclaimable.join("rotation-20000101T000000Z-1");
+        std::fs::create_dir(&unknown).unwrap();
+        std::fs::create_dir(&recorded).unwrap();
+        std::fs::write(
+            recorded.join("manifest.json"),
+            b"recovery transaction evidence",
+        )
+        .unwrap();
+        std::fs::create_dir_all(nested.join("unfinished-stage")).unwrap();
+
+        // Use the original oversized backlog, not a reduced inventory limit.
+        // Even the maximum one-pass drain leaves publication inventory incomplete.
+        for index in 0..EMPTY_BATCHES {
+            std::fs::create_dir(
+                reclaimable.join(format!("rotation-20000101T000000Z-{}", index + 10)),
+            )
+            .unwrap();
+        }
+        let remaining = || {
+            std::fs::read_dir(&reclaimable)
+                .unwrap()
+                .map(Result::unwrap)
+                .count()
+                - 3
+        };
+        let policy = PeriodicBackupPolicy::new(&root, 3);
+        let refusal = crate::backup_rotation::admit_periodic_publication(&root, &primary, 3)
+            .expect_err("the original backlog exceeds the inventory bound");
+        assert!(!crate::backup_rotation::periodic_publication_budget_exhausted(&refusal));
+        assert_eq!(remaining(), EMPTY_BATCHES);
+
+        // Independent cleanup still needs both an unspent work quantum and
+        // snapshot admission. Neither refusal may turn into a repair export.
+        for (budget, hold_authority) in [
+            (Duration::ZERO, false),
+            (crate::backup_rotation::BACKGROUND_ROTATION_BUDGET, true),
+        ] {
+            let _reader =
+                hold_authority.then(|| SnapshotRetentionGuard::acquire(&primary).unwrap());
+            let refused = prepare_periodic_publication(
+                &primary,
+                PeriodicBackupPolicy {
+                    rotation_budget: budget,
+                    ..policy
+                },
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(refused.to_string(), refusal.to_string());
+            assert_eq!(remaining(), EMPTY_BATCHES);
+        }
+
+        let now = Instant::now();
+        let mut schedule = AutomaticBackupSchedule::default();
+        schedule.request_verified();
+        assert!(run_admitted_backup_with(
+            &primary,
+            &mut schedule,
+            || now,
+            Some(policy),
+            |_, _, _| panic!("incomplete inventory cannot admit a producer or repair export"),
+        ));
+        let retained = remaining();
+        assert!(
+            (EMPTY_BATCHES - MAX_REMOVED_PER_PASS..EMPTY_BATCHES).contains(&retained),
+            "a refused automatic attempt must drain one bounded pass: {retained}"
+        );
+        assert_eq!(schedule.consecutive_failures(), 1);
+        assert_eq!(
+            schedule.retry_remaining(now),
+            schedule::BACKUP_RETRY_INITIAL
+        );
+        assert_eq!(schedule.next_attempt(now), None);
+        assert_eq!(
+            schedule.next_attempt(now + schedule::BACKUP_RETRY_INITIAL),
+            Some(BackupKind::Verified)
+        );
+        assert_eq!(next_rotation_continuation(&primary), None);
+        let refused = crate::backup_rotation::admit_periodic_publication(&root, &primary, 3)
+            .expect_err("one bounded pass cannot complete the oversized inventory");
+        assert!(!crate::backup_rotation::periodic_publication_budget_exhausted(&refused));
+
+        let retry_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 24 * 3600;
+        backup_budget::with_admission(&primary, |_| {
+            let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                &primary,
+                BackupKind::Verified,
+                retry_at,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!lease.retention_repair_spent());
+            lease.finish(BackupCompletion::Skipped).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&primary).unwrap(), live);
+        assert_eq!(std::fs::read(&backup).unwrap(), live);
+        assert_eq!(
+            std::fs::read(snapshot_meta_path(&primary)).unwrap(),
+            metadata
+        );
+        assert_eq!(
+            std::fs::read(recorded.join("manifest.json")).unwrap(),
+            b"recovery transaction evidence"
+        );
+        assert!(unknown.is_dir());
+        assert!(nested.join("unfinished-stage").is_dir());
     }
 
     #[cfg(unix)]

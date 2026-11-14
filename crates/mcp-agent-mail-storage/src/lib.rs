@@ -1748,16 +1748,30 @@ const DIRECT_FENCE_ADMISSION_BUDGET: Duration = Duration::from_secs(5);
 /// blocking acquirers leave it.
 const DIRECT_FENCE_ADMISSION_MAX_PAUSE: Duration = Duration::from_millis(1);
 
+#[cfg(test)]
+thread_local! {
+    static DIRECT_PUBLICATION_AFTER_REPAIR_PROBE_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce(bool)>>> =
+            const { std::cell::RefCell::new(None) };
+}
+
 /// A scheduling hint only: never reserve the fence or change holder metadata
 /// or mutation epochs while deciding whether to give a repair an opening.
 fn publication_fence_available_for_repair_turn() -> bool {
     let guard = match ARCHIVE_PUBLICATION_FENCE.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return false,
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
     };
+    let available = guard.is_some();
     drop(guard);
-    true
+    #[cfg(test)]
+    if let Some(hook) =
+        DIRECT_PUBLICATION_AFTER_REPAIR_PROBE_TEST_HOOK.with(|slot| slot.borrow_mut().take())
+    {
+        hook(available);
+    }
+    available
 }
 
 /// Admit a direct write to the publication fence. Contention is retried with a
@@ -1777,13 +1791,14 @@ fn admit_direct_publication(
     let mut waiting = None;
     let mut repair_turn_given = false;
     loop {
-        if !repair_turn_given
+        let repair_turn_pending = !repair_turn_given
             && REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0
             && ARCHIVE_MUTATION_DEPTH
                 .try_with(std::cell::Cell::get)
-                .is_ok_and(|depth| depth == 0)
-            && publication_fence_available_for_repair_turn()
-        {
+                .is_ok_and(|depth| depth == 0);
+        let fence_busy_before_repair_turn =
+            repair_turn_pending && !publication_fence_available_for_repair_turn();
+        if repair_turn_pending && !fence_busy_before_repair_turn {
             repair_turn_given = true;
             let turn_deadline = deadline.min(Instant::now() + DIRECT_WAITER_GIVE_WAY);
             while REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0 {
@@ -1801,9 +1816,28 @@ fn admit_direct_publication(
                 std::thread::sleep(remaining.min(Duration::from_micros(200)));
             }
         }
-        let contention = match ArchiveMutationGuard::try_begin_repair(path, &mut *cancelled) {
-            Err(error @ StorageError::LockContention { .. }) => error,
-            admitted_or_failed => return admitted_or_failed,
+        let contention = if fence_busy_before_repair_turn {
+            // The owner can release after the scheduling probe. A second
+            // acquisition here would then barge ahead of the waiting repair
+            // without giving its opening. Retain the ordinary cancellable
+            // contention path and start that bounded opening only after a
+            // later probe actually observes the fence free.
+            if cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "direct archive publication admission cancelled",
+                )
+                .into());
+            }
+            StorageError::LockContention {
+                message: "archive repair publication admission deferred: publication fence busy"
+                    .to_string(),
+            }
+        } else {
+            match ArchiveMutationGuard::try_begin_repair(path, &mut *cancelled) {
+                Err(error @ StorageError::LockContention { .. }) => error,
+                admitted_or_failed => return admitted_or_failed,
+            }
         };
         waiting.get_or_insert_with(DirectFenceWaiter::register);
         let remaining = deadline.saturating_duration_since(Instant::now());
