@@ -254,30 +254,57 @@ fn read_active_lease_entries(
     Ok(results)
 }
 
-/// Hold one stable lock inode throughout a slot's read/modify/write operation.
-/// Never unlink the lock file: another process may already hold an open handle
-/// to it. File close releases the OS lock, including on errors and unwinding.
-/// `None` means the slot directory is absent and no creation was requested.
-fn try_lock_slot(slot_path: &Path, create: bool) -> std::io::Result<Option<std::fs::File>> {
-    if create {
-        std::fs::create_dir_all(slot_path)?;
+/// Keep the no-follow directory and lock authority together. Holding a flock
+/// on a displaced inode does not serialize a peer that opens its replacement.
+/// Validate before publication and before returning a successful receipt.
+#[derive(Debug)]
+struct BuildSlotLock {
+    directory: mcp_agent_mail_core::journal_io::JournalDirectory,
+    file: std::fs::File,
+}
+
+impl BuildSlotLock {
+    fn validate(&self) -> std::io::Result<()> {
+        self.directory.validate_file(".slot.lock", &self.file)
     }
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(slot_path.join(".slot.lock"))
-    {
-        Ok(file) => file,
-        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
+}
+
+/// Hold one stable lock inode throughout a slot's read/modify/write operation.
+/// Neither a symlink nor a special file may stand in for the slot directory or
+/// lock. Never unlink the lock: another process may hold an open handle to it.
+/// File close releases the OS lock, including on errors and unwinding.
+/// `None` means the slot directory is absent and no creation was requested.
+fn try_lock_slot(slot_path: &Path, create: bool) -> std::io::Result<Option<BuildSlotLock>> {
+    let parent = slot_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = slot_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "build slot directory must have a Unicode final component",
+            )
+        })?;
+    let directory =
+        match mcp_agent_mail_core::journal_io::JournalDirectory::open(parent, name, create) {
+            Ok(directory) => directory,
+            Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+    let file = directory.open_file(
+        ".slot.lock",
+        mcp_agent_mail_core::journal_io::JournalFileMode::Lock,
+    )?;
     // Non-blocking: never park an async executor thread behind another process.
     fs2::FileExt::try_lock_exclusive(&file)?;
-    Ok(Some(file))
+    let guard = BuildSlotLock { directory, file };
+    guard.validate()?;
+    Ok(Some(guard))
 }
 
 fn slot_io_error(error: std::io::Error) -> McpError {
@@ -516,7 +543,8 @@ fn acquire_slot_lease(
     ttl: i64,
     is_exclusive: bool,
 ) -> std::io::Result<AcquireBuildSlotResponse> {
-    let _slot_lock = try_lock_slot(slot_path, true)?;
+    let slot_lock = try_lock_slot(slot_path, true)?
+        .ok_or_else(|| std::io::Error::other("build slot directory was not created"))?;
     let now = chrono::Utc::now();
     let active = read_active_leases(slot_path, now)?;
     let conflicts = collect_slot_conflicts(active, agent_name, branch.as_deref(), is_exclusive);
@@ -530,7 +558,9 @@ fn acquire_slot_lease(
         expires_ts: (now + chrono::Duration::seconds(ttl)).to_rfc3339(),
         released_ts: None,
     };
+    slot_lock.validate()?;
     write_lease_json(&lease_path, &granted)?;
+    slot_lock.validate()?;
     Ok(AcquireBuildSlotResponse { granted, conflicts })
 }
 
@@ -544,7 +574,7 @@ fn renew_slot_lease(
         renewed: false,
         expires_ts: String::new(),
     };
-    let Some(_slot_lock) = try_lock_slot(slot_path, false)? else {
+    let Some(slot_lock) = try_lock_slot(slot_path, false)? else {
         return Ok(missing);
     };
     let now = chrono::Utc::now();
@@ -556,6 +586,7 @@ fn renew_slot_lease(
         })
         .collect();
     let Some(latest) = owned.iter().map(|entry| entry.expires_at).max() else {
+        slot_lock.validate()?;
         return Ok(missing);
     };
     // One response expiry must describe every active alias. Extend from the
@@ -563,8 +594,10 @@ fn renew_slot_lease(
     let new_exp = compute_renewed_expiry(now, &latest.to_rfc3339(), extend);
     for mut entry in owned {
         entry.lease.expires_ts.clone_from(&new_exp);
+        slot_lock.validate()?;
         write_lease_json(&entry.path, &entry.lease)?;
     }
+    slot_lock.validate()?;
     Ok(RenewBuildSlotResponse {
         renewed: true,
         expires_ts: new_exp,
@@ -580,7 +613,7 @@ fn release_slot_lease(
         released: false,
         released_at: String::new(),
     };
-    let Some(_slot_lock) = try_lock_slot(slot_path, false)? else {
+    let Some(slot_lock) = try_lock_slot(slot_path, false)? else {
         return Ok(missing);
     };
     let now = chrono::Utc::now();
@@ -595,6 +628,7 @@ fn release_slot_lease(
             existing.clone()
         } else {
             entry.lease.released_ts = Some(released_now.clone());
+            slot_lock.validate()?;
             write_lease_json(&entry.path, &entry.lease)?;
             released_now.clone()
         };
@@ -609,6 +643,7 @@ fn release_slot_lease(
             response.released_at = released_at;
         }
     }
+    slot_lock.validate()?;
     Ok(response)
 }
 
@@ -1235,6 +1270,174 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _first = try_lock_slot(&dir.path().join("first"), true).unwrap();
         let _second = try_lock_slot(&dir.path().join("second"), true).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_slot_locks_refuse_all_mutations_without_touching_foreign_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for hard_link in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let slot = dir.path().join("slot");
+            let owned = lease_path_for_holder(&slot, "BlueLake", None);
+            write_lease_json(&owned, &make_lease("BlueLake", None, true)).unwrap();
+            let before = std::fs::read(&owned).unwrap();
+            let target = dir.path().join("foreign-lock");
+            std::fs::write(&target, b"foreign lock evidence").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let linked = slot.join(".slot.lock");
+            if hard_link {
+                std::fs::hard_link(&target, &linked).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&target, &linked).unwrap();
+            }
+
+            assert!(try_lock_slot(&slot, true).is_err());
+            assert!(acquire_slot_lease(&slot, "slot-a", "GreenPeak", None, 3600, true).is_err());
+            assert!(renew_slot_lease(&slot, "BlueLake", None, 600).is_err());
+            assert!(release_slot_lease(&slot, "BlueLake", None).is_err());
+            assert_eq!(std::fs::read(&owned).unwrap(), before);
+            assert!(!lease_path_for_holder(&slot, "GreenPeak", None).exists());
+            assert_eq!(std::fs::read(&target).unwrap(), b"foreign lock evidence");
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o640,
+                "refusing an aliased lock must not chmod its foreign target"
+            );
+            if !hard_link {
+                assert_eq!(std::fs::read_link(&linked).unwrap(), target);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_slot_directory_refuses_all_mutations_without_entering_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("foreign-slot");
+        acquire_slot_lease(&target, "slot-a", "BlueLake", None, 3600, true).unwrap();
+        let owned = lease_path_for_holder(&target, "BlueLake", None);
+        let before = std::fs::read(&owned).unwrap();
+        let linked = dir.path().join("slot");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+
+        assert!(acquire_slot_lease(&linked, "slot-a", "GreenPeak", None, 3600, true).is_err());
+        assert!(renew_slot_lease(&linked, "BlueLake", None, 600).is_err());
+        assert!(release_slot_lease(&linked, "BlueLake", None).is_err());
+        assert_eq!(std::fs::read(&owned).unwrap(), before);
+        assert!(!lease_path_for_holder(&target, "GreenPeak", None).exists());
+        assert_eq!(std::fs::read_link(&linked).unwrap(), target);
+
+        let dangling = dir.path().join("dangling-slot");
+        let missing = dir.path().join("must-stay-absent");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        assert!(acquire_slot_lease(&dangling, "slot-a", "GreenPeak", None, 3600, true).is_err());
+        assert!(renew_slot_lease(&dangling, "BlueLake", None, 600).is_err());
+        assert!(release_slot_lease(&dangling, "BlueLake", None).is_err());
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_link(&dangling).unwrap(), missing);
+    }
+
+    #[test]
+    fn directory_slot_lock_refuses_all_mutations_without_changing_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = lease_path_for_holder(dir.path(), "BlueLake", None);
+        write_lease_json(&owned, &make_lease("BlueLake", None, true)).unwrap();
+        let before = std::fs::read(&owned).unwrap();
+        std::fs::create_dir(dir.path().join(".slot.lock")).unwrap();
+
+        assert!(acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, true).is_err());
+        assert!(renew_slot_lease(dir.path(), "BlueLake", None, 600).is_err());
+        assert!(release_slot_lease(dir.path(), "BlueLake", None).is_err());
+        assert_eq!(std::fs::read(&owned).unwrap(), before);
+        assert!(!lease_path_for_holder(dir.path(), "GreenPeak", None).exists());
+        assert!(dir.path().join(".slot.lock").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slot_lock_fifo_is_rejected_without_waiting_for_a_peer() {
+        const CHILD_SLOT: &str = "MCP_AGENT_MAIL_SLOT_LOCK_FIFO_TEST_PATH";
+        const TEST: &str =
+            "build_slots::tests::slot_lock_fifo_is_rejected_without_waiting_for_a_peer";
+        const WITNESS: &str = "build-slot-lock-fifo-refused";
+
+        if let Some(path) = std::env::var_os(CHILD_SLOT) {
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                eprintln!("build-slot lock waited on a writerless FIFO");
+                std::process::exit(3);
+            });
+            let slot = Path::new(&path);
+            assert!(try_lock_slot(slot, false).is_err());
+            assert!(acquire_slot_lease(slot, "slot-a", "GreenPeak", None, 3600, true).is_err());
+            assert!(renew_slot_lease(slot, "BlueLake", None, 600).is_err());
+            assert!(release_slot_lease(slot, "BlueLake", None).is_err());
+            println!("{WITNESS}");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let owned = lease_path_for_holder(dir.path(), "BlueLake", None);
+        write_lease_json(&owned, &make_lease("BlueLake", None, true)).unwrap();
+        let before = std::fs::read(&owned).unwrap();
+        let fifo = dir.path().join(".slot.lock");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .expect("create real writerless lock FIFO")
+                .success()
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD_SLOT, dir.path())
+            .current_dir(dir.path())
+            .output()
+            .expect("run bounded build-slot lock child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout.contains(WITNESS)
+                && stdout.contains("test result: ok. 1 passed;"),
+            "child must pass exactly one test: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&owned).unwrap(), before);
+        assert!(!lease_path_for_holder(dir.path(), "GreenPeak", None).exists());
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slot_guard_detects_replaced_lock_and_directory_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        let guard = try_lock_slot(&slot, true).unwrap().unwrap();
+        guard.validate().unwrap();
+        std::fs::rename(slot.join(".slot.lock"), dir.path().join("retained-lock")).unwrap();
+        std::fs::write(slot.join(".slot.lock"), b"replacement").unwrap();
+        assert!(guard.validate().is_err());
+        let replacement = try_lock_slot(&slot, false).unwrap().unwrap();
+        replacement.validate().unwrap();
+
+        std::fs::rename(&slot, dir.path().join("retained-slot")).unwrap();
+        let current = try_lock_slot(&slot, true).unwrap().unwrap();
+        assert!(guard.validate().is_err());
+        assert!(replacement.validate().is_err());
+        current.validate().unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("retained-slot/.slot.lock")).unwrap(),
+            b"replacement"
+        );
     }
 
     #[test]
