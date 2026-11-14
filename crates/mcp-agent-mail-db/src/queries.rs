@@ -619,7 +619,26 @@ pub fn orphaned_project_placeholder(project_id: i64, created_at: i64) -> Project
 }
 
 fn decode_file_reservation_row(row: &SqlRow) -> std::result::Result<FileReservationRow, DbError> {
-    FileReservationRow::from_row(row).map_err(|e| map_sql_error(&e))
+    let reservation = FileReservationRow::from_row(row).map_err(|e| map_sql_error(&e))?;
+    if reservation.revision < 0 {
+        return Err(DbError::Internal(
+            "reservation revision must be nonnegative".to_string(),
+        ));
+    }
+    Ok(reservation)
+}
+
+fn next_reservation_revision(revision: i64) -> std::result::Result<i64, DbError> {
+    if revision < 0 {
+        return Err(DbError::Internal(
+            "reservation revision must be nonnegative".to_string(),
+        ));
+    }
+    revision.checked_add(1).ok_or_else(|| {
+        DbError::Internal(
+            "reservation revision exhausted; lease change was not committed".to_string(),
+        )
+    })
 }
 
 fn decode_agent_link_row(row: &SqlRow) -> std::result::Result<AgentLinkRow, DbError> {
@@ -933,7 +952,7 @@ const ATC_ROLLUP_SNAPSHOT_SELECT_SQL: &str = "\
     FROM atc_experience_rollups ORDER BY stratum_key";
 
 pub(crate) const ATC_EXPERIENCE_SELECT_COLUMNS_SQL: &str = "SELECT experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, feature_schema_version, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json FROM atc_experiences";
-const FILE_RESERVATION_SELECT_COLUMNS_SQL: &str = "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
+const FILE_RESERVATION_SELECT_COLUMNS_SQL: &str = "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts, revision \
      FROM file_reservations";
 const AGENT_LINK_SELECT_COLUMNS_SQL: &str = "SELECT id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts \
      FROM agent_links";
@@ -8456,7 +8475,7 @@ where
     for chunk in inserts.chunks(50) {
         let mut query = String::from(
             "INSERT INTO file_reservations \
-             (project_id, agent_id, path_pattern, created_ts, expires_ts, \"exclusive\", reason) \
+             (project_id, agent_id, path_pattern, created_ts, expires_ts, \"exclusive\", reason, revision) \
              VALUES ",
         );
         let mut params = Vec::with_capacity(chunk.len() * 7);
@@ -8465,7 +8484,7 @@ where
             if i > 0 {
                 query.push_str(", ");
             }
-            query.push_str("(?, ?, ?, ?, ?, ?, ?)");
+            query.push_str("(?, ?, ?, ?, ?, ?, ?, 1)");
             let expires = now.saturating_add(ttl.saturating_mul(1_000_000));
             params.push(Value::BigInt(project_id));
             params.push(Value::BigInt(*agent_id));
@@ -8485,6 +8504,7 @@ where
                 created_ts: now,
                 expires_ts: expires,
                 released_ts: None,
+                revision: 1,
             });
         }
 
@@ -16079,18 +16099,35 @@ async fn create_file_reservations_impl(
                     // Re-reserving asks for the lease to run at least `ttl`
                     // from now: keep a later expiry, never stack the TTL on
                     // what is left (repeat calls would extend without bound).
-                    row.expires_ts = row.expires_ts.max(now.saturating_add(lease_extension));
+                    let next_expires = row.expires_ts.max(now.saturating_add(lease_extension));
                     // Re-acquisition applies the new request's intent as well
                     // as its TTL. In particular, shared -> exclusive must not
                     // report a successful acquisition that still lets peers
                     // acquire shared leases. The requested mode was checked
                     // against every peer above in this same transaction.
-                    row.exclusive = i64::from(exclusive);
+                    let next_exclusive = i64::from(exclusive);
+                    if row.expires_ts == next_expires
+                        && row.exclusive == next_exclusive
+                        && row.reason == reason
+                    {
+                        out.push(row);
+                        continue;
+                    }
+                    row.revision = match next_reservation_revision(row.revision) {
+                        Ok(revision) => revision,
+                        Err(error) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Err(error);
+                        }
+                    };
+                    row.expires_ts = next_expires;
+                    row.exclusive = next_exclusive;
                     row.reason = reason.to_string();
                     let renew_params = [
                         Value::BigInt(row.expires_ts),
                         Value::BigInt(row.exclusive),
                         Value::Text(row.reason.clone()),
+                        Value::BigInt(row.revision),
                         Value::BigInt(id),
                     ];
                     try_in_tx!(
@@ -16101,7 +16138,7 @@ async fn create_file_reservations_impl(
                                 cx,
                                 &tracked,
                                 "UPDATE file_reservations \
-                                 SET expires_ts = ?, \"exclusive\" = ?, reason = ? WHERE id = ?",
+                                 SET expires_ts = ?, \"exclusive\" = ?, reason = ?, revision = ? WHERE id = ?",
                                 &renew_params,
                             )
                             .await
@@ -16122,13 +16159,14 @@ async fn create_file_reservations_impl(
                 created_ts: now,
                 expires_ts: expires,
                 released_ts: None,
+                revision: 1,
             };
 
             // Insert the row explicitly so this critical coordination path does not
             // depend on macro-generated SQL shape.
             let insert_sql = "INSERT INTO file_reservations \
-                (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)";
+                (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts, revision) \
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1)";
             let insert_params = [
                 Value::BigInt(row.project_id),
                 Value::BigInt(row.agent_id),
@@ -16257,7 +16295,7 @@ async fn get_active_reservations_once(
     // their authoritative `released_ts` is `fr.released_ts`.
     let candidate_sql = format!(
         "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                fr.created_ts, fr.expires_ts, fr.released_ts AS released_ts \
+                fr.created_ts, fr.expires_ts, fr.released_ts AS released_ts, fr.revision \
          FROM file_reservations fr \
          WHERE fr.project_id = ? AND {candidate_predicate} AND fr.expires_ts > ?"
     );
@@ -16367,7 +16405,7 @@ async fn list_released_unexpired_reservations_once(
 
     let candidate_sql = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, \
                 fr.\"exclusive\", fr.reason, fr.created_ts, fr.expires_ts, \
-                fr.released_ts AS released_ts \
+                fr.released_ts AS released_ts, fr.revision \
          FROM file_reservations fr \
          WHERE fr.project_id = ? AND fr.expires_ts > ?";
     let candidate_params = [Value::BigInt(project_id), Value::BigInt(now)];
@@ -16963,7 +17001,7 @@ async fn release_reservations_by_ids_with_constraints(
         if stale_guard.is_some() {
             check_sql.push_str(
                 " AND project_id = ? AND agent_id = ? AND path_pattern = ? \
-                 AND \"exclusive\" = ? AND reason = ? AND created_ts = ? AND expires_ts = ?",
+                 AND \"exclusive\" = ? AND reason = ? AND created_ts = ? AND expires_ts = ? AND revision = ?",
             );
         }
         check_sql.push_str(" LIMIT 1");
@@ -17010,6 +17048,7 @@ async fn release_reservations_by_ids_with_constraints(
                     Value::Text(observed.reason.clone()),
                     Value::BigInt(observed.created_ts),
                     Value::BigInt(observed.expires_ts),
+                    Value::BigInt(observed.revision),
                 ]);
                 Some((guard, candidate))
             } else {
@@ -17313,7 +17352,7 @@ pub async fn renew_reservations(
 
         // Fetch candidate reservations first (so tools can report old/new expiry).
         let mut sql = format!(
-            "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
+            "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts, revision \
              FROM file_reservations \
              WHERE project_id = ? AND agent_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ?"
         );
@@ -17360,11 +17399,11 @@ pub async fn renew_reservations(
             Outcome::Ok(rows) => {
                 let mut out = Vec::with_capacity(rows.len());
                 for r in rows {
-                    match FileReservationRow::from_row(&r) {
+                    match decode_file_reservation_row(&r) {
                         Ok(row) => out.push(row),
                         Err(e) => {
                             rollback_tx(cx, &tracked).await;
-                            return Outcome::Err(map_sql_error(&e));
+                            return Outcome::Err(e);
                         }
                     }
                 }
@@ -17385,19 +17424,30 @@ pub async fn renew_reservations(
         };
 
         let update_sql = format!(
-            "UPDATE file_reservations SET expires_ts = ? \
+            "UPDATE file_reservations SET expires_ts = ?, revision = ? \
              WHERE id = ? AND project_id = ? AND agent_id = ? \
-               AND expires_ts = ? AND expires_ts > ? AND ({ACTIVE_RESERVATION_PREDICATE})"
+               AND expires_ts = ? AND revision = ? AND expires_ts > ? AND ({ACTIVE_RESERVATION_PREDICATE})"
         );
         let verify_sql = format!(
-            "SELECT expires_ts FROM file_reservations \
+            "SELECT expires_ts, revision FROM file_reservations \
              WHERE id = ? AND project_id = ? AND agent_id = ? \
                AND ({ACTIVE_RESERVATION_PREDICATE})"
         );
         for row in &mut reservations {
             let old_expires = row.expires_ts;
+            let old_revision = row.revision;
             let base = old_expires.max(now);
             row.expires_ts = base.saturating_add(extend);
+            if row.expires_ts == old_expires {
+                continue;
+            }
+            row.revision = match next_reservation_revision(old_revision) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
+            };
             let Some(id) = row.id else {
                 rollback_tx(cx, &tracked).await;
                 return Outcome::Err(DbError::Internal(
@@ -17407,10 +17457,12 @@ pub async fn renew_reservations(
 
             let params = [
                 Value::BigInt(row.expires_ts),
+                Value::BigInt(row.revision),
                 Value::BigInt(id),
                 Value::BigInt(project_id),
                 Value::BigInt(agent_id),
                 Value::BigInt(old_expires),
+                Value::BigInt(old_revision),
                 Value::BigInt(now),
             ];
             try_in_tx!(
@@ -17430,10 +17482,13 @@ pub async fn renew_reservations(
                     &[Value::BigInt(id), Value::BigInt(project_id), Value::BigInt(agent_id)],
                 ).await)
             );
-            if stored.first().and_then(row_first_i64) != Some(row.expires_ts) {
+            if stored.first().and_then(row_first_i64) != Some(row.expires_ts)
+                || stored.first().and_then(|row| row.get(1)).and_then(value_as_i64)
+                    != Some(row.revision)
+            {
                 rollback_tx(cx, &tracked).await;
                 return Outcome::Err(DbError::Internal(
-                    "renew_reservations: eligible lease expiry was not stored".to_string(),
+                    "renew_reservations: eligible lease expiry and revision were not stored".to_string(),
                 ));
             }
         }
@@ -17693,7 +17748,8 @@ fn file_reservation_snapshot_with_bounds(
         let reservation_bounds = query(
             &format!(
                 "SELECT COUNT(*) AS row_count, COALESCE(SUM(\
-                COALESCE(length(CAST(fr.path_pattern AS BLOB)), 0) + COALESCE(length(CAST(fr.reason AS BLOB)), 0)), 0) AS raw_bytes \
+                COALESCE(length(CAST(fr.path_pattern AS BLOB)), 0) + COALESCE(length(CAST(fr.reason AS BLOB)), 0) + \
+                COALESCE(length(CAST(fr.revision AS BLOB)), 0)), 0) AS raw_bytes \
                 FROM file_reservations fr WHERE fr.project_id = ?{predicate}"
             ),
             &reservation_params,
@@ -17788,7 +17844,7 @@ fn file_reservation_snapshot_with_bounds(
         let rows = query(
             &format!(
                 "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-             fr.created_ts, fr.expires_ts, {released} AS released_ts \
+             fr.created_ts, fr.expires_ts, {released} AS released_ts, fr.revision \
              FROM file_reservations fr{release_join} WHERE fr.project_id = ?{predicate} \
              ORDER BY fr.created_ts, fr.id LIMIT ?"
             ),
@@ -17911,7 +17967,7 @@ async fn list_file_reservations_once(
         (
             format!(
                 "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                        fr.created_ts, fr.expires_ts, fr.released_ts AS released_ts \
+                        fr.created_ts, fr.expires_ts, fr.released_ts AS released_ts, fr.revision \
                  FROM file_reservations fr \
                  WHERE fr.project_id = ? AND {candidate_predicate} AND fr.expires_ts > ? ORDER BY {order_by}"
             ),
@@ -17934,7 +17990,7 @@ async fn list_file_reservations_once(
                               ELSE 0 \
                          END \
                      ELSE fr.released_ts \
-                 END) AS released_ts \
+                 END) AS released_ts, fr.revision \
              FROM file_reservations fr \
              LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
              WHERE fr.project_id = ? \
@@ -18038,6 +18094,17 @@ async fn list_file_reservations_once(
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
+                let revision: i64 = match row.get_named("revision") {
+                    Ok(v) if v >= 0 => v,
+                    _ => {
+                        if active_only {
+                            rollback_tx(cx, &tracked).await;
+                        }
+                        return Outcome::Err(DbError::Internal(
+                            "invalid reservation revision".to_string(),
+                        ));
+                    }
+                };
                 out.push(FileReservationRow {
                     id: Some(id),
                     project_id: proj_id,
@@ -18048,6 +18115,7 @@ async fn list_file_reservations_once(
                     created_ts,
                     expires_ts,
                     released_ts,
+                    revision,
                 });
             }
             Outcome::Ok(out)
@@ -18151,7 +18219,7 @@ async fn list_unreleased_file_reservations_once(
                       ELSE 0 \
                  END \
              ELSE released_ts \
-         END AS released_ts \
+         END AS released_ts, revision \
          FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) ORDER BY id"
     );
     let params = vec![Value::BigInt(project_id)];
@@ -18224,6 +18292,15 @@ async fn list_unreleased_file_reservations_once(
                         return Outcome::Err(map_sql_error(&e));
                     }
                 };
+                let revision: i64 = match row.get_named("revision") {
+                    Ok(v) if v >= 0 => v,
+                    _ => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(DbError::Internal(
+                            "invalid reservation revision".to_string(),
+                        ));
+                    }
+                };
                 out.push(FileReservationRow {
                     id: Some(id),
                     project_id: proj_id,
@@ -18234,6 +18311,7 @@ async fn list_unreleased_file_reservations_once(
                     created_ts,
                     expires_ts,
                     released_ts,
+                    revision,
                 });
             }
             Outcome::Ok(out)
@@ -19605,7 +19683,7 @@ pub async fn get_reservations_by_ids(
         let placeholders = placeholders(chunk.len());
         let sql = format!(
             "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
-                    created_ts, expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts \
+                    created_ts, expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts, fr.revision \
              FROM file_reservations fr \
              LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
              WHERE fr.id IN ({placeholders})"
@@ -22143,7 +22221,8 @@ mod tests {
                 + project.human_key.len()
                 + "BlueLake".len() * 2
                 + "src/**".len()
-                + "é".len();
+                + "é".len()
+                + "0".len();
             let exact = file_reservation_snapshot_with_bounds(
                 &**conn, &project, false, 500, 1, raw_bytes,
             ).unwrap();
@@ -27586,6 +27665,7 @@ mod tests {
                 created_ts: 10,
                 expires_ts: 20,
                 released_ts: None,
+                revision: 1,
             },
             FileReservationRow {
                 id: Some(12),
@@ -27597,6 +27677,7 @@ mod tests {
                 created_ts: 11,
                 expires_ts: 21,
                 released_ts: None,
+                revision: 1,
             },
         ];
 
@@ -34895,6 +34976,178 @@ mod tests {
             agent_last_active_ts: agent.last_active_ts,
             last_mail_activity_ts,
         }
+    }
+
+    #[test]
+    fn reservation_revisions_order_same_expiry_intent_and_reject_aba_cleanup() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("reservation-revisions.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project_id = ensure_project(&cx, &pool, "/tmp/reservation-revisions")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let candidate =
+                stale_release_candidate_for_test(&cx, &pool, project_id, "BlueLake").await;
+            let original = candidate.reservation.clone();
+            let id = original.id.unwrap();
+            assert_eq!(original.revision, 1, "new grants start at revision one");
+            let observed_at = now_micros();
+
+            for (exclusive, reason, revision) in [
+                (true, "stale observation", 1),
+                (false, "observing", 2),
+                (true, "stale observation", 3),
+            ] {
+                let rows = create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    original.agent_id,
+                    &[original.path_pattern.as_str()],
+                    1,
+                    exclusive,
+                    reason,
+                )
+                .await
+                .into_result()
+                .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, Some(id));
+                assert_eq!(rows[0].created_ts, original.created_ts);
+                assert_eq!(rows[0].expires_ts, original.expires_ts);
+                assert_eq!(rows[0].revision, revision);
+                assert_eq!(rows[0].exclusive, i64::from(exclusive));
+                assert_eq!(rows[0].reason, reason);
+            }
+
+            // Intent has returned to exactly the observed values, including
+            // expiry. Only the durable revision exposes these intervening
+            // writes; cleanup must not consume the renewed coordination claim.
+            let released =
+                release_stale_reservations(&cx, &pool, project_id, &[candidate], observed_at, 1, 0)
+                    .await
+                    .into_result()
+                    .unwrap();
+            assert!(released.is_empty());
+            let renewed = renew_reservations(
+                &cx,
+                &pool,
+                project_id,
+                original.agent_id,
+                60,
+                None,
+                Some(&[id]),
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(renewed[0].revision, 4);
+            assert_eq!(renewed[0].expires_ts, original.expires_ts + 60_000_000);
+            let stored = get_reservations_by_ids(&cx, &pool, &[id])
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&stored).unwrap(),
+                serde_json::to_value(&renewed).unwrap()
+            );
+            assert!(stored[0].released_ts.is_none());
+        });
+    }
+
+    #[test]
+    fn reservation_revision_exhaustion_rolls_back_grants_and_renewals() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("reservation-revision-exhaustion.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project_id = ensure_project(&cx, &pool, "/tmp/reservation-revision-exhaustion")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let original = stale_release_candidate_for_test(&cx, &pool, project_id, "BlueLake")
+                .await
+                .reservation;
+            let id = original.id.unwrap();
+            {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                conn.execute_sync(
+                    "UPDATE file_reservations SET revision = ? WHERE id = ?",
+                    &[Value::BigInt(i64::MAX), Value::BigInt(id)],
+                )
+                .unwrap();
+            }
+            let before = get_reservations_by_ids(&cx, &pool, &[id])
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(before[0].revision, i64::MAX);
+
+            // The first path inserts successfully inside the transaction. The
+            // exhausted second path must roll the whole batch back, without
+            // wrapping the ordering counter or leaking the first grant.
+            let error = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                original.agent_id,
+                &["src/new.rs", original.path_pattern.as_str()],
+                1,
+                false,
+                "new intent",
+            )
+            .await
+            .into_result()
+            .expect_err("exhausted revision refuses mutation");
+            assert!(error.to_string().contains("revision exhausted"), "{error}");
+            let error = renew_reservations(
+                &cx,
+                &pool,
+                project_id,
+                original.agent_id,
+                60,
+                None,
+                Some(&[id]),
+            )
+            .await
+            .into_result()
+            .expect_err("exhausted revision refuses renewal");
+            assert!(error.to_string().contains("revision exhausted"), "{error}");
+            let after = list_file_reservations(&cx, &pool, project_id, false)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+
+            // Terminal release does not require another active revision and
+            // must stay possible even when the version counter is exhausted.
+            assert_eq!(
+                release_reservations_by_ids(&cx, &pool, &[id])
+                    .await
+                    .into_result()
+                    .unwrap(),
+                1
+            );
+            let terminal = get_reservations_by_ids(&cx, &pool, &[id])
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(terminal[0].revision, i64::MAX);
+            assert!(terminal[0].released_ts.is_some());
+        });
     }
 
     #[test]

@@ -436,6 +436,7 @@ fn escalate_observed(
         "reason": &reservation.reason,
         "created_ts": micros_to_iso(reservation.created_ts),
         "expires_ts": micros_to_iso(reservation.expires_ts),
+        "revision": reservation.revision,
     });
     if let Some(generation) = generation_id {
         artifact["db_generation"] = serde_json::json!(generation);

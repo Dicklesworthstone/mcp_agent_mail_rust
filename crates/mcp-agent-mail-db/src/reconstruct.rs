@@ -1584,9 +1584,15 @@ fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
 ///
 /// Returns an error if the database cannot be opened or if schema creation
 /// fails. Individual archive files that fail to parse are skipped (counted
-/// in `parse_errors`).
+/// in `parse_errors`); contradictory reservation identity or revision evidence
+/// refuses reconstruction so an older lease cannot silently become authority.
 pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult<ReconstructStats> {
-    reconstruct_from_archive_impl(db_path, storage_root, false)
+    reconstruct_from_archive_impl(
+        db_path,
+        storage_root,
+        false,
+        &mut ReservationReplayProvenance::default(),
+    )
 }
 
 fn ensure_unoccupied_reconstruction_target_family(db_path: &Path) -> DbResult<()> {
@@ -1652,6 +1658,7 @@ fn reconstruct_from_archive_impl(
     db_path: &Path,
     storage_root: &Path,
     create_empty_target: bool,
+    reservation_provenance: &mut ReservationReplayProvenance,
 ) -> DbResult<ReconstructStats> {
     let mut stats = ReconstructStats::default();
     crate::pool::validate_sqlite_target_path(db_path, "reconstruct sqlite target")
@@ -1816,11 +1823,9 @@ fn reconstruct_from_archive_impl(
         // earlier reservation. `used_reservation_ids` tracks which archived ids we
         // have already preserved verbatim; a later artifact whose id is already taken
         // is re-inserted under a fresh id instead of collapsing via INSERT OR REPLACE.
-        // `seen_reservations` dedups the two on-disk artifacts of one reservation (the
-        // `id-<id>[-g<gen>].json` file and its `sha1(pattern).json` mirror) plus exact
-        // re-scans, keyed by (project, generation, archived id).
+        // Same-generation snapshots are selected by revision before insertion,
+        // so a stale digest mirror cannot hide a later canonical intent change.
         let mut used_reservation_ids: HashSet<i64> = HashSet::new();
-        let mut seen_reservations: HashSet<(i64, String, i64)> = HashSet::new();
         // Stable-identity dedup, GLOBAL: one reservation can surface under legacy
         // and generation-stamped names, and later generations can carry renewed or
         // released lifecycle state for that same lease. Track the imported row by
@@ -1862,7 +1867,7 @@ fn reconstruct_from_archive_impl(
                     pid,
                     &mut agent_ids,
                     &mut used_reservation_ids,
-                    &mut seen_reservations,
+                    reservation_provenance,
                     &mut seen_reservation_identities,
                     &mut stats,
                 )?;
@@ -2189,7 +2194,12 @@ pub fn reconstruct_from_archive_with_live_salvage(
         Err(error) => {
             let message = error.to_string();
             if crate::pool::is_corruption_error_message(&message) {
-                let mut stats = reconstruct_from_archive_impl(db_path, storage_root, true)?;
+                let mut stats = reconstruct_from_archive_impl(
+                    db_path,
+                    storage_root,
+                    true,
+                    &mut ReservationReplayProvenance::default(),
+                )?;
                 stats.push_warning(format!(
                     "live salvage source {} could not be materialized because it is corrupt ({message}); rebuilt archive-only candidate",
                     live_salvage_db_path.display()
@@ -2250,8 +2260,13 @@ fn reconstruct_from_archive_with_salvage(
         }
     }
 
-    let mut stats =
-        reconstruct_from_archive_impl(db_path, storage_root, salvage_db_path.is_some())?;
+    let mut reservation_provenance = ReservationReplayProvenance::default();
+    let mut stats = reconstruct_from_archive_impl(
+        db_path,
+        storage_root,
+        salvage_db_path.is_some(),
+        &mut reservation_provenance,
+    )?;
     if let Some(message) = unreadable_salvage {
         stats.push_warning(format!(
             "salvage source skipped ({message}); \
@@ -2259,7 +2274,12 @@ fn reconstruct_from_archive_with_salvage(
         ));
     }
     if let Some(salvage_db_path) = salvage_for_merge {
-        match merge_salvaged_database(db_path, salvage_db_path, &mut stats) {
+        match merge_salvaged_database(
+            db_path,
+            salvage_db_path,
+            &reservation_provenance,
+            &mut stats,
+        ) {
             Ok(conn) => {
                 // The merge is committed. A finalization failure must never be
                 // treated as source corruption with a rolled-back transaction:
@@ -3497,6 +3517,7 @@ fn sync_reconstructed_message_recipients_json(conn: &DbConn, message_id: i64) ->
     })
 }
 
+#[derive(Clone)]
 struct ArchivedFileReservation {
     reservation_id: Option<i64>,
     /// DB generation token this artifact was written by (br-n8qh6), from the
@@ -3511,6 +3532,19 @@ struct ArchivedFileReservation {
     created_ts: i64,
     expires_ts: i64,
     released_ts: Option<i64>,
+    revision: i64,
+}
+
+/// The source generation and row id are the only evidence that permits a
+/// mutable intent comparison during salvage. Target row ids may be remapped,
+/// and stable lease identities can merge across unrelated DB generations.
+#[derive(Default)]
+struct ReservationReplayProvenance {
+    snapshots: HashMap<(i64, String, i64), (i64, ArchivedFileReservation)>,
+    /// Stable-identity merges may combine evidence from different generations
+    /// or unstamped legacy artifacts. One source cannot later replace their
+    /// combined intent just because its own revision advanced.
+    coalesced_targets: HashSet<i64>,
 }
 
 fn reservation_artifact_paths(reservations_dir: &Path) -> Vec<PathBuf> {
@@ -3538,7 +3572,7 @@ fn reservation_artifact_paths(reservations_dir: &Path) -> Vec<PathBuf> {
 fn parse_archived_file_reservation(
     file_path: &Path,
     stats: &mut ReconstructStats,
-) -> Option<ArchivedFileReservation> {
+) -> DbResult<Option<ArchivedFileReservation>> {
     let reservation_data = match read_archive_text_capped(file_path) {
         Ok(data) => data,
         Err(e) => {
@@ -3547,7 +3581,7 @@ fn parse_archived_file_reservation(
                 "Cannot read reservation artifact {}: {e}",
                 file_path.display()
             ));
-            return None;
+            return Ok(None);
         }
     };
 
@@ -3559,7 +3593,7 @@ fn parse_archived_file_reservation(
                 "Cannot parse reservation artifact {}: {e}",
                 file_path.display()
             ));
-            return None;
+            return Ok(None);
         }
     };
 
@@ -3574,7 +3608,19 @@ fn parse_archived_file_reservation(
             "Reservation artifact {} is missing path_pattern/path",
             file_path.display()
         ));
-        return None;
+        return Ok(None);
+    };
+
+    // An explicit but invalid revision is contradictory ordering evidence.
+    // Skipping it would allow an older shared snapshot to become authority.
+    let revision = match reservation.get("revision") {
+        None => 0,
+        Some(value) => value.as_i64().filter(|revision| *revision >= 0).ok_or_else(|| {
+            DbError::Sqlite(format!(
+                "reconstruct: invalid reservation revision in {}; refusing an ambiguous lease snapshot",
+                file_path.display()
+            ))
+        })?,
     };
 
     let agent_name = normalized_archive_agent_name(json_str(&reservation, "agent"))
@@ -3593,23 +3639,50 @@ fn parse_archived_file_reservation(
         .or_else(|| parse_ts_from_json(&reservation, "created"))
         .unwrap_or(0);
     let expires_ts = parse_ts_from_json(&reservation, "expires_ts").unwrap_or(created_ts);
-    let released_ts = parse_ts_from_json(&reservation, "released_ts");
-    let reservation_id = reservation
+    let released_ts =
+        parse_ts_from_json(&reservation, "released_ts").filter(|timestamp| *timestamp > 0);
+    let payload_id = reservation
         .get("id")
         .and_then(serde_json::Value::as_i64)
         .filter(|id| *id > 0);
 
-    // Generation token: prefer the filename (`id-<id>-g<generation>.json`), then
-    // fall back to the artifact's own `db_generation` field so a mirror
-    // (`sha1(pattern).json`) or a legacy-named-but-stamped file still attributes.
-    let generation = file_path
+    let filename_identity = file_path
         .file_name()
         .and_then(|name| name.to_str())
-        .and_then(mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename)
-        .and_then(|parsed| parsed.generation)
-        .or_else(|| json_str(&reservation, "db_generation").map(str::to_string));
+        .and_then(mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename);
+    let content_generation = match reservation.get("db_generation") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) if value.is_empty() => None,
+        Some(serde_json::Value::String(value))
+            if value.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Some(value.clone())
+        }
+        Some(_) => {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: invalid reservation generation in {}",
+                file_path.display()
+            )));
+        }
+    };
+    if let Some(identity) = &filename_identity
+        && (payload_id.is_some_and(|id| id != identity.id)
+            || matches!(
+                (&identity.generation, &content_generation),
+                (Some(filename), Some(content)) if filename != content
+            ))
+    {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct: reservation filename and payload identity disagree in {}; refusing to order unrelated snapshots",
+            file_path.display()
+        )));
+    }
+    let reservation_id = payload_id.or_else(|| filename_identity.as_ref().map(|value| value.id));
+    let generation = filename_identity
+        .and_then(|value| value.generation)
+        .or(content_generation);
 
-    Some(ArchivedFileReservation {
+    Ok(Some(ArchivedFileReservation {
         reservation_id,
         generation,
         agent_name,
@@ -3619,7 +3692,75 @@ fn parse_archived_file_reservation(
         created_ts,
         expires_ts,
         released_ts,
-    })
+        revision,
+    }))
+}
+
+/// Merge snapshots only after their source generation and row id match.
+/// Release is terminal independently of revision; the largest revision owns
+/// mutable intent even when an older terminal snapshot is encountered later.
+fn merge_same_generation_reservation(
+    current: &mut ArchivedFileReservation,
+    incoming: &ArchivedFileReservation,
+    evidence: &str,
+) -> DbResult<()> {
+    if current.agent_name != incoming.agent_name
+        || current.path_pattern != incoming.path_pattern
+        || current.created_ts != incoming.created_ts
+    {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct: conflicting immutable reservation identity in {evidence}"
+        )));
+    }
+    let intent_differs = current.exclusive != incoming.exclusive
+        || current.reason != incoming.reason
+        || current.expires_ts != incoming.expires_ts;
+    if current.revision > 0 && current.revision == incoming.revision && intent_differs {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct: conflicting reservation snapshots at revision {} in {evidence}; refusing to guess intent",
+            current.revision
+        )));
+    }
+    // Committed active mutations never shorten expiry. A larger revision with
+    // a shorter active lease is contradictory evidence, not permission to
+    // discard the longer protection. Check both encounter orders; a terminal
+    // snapshot remains authoritative independently of its captured expiry.
+    let both_active = current.released_ts.is_none_or(|timestamp| timestamp <= 0)
+        && incoming.released_ts.is_none_or(|timestamp| timestamp <= 0);
+    if both_active
+        && ((incoming.revision > current.revision && incoming.expires_ts < current.expires_ts)
+            || (incoming.revision < current.revision && incoming.expires_ts > current.expires_ts))
+    {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct: a newer reservation revision has a shorter active expiry in {evidence}; refusing to weaken lease protection"
+        )));
+    }
+
+    if incoming.revision > current.revision {
+        current.exclusive = incoming.exclusive;
+        current.reason.clone_from(&incoming.reason);
+        current.expires_ts = incoming.expires_ts;
+        current.revision = incoming.revision;
+    } else if current.revision == 0 && incoming.revision == 0 {
+        // Legacy snapshots have no intent clock. Preserve the longest lease
+        // and strongest exclusion; never choose a shared downgrade by filename.
+        if (incoming.expires_ts, incoming.reason.as_str())
+            > (current.expires_ts, current.reason.as_str())
+        {
+            current.reason.clone_from(&incoming.reason);
+        }
+        current.expires_ts = current.expires_ts.max(incoming.expires_ts);
+        current.exclusive |= incoming.exclusive;
+    }
+    current.released_ts = match (
+        current.released_ts.filter(|timestamp| *timestamp > 0),
+        incoming.released_ts.filter(|timestamp| *timestamp > 0),
+    ) {
+        (Some(existing), Some(incoming)) => Some(existing.max(incoming)),
+        (Some(existing), None) => Some(existing),
+        (None, incoming) => incoming,
+    };
+    Ok(())
 }
 
 fn insert_archived_file_reservation(
@@ -3629,19 +3770,9 @@ fn insert_archived_file_reservation(
     file_path: &Path,
     agent_ids: &mut HashMap<(i64, String), i64>,
     used_reservation_ids: &mut HashSet<i64>,
-    seen_reservations: &mut HashSet<(i64, String, i64)>,
     seen_reservation_identities: &mut HashMap<ReservationIdentity, i64>,
-) -> DbResult<()> {
+) -> DbResult<(i64, bool)> {
     let agent_id = ensure_agent_exists(conn, project_id, &reservation.agent_name, agent_ids)?;
-
-    // Dedup the two on-disk artifacts of one reservation (id file + sha1 mirror)
-    // and exact re-scans before interpreting lifecycle variants across generations.
-    if let Some(id) = reservation.reservation_id {
-        let generation_key = reservation.generation.clone().unwrap_or_default();
-        if !seen_reservations.insert((project_id, generation_key, id)) {
-            return Ok(());
-        }
-    }
 
     let stable_identity = (
         project_id,
@@ -3656,10 +3787,10 @@ fn insert_archived_file_reservation(
     // already-imported row instead of minting a fresh phantom id.
     if let Some(existing_id) = seen_reservation_identities.get(&stable_identity).copied() {
         merge_archived_file_reservation_lifecycle(conn, existing_id, reservation)?;
-        return Ok(());
+        return Ok((existing_id, true));
     }
 
-    let columns_no_id = "project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts";
+    let columns_no_id = "project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts, revision";
     let values_no_id = [
         Value::BigInt(project_id),
         Value::BigInt(agent_id),
@@ -3669,6 +3800,7 @@ fn insert_archived_file_reservation(
         Value::BigInt(reservation.created_ts),
         Value::BigInt(reservation.expires_ts),
         reservation.released_ts.map_or(Value::Null, Value::BigInt),
+        Value::BigInt(reservation.revision),
     ];
 
     // A fresh-id insert (no explicit id) — used for legacy no-id artifacts and for
@@ -3676,7 +3808,7 @@ fn insert_archived_file_reservation(
     let insert_fresh = |conn: &DbConn| -> DbResult<i64> {
         conn.execute_sync(
             &format!(
-                "INSERT INTO file_reservations ({columns_no_id}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO file_reservations ({columns_no_id}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ),
             &values_no_id,
         )
@@ -3691,16 +3823,17 @@ fn insert_archived_file_reservation(
 
     let Some(id) = reservation.reservation_id else {
         let inserted_id = insert_fresh(conn)?;
+        used_reservation_ids.insert(inserted_id);
         seen_reservation_identities.insert(stable_identity, inserted_id);
-        return Ok(());
+        return Ok((inserted_id, false));
     };
 
     let inserted_id = if used_reservation_ids.insert(id) {
         // First artifact to claim this id — preserve it verbatim.
         conn.execute_sync(
             &format!(
-                "INSERT OR REPLACE INTO file_reservations (id, {columns_no_id}) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO file_reservations (id, {columns_no_id}) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ),
             &[
                 Value::BigInt(id),
@@ -3712,6 +3845,7 @@ fn insert_archived_file_reservation(
                 Value::BigInt(reservation.created_ts),
                 Value::BigInt(reservation.expires_ts),
                 reservation.released_ts.map_or(Value::Null, Value::BigInt),
+                Value::BigInt(reservation.revision),
             ],
         )
         .map_err(|e| {
@@ -3727,8 +3861,9 @@ fn insert_archived_file_reservation(
         // preserved instead of overwriting the earlier one (br-n8qh6).
         insert_fresh(conn)?
     };
+    used_reservation_ids.insert(inserted_id);
     seen_reservation_identities.insert(stable_identity, inserted_id);
-    Ok(())
+    Ok((inserted_id, false))
 }
 
 fn merge_archived_file_reservation_lifecycle(
@@ -3738,7 +3873,7 @@ fn merge_archived_file_reservation_lifecycle(
 ) -> DbResult<()> {
     let rows = conn
         .query_sync(
-            "SELECT reason, expires_ts, released_ts FROM file_reservations WHERE id = ? LIMIT 1",
+            "SELECT reason, expires_ts, released_ts, revision FROM file_reservations WHERE id = ? LIMIT 1",
             &[Value::BigInt(existing_id)],
         )
         .map_err(|e| {
@@ -3757,9 +3892,17 @@ fn merge_archived_file_reservation_lifecycle(
             "reconstruct: decode expires_ts for file reservation {existing_id}: {e}"
         ))
     })?;
-    let existing_released = row.get_named::<Option<i64>>("released_ts").map_err(|e| {
+    let existing_released = row
+        .get_named::<Option<i64>>("released_ts")
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct: decode released_ts for file reservation {existing_id}: {e}"
+            ))
+        })?
+        .filter(|timestamp| *timestamp > 0);
+    let existing_revision = row.get_named::<i64>("revision").map_err(|e| {
         DbError::Sqlite(format!(
-            "reconstruct: decode released_ts for file reservation {existing_id}: {e}"
+            "reconstruct: decode revision for file reservation {existing_id}: {e}"
         ))
     })?;
 
@@ -3790,11 +3933,14 @@ fn merge_archived_file_reservation_lifecycle(
     };
 
     conn.execute_sync(
-        "UPDATE file_reservations SET reason = ?, expires_ts = ?, released_ts = ? WHERE id = ?",
+        "UPDATE file_reservations SET reason = ?, expires_ts = ?, released_ts = ?, revision = ? WHERE id = ?",
         &[
             Value::Text(merged_reason),
             Value::BigInt(merged_expires),
             merged_released.map_or(Value::Null, Value::BigInt),
+            // Counters from unrelated generations do not order their intent.
+            // Carry their maximum only as a floor for the new DB generation.
+            Value::BigInt(existing_revision.max(incoming.revision)),
             Value::BigInt(existing_id),
         ],
     )
@@ -3817,24 +3963,52 @@ fn discover_file_reservations(
     project_id: i64,
     agent_ids: &mut HashMap<(i64, String), i64>,
     used_reservation_ids: &mut HashSet<i64>,
-    seen_reservations: &mut HashSet<(i64, String, i64)>,
+    provenance: &mut ReservationReplayProvenance,
     seen_reservation_identities: &mut HashMap<ReservationIdentity, i64>,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
+    let mut selected: Vec<(PathBuf, ArchivedFileReservation)> = Vec::new();
+    let mut by_generation: HashMap<(String, i64), usize> = HashMap::new();
     for file_path in reservation_artifact_paths(reservations_dir) {
-        let Some(reservation) = parse_archived_file_reservation(&file_path, stats) else {
+        let Some(reservation) = parse_archived_file_reservation(&file_path, stats)? else {
             continue;
         };
-        insert_archived_file_reservation(
+        if let (Some(generation), Some(id)) = (&reservation.generation, reservation.reservation_id)
+        {
+            let key = (generation.clone(), id);
+            if let Some(index) = by_generation.get(&key).copied() {
+                merge_same_generation_reservation(
+                    &mut selected[index].1,
+                    &reservation,
+                    &file_path.display().to_string(),
+                )?;
+                continue;
+            }
+            by_generation.insert(key, selected.len());
+        }
+        selected.push((file_path, reservation));
+    }
+
+    for (file_path, reservation) in selected {
+        let (target_id, coalesced) = insert_archived_file_reservation(
             conn,
             project_id,
             &reservation,
             &file_path,
             agent_ids,
             used_reservation_ids,
-            seen_reservations,
             seen_reservation_identities,
         )?;
+        if coalesced {
+            provenance.coalesced_targets.insert(target_id);
+        }
+        if let (Some(generation), Some(id)) = (&reservation.generation, reservation.reservation_id)
+        {
+            provenance.snapshots.insert(
+                (project_id, generation.clone(), id),
+                (target_id, reservation),
+            );
+        }
     }
 
     Ok(())
@@ -4506,6 +4680,7 @@ fn enrich_existing_agent_from_salvage(
 fn merge_salvaged_database(
     target_db_path: &Path,
     salvage_db_path: &Path,
+    reservation_provenance: &ReservationReplayProvenance,
     stats: &mut ReconstructStats,
 ) -> DbResult<DbConn> {
     let target_path = target_db_path.to_str().ok_or_else(|| {
@@ -4533,6 +4708,24 @@ fn merge_salvaged_database(
     let has_products = table_exists(&salvage_conn, "products")?;
     let has_product_project_links = table_exists(&salvage_conn, "product_project_links")?;
     let has_proof_gate_consumed_nonces = table_exists(&salvage_conn, "proof_gate_consumed_nonces")?;
+    let salvage_generation = if has_file_reservations && table_exists(&salvage_conn, "db_identity")?
+    {
+        salvage_conn
+            .query_sync(
+                "SELECT generation_id FROM db_identity WHERE singleton = 0",
+                &[],
+            )
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: read reservation source generation: {error}"
+                ))
+            })?
+            .first()
+            .and_then(|row| row.get_named::<String>("generation_id").ok())
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    } else {
+        None
+    };
 
     if !(has_projects
         || has_agents
@@ -4563,6 +4756,7 @@ fn merge_salvaged_database(
         let mut agent_id_map: HashMap<i64, i64> = HashMap::new();
         let mut message_id_map: HashMap<i64, i64> = HashMap::new();
         let mut reservation_id_map: HashMap<i64, i64> = HashMap::new();
+        let mut coalesced_reservation_targets = reservation_provenance.coalesced_targets.clone();
         let mut product_id_map: HashMap<i64, i64> = HashMap::new();
         // `None` means the source explicitly records a deregistration but its
         // timestamp is absent or unreadable. The state itself remains
@@ -5001,7 +5195,10 @@ fn merge_salvaged_database(
 
         if has_file_reservations {
             let reservation_columns = table_columns(&salvage_conn, "file_reservations")?;
-            let reservation_select = build_salvage_select(
+            let has_reservation_revision = reservation_columns
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case("revision"));
+            let mut reservation_select = build_salvage_select(
                 "file_reservations",
                 &reservation_columns,
                 &["id", "project_id", "agent_id", "path_pattern"],
@@ -5021,6 +5218,12 @@ fn merge_salvaged_database(
                     salvage_db_path.display()
                 ))
             })?;
+            if has_reservation_revision {
+                // SQLite column names are case-insensitive, while decoded row
+                // labels need a stable spelling. A present `Revision` column
+                // must never be mistaken for legacy absence or decoded as zero.
+                reservation_select.push_str(", revision AS revision");
+            }
             let reservation_rows = salvage_conn
                 .query_sync(
                     &format!("SELECT {reservation_select} FROM file_reservations ORDER BY id"),
@@ -5117,28 +5320,53 @@ fn merge_salvaged_database(
                 // wedge doctor (br-r6awv).
                 let created_ts = salvage_ts_or_zero(row.get_named::<i64>("created_ts"));
                 let expires_ts = row.get_named::<i64>("expires_ts").unwrap_or(created_ts);
-                let released_ts = row.get_named::<i64>("released_ts").ok();
+                let released_ts = row
+                    .get_named::<i64>("released_ts")
+                    .ok()
+                    .filter(|timestamp| *timestamp > 0);
+                let revision = if has_reservation_revision {
+                    row.get_named::<i64>("revision").map_err(|error| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: invalid revision for reservation {source_reservation_id}: {error}"
+                        ))
+                    })?
+                } else {
+                    0
+                };
+                if revision < 0 {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: negative revision for reservation {source_reservation_id}"
+                    )));
+                }
 
                 // Numeric ids are local to the source database. Resolve the
-                // logical reservation through remapped stable project/agent
-                // identities plus the promotion identity key (path, exclusive,
-                // created_ts). Exclusive belongs in the lookup: it is part of
-                // reservation identity, and a mismatch must insert a second
-                // lease rather than fail the whole salvage merge (that error
-                // is not corruption-class and would refuse the archive-only
-                // candidate, br-r6awv).
+                // exact replayed row only when its generation/id provenance is
+                // proven. Otherwise retain the conservative stable-identity
+                // lookup, including exclusive: counters in unrelated generations
+                // cannot justify overwriting another lease's intent.
+                let replayed = salvage_generation.as_ref().and_then(|generation| {
+                    reservation_provenance.snapshots.get(&(
+                        target_project_id,
+                        generation.clone(),
+                        source_reservation_id,
+                    ))
+                });
+                let (identity_column, identity_value) = replayed
+                    .map_or(("exclusive", exclusive), |(target_id, _)| {
+                        ("id", *target_id)
+                    });
                 let existing_rows = target_conn
                     .query_sync(
-                        "SELECT id, exclusive, reason, expires_ts, released_ts \
+                        &format!("SELECT id, exclusive, reason, expires_ts, released_ts, revision \
                          FROM file_reservations \
                          WHERE project_id = ? AND agent_id = ? AND path_pattern = ? \
-                           AND exclusive = ? AND created_ts = ? \
-                         ORDER BY id",
+                           AND {identity_column} = ? AND created_ts = ? \
+                         ORDER BY id"),
                         &[
                             Value::BigInt(target_project_id),
                             Value::BigInt(target_agent_id),
                             Value::Text(path_pattern.clone()),
-                            Value::BigInt(exclusive),
+                            Value::BigInt(identity_value),
                             Value::BigInt(created_ts),
                         ],
                     )
@@ -5147,6 +5375,11 @@ fn merge_salvaged_database(
                             "reconstruct salvage: resolve reservation {source_reservation_id} by stable identity: {e}"
                         ))
                     })?;
+                if replayed.is_some() && existing_rows.is_empty() {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage: conflicting immutable identity for reservation {source_reservation_id} in its archived generation"
+                    )));
+                }
                 if existing_rows.len() > 1 {
                     stats.push_warning(format!(
                         "salvaged reservation {source_reservation_id} matched {} target rows for the same identity; using the earliest id and keeping the archive candidate",
@@ -5160,29 +5393,97 @@ fn merge_salvaged_database(
                             "reconstruct salvage: decode target reservation id: {e}"
                         ))
                     })?;
+                    if replayed.is_none() {
+                        // Another source row can coalesce into this target
+                        // before its proven generation/id is processed later
+                        // in the salvage scan. Protect that evidence too.
+                        coalesced_reservation_targets.insert(target_reservation_id);
+                    }
+                    let current_exclusive = existing.get_named::<i64>("exclusive").unwrap_or(1);
                     let current_reason = existing.get_named::<String>("reason").unwrap_or_default();
                     let current_expires_ts = existing
                         .get_named::<i64>("expires_ts")
                         .unwrap_or(expires_ts);
-                    let current_released_ts = existing.get_named::<i64>("released_ts").ok();
-                    let merged_reason = if current_reason.is_empty() {
-                        reason.clone()
-                    } else {
-                        current_reason.clone()
-                    };
-                    let merged_expires_ts = current_expires_ts.max(expires_ts);
-                    let merged_released_ts = current_released_ts.or(released_ts);
-                    if merged_reason != current_reason
+                    let current_released_ts = existing
+                        .get_named::<i64>("released_ts")
+                        .ok()
+                        .filter(|timestamp| *timestamp > 0);
+                    let current_revision =
+                        existing.get_named::<i64>("revision").map_err(|error| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: decode target reservation revision: {error}"
+                            ))
+                        })?;
+                    let (merged_exclusive, merged_reason, merged_expires_ts, merged_released_ts) =
+                        if let Some((_, archived)) = replayed {
+                            let mut selected = archived.clone();
+                            let mut incoming = archived.clone();
+                            incoming.exclusive = exclusive != 0;
+                            incoming.reason.clone_from(&reason);
+                            incoming.expires_ts = expires_ts;
+                            incoming.released_ts = released_ts;
+                            incoming.revision = revision;
+                            merge_same_generation_reservation(
+                                &mut selected,
+                                &incoming,
+                                &format!("salvaged reservation {source_reservation_id}"),
+                            )?;
+                            if coalesced_reservation_targets.contains(&target_reservation_id) {
+                                let source_intent_changed = selected.exclusive
+                                    != archived.exclusive
+                                    || selected.reason != archived.reason
+                                    || selected.expires_ts != archived.expires_ts;
+                                let target_intent_differs = i64::from(selected.exclusive)
+                                    != current_exclusive
+                                    || selected.reason != current_reason
+                                    || selected.expires_ts != current_expires_ts;
+                                if source_intent_changed && target_intent_differs {
+                                    return Err(DbError::Sqlite(format!(
+                                        "reconstruct salvage: reservation {source_reservation_id} has newer mutable intent but its target combines different archive identities; refusing to overwrite unrelated reservation evidence"
+                                    )));
+                                }
+                                (
+                                    current_exclusive,
+                                    current_reason.clone(),
+                                    current_expires_ts,
+                                    current_released_ts.or(selected.released_ts),
+                                )
+                            } else {
+                                (
+                                    i64::from(selected.exclusive),
+                                    selected.reason,
+                                    selected.expires_ts,
+                                    current_released_ts.or(selected.released_ts),
+                                )
+                            }
+                        } else {
+                            (
+                                current_exclusive,
+                                if current_reason.is_empty() {
+                                    reason.clone()
+                                } else {
+                                    current_reason.clone()
+                                },
+                                current_expires_ts.max(expires_ts),
+                                current_released_ts.or(released_ts),
+                            )
+                        };
+                    let merged_revision = current_revision.max(revision);
+                    if merged_exclusive != current_exclusive
+                        || merged_reason != current_reason
                         || merged_expires_ts != current_expires_ts
                         || merged_released_ts != current_released_ts
+                        || merged_revision != current_revision
                     {
                         target_conn
                             .execute_sync(
-                                "UPDATE file_reservations SET reason = ?, expires_ts = ?, released_ts = ? WHERE id = ?",
+                                "UPDATE file_reservations SET exclusive = ?, reason = ?, expires_ts = ?, released_ts = ?, revision = ? WHERE id = ?",
                                 &[
+                                    Value::BigInt(merged_exclusive),
                                     Value::Text(merged_reason),
                                     Value::BigInt(merged_expires_ts),
                                     merged_released_ts.map_or(Value::Null, Value::BigInt),
+                                    Value::BigInt(merged_revision),
                                     Value::BigInt(target_reservation_id),
                                 ],
                             )
@@ -5198,8 +5499,8 @@ fn merge_salvaged_database(
                     target_conn
                         .execute_sync(
                             "INSERT INTO file_reservations \
-                             (project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                             (project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts, revision) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             &[
                                 Value::BigInt(target_project_id),
                                 Value::BigInt(target_agent_id),
@@ -5209,6 +5510,7 @@ fn merge_salvaged_database(
                                 Value::BigInt(created_ts),
                                 Value::BigInt(expires_ts),
                                 released_ts.map_or(Value::Null, Value::BigInt),
+                                Value::BigInt(revision),
                             ],
                         )
                         .map_err(|e| {
@@ -5270,6 +5572,13 @@ fn merge_salvaged_database(
                         "reconstruct salvage: decode release timestamp for reservation {source_reservation_id}: {e}"
                     ))
                 })?;
+                if released_ts <= 0 {
+                    stats.push_warning(format!(
+                        "skipped salvaged reservation release for reservation {source_reservation_id}: nonpositive release timestamp is not terminal evidence"
+                    ));
+                    stats.salvaged_rows_skipped_unmapped += 1;
+                    continue;
+                }
                 // #219: a release ledger row for a reservation that was not
                 // carried into the candidate (e.g. its owner was a dangling
                 // cross-generation identity) has nothing to release — skip.
@@ -5322,6 +5631,7 @@ fn merge_salvaged_database(
                 if let Some(legacy_release) = legacy_release_rows
                     .first()
                     .and_then(|existing| existing.get_named::<i64>("released_ts").ok())
+                    .filter(|timestamp| *timestamp > 0)
                     && legacy_release != released_ts
                 {
                     stats.push_warning(format!(
@@ -11889,6 +12199,570 @@ body
         );
     }
 
+    fn reservation_revision_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = temp.path().join("storage");
+        let project = storage.join("projects/revision-project");
+        let reservations = project.join("file_reservations");
+        std::fs::create_dir_all(&reservations).expect("reservation archive");
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"revision-project","human_key":"/revision-project","created_at":1}"#,
+        )
+        .expect("project metadata");
+        let target = temp.path().join("reconstructed.sqlite3");
+        (temp, storage, reservations, target)
+    }
+
+    fn reservation_revision_snapshot(revision: i64, exclusive: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": 7,
+            "db_generation": "aabb",
+            "project": "/revision-project",
+            "agent": "CoralMarsh",
+            "path_pattern": "src/**",
+            "exclusive": exclusive,
+            "reason": if exclusive { "exclusive work" } else { "shared inspection" },
+            "created_ts": 10,
+            "expires_ts": 1000,
+            "released_ts": null,
+            "revision": revision,
+        })
+    }
+
+    fn write_reservation_snapshot(path: &Path, snapshot: &serde_json::Value) {
+        std::fs::write(
+            path,
+            serde_json::to_vec(snapshot).expect("serialize reservation"),
+        )
+        .expect("reservation artifact");
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_selects_newest_intent_in_either_file_order() {
+        for canonical_is_newest in [false, true] {
+            let (_temp, storage, reservations, target) = reservation_revision_fixture();
+            let newest = reservation_revision_snapshot(2, true);
+            let stale = reservation_revision_snapshot(1, false);
+            let (canonical, mirror) = if canonical_is_newest {
+                (&newest, &stale)
+            } else {
+                (&stale, &newest)
+            };
+            write_reservation_snapshot(&reservations.join("id-7-gaabb.json"), canonical);
+            write_reservation_snapshot(
+                &reservations.join("0000000000000000000000000000000000000000.json"),
+                mirror,
+            );
+
+            reconstruct_from_archive(&target, &storage).expect("reconstruct versioned lease");
+            let conn = SqliteDbConn::open_file(target.to_str().unwrap()).expect("open target");
+            let rows = conn
+                .query_sync(
+                    "SELECT exclusive, reason, expires_ts, revision FROM file_reservations",
+                    &[],
+                )
+                .expect("read lease");
+            assert_eq!(rows.len(), 1, "a changed intent is still one lease");
+            assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 1);
+            assert_eq!(
+                rows[0].get_named::<String>("reason").unwrap(),
+                "exclusive work"
+            );
+            assert_eq!(rows[0].get_named::<i64>("expires_ts").unwrap(), 1000);
+            assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_preserves_older_terminal_release() {
+        let (_temp, storage, reservations, target) = reservation_revision_fixture();
+        let newest = reservation_revision_snapshot(3, true);
+        let mut released = reservation_revision_snapshot(1, false);
+        released["expires_ts"] = serde_json::json!(600);
+        released["released_ts"] = serde_json::json!(500);
+        write_reservation_snapshot(&reservations.join("id-7-gaabb.json"), &newest);
+        write_reservation_snapshot(&reservations.join("mirror.json"), &released);
+
+        reconstruct_from_archive(&target, &storage).expect("reconstruct released lease");
+        let conn = SqliteDbConn::open_file(target.to_str().unwrap()).expect("open target");
+        let rows = conn
+            .query_sync("SELECT exclusive, reason, expires_ts, released_ts, revision FROM file_reservations", &[])
+            .expect("read lease");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 1);
+        assert_eq!(
+            rows[0].get_named::<String>("reason").unwrap(),
+            "exclusive work"
+        );
+        assert_eq!(rows[0].get_named::<i64>("expires_ts").unwrap(), 1000);
+        assert_eq!(rows[0].get_named::<i64>("released_ts").unwrap(), 500);
+        assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 3);
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_refuses_shorter_active_expiry_in_either_file_order() {
+        for newer_is_terminal in [false, true] {
+            for canonical_is_newest in [false, true] {
+                let (_temp, storage, reservations, target) = reservation_revision_fixture();
+                let mut older = reservation_revision_snapshot(1, true);
+                older["expires_ts"] = serde_json::json!(2000);
+                let mut newer = reservation_revision_snapshot(2, true);
+                if newer_is_terminal {
+                    newer["released_ts"] = serde_json::json!(500);
+                }
+                let (canonical, mirror) = if canonical_is_newest {
+                    (&newer, &older)
+                } else {
+                    (&older, &newer)
+                };
+                write_reservation_snapshot(&reservations.join("id-7-gaabb.json"), canonical);
+                write_reservation_snapshot(&reservations.join("mirror.json"), mirror);
+                let result = reconstruct_from_archive(&target, &storage);
+                if newer_is_terminal {
+                    result.expect("terminal release is independent of captured expiry");
+                    let conn = SqliteDbConn::open_file(target.to_str().unwrap()).unwrap();
+                    let rows = conn
+                        .query_sync("SELECT released_ts, revision FROM file_reservations", &[])
+                        .unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].get_named::<i64>("released_ts").unwrap(), 500);
+                    assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 2);
+                } else {
+                    let error = result.expect_err("a revision must not shorten active protection");
+                    assert!(error.to_string().contains("shorter active expiry"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_refuses_conflicting_evidence_without_mutating_archive() {
+        for (field, value) in [
+            ("exclusive", serde_json::json!(false)),
+            ("reason", serde_json::json!("other intent")),
+            ("expires_ts", serde_json::json!(900)),
+            ("agent", serde_json::json!("BlueLake")),
+            ("path_pattern", serde_json::json!("other/**")),
+            ("created_ts", serde_json::json!(11)),
+            ("revision", serde_json::json!(-1)),
+            ("revision", serde_json::json!(null)),
+            ("revision", serde_json::json!("2")),
+        ] {
+            let (_temp, storage, reservations, target) = reservation_revision_fixture();
+            let original = reservation_revision_snapshot(2, true);
+            let mut conflicting = original.clone();
+            conflicting[field] = value;
+            let canonical = reservations.join("id-7-gaabb.json");
+            let mirror = reservations.join("mirror.json");
+            write_reservation_snapshot(&canonical, &original);
+            write_reservation_snapshot(&mirror, &conflicting);
+            let canonical_before = std::fs::read(&canonical).unwrap();
+            let mirror_before = std::fs::read(&mirror).unwrap();
+
+            let error = reconstruct_from_archive(&target, &storage)
+                .expect_err("conflicting version evidence must refuse promotion");
+            assert!(
+                error.to_string().contains("reservation"),
+                "{field}: {error}"
+            );
+            assert_eq!(std::fs::read(&canonical).unwrap(), canonical_before);
+            assert_eq!(std::fs::read(&mirror).unwrap(), mirror_before);
+        }
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_never_orders_unrelated_generations() {
+        let (_temp, storage, reservations, target) = reservation_revision_fixture();
+        let shared = reservation_revision_snapshot(90, false);
+        let mut exclusive = reservation_revision_snapshot(1, true);
+        exclusive["db_generation"] = serde_json::json!("ccdd");
+        write_reservation_snapshot(&reservations.join("id-7-gaabb.json"), &shared);
+        write_reservation_snapshot(&reservations.join("id-7-gccdd.json"), &exclusive);
+
+        reconstruct_from_archive(&target, &storage).expect("recover both generations");
+        let conn = SqliteDbConn::open_file(target.to_str().unwrap()).expect("open target");
+        let rows = conn
+            .query_sync(
+                "SELECT exclusive, revision FROM file_reservations ORDER BY exclusive",
+                &[],
+            )
+            .expect("read leases");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 0);
+        assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 90);
+        assert_eq!(rows[1].get_named::<i64>("exclusive").unwrap(), 1);
+        assert_eq!(rows[1].get_named::<i64>("revision").unwrap(), 1);
+    }
+
+    #[test]
+    fn reconstruct_reservation_generated_ids_cannot_overwrite_a_replayed_lease() {
+        let (_temp, storage, reservations, target) = reservation_revision_fixture();
+        for (id, generation, path) in [
+            (7, "aabb", "first/**"),
+            (7, "ccdd", "second/**"),
+            (8, "ccdd", "third/**"),
+        ] {
+            let mut snapshot = reservation_revision_snapshot(1, true);
+            snapshot["id"] = serde_json::json!(id);
+            snapshot["db_generation"] = serde_json::json!(generation);
+            snapshot["path_pattern"] = serde_json::json!(path);
+            write_reservation_snapshot(
+                &reservations.join(format!("id-{id}-g{generation}.json")),
+                &snapshot,
+            );
+        }
+        reconstruct_from_archive(&target, &storage).expect("recover colliding ids");
+        let conn = SqliteDbConn::open_file(target.to_str().unwrap()).expect("open target");
+        let rows = conn
+            .query_sync(
+                "SELECT path_pattern FROM file_reservations ORDER BY path_pattern",
+                &[],
+            )
+            .expect("read leases");
+        assert_eq!(
+            rows.len(),
+            3,
+            "a generated id must also be reserved before the next canonical insert"
+        );
+        assert_eq!(
+            rows[1].get_named::<String>("path_pattern").unwrap(),
+            "second/**"
+        );
+    }
+
+    fn seed_reservation_revision_salvage(
+        path: &Path,
+        generation: &str,
+        snapshot: &serde_json::Value,
+    ) {
+        let conn = SqliteDbConn::open_file(path.to_str().unwrap()).expect("open salvage");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("salvage schema");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (100, 'revision-project', '/revision-project', 1);
+             INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts)
+             VALUES (200, 100, 'CoralMarsh', 'codex-cli', 'test', '', 1, 2);",
+        ).expect("salvage identities");
+        conn.execute_sync(
+            "INSERT INTO db_identity (singleton, generation_id) VALUES (0, ?)",
+            &[Value::Text(generation.to_string())],
+        )
+        .expect("source generation");
+        conn.execute_sync(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts, revision)
+             VALUES (7, 100, 200, ?, ?, ?, 10, ?, ?, ?)",
+            &[
+                Value::Text(snapshot["path_pattern"].as_str().unwrap().to_string()),
+                Value::BigInt(i64::from(snapshot["exclusive"].as_bool().unwrap())),
+                Value::Text(snapshot["reason"].as_str().unwrap().to_string()),
+                Value::BigInt(snapshot["expires_ts"].as_i64().unwrap()),
+                snapshot["released_ts"].as_i64().map_or(Value::Null, Value::BigInt),
+                Value::BigInt(snapshot["revision"].as_i64().unwrap()),
+            ],
+        ).expect("salvage reservation");
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_salvage_uses_provenance_for_mutable_intent() {
+        for archive_is_newest in [false, true] {
+            let (temp, storage, reservations, target) = reservation_revision_fixture();
+            let newer = reservation_revision_snapshot(3, true);
+            let older = reservation_revision_snapshot(1, false);
+            let (archive, source) = if archive_is_newest {
+                (&newer, &older)
+            } else {
+                (&older, &newer)
+            };
+            write_reservation_snapshot(&reservations.join("id-7-gaabb.json"), archive);
+            let salvage = temp.path().join("source.sqlite3");
+            seed_reservation_revision_salvage(&salvage, "aabb", source);
+            let source_before = std::fs::read(&salvage).unwrap();
+
+            reconstruct_from_archive_with_salvage(&target, &storage, Some(&salvage))
+                .expect("merge revision using source generation and immutable identity");
+            let conn = SqliteDbConn::open_file(target.to_str().unwrap()).expect("open target");
+            let rows = conn
+                .query_sync(
+                    "SELECT exclusive, reason, expires_ts, revision FROM file_reservations",
+                    &[],
+                )
+                .expect("read recovered lease");
+            assert_eq!(
+                rows.len(),
+                1,
+                "reacquisition must not produce a phantom second lease"
+            );
+            assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 1);
+            assert_eq!(
+                rows[0].get_named::<String>("reason").unwrap(),
+                "exclusive work"
+            );
+            assert_eq!(rows[0].get_named::<i64>("expires_ts").unwrap(), 1000);
+            assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 3);
+            assert_eq!(
+                std::fs::read(&salvage).unwrap(),
+                source_before,
+                "salvage must stay read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_salvage_refuses_equal_revision_conflict() {
+        let (temp, storage, reservations, target) = reservation_revision_fixture();
+        write_reservation_snapshot(
+            &reservations.join("id-7-gaabb.json"),
+            &reservation_revision_snapshot(2, true),
+        );
+        let salvage = temp.path().join("source.sqlite3");
+        seed_reservation_revision_salvage(
+            &salvage,
+            "aabb",
+            &reservation_revision_snapshot(2, false),
+        );
+        let before = std::fs::read(&salvage).unwrap();
+        let error = reconstruct_from_archive_with_salvage(&target, &storage, Some(&salvage))
+            .expect_err("equal revision with different intent must refuse promotion");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting reservation snapshots at revision 2")
+        );
+        assert_eq!(std::fs::read(&salvage).unwrap(), before);
+        let conn =
+            SqliteDbConn::open_file(target.to_str().unwrap()).expect("open rolled-back target");
+        let rows = conn
+            .query_sync("SELECT exclusive, revision FROM file_reservations", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 2);
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_salvage_refuses_shorter_active_expiry() {
+        for source_is_newest in [false, true] {
+            let (temp, storage, reservations, target) = reservation_revision_fixture();
+            let mut older = reservation_revision_snapshot(1, true);
+            older["expires_ts"] = serde_json::json!(2000);
+            let newer = reservation_revision_snapshot(2, true);
+            let (archive, source) = if source_is_newest {
+                (&older, &newer)
+            } else {
+                (&newer, &older)
+            };
+            write_reservation_snapshot(&reservations.join("id-7-gaabb.json"), archive);
+            let salvage = temp.path().join("source.sqlite3");
+            seed_reservation_revision_salvage(&salvage, "aabb", source);
+            let source_before = std::fs::read(&salvage).unwrap();
+            let error = reconstruct_from_archive_with_salvage(&target, &storage, Some(&salvage))
+                .expect_err("salvage must not shorten a same-generation active lease");
+            assert!(error.to_string().contains("shorter active expiry"));
+            assert_eq!(std::fs::read(&salvage).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_salvage_reads_mixed_case_column_strictly() {
+        for malformed in [false, true] {
+            let (temp, storage, _reservations, target) = reservation_revision_fixture();
+            let salvage = temp.path().join("source.sqlite3");
+            seed_reservation_revision_salvage(
+                &salvage,
+                "aabb",
+                &reservation_revision_snapshot(7, true),
+            );
+            {
+                let conn = SqliteDbConn::open_file(salvage.to_str().unwrap()).unwrap();
+                conn.execute_raw(
+                    "ALTER TABLE file_reservations RENAME COLUMN revision TO Revision;",
+                )
+                .expect("mixed-case SQLite column is valid");
+                if malformed {
+                    conn.execute_raw("UPDATE file_reservations SET Revision = 'malformed';")
+                        .expect("store malformed present revision");
+                }
+            }
+            let source_before = std::fs::read(&salvage).unwrap();
+            let result = reconstruct_from_archive_with_salvage(&target, &storage, Some(&salvage));
+            if malformed {
+                let error =
+                    result.expect_err("a present malformed Revision column is not legacy absence");
+                assert!(error.to_string().contains("invalid revision"));
+            } else {
+                result.expect("case-insensitive source column must preserve its revision");
+                let conn = SqliteDbConn::open_file(target.to_str().unwrap()).unwrap();
+                let rows = conn
+                    .query_sync("SELECT revision FROM file_reservations", &[])
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 7);
+            }
+            assert_eq!(std::fs::read(&salvage).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_salvage_keeps_foreign_generation_separate() {
+        let (temp, storage, reservations, target) = reservation_revision_fixture();
+        write_reservation_snapshot(
+            &reservations.join("id-7-gaabb.json"),
+            &reservation_revision_snapshot(1, true),
+        );
+        let salvage = temp.path().join("source.sqlite3");
+        seed_reservation_revision_salvage(
+            &salvage,
+            "ccdd",
+            &reservation_revision_snapshot(90, false),
+        );
+        reconstruct_from_archive_with_salvage(&target, &storage, Some(&salvage))
+            .expect("separate source generation");
+        let conn = SqliteDbConn::open_file(target.to_str().unwrap()).expect("open target");
+        let rows = conn
+            .query_sync(
+                "SELECT exclusive, revision FROM file_reservations ORDER BY exclusive",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 0);
+        assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 90);
+        assert_eq!(rows[1].get_named::<i64>("exclusive").unwrap(), 1);
+        assert_eq!(rows[1].get_named::<i64>("revision").unwrap(), 1);
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_salvage_protects_coalesced_generation_authority() {
+        for source_changes_intent in [false, true] {
+            let (temp, storage, reservations, target) = reservation_revision_fixture();
+            let first = reservation_revision_snapshot(1, true);
+            let mut other_generation = reservation_revision_snapshot(50, true);
+            other_generation["db_generation"] = serde_json::json!("ccdd");
+            other_generation["expires_ts"] = serde_json::json!(2000);
+            other_generation["reason"] = serde_json::json!("other generation work");
+            write_reservation_snapshot(&reservations.join("id-7-gaabb.json"), &first);
+            write_reservation_snapshot(&reservations.join("id-7-gccdd.json"), &other_generation);
+            let source = if source_changes_intent {
+                reservation_revision_snapshot(2, false)
+            } else {
+                first
+            };
+            let salvage = temp.path().join("source.sqlite3");
+            seed_reservation_revision_salvage(&salvage, "aabb", &source);
+
+            let result = reconstruct_from_archive_with_salvage(&target, &storage, Some(&salvage));
+            if source_changes_intent {
+                let error = result.expect_err("one generation must not weaken a coalesced lease");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("refusing to overwrite unrelated reservation evidence")
+                );
+            } else {
+                result.expect("unchanged source must retain the merged archive state");
+            }
+            let conn = SqliteDbConn::open_file(target.to_str().unwrap()).expect("open target");
+            let rows = conn
+                .query_sync(
+                    "SELECT exclusive, reason, expires_ts, revision FROM file_reservations",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 1);
+            assert_eq!(
+                rows[0].get_named::<String>("reason").unwrap(),
+                "other generation work"
+            );
+            assert_eq!(rows[0].get_named::<i64>("expires_ts").unwrap(), 2000);
+            assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 50);
+        }
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_salvage_release_beats_nonpositive_hot_sentinel() {
+        for sentinel in [0, -1] {
+            for ledger_only in [false, true] {
+                let (temp, storage, reservations, target) = reservation_revision_fixture();
+                let mut archive = reservation_revision_snapshot(1, true);
+                archive["released_ts"] = serde_json::json!(sentinel);
+                write_reservation_snapshot(&reservations.join("id-7-gaabb.json"), &archive);
+                let mut source = reservation_revision_snapshot(2, true);
+                source["released_ts"] = serde_json::json!(if ledger_only { sentinel } else { 400 });
+                let salvage = temp.path().join("source.sqlite3");
+                seed_reservation_revision_salvage(&salvage, "aabb", &source);
+                if ledger_only {
+                    let conn = SqliteDbConn::open_file(salvage.to_str().unwrap()).unwrap();
+                    conn.execute_raw("INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (7, 400);")
+                        .expect("terminal ledger evidence");
+                }
+
+                reconstruct_from_archive_with_salvage(&target, &storage, Some(&salvage))
+                    .expect("terminal source state must survive legacy hot-row sentinels");
+                let conn = SqliteDbConn::open_file(target.to_str().unwrap()).unwrap();
+                let rows = conn.query_sync(
+                    "SELECT COALESCE(rr.released_ts, fr.released_ts) AS effective_released_ts, fr.revision
+                     FROM file_reservations fr LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id",
+                    &[],
+                ).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_named::<i64>("effective_released_ts").unwrap(),
+                    400
+                );
+                assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruct_reservation_revision_salvage_protects_an_earlier_coalesced_source_row() {
+        let (temp, storage, reservations, target) = reservation_revision_fixture();
+        write_reservation_snapshot(
+            &reservations.join("id-7-gaabb.json"),
+            &reservation_revision_snapshot(1, true),
+        );
+        let salvage = temp.path().join("source.sqlite3");
+        seed_reservation_revision_salvage(
+            &salvage,
+            "aabb",
+            &reservation_revision_snapshot(2, false),
+        );
+        {
+            let conn = SqliteDbConn::open_file(salvage.to_str().unwrap()).unwrap();
+            conn.execute_raw(
+                "INSERT INTO file_reservations
+                 (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, revision)
+                 VALUES (6, 100, 200, 'src/**', 1, 'independent exclusive work', 10, 2000, 99);",
+            ).expect("source row encountered before the proven archive identity");
+        }
+        let source_before = std::fs::read(&salvage).unwrap();
+        let error = reconstruct_from_archive_with_salvage(&target, &storage, Some(&salvage))
+            .expect_err("later mutable intent must not erase an earlier salvaged lease");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to overwrite unrelated reservation evidence")
+        );
+        assert_eq!(std::fs::read(&salvage).unwrap(), source_before);
+        let conn = SqliteDbConn::open_file(target.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT exclusive, expires_ts, revision FROM file_reservations",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the refused merge must roll back all salvage writes"
+        );
+        assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<i64>("expires_ts").unwrap(), 1000);
+        assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 1);
+    }
+
     #[test]
     fn reconstruct_recovers_file_reservations_from_archive() {
         let storage_root = tempfile::tempdir().expect("tempdir");
@@ -11956,7 +12830,7 @@ body
         let conn = SqliteDbConn::open_file(db_path.display().to_string()).expect("open db");
         let rows = conn
             .query_sync(
-                "SELECT fr.id, a.name AS agent_name, fr.path_pattern, fr.exclusive, fr.reason
+                "SELECT fr.id, a.name AS agent_name, fr.path_pattern, fr.exclusive, fr.reason, fr.revision
                  FROM file_reservations fr
                  JOIN agents a ON a.id = fr.agent_id
                  ORDER BY fr.id ASC",
@@ -11966,6 +12840,8 @@ body
 
         assert_eq!(rows.len(), 2, "reconstruction should recover both formats");
         assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 904);
+        assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 0);
+        assert_eq!(rows[1].get_named::<i64>("revision").unwrap(), 0);
         assert_eq!(
             rows[0].get_named::<String>("agent_name").unwrap(),
             "CoralMarsh"

@@ -1554,6 +1554,7 @@ fn write_cleanup_artifacts(
                 "created_ts": mcp_agent_mail_db::micros_to_iso(row.created_ts),
                 "expires_ts": mcp_agent_mail_db::micros_to_iso(row.expires_ts),
                 "released_ts": mcp_agent_mail_db::micros_to_iso(released_ts),
+                "revision": row.revision,
             });
             if let Some(generation) = &scope.generation {
                 artifact["db_generation"] = serde_json::json!(generation);

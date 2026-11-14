@@ -10951,6 +10951,30 @@ fn write_file_reservation_records_admitted(
     let mut publication_checks = Vec::new();
     let mut normalized_reservations = Vec::with_capacity(reservations.len());
     for res in reservations {
+        let id = res
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let revision = reservation_publication_revision(id, res)?;
+        if revision > 0
+            && (id <= 0
+                || !res
+                    .get("db_generation")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|generation| {
+                        !generation.is_empty()
+                            && generation.len() <= 128
+                            && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }))
+        {
+            // A failed generation lookup must not silently route a versioned
+            // snapshot through the unordered legacy publication path. Without
+            // the common generation/id key its revision proves no ordering.
+            return Err(reservation_publication_conflict(
+                id,
+                "positive reservation revision requires a positive id and valid database generation; nothing published",
+            ));
+        }
         let path_pattern = res
             .get("path_pattern")
             .or_else(|| res.get("path"))
@@ -19840,22 +19864,99 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = test_config(temp.path());
         let archive = ensure_archive(&config, "publication-invalid-revision").unwrap();
-        let mut value = publication_test_reservation(19, "aabbccdd");
-        let (stable, alias) = publication_test_paths(&archive, &value);
-        for revision in [
-            serde_json::Value::Null,
-            serde_json::json!(-1),
-            serde_json::json!(1.5),
-            serde_json::json!("2"),
-            serde_json::json!(true),
-            serde_json::json!(u64::MAX),
-        ] {
-            value["revision"] = revision;
-            let error = write_file_reservation_record(&archive, &config, &value).unwrap_err();
-            assert!(error.to_string().contains("revision is invalid"));
-            assert!(!stable.exists());
-            assert!(!alias.exists());
-            assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+        let original = publication_test_reservation(19, "aabbccdd");
+        let (stable, alias) = publication_test_paths(&archive, &original);
+        for naming in ["stamped", "legacy", "digest-only"] {
+            for revision in [
+                serde_json::Value::Null,
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("2"),
+                serde_json::json!(true),
+                serde_json::json!(u64::MAX),
+            ] {
+                let mut value = original.clone();
+                if naming != "stamped" {
+                    value.as_object_mut().unwrap().remove("db_generation");
+                }
+                if naming == "digest-only" {
+                    value.as_object_mut().unwrap().remove("id");
+                }
+                value["revision"] = revision;
+                let error = write_file_reservation_record(&archive, &config, &value).unwrap_err();
+                assert!(
+                    error.to_string().contains("revision is invalid"),
+                    "{naming}"
+                );
+                assert!(!stable.exists());
+                assert!(!archive.root.join("file_reservations/id-19.json").exists());
+                assert!(!alias.exists());
+                assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn positive_reservation_revisions_require_generation_and_id_before_any_publication() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-revision-identity").unwrap();
+        let mut original = publication_test_reservation(20, "aabbccdd");
+        original["revision"] = serde_json::json!(1);
+        write_file_reservation_record(&archive, &config, &original).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &original);
+        let protected = fs::read(&stable).unwrap();
+        let mut fresh = publication_test_reservation(21, "aabbccdd");
+        fresh["revision"] = serde_json::json!(1);
+        let (fresh_stable, fresh_alias) = publication_test_paths(&archive, &fresh);
+
+        for released in [false, true] {
+            for (field, replacement) in [
+                ("id", None),
+                ("id", Some(serde_json::Value::Null)),
+                ("id", Some(serde_json::json!(0))),
+                ("id", Some(serde_json::json!(-1))),
+                ("id", Some(serde_json::json!("20"))),
+                ("id", Some(serde_json::json!(u64::MAX))),
+                ("db_generation", None),
+                ("db_generation", Some(serde_json::Value::Null)),
+                ("db_generation", Some(serde_json::json!(42))),
+                ("db_generation", Some(serde_json::json!(""))),
+                ("db_generation", Some(serde_json::json!("not-a-generation"))),
+                ("db_generation", Some(serde_json::json!("../aabb"))),
+                ("db_generation", Some(serde_json::json!("a".repeat(129)))),
+            ] {
+                let mut invalid = original.clone();
+                if let Some(replacement) = replacement {
+                    invalid[field] = replacement;
+                } else {
+                    invalid.as_object_mut().unwrap().remove(field);
+                }
+                if released {
+                    invalid["released_ts"] = serde_json::json!(42);
+                }
+                let error =
+                    write_file_reservation_records(&archive, &config, &[fresh.clone(), invalid])
+                        .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("positive reservation revision requires")
+                );
+                assert_eq!(
+                    fs::read(&stable).unwrap(),
+                    protected,
+                    "{field}, released={released}"
+                );
+                assert_eq!(
+                    fs::read(&alias).unwrap(),
+                    protected,
+                    "{field}, released={released}"
+                );
+                assert!(!fresh_stable.exists());
+                assert!(!fresh_alias.exists());
+                assert_eq!(fs::read_dir(stable.parent().unwrap()).unwrap().count(), 2);
+            }
         }
     }
 

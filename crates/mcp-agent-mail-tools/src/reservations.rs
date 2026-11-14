@@ -445,6 +445,7 @@ fn active_reservation_artifact_json(
         "reason": &row.reason,
         "created_ts": micros_to_iso(row.created_ts),
         "expires_ts": micros_to_iso(row.expires_ts),
+        "revision": row.revision,
     });
     stamp_db_generation(&mut value, db_generation);
     value
@@ -470,6 +471,7 @@ fn released_reservation_artifact_json(
         "created_ts": micros_to_iso(row.created_ts),
         "expires_ts": micros_to_iso(row.expires_ts),
         "released_ts": released_ts_json_value(row.released_ts),
+        "revision": row.revision,
     });
     stamp_db_generation(&mut value, db_generation);
     value
@@ -525,6 +527,7 @@ fn active_artifact_confirms_guard_coverage(
         && record.get("exclusive").and_then(Value::as_bool) == Some(row.exclusive != 0)
         && record.get("expires_ts").and_then(Value::as_str)
             == Some(micros_to_iso(row.expires_ts).as_str())
+        && record.get("revision").map_or(Some(0), Value::as_i64) == Some(row.revision)
         && record.get("db_generation").and_then(Value::as_str) == Some(generation)
         && record.get("released_ts").is_none_or(Value::is_null)
 }
@@ -683,6 +686,9 @@ fn active_archive_artifact_diverges(
         return true;
     }
     if view.agent_name.trim() != agent_name.trim() {
+        return true;
+    }
+    if view.revision != Some(row.revision) {
         return true;
     }
     if let Some(archive_path) = view.path_pattern.as_deref()
@@ -3587,6 +3593,7 @@ pub async fn force_release_file_reservation(
             "created_ts": micros_to_iso(reservation.created_ts),
             "expires_ts": micros_to_iso(reservation.expires_ts),
             "released_ts": released_iso.clone(),
+            "revision": reservation.revision,
         });
         stamp_db_generation(&mut res_json, db_generation.as_deref());
 
@@ -5892,6 +5899,7 @@ mod tests {
             created_ts: 1,
             expires_ts,
             released_ts,
+            revision: 0,
         }
     }
 
@@ -5941,6 +5949,7 @@ mod tests {
             exclusive,
             released_ts,
             expires_ts: None,
+            revision: Some(0),
             generation: None,
         }
     }
@@ -6170,6 +6179,63 @@ mod tests {
         let mut released = row;
         released.released_ts = Some(mcp_agent_mail_db::now_micros());
         assert!(!confirms(&canonical, &released));
+    }
+
+    #[test]
+    fn guard_coverage_requires_the_current_reservation_revision() {
+        let mut row = reservation_row(
+            1,
+            7,
+            "src/**",
+            mcp_agent_mail_db::now_micros() + 60_000_000,
+            None,
+        );
+        row.revision = 2;
+        let canonical =
+            active_reservation_artifact_json("/abs/proj", "GreenCastle", &row, Some("aabbccdd"));
+        let confirms = |record: &Value, row: &mcp_agent_mail_db::FileReservationRow| {
+            active_artifact_confirms_guard_coverage(
+                record,
+                "/abs/proj",
+                "GreenCastle",
+                row,
+                "aabbccdd",
+            )
+        };
+        assert!(confirms(&canonical, &row));
+        for revision in [
+            json!(0),
+            json!(1),
+            json!(3),
+            json!(-1),
+            json!("2"),
+            Value::Null,
+        ] {
+            let mut stale = canonical.clone();
+            stale["revision"] = revision;
+            assert!(!confirms(&stale, &row));
+        }
+        let mut legacy = canonical;
+        legacy.as_object_mut().unwrap().remove("revision");
+        assert!(!confirms(&legacy, &row));
+        row.revision = 0;
+        assert!(confirms(&legacy, &row), "legacy zero remains readable");
+        row.revision = 2;
+        let mut view = archive_view(1, "GreenCastle", Some("src/**"), Some(true), None);
+        view.expires_ts = Some(row.expires_ts);
+        assert!(active_archive_artifact_diverges(
+            &view,
+            &row,
+            "GreenCastle",
+            None
+        ));
+        view.revision = Some(2);
+        assert!(!active_archive_artifact_diverges(
+            &view,
+            &row,
+            "GreenCastle",
+            None
+        ));
     }
 
     #[test]
@@ -9625,6 +9691,7 @@ mod tests {
             created_ts: 0,
             expires_ts: 1,
             released_ts: None,
+            revision: 0,
         };
         let empty_paths: Vec<String> = Vec::new();
         let empty_ids: Vec<i64> = Vec::new();

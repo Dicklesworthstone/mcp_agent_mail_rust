@@ -1307,6 +1307,24 @@ INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive
         // rewritten; drift → 0.
         let (storage_root, db_path) =
             materialize_fixture(ARCHIVE_ACTIVE_SQL, ARCHIVE_ACTIVE_JSON, 301);
+        let archive_path = storage_root
+            .path()
+            .join("projects/reservation-regression/file_reservations/id-301.json");
+        let mut expected_archive: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&archive_path).unwrap()).unwrap();
+        expected_archive["revision"] = serde_json::json!(12);
+        std::fs::write(
+            &archive_path,
+            serde_json::to_vec(&expected_archive).unwrap(),
+        )
+        .unwrap();
+        let conn = CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(
+            "ALTER TABLE file_reservations ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+             UPDATE file_reservations SET revision = 12 WHERE id = 301;",
+        )
+        .expect("version the released lease");
+        drop(conn);
         let mut findings = detect(Some(storage_root.path()), std::slice::from_ref(&db_path));
         assert_eq!(findings.len(), 1, "precondition: release drift present");
         let finding = findings.pop().expect("finding");
@@ -1324,6 +1342,12 @@ INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive
         assert!(
             archive.contains("1700003010000000"),
             "archive released_ts rewritten: {archive}"
+        );
+        expected_archive["released_ts"] = serde_json::json!(1_700_003_010_000_000_i64);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&archive).unwrap(),
+            expected_archive,
+            "terminal repair must preserve the revision and all mutable lease intent"
         );
         assert!(
             detect(Some(storage_root.path()), std::slice::from_ref(&db_path)).is_empty(),

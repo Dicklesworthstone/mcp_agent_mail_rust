@@ -165,9 +165,9 @@ fn descriptor_exhaustion_source_inspection_is_bounded() {
 /// inferred from a separately observed row.
 pub(super) const RESERVATION_SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
             fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
-            rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
+            rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id, fr.revision \
      FROM (SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
-                  created_ts, expires_ts, released_ts \
+                  created_ts, expires_ts, released_ts, revision \
            FROM file_reservations WHERE id = ?1) fr \
      JOIN projects p ON p.id = fr.project_id \
      JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
@@ -178,7 +178,7 @@ pub(super) const RESERVATION_SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr
      WHERE length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
            length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
            length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
-           length(CAST(fr.\"exclusive\" AS BLOB)) + \
+           length(CAST(fr.\"exclusive\" AS BLOB)) + length(CAST(fr.revision AS BLOB)) + \
            COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
            COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
            COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?2";
@@ -521,11 +521,12 @@ mod tests {
         conn.execute_raw("COMMIT").unwrap();
     }
 
-    // Retain the actual pre-GH354 query as the independent oracle and benchmark
-    // incumbent. Do not derive it by transforming the candidate SQL.
+    // Retain the pre-GH354 join shape as the independent oracle and benchmark
+    // incumbent, projecting the durable revision on both sides. Do not derive
+    // it by transforming the candidate SQL.
     const LEGACY_RESERVATION_SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                 fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
-                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
+                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id, fr.revision \
          FROM file_reservations fr JOIN projects p ON p.id = fr.project_id \
          JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
          LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
@@ -533,7 +534,7 @@ mod tests {
          WHERE fr.id = ?1 AND length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
                length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
                length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
-               length(CAST(fr.\"exclusive\" AS BLOB)) + \
+               length(CAST(fr.\"exclusive\" AS BLOB)) + length(CAST(fr.revision AS BLOB)) + \
                COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
                COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
                COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?2";
@@ -791,7 +792,7 @@ mod tests {
     fn reservation_source_byte_limit_counts_utf8_and_every_authority() {
         let (_temp, conn) = reservation_source_mailbox(4, 4);
         conn.execute_raw(
-            "UPDATE file_reservations SET reason = '', released_ts = 1000000 WHERE id = 1",
+            "UPDATE file_reservations SET reason = '', released_ts = 1000000, revision = 1 WHERE id = 1",
         )
         .unwrap();
         let fixed = compare_reservation_sources(&conn, 1, RESERVATION_FIXTURE_BYTES)
@@ -848,6 +849,10 @@ mod tests {
             (
                 13,
                 "UPDATE db_identity SET generation_id = ?1 WHERE singleton = 0",
+            ),
+            (
+                14,
+                "UPDATE file_reservations SET revision = ?1 WHERE id = 1",
             ),
         ] {
             let previous = exact.values().nth(column).unwrap().clone();

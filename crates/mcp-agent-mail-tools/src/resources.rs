@@ -7856,6 +7856,7 @@ mod resource_shape_tests {
                     created_ts: 2_000_000,
                     expires_ts: 4_000_000,
                     released_ts: Some(3_000_000),
+                    revision: 0,
                 })
                 .collect(),
             captured_ts: 5_000_000,
@@ -13154,6 +13155,7 @@ mod query_param_tests {
             created_ts: 1,
             expires_ts,
             released_ts,
+            revision: 0,
         }
     }
 

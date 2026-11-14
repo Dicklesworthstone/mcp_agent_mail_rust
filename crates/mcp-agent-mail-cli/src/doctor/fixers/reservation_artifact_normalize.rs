@@ -85,7 +85,7 @@ impl ReservationArtifactNormalizeFinding {
                     "source": artifact.source.to_string_lossy(),
                     "reason": artifact.reason,
                 })).collect::<Vec<_>>(),
-                "safety_policy": "Only a regular JSON artifact whose embedded id and project match its path is eligible. Legacy names additionally require a live (project, id) DB row. Filename generation wins over JSON db_generation; malformed, symlinked, and unmatched artifacts remain untouched.",
+                "safety_policy": "Only a regular JSON artifact whose embedded id and project match its path is eligible. Legacy names additionally require a live (project, id) DB row. A stamped peer must preserve the legacy snapshot or prove a newer revision in the same generation before the legacy copy is quarantined; terminal release evidence is preserved. Malformed, symlinked, and ambiguous artifacts remain untouched.",
             }),
             remediation: FindingRemediation {
                 command: super::fix_only_command(FM_ID),
@@ -415,6 +415,7 @@ fn scan_artifacts(
                     &project,
                     human_key,
                     current_generation,
+                    &json,
                 ) {
                     quarantines.push(QuarantineArtifact {
                         source: path,
@@ -473,6 +474,7 @@ fn is_matching_current_artifact(
     project: &str,
     human_key: Option<&str>,
     current_generation: &str,
+    legacy: &Value,
 ) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -480,9 +482,140 @@ fn is_matching_current_artifact(
     let Some(parsed) = parse_reservation_artifact_filename(name) else {
         return false;
     };
-    parsed.id == id
-        && parsed.generation.as_deref() == Some(current_generation)
-        && read_matching_artifact_json(path, id, project, human_key).is_some()
+    if parsed.id != id || parsed.generation.as_deref() != Some(current_generation) {
+        return false;
+    }
+    let Some(stamped) = read_matching_artifact_json(path, id, project, human_key) else {
+        return false;
+    };
+    if stamped
+        .get("db_generation")
+        .and_then(Value::as_str)
+        .is_some_and(|generation| !generation.is_empty() && generation != current_generation)
+    {
+        return false;
+    }
+    stamped_preserves_legacy_snapshot(legacy, &stamped, current_generation)
+}
+
+/// A duplicate name is not evidence that its contents are obsolete. In
+/// particular, a delayed stamped publication can be older than the legacy
+/// copy, and release is terminal independently of the mutable revision.
+fn stamped_preserves_legacy_snapshot(
+    legacy: &Value,
+    stamped: &Value,
+    current_generation: &str,
+) -> bool {
+    let revision = |snapshot: &Value| {
+        snapshot.get("revision").map_or(Some(0), |value| {
+            value.as_i64().filter(|revision| *revision >= 0)
+        })
+    };
+    let (Some(legacy_revision), Some(stamped_revision)) = (revision(legacy), revision(stamped))
+    else {
+        return false;
+    };
+    let Some(mut old_fields) = legacy.as_object().cloned() else {
+        return false;
+    };
+    let Some(mut new_fields) = stamped.as_object().cloned() else {
+        return false;
+    };
+    for snapshot in [legacy, stamped] {
+        if !snapshot
+            .get("released_ts")
+            .is_none_or(|value| value.is_null() || reservation_snapshot_timestamp(value).is_some())
+        {
+            return false;
+        }
+    }
+    if legacy
+        .get("released_ts")
+        .is_some_and(|value| !value.is_null())
+        && legacy.get("released_ts") != stamped.get("released_ts")
+    {
+        return false;
+    }
+    if stamped_revision != legacy_revision {
+        // An unstamped legacy name cannot establish a common generation just
+        // because the live DB reused its id. Retain that evidence instead.
+        if legacy.get("db_generation").and_then(Value::as_str) != Some(current_generation)
+            || stamped_revision < legacy_revision
+        {
+            return false;
+        }
+        // A revision cannot make an unreadable mutable snapshot authoritative.
+        // Keep the older evidence if recovery/guard readers would have to
+        // replace missing or malformed values with defaults.
+        if !stamped
+            .get("exclusive")
+            .is_some_and(|value| value.is_boolean() || value.as_i64().is_some())
+            || stamped.get("reason").and_then(Value::as_str).is_none()
+            || stamped
+                .get("expires_ts")
+                .and_then(reservation_snapshot_timestamp)
+                .is_none()
+        {
+            return false;
+        }
+        let legacy_released = legacy
+            .get("released_ts")
+            .and_then(reservation_snapshot_timestamp)
+            .is_some_and(|timestamp| timestamp > 0);
+        let stamped_released = stamped
+            .get("released_ts")
+            .and_then(reservation_snapshot_timestamp)
+            .is_some_and(|timestamp| timestamp > 0);
+        if !legacy_released && !stamped_released {
+            let Some(old_expiry) = legacy
+                .get("expires_ts")
+                .and_then(reservation_snapshot_timestamp)
+            else {
+                return false;
+            };
+            if stamped
+                .get("expires_ts")
+                .and_then(reservation_snapshot_timestamp)
+                .is_none_or(|new_expiry| new_expiry < old_expiry)
+            {
+                return false;
+            }
+        }
+        // Mutable changes are allowed only when the immutable lease identity
+        // is present and unchanged. Missing identity fields are not proof.
+        for (field, alias) in [
+            ("agent", "agent_name"),
+            ("path_pattern", "path"),
+            ("created_ts", "created"),
+        ] {
+            let old = legacy.get(field).or_else(|| legacy.get(alias));
+            let new = stamped.get(field).or_else(|| stamped.get(alias));
+            if old.is_none_or(Value::is_null) || old != new {
+                return false;
+            }
+        }
+        for field in ["exclusive", "reason", "expires_ts"] {
+            old_fields.remove(field);
+            new_fields.remove(field);
+        }
+    }
+    // Project aliases were checked against the current DB above. Generation,
+    // revision and terminal release were checked separately; retain every
+    // other field so normalization never discards unexplained evidence.
+    for field in ["project", "db_generation", "revision", "released_ts"] {
+        old_fields.remove(field);
+        new_fields.remove(field);
+    }
+    old_fields == new_fields
+}
+
+fn reservation_snapshot_timestamp(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        let text = value.as_str()?.trim();
+        text.parse::<i64>()
+            .ok()
+            .or_else(|| mcp_agent_mail_core::timestamps::iso_to_micros(text))
+    })
 }
 
 fn quarantine_destination(
@@ -876,7 +1009,7 @@ mod tests {
         std::fs::write(
             reservation_dir.join(format!("id-7-g{CURRENT_GENERATION}.json")),
             format!(
-                r#"{{"id":7,"project":"/data/projects/live-project","db_generation":"{CURRENT_GENERATION}"}}"#
+                r#"{{"id":7,"project":"/data/projects/live-project","agent":"legacy","db_generation":"{CURRENT_GENERATION}"}}"#
             ),
         )
         .expect("stamped peer");
@@ -895,5 +1028,124 @@ mod tests {
                 .exists()
         );
         assert_eq!(outcome.actions_taken, 2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn duplicate_normalization_preserves_newer_or_ambiguous_revision_evidence() {
+        for case in [
+            "newer_legacy",
+            "equal_revision_conflict",
+            "terminal_legacy",
+            "unknown_generation",
+            "malformed_revision",
+            "malformed_newer_expiry",
+            "missing_newer_expiry",
+            "malformed_newer_release",
+            "malformed_newer_exclusive",
+            "malformed_newer_reason",
+            "shorter_newer_expiry",
+            "shorter_newer_terminal",
+            "newer_stamped",
+            "terminal_stamped",
+        ] {
+            let (td, db_path, reservation_dir) = fixture();
+            let mut legacy = serde_json::json!({
+                "id": 7,
+                "project": "live-project",
+                "agent": "CoralMarsh",
+                "path_pattern": "src/**",
+                "created_ts": 10,
+                "expires_ts": 1000,
+                "exclusive": true,
+                "reason": "exclusive work",
+                "released_ts": null,
+                "revision": 2,
+                "db_generation": CURRENT_GENERATION,
+            });
+            let mut stamped = legacy.clone();
+            stamped["project"] = serde_json::json!("/data/projects/live-project");
+            match case {
+                "newer_legacy" => stamped["revision"] = serde_json::json!(1),
+                "equal_revision_conflict" => stamped["exclusive"] = serde_json::json!(false),
+                "terminal_legacy" => {
+                    legacy["released_ts"] = serde_json::json!(500);
+                    stamped["revision"] = serde_json::json!(3);
+                }
+                "unknown_generation" => {
+                    legacy.as_object_mut().unwrap().remove("db_generation");
+                    stamped["revision"] = serde_json::json!(3);
+                }
+                "malformed_revision" => legacy["revision"] = serde_json::json!("2"),
+                "malformed_newer_expiry" => {
+                    stamped["revision"] = serde_json::json!(3);
+                    stamped["expires_ts"] = serde_json::json!("unreadable expiry");
+                }
+                "missing_newer_expiry" => {
+                    stamped["revision"] = serde_json::json!(3);
+                    stamped.as_object_mut().unwrap().remove("expires_ts");
+                }
+                "malformed_newer_release" => {
+                    stamped["revision"] = serde_json::json!(3);
+                    stamped["released_ts"] = serde_json::json!(true);
+                }
+                "malformed_newer_exclusive" => {
+                    stamped["revision"] = serde_json::json!(3);
+                    stamped["exclusive"] = serde_json::json!("not a boolean");
+                }
+                "malformed_newer_reason" => {
+                    stamped["revision"] = serde_json::json!(3);
+                    stamped["reason"] = serde_json::json!({"malformed": true});
+                }
+                "shorter_newer_expiry" => {
+                    stamped["revision"] = serde_json::json!(3);
+                    stamped["expires_ts"] = serde_json::json!(900);
+                }
+                "shorter_newer_terminal" => {
+                    stamped["revision"] = serde_json::json!(3);
+                    stamped["expires_ts"] = serde_json::json!(900);
+                    stamped["released_ts"] = serde_json::json!(500);
+                }
+                "newer_stamped" => {
+                    legacy["exclusive"] = serde_json::json!(false);
+                    legacy["reason"] = serde_json::json!("shared inspection");
+                    stamped["revision"] = serde_json::json!(3);
+                }
+                "terminal_stamped" => stamped["released_ts"] = serde_json::json!(500),
+                _ => unreachable!(),
+            }
+            let legacy_path = reservation_dir.join("id-7.json");
+            let stamped_path = reservation_dir.join(format!("id-7-g{CURRENT_GENERATION}.json"));
+            let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+            let stamped_bytes = serde_json::to_vec(&stamped).unwrap();
+            std::fs::write(&legacy_path, &legacy_bytes).unwrap();
+            std::fs::write(&stamped_path, &stamped_bytes).unwrap();
+
+            let finding = detect(Some(td.path()), std::slice::from_ref(&db_path))
+                .pop()
+                .expect("fixture includes a foreign artifact to quarantine");
+            let should_quarantine = matches!(
+                case,
+                "newer_stamped" | "terminal_stamped" | "shorter_newer_terminal"
+            );
+            assert_eq!(
+                finding.quarantines.iter().any(|artifact| {
+                    artifact.source == legacy_path
+                        && artifact.reason == QuarantineReason::LegacyDuplicateOfStampedArtifact
+                }),
+                should_quarantine,
+                "{case}",
+            );
+            fix(&ctx(&td), &finding).expect("normalize safely");
+            assert_eq!(legacy_path.exists(), !should_quarantine, "{case}");
+            if !should_quarantine {
+                assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_bytes, "{case}");
+            }
+            assert_eq!(
+                std::fs::read(&stamped_path).unwrap(),
+                stamped_bytes,
+                "{case}"
+            );
+        }
     }
 }

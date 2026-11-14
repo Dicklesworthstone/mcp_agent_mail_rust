@@ -445,11 +445,13 @@ fn read_source_connection_inner(
     let created = integer("created_ts")?;
     let expires = integer("expires_ts")?;
     let exclusive = integer("exclusive")?;
+    let revision = integer("revision")?;
     if id <= 0
         || integer("id")? != id
         || !Path::new(&key).is_absolute()
         || pattern.trim().is_empty()
         || !matches!(exclusive, 0 | 1)
+        || revision < 0
         || [created, expires, release]
             .into_iter()
             .any(|value| chrono::DateTime::from_timestamp_micros(value).is_none())
@@ -458,7 +460,7 @@ fn read_source_connection_inner(
     }
     let mut artifact = json!({
         "id": id, "project": key, "agent": name, "path_pattern": pattern.trim(),
-        "exclusive": exclusive != 0, "reason": text("reason")?,
+        "exclusive": exclusive != 0, "reason": text("reason")?, "revision": revision,
         "created_ts": mcp_agent_mail_db::micros_to_iso(created),
         "expires_ts": mcp_agent_mail_db::micros_to_iso(expires),
         "released_ts": mcp_agent_mail_db::micros_to_iso(release),
@@ -477,6 +479,8 @@ fn read_source_connection_inner(
 }
 
 fn validate_artifact(source: &ReleaseSource, value: &Value) -> crate::Result<()> {
+    let source_revision = crate::reservation_publication_revision(source.id, &source.artifact)?;
+    let artifact_revision = crate::reservation_publication_revision(source.id, value)?;
     let generation = match value.get("db_generation") {
         None => None,
         Some(Value::String(generation))
@@ -497,12 +501,29 @@ fn validate_artifact(source: &ReleaseSource, value: &Value) -> crate::Result<()>
             "reservation artifact belongs to a foreign generation; preserved",
         ));
     }
-    for field in ["id", "project", "agent", "path_pattern", "exclusive"] {
+    for field in ["id", "project", "agent", "path_pattern"] {
         if value.get(field) != source.artifact.get(field) {
             return Err(invalid(format!(
                 "reservation {field} conflicts with live identity; preserved"
             )));
         }
+    }
+    if value["exclusive"].as_bool().is_none()
+        || (source_revision == artifact_revision
+            && value["exclusive"] != source.artifact["exclusive"])
+    {
+        return Err(invalid(
+            "reservation exclusive intent conflicts without a newer revision; preserved",
+        ));
+    }
+    if source_revision > 0
+        && source_revision == artifact_revision
+        && (value["reason"] != source.artifact["reason"]
+            || timestamp(&value["expires_ts"]) != timestamp(&source.artifact["expires_ts"]))
+    {
+        return Err(invalid(
+            "equal reservation revision has conflicting intent or expiry; preserved",
+        ));
     }
     if timestamp(&value["created_ts"]) != timestamp(&source.artifact["created_ts"]) {
         return Err(invalid(
@@ -589,8 +610,41 @@ fn prepare_target(
                 .clone(),
         );
     }
-    // Preserve unknown fields while restoring the complete DB-authored record.
+    // A release is terminal even if a surviving artifact contains a newer
+    // intent revision. Retain that revision's complete mutable snapshot while
+    // taking the terminal marker and immutable identity from the live source.
+    let mut latest = &source.artifact;
+    let mut latest_revision = crate::reservation_publication_revision(source.id, latest)?;
+    for artifact in [committed.as_ref(), working.as_ref()].into_iter().flatten() {
+        let revision = crate::reservation_publication_revision(source.id, &artifact.value)?;
+        if revision == latest_revision && revision > 0 {
+            if artifact.value["exclusive"] != latest["exclusive"]
+                || artifact.value["reason"] != latest["reason"]
+                || timestamp(&artifact.value["expires_ts"]) != timestamp(&latest["expires_ts"])
+            {
+                return Err(invalid(
+                    "equal reservation revision has conflicting intent or expiry; preserved",
+                ));
+            }
+        } else if revision > latest_revision {
+            if artifact.value["reason"].as_str().is_none()
+                || timestamp(&artifact.value["expires_ts"]).is_none()
+            {
+                return Err(invalid(
+                    "newer reservation revision has malformed intent or expiry; preserved",
+                ));
+            }
+            latest = &artifact.value;
+            latest_revision = revision;
+        }
+    }
+    // Preserve unknown fields while restoring the DB-authored release record.
     object.extend(source.artifact.as_object().expect("source object").clone());
+    if latest_revision > crate::reservation_publication_revision(source.id, &source.artifact)? {
+        for field in ["revision", "exclusive", "reason", "expires_ts"] {
+            object.insert(field.to_owned(), latest[field].clone());
+        }
+    }
     let bytes = serde_json::to_vec_pretty(&value)?;
     if bytes.len() > MAX_ARTIFACT_BYTES {
         return Err(invalid("reservation artifact exceeds byte bound"));
@@ -864,12 +918,17 @@ pub fn reconcile_released_reservation(
     let source = read_source(cx, pool, id)
         .map_err(|error| error.to_string())?
         .ok_or("captured reservation has no live terminal release authority")?;
+    let source_revision = crate::reservation_publication_revision(id, &source.artifact)
+        .map_err(|error| error.to_string())?;
     if source.generation.as_deref() != Some(expected_generation)
         || source.project_id != reservation.project_id
         || source.agent_id != reservation.agent_id
         || timestamp(&source.artifact["created_ts"]) != Some(reservation.created_ts)
         || source.artifact["path_pattern"].as_str() != Some(reservation.path_pattern.trim())
-        || source.artifact["exclusive"].as_bool().map(i64::from) != Some(reservation.exclusive)
+        || reservation.revision < 0
+        || source_revision < reservation.revision
+        || (source.artifact["exclusive"].as_bool().map(i64::from) != Some(reservation.exclusive)
+            && source_revision <= reservation.revision)
     {
         return Err("captured release identity or generation changed; archive preserved".into());
     }
@@ -924,7 +983,7 @@ mod tests {
     // making machine-dependent timing a unit-test gate.
     const PREVIOUS_SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                 fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
-                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
+                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id, fr.revision \
          FROM file_reservations fr JOIN projects p ON p.id = fr.project_id \
          JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
          LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
@@ -932,7 +991,7 @@ mod tests {
          WHERE fr.id = ? AND length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
                length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
                length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
-               length(CAST(fr.\"exclusive\" AS BLOB)) + \
+               length(CAST(fr.\"exclusive\" AS BLOB)) + length(CAST(fr.revision AS BLOB)) + \
                COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
                COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
                COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?";
@@ -1293,7 +1352,7 @@ mod tests {
                 source.artifact,
                 json!({
                     "id": 401, "project": "/project", "agent": "BlueLake",
-                    "path_pattern": "src/*.rs", "exclusive": true, "reason": "release-test",
+                    "path_pattern": "src/*.rs", "exclusive": true, "reason": "release-test", "revision": 0,
                     "created_ts": mcp_agent_mail_db::micros_to_iso(1_000_000),
                     "expires_ts": mcp_agent_mail_db::micros_to_iso(9_000_000),
                     "released_ts": mcp_agent_mail_db::micros_to_iso(5_000_000),
@@ -1305,7 +1364,7 @@ mod tests {
                 legacy.artifact,
                 json!({
                     "id": 402, "project": "/project", "agent": "BlueLake",
-                    "path_pattern": "docs/*.md", "exclusive": false, "reason": "legacy-hot",
+                    "path_pattern": "docs/*.md", "exclusive": false, "reason": "legacy-hot", "revision": 0,
                     "created_ts": mcp_agent_mail_db::micros_to_iso(2_000_000),
                     "expires_ts": mcp_agent_mail_db::micros_to_iso(10_000_000),
                     "released_ts": mcp_agent_mail_db::micros_to_iso(6_000_000),
@@ -1346,7 +1405,7 @@ mod tests {
             // UTF-8 must be limited by bytes before Rust materializes the row.
             let fixed_bytes = [
                 "src/*.rs", "project", "/project", "BlueLake", "1000000", "9000000", "1",
-                "5000000", "aabb",
+                "5000000", "aabb", "0",
             ]
             .into_iter()
             .map(str::len)
@@ -1921,6 +1980,159 @@ mod tests {
         .into_iter()
         .next()
         .expect("fixture reservation")
+    }
+
+    #[test]
+    fn terminal_repair_uses_a_newer_revision_after_an_unpublished_intent_change() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE file_reservations SET \"exclusive\"=0, reason='observing', revision=1 WHERE id=401",
+            )
+            .unwrap();
+            drop(conn);
+            let original = read_source(cx, pool, 401).unwrap().unwrap();
+            let captured = captured_row(cx, pool, 401);
+            let (path, before) = seed_artifact(config, &original, "aabb", false);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE file_reservations SET \"exclusive\"=1, reason='editing', revision=2 WHERE id=401",
+            )
+            .unwrap();
+            drop(conn);
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            assert_eq!(
+                source.artifact["expires_ts"],
+                original.artifact["expires_ts"]
+            );
+            assert!(reconcile_released_reservation(cx, pool, config, &captured, "aabb").unwrap());
+            let repaired = read_artifact(&path).unwrap().unwrap();
+            assert_ne!(repaired.bytes, before);
+            assert_eq!(repaired.value["revision"], 2);
+            assert_eq!(repaired.value["exclusive"], true);
+            assert_eq!(repaired.value["reason"], "editing");
+            assert_eq!(
+                repaired.value["released_ts"],
+                source.artifact["released_ts"]
+            );
+            assert_eq!(repaired.value["operator_note"], "preserve this note");
+            let archive = crate::ensure_archive(config, &source.project_slug).unwrap();
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let tree = head_tree(&repo).unwrap().unwrap();
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+            assert_eq!(
+                committed_artifact(&repo, Some(&tree), &relative)
+                    .unwrap()
+                    .unwrap()
+                    .bytes,
+                repaired.bytes,
+            );
+            let head = repo.head().unwrap().target();
+            assert!(!reconcile_released_reservation(cx, pool, config, &captured, "aabb").unwrap());
+            assert_eq!(repo.head().unwrap().target(), head);
+            let mut delayed = original.artifact;
+            delayed.as_object_mut().unwrap().remove("released_ts");
+            assert!(crate::write_file_reservation_record(&archive, config, &delayed).is_err());
+            assert_eq!(fs::read(path).unwrap(), repaired.bytes);
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+        });
+    }
+
+    #[test]
+    fn terminal_repair_preserves_the_highest_surviving_mutable_revision() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE file_reservations SET revision=1 WHERE id=401")
+                .unwrap();
+            drop(conn);
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            let captured = captured_row(cx, pool, 401);
+            let (path, _) = seed_artifact(config, &source, "aabb", false);
+            let archive = crate::ensure_archive(config, &source.project_slug).unwrap();
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+            let mut newest = read_artifact(&path).unwrap().unwrap().value;
+            newest["revision"] = json!(3);
+            newest["exclusive"] = json!(false);
+            newest["reason"] = json!("newest shared intent");
+            newest["expires_ts"] = json!(mcp_agent_mail_db::micros_to_iso(10_000_000));
+            fs::write(&path, serde_json::to_vec_pretty(&newest).unwrap()).unwrap();
+            crate::commit_paths_with_retry(
+                &archive.repo_root,
+                config,
+                "fixture: latest reservation revision",
+                &[&relative],
+            )
+            .unwrap();
+            // The working copy is older than HEAD. Terminal authority must
+            // not destroy the newer intent that survives only in Git.
+            let mut intermediate = newest.clone();
+            intermediate["revision"] = json!(2);
+            intermediate["exclusive"] = json!(true);
+            intermediate["reason"] = json!("intermediate exclusive intent");
+            intermediate["expires_ts"] = source.artifact["expires_ts"].clone();
+            fs::write(&path, serde_json::to_vec_pretty(&intermediate).unwrap()).unwrap();
+            assert!(reconcile_released_reservation(cx, pool, config, &captured, "aabb").unwrap());
+            let repaired = read_artifact(&path).unwrap().unwrap();
+            let mut expected = newest;
+            expected["released_ts"] = source.artifact["released_ts"].clone();
+            assert_eq!(repaired.value, expected);
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let tree = head_tree(&repo).unwrap().unwrap();
+            assert_eq!(
+                committed_artifact(&repo, Some(&tree), &relative)
+                    .unwrap()
+                    .unwrap()
+                    .bytes,
+                repaired.bytes,
+            );
+            assert!(!reconcile_released_reservation(cx, pool, config, &captured, "aabb").unwrap());
+            let mut active = expected;
+            active.as_object_mut().unwrap().remove("released_ts");
+            active["revision"] = json!(4);
+            assert!(crate::write_file_reservation_record(&archive, config, &active).is_err());
+            assert_eq!(fs::read(path).unwrap(), repaired.bytes);
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+        });
+    }
+
+    #[test]
+    fn terminal_repair_preserves_conflicting_or_malformed_revision_evidence() {
+        if isolated_admission_test() {
+            return;
+        }
+        for (field, replacement) in [
+            ("exclusive", json!(false)),
+            ("reason", json!("unproven intent")),
+            (
+                "expires_ts",
+                json!(mcp_agent_mail_db::micros_to_iso(10_000_000)),
+            ),
+            ("revision", json!(-1)),
+            ("revision", json!("2")),
+            ("revision", Value::Null),
+        ] {
+            fixture(|cx, pool, config| {
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                conn.execute_raw("UPDATE file_reservations SET revision=2 WHERE id=401")
+                    .unwrap();
+                drop(conn);
+                let source = read_source(cx, pool, 401).unwrap().unwrap();
+                let captured = captured_row(cx, pool, 401);
+                let (path, _) = seed_artifact(config, &source, "aabb", false);
+                let mut conflicting = read_artifact(&path).unwrap().unwrap().value;
+                conflicting[field] = replacement.clone();
+                let bytes = serde_json::to_vec_pretty(&conflicting).unwrap();
+                fs::write(&path, &bytes).unwrap();
+                let repo = Repository::open(&config.storage_root).unwrap();
+                let head = repo.head().ok().and_then(|head| head.target());
+                assert!(
+                    reconcile_released_reservation(cx, pool, config, &captured, "aabb").is_err()
+                );
+                assert_eq!(fs::read(path).unwrap(), bytes, "{field}={replacement}");
+                assert_eq!(repo.head().ok().and_then(|head| head.target()), head);
+                assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+            });
+        }
     }
 
     #[test]

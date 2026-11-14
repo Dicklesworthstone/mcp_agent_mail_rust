@@ -149,7 +149,8 @@ CREATE TABLE IF NOT EXISTS file_reservations (
     reason TEXT NOT NULL DEFAULT '',
     created_ts INTEGER NOT NULL,
     expires_ts INTEGER NOT NULL,
-    released_ts INTEGER
+    released_ts INTEGER,
+    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_file_reservations_project_released_expires ON file_reservations(project_id, released_ts, expires_ts);
 CREATE INDEX IF NOT EXISTS idx_file_reservations_project_agent_released ON file_reservations(project_id, agent_id, released_ts);
@@ -1132,6 +1133,21 @@ CREATE TABLE IF NOT EXISTS messages (
     attachments TEXT NOT NULL DEFAULT '[]'
 )";
 
+// Preserve the already-applied v1 checksum as the bootstrap schema gains
+// revision ordering. Existing ledgers add the column through v37 instead.
+const V1_CREATE_FILE_RESERVATIONS_MIGRATION_SQL: &str = r"-- File reservations table
+CREATE TABLE IF NOT EXISTS file_reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    path_pattern TEXT NOT NULL,
+    exclusive INTEGER NOT NULL DEFAULT 1,
+    reason TEXT NOT NULL DEFAULT '',
+    created_ts INTEGER NOT NULL,
+    expires_ts INTEGER NOT NULL,
+    released_ts INTEGER
+)";
+
 /// Return the complete list of schema migrations.
 ///
 /// Migrations are designed so each `up` is a single `SQLite` statement (compatible with
@@ -1157,6 +1173,8 @@ pub fn schema_migrations() -> Vec<Migration> {
 
         let up = if id == "v1_create_table_messages" {
             V1_CREATE_MESSAGES_MIGRATION_SQL
+        } else if id == "v1_create_table_file_reservations" {
+            V1_CREATE_FILE_RESERVATIONS_MIGRATION_SQL
         } else {
             stmt
         };
@@ -3128,6 +3146,14 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    migrations.push(Migration::new(
+        "v37_file_reservations_revision".to_string(),
+        "order reservation intent and expiry snapshots independently of TTL".to_string(),
+        "ALTER TABLE file_reservations ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)"
+            .to_string(),
+        String::new(),
+    ));
+
     // These indexes are also present in the latest static DDL, which gives
     // them generated v1 migration IDs. On an existing pre-v27/v28 database,
     // however, their columns do not exist until the explicit evolution
@@ -3916,6 +3942,7 @@ pub async fn validate_startup_schema_gate<C: Connection>(
                 "path_pattern",
                 "expires_ts",
                 "released_ts",
+                "revision",
             ],
         ),
         (
@@ -7793,6 +7820,104 @@ mod tests {
                 assert_v15_unsupported_schema_is_retained(&cx, &runtime, mutations, expected).await;
             });
         }
+    }
+
+    async fn assert_reservation_revision_upgrade<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+    ) {
+        const V37: &str = "v37_file_reservations_revision";
+        // Independent FNV-1a witness from the pre-revision v1 table SQL.
+        const OLD_V1_CHECKSUM: &str = "38e75b648df1fff5";
+        init_migrations_table(cx, conn).await.into_result().unwrap();
+        let old = schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id != V37)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            old.iter()
+                .find(|migration| migration.id == "v1_create_table_file_reservations")
+                .unwrap()
+                .checksum(),
+            OLD_V1_CHECKSUM
+        );
+        run_specific_migrations(cx, conn, old)
+            .await
+            .into_result()
+            .unwrap();
+        let columns = conn
+            .query_sync("PRAGMA table_info(file_reservations)", &[])
+            .unwrap();
+        assert!(
+            columns
+                .iter()
+                .all(|column| column.get_named::<String>("name").unwrap() != "revision")
+        );
+        for sql in [
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'old','/old',1)",
+            "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES(1,1,'BlueLake','test','test',1,1)",
+            "INSERT INTO file_reservations(id,project_id,agent_id,path_pattern,exclusive,reason,created_ts,expires_ts,released_ts) VALUES(1,1,1,'src/**',1,'legacy active',10,1000,NULL),(2,1,1,'docs/**',0,'legacy released',20,2000,30)",
+        ] {
+            conn.execute(cx, sql, &[]).await.into_result().unwrap();
+        }
+        let ledger_sql = format!(
+            "SELECT checksum, applied_at FROM {MIGRATIONS_TABLE_NAME} WHERE id = 'v1_create_table_file_reservations'"
+        );
+        let before = conn.query_sync(&ledger_sql, &[]).unwrap();
+        let applied = run_specific_migrations(cx, conn, schema_migrations())
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(applied, vec![V37.to_string()]);
+        let after = conn.query_sync(&ledger_sql, &[]).unwrap();
+        assert_eq!(
+            after[0].get_named::<String>("checksum").unwrap(),
+            OLD_V1_CHECKSUM
+        );
+        assert_eq!(
+            after[0].get_named::<i64>("applied_at").unwrap(),
+            before[0].get_named::<i64>("applied_at").unwrap()
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT reason, revision, released_ts FROM file_reservations ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get_named::<String>("reason").unwrap(),
+            "legacy active"
+        );
+        assert_eq!(rows[0].get_named::<i64>("revision").unwrap(), 0);
+        assert_eq!(
+            rows[0].get_named::<Option<i64>>("released_ts").unwrap(),
+            None
+        );
+        assert_eq!(
+            rows[1].get_named::<String>("reason").unwrap(),
+            "legacy released"
+        );
+        assert_eq!(rows[1].get_named::<i64>("revision").unwrap(), 0);
+        assert_eq!(
+            rows[1].get_named::<Option<i64>>("released_ts").unwrap(),
+            Some(30)
+        );
+        assert!(
+            run_specific_migrations(cx, conn, schema_migrations())
+                .await
+                .into_result()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reservation_revision_upgrade_preserves_existing_ledgers_and_leases() {
+        let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+        block_on(|cx| async move { assert_reservation_revision_upgrade(&cx, &canonical).await });
+        let runtime = DbConn::open_memory().unwrap();
+        block_on(|cx| async move { assert_reservation_revision_upgrade(&cx, &runtime).await });
     }
 
     #[test]

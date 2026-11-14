@@ -297,6 +297,7 @@ struct DbReservationState {
     exclusive: bool,
     created_ts: i64,
     expires_ts: i64,
+    revision: i64,
     reservation_released_ts: Option<i64>,
     ledger_released_ts: Option<i64>,
 }
@@ -336,6 +337,8 @@ struct ArchiveReservationState {
     /// drift, br-xyy95). Consumed by reconcile-on-read so a stale pre-renew
     /// artifact heals; the parity drift report intentionally does not count it.
     expires_ts: Option<i64>,
+    /// Legacy artifacts are revision zero; malformed explicit revisions are unknown.
+    revision: Option<i64>,
 }
 
 impl ArchiveReservationState {
@@ -386,8 +389,21 @@ fn query_db_reservations_with<F>(mut query: F) -> Result<Vec<DbReservationState>
 where
     F: FnMut(&str, &[Value]) -> Result<Vec<Row>, String>,
 {
+    // Doctor can inspect an immutable pre-v37 database without running its
+    // migrations. Only a proven absent column is legacy revision zero; a
+    // failed schema probe or malformed stored revision remains an error.
+    let columns = query("PRAGMA table_info(file_reservations)", &[])?;
+    let mut has_revision = false;
+    for column in columns {
+        let name = column
+            .get_named::<String>("name")
+            .map_err(|error| error.to_string())?;
+        has_revision |= name.eq_ignore_ascii_case("revision");
+    }
+    let revision_sql = if has_revision { "fr.revision" } else { "0" };
     let rows = query(
-        "SELECT fr.id AS reservation_id,
+        &format!(
+            "SELECT fr.id AS reservation_id,
                 fr.project_id AS project_id,
                 fr.agent_id AS agent_id,
                 p.slug AS project_slug,
@@ -399,13 +415,15 @@ where
                 fr.exclusive AS exclusive,
                 fr.created_ts AS created_ts,
                 fr.expires_ts AS expires_ts,
+                {revision_sql} AS revision,
                 fr.released_ts AS reservation_released_ts,
                 rr.released_ts AS ledger_released_ts
          FROM file_reservations fr
          JOIN projects p ON p.id = fr.project_id
          LEFT JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id
          LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id
-         ORDER BY p.slug, fr.id",
+         ORDER BY p.slug, fr.id"
+        ),
         &[],
     )?;
 
@@ -414,6 +432,12 @@ where
             let raw_exclusive = row
                 .get_named::<i64>("exclusive")
                 .map_err(|error| error.to_string())?;
+            let revision = row
+                .get_named::<i64>("revision")
+                .map_err(|error| error.to_string())?;
+            if revision < 0 {
+                return Err("reservation revision must be nonnegative".to_string());
+            }
             Ok(DbReservationState {
                 reservation_id: row
                     .get_named::<i64>("reservation_id")
@@ -450,6 +474,7 @@ where
                 expires_ts: row
                     .get_named::<i64>("expires_ts")
                     .map_err(|error| error.to_string())?,
+                revision,
                 reservation_released_ts: row
                     .get_named::<Option<i64>>("reservation_released_ts")
                     .map_err(|error| error.to_string())?,
@@ -712,6 +737,7 @@ where
                         exclusive: db.raw_exclusive,
                         created_ts: db.created_ts,
                         expires_ts: db.expires_ts,
+                        revision: db.revision,
                         hot_release_ts: db.reservation_released_ts,
                         ledger_release_ts: db.ledger_released_ts,
                         live_generation: current_generation.as_deref(),
@@ -1063,6 +1089,9 @@ pub struct ArchiveReservationView {
     /// Lets reconcile-on-read heal a stale pre-renew artifact whose only
     /// divergence is the expiry.
     pub expires_ts: Option<i64>,
+    /// Legacy artifacts are revision zero; malformed explicit revisions cannot
+    /// certify the current database snapshot.
+    pub revision: Option<i64>,
     /// The DB generation token embedded in (or attributed to) this artifact —
     /// `None` for a legacy `id-<id>.json` name that carries no `db_generation`
     /// field either. Lets a caller detect a resolved artifact that is only
@@ -1082,6 +1111,7 @@ impl From<ArchiveReservationState> for ArchiveReservationView {
             exclusive: state.exclusive,
             released_ts: state.released_ts,
             expires_ts: state.expires_ts,
+            revision: state.revision,
             generation: state.generation,
         }
     }
@@ -1247,6 +1277,10 @@ fn parse_archive_reservation(
     let exclusive = json.get("exclusive").and_then(serde_json::Value::as_bool);
     let released_ts = parse_json_micros(&json, "released_ts");
     let expires_ts = parse_json_micros(&json, "expires_ts");
+    let revision = json
+        .get("revision")
+        .map_or(Some(0), serde_json::Value::as_i64)
+        .filter(|revision| *revision >= 0);
 
     Ok(ArchiveReservationState {
         reservation_id,
@@ -1258,6 +1292,7 @@ fn parse_archive_reservation(
         exclusive,
         released_ts,
         expires_ts,
+        revision,
     })
 }
 
@@ -1310,6 +1345,7 @@ mod tests {
             exclusive,
             created_ts: 100,
             expires_ts: 9_999_999_999_999_999,
+            revision: 0,
             reservation_released_ts: None,
             ledger_released_ts: None,
         }
@@ -1326,6 +1362,7 @@ mod tests {
             exclusive,
             released_ts: None,
             expires_ts: None,
+            revision: Some(0),
         }
     }
 
@@ -1393,6 +1430,51 @@ mod tests {
         )
         .expect("insert reservation");
         conn
+    }
+
+    #[test]
+    fn reservation_revision_parity_reads_legacy_immutable_databases() {
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects(id INTEGER PRIMARY KEY,slug TEXT,human_key TEXT); \
+             CREATE TABLE agents(id INTEGER PRIMARY KEY,project_id INTEGER,name TEXT); \
+             CREATE TABLE file_reservations(id INTEGER PRIMARY KEY,project_id INTEGER,agent_id INTEGER,path_pattern TEXT,exclusive INTEGER,reason TEXT,created_ts INTEGER,expires_ts INTEGER,released_ts INTEGER); \
+             CREATE TABLE file_reservation_releases(reservation_id INTEGER PRIMARY KEY,released_ts INTEGER); \
+             INSERT INTO projects VALUES(1,'legacy','/legacy'); \
+             INSERT INTO agents VALUES(1,1,'BlueLake'); \
+             INSERT INTO file_reservations VALUES(1,1,1,'src/**',1,'legacy lease',100,200,NULL); \
+             PRAGMA query_only=ON"
+        ).unwrap();
+        let read = || {
+            query_db_reservations_with(|sql, params| {
+                conn.query_sync(sql, params)
+                    .map_err(|error| error.to_string())
+            })
+        };
+        let rows = read().expect("old read-only database remains inspectable");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].revision, 0);
+        assert_eq!(rows[0].reason, "legacy lease");
+        let columns = conn
+            .query_sync("PRAGMA table_info(file_reservations)", &[])
+            .unwrap();
+        assert!(
+            columns
+                .iter()
+                .all(|column| column.get_named::<String>("name").unwrap() != "revision")
+        );
+        conn.execute_raw(
+            "PRAGMA query_only=OFF; \
+             ALTER TABLE file_reservations ADD COLUMN Revision INTEGER NOT NULL DEFAULT 0; \
+             UPDATE file_reservations SET revision=7; PRAGMA query_only=ON",
+        )
+        .unwrap();
+        assert_eq!(read().unwrap()[0].revision, 7);
+        conn.execute_raw("PRAGMA query_only=OFF; UPDATE file_reservations SET revision='malformed'; PRAGMA query_only=ON").unwrap();
+        assert!(
+            read().is_err(),
+            "present malformed revision is never legacy zero"
+        );
     }
 
     #[test]

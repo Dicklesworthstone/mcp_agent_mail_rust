@@ -90,8 +90,8 @@ WHERE m.id = ?1 AND m.project_id = ?2 AND m.created_ts = ?3 \
 
 const INSERT_SQL: &str = "\
 INSERT INTO file_reservations \
-(project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)";
+(project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts, revision) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 1)";
 
 fn sql_error(error: sqlmodel_core::Error) -> DbError {
     DbError::Sqlite(error.to_string())
@@ -283,6 +283,7 @@ async fn apply_claim(
         created_ts: now,
         expires_ts: now.saturating_add(request.ttl_seconds.saturating_mul(1_000_000)),
         released_ts: None,
+        revision: 1,
     };
     let params = [
         reservation.project_id.into(),
@@ -320,7 +321,7 @@ async fn apply_claim(
          WHERE project_id = ?1 AND agent_id = ?2 \
            AND path_pattern = ?3 COLLATE BINARY AND \"exclusive\" = ?4 \
            AND reason = ?5 COLLATE BINARY AND created_ts = ?6 \
-           AND expires_ts = ?7 AND id = ?8 AND released_ts IS NULL \
+           AND expires_ts = ?7 AND id = ?8 AND released_ts IS NULL AND revision = 1 \
            AND ({ACTIVE_RESERVATION_PREDICATE})"
     );
     let mut verify_params = params.to_vec();

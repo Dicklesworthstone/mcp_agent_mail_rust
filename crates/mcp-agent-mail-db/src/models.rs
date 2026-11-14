@@ -393,6 +393,13 @@ pub struct FileReservationRow {
 
     #[sqlmodel(nullable)]
     pub released_ts: Option<i64>,
+
+    /// Monotone version of the active lease's mutable intent and expiry.
+    /// Zero identifies legacy rows/artifacts; new grants start at one.
+    /// A terminal release takes precedence over every active revision.
+    #[sqlmodel(default = "0")]
+    #[serde(default)]
+    pub revision: i64,
 }
 
 impl Default for FileReservationRow {
@@ -408,6 +415,7 @@ impl Default for FileReservationRow {
             created_ts: now,
             expires_ts: now,
             released_ts: None,
+            revision: 0,
         }
     }
 }
