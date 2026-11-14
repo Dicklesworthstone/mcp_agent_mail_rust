@@ -1936,14 +1936,15 @@ mod tests {
     }
 
     fn add_second_archive_message(storage_root: &Path) {
-        let _mutation = mcp_agent_mail_storage::ArchiveMutationGuard::begin_at(storage_root);
-        fs::write(
-            storage_root.join(
-                "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-01Z__later__2.md",
-            ),
-            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[],\"cc\":[],\"bcc\":[],\"subject\":\"later\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-07-19T00:00:01Z\",\"attachments\":[]}\n---\n\narchive-only body\n",
-        )
-        .expect("publish a later canonical archive message");
+        mcp_agent_mail_storage::with_archive_mutation_for_test(storage_root, || {
+            fs::write(
+                storage_root.join(
+                    "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-01Z__later__2.md",
+                ),
+                "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[],\"cc\":[],\"bcc\":[],\"subject\":\"later\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-07-19T00:00:01Z\",\"attachments\":[]}\n---\n\narchive-only body\n",
+            )
+            .expect("publish a later canonical archive message");
+        });
     }
 
     #[test]
@@ -1991,6 +1992,7 @@ mod tests {
                 state.ready.is_none(),
                 "the positive live proof is not cached"
             );
+            drop(state);
         }
         reset_for_test();
     }
@@ -2002,29 +2004,33 @@ mod tests {
         }
         let (_directory, slot, database_url) = live_read_fixture();
         let writer = WriteGuard::begin(&slot.scope.storage_root, Some(&slot.scope.sqlite_path));
-        let mutation =
-            mcp_agent_mail_storage::ArchiveMutationGuard::begin_at(&slot.scope.storage_root);
         let cx = Cx::for_testing();
         let reader_cx = cx.clone();
         let reader_scope = slot.scope.clone();
         let (result_tx, result_rx) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            let result = acquire_if_needed(
-                &reader_scope.storage_root,
-                &reader_scope.sqlite_path,
-                &database_url,
-                &reader_cx,
+        let (reader, attempted_while_archive_busy, premature) =
+            mcp_agent_mail_storage::with_archive_mutation_for_test(
+                &slot.scope.storage_root,
+                || {
+                    let reader = std::thread::spawn(move || {
+                        let result = acquire_if_needed(
+                            &reader_scope.storage_root,
+                            &reader_scope.sqlite_path,
+                            &database_url,
+                            &reader_cx,
+                        );
+                        let _ = result_tx.send(result);
+                    });
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while TEST_LIVE_DECISION_ATTEMPTS.load(Ordering::Acquire) == 0
+                        && Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                    let attempted = TEST_LIVE_DECISION_ATTEMPTS.load(Ordering::Acquire) != 0;
+                    (reader, attempted, result_rx.try_recv())
+                },
             );
-            let _ = result_tx.send(result);
-        });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while TEST_LIVE_DECISION_ATTEMPTS.load(Ordering::Acquire) == 0 && Instant::now() < deadline
-        {
-            std::thread::yield_now();
-        }
-        let attempted_while_archive_busy = TEST_LIVE_DECISION_ATTEMPTS.load(Ordering::Acquire) != 0;
-        let premature = result_rx.try_recv();
-        drop(mutation);
         let result = result_rx.recv_timeout(Duration::from_secs(10));
         cx.set_cancel_requested(true);
         reader.join().expect("join live decision reader");
@@ -2163,9 +2169,7 @@ mod tests {
             return;
         }
         let (_directory, slot, database_url) = live_read_fixture();
-        {
-            let _mutation =
-                mcp_agent_mail_storage::ArchiveMutationGuard::begin_at(&slot.scope.storage_root);
+        mcp_agent_mail_storage::with_archive_mutation_for_test(&slot.scope.storage_root, || {
             fs::write(
                 slot.scope.storage_root.join(
                     "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-02Z__malformed__3.md",
@@ -2173,7 +2177,7 @@ mod tests {
                 "---json\n{malformed\n---\n\nretained evidence\n",
             )
             .unwrap();
-        }
+        });
         let cx = Cx::for_testing();
         assert!(!live_read_is_sufficient(&slot.scope, &database_url, &cx).unwrap());
         reset_for_test();

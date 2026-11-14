@@ -1,5 +1,84 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 Review29 integration continuation — EmeraldEagle, 20:22 UTC
+
+- [x] Preserve source24e252aa and qualification62bc874d. Normal push raced
+  with upstream51e327b8 and was rejected. Fetch/normal merge c9cf9905 plus
+  Beads import preserve both histories; concurrent local8e046aec adds TUI
+  changes. Earlier passes retain exact8a92/overlay scope, not current-head proof.
+- [x] Freeze committed integration input8e046aece16a3f9347d88d98af47c61d41d67a9e;
+  use strict RCH --no-overlay. Predeclare20 tools cases: original14 plus the
+  five incoming archive-read decisions and public thread/product writer-read case.
+- [x] Correct launcher error: both first worker guards refused with live30GiB
+  reservations. The launcher nevertheless queued two attempts. Cancel only
+  own rchw-26271514 and rchw-65c9f093 before start; both terminal130, admission
+  null, recovered/acknowledged. No remote execution or code/test result credited.
+  Inspect actual terminal preflight status before every replacement submission.
+- [x] Select workers with passing unchanged30GiB proposal/10GiB floor guards:
+  compiler vmi1149989 (guard0, no active reservation); native hz4 (guard0,
+  124,575,920,128 free/40,802,189,312 already reserved bytes). Submit only
+  after observing those terminal passes. Original queued130s stay separate.
+- [x] Run integration workspace/all-targets check on the frozen commit;
+  actual terminal101 is retained below, not credited as a passing check.
+- [x] Preserve its actual terminal101: six E0603/E0624 errors because three
+  new archive-read fixtures call the storage-private mutation guard. Stop
+  the matching native8e attempt rather than finish known-broken input;
+  local143/daemon130/recovered-delivery120 are retained, with no test credit.
+- [x] Keep the guard private; expose a non-default test-internals closure
+  over the same real RAII guard and enable it only in tools dev-dependencies.
+  Move the three fixtures into that scope; every assertion, data expectation
+  and ten-second bound is preserved. No fake epoch/state or default production API.
+- [x] Manually correct formatting and freeze four overlay files on8e;
+  direct fmt2=0, initial fmt1 retained. Rerun all gates on this repaired input,
+  including separate production graph so dev-only exposure cannot hide errors.
+- [x] Recheck integration workspace/all-targets after that fixture repair:
+  terminal0/Cargo13m30s on1156, base8e/overlay57354a9d/tree b170b812.
+  Keep earlier no-overlay101 and aborted/admission-refused native attempts.
+- [x] Run separate integration production workspace/lib+bins check:
+  terminal0/Cargo4m42s on hz4, same base8e/four-file overlay57354a9d.
+- [x] Check formatting directly: fmt2 terminal0. Whole-file UBS scans report
+  statusok/no failed modules: archive_read critical0/warning303/info80;
+  storage lib0/5060/1260. Preserve warnings and earlier formatting failures.
+- [x] Run integration strict workspace/all-target Clippy: terminal101 on hz4.
+  Preserve one significant-drop diagnostic in the incoming live-read test
+  and five assert-is-empty diagnostics in the incoming shared-receipt test.
+  Add explicit drop after final state use; use identical typed empty-vector
+  expectations. No suppression, weakened assertion or expected-value change.
+- [x] Check lint-only corrections' formatting directly: fmt2 terminal0;
+  retain initial line-wrap fmt1. Predeclare the affected live-read test and
+  shared-message receipt test before their five-file-overlay native execution.
+- [x] Verify final workspace/all-targets check after the test-only fixes:
+  terminal0/Cargo9m32s on hz2, base8e/five-file overlaya9b7f56b.
+  Keep earlier four-file results and admission failures separately scoped.
+- [x] Finish final production workspace/lib+bins check on the same5-file input:
+  terminal0/Cargo4m20s on hz2; exact base8e/overlaya9b7f56b receipt retained.
+- [x] Finish final strict workspace/all-target Clippy on the same5-file input:
+  terminal0/Cargo44m47s on129. No warning suppression or gate relaxation.
+- [x] Execute the two affected native cases: run89fe9153-0e55-4a6d-9480-
+  5a952249e031, terminal0/2PASS/6925skipped/8.889s after Cargo21m30s.
+  Exact unique-name census matches; base8e/five-file overlaya9b7f56b.
+  Tools ELF aa9f7c1867e81f8a78dabd7450b9100212f7ddd8b25ddb460d069ebc2f63f7cd;
+  server ELF ee57d121c8456a5521bf0ff8d4d0ebe814e4c003042fb4a80cfeffdf355a7c6a.
+  Complete-file UBS messages terminal0/statusok/critical0/warning805/info250;
+  archive_read0/303/80. No broader TUI acceptance from this selected test.
+- [x] Execute the predeclared20 native cases: run83b41788-15a5-4ad9-9dc5-
+  b5bab5c2e2d1, terminal0/20PASS/1274skipped/79.244s after Cargo15m59s.
+  Exact first-report unique-name census matches; base8e/overlay57354a9d/
+  tree b170b812, worker hz4, rustc908501772. Executable SHA256
+  088fac571ba2dac74cc0f00dc294bcee4631110771bb44c411cc88608e5a09c3.
+  Keep unexecuted peer TUI/maintenance runtime acceptance open; these tools
+  cases do not qualify every incoming path, HTTP/restart or release behavior.
+- [x] Record scoped integration evidence in br-kp1in.19 comment4396; keep
+  original acceptance and in_progress status. Preserve all2871 IDs and every
+  prior comment in both exports; only own comments/updated_at change.
+  Flush0/cycles0; source10-file manifest unchanged. Complete the final source
+  reread: no further concrete defect, no independent-review/release claim.
+- [x] Prepare one source/qualification publication with the owned five code
+  files, existing plan and two exports. Preserve newer peer8e..b4 history;
+  those additions retain unqualified runtime/static scope. Actual normal
+  merge/push/ref verification and owned-lease release receipts are finalized
+  after execution in the retained review-audit.md, without a status-only commit.
+
 ## November 14 committed force-release review — EmeraldEagle, 18:40 UTC
 
 - [x] Reread the latest quarantine/lint repair and callers; no new defect

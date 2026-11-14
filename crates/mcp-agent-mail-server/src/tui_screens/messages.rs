@@ -10951,9 +10951,18 @@ first body
                 assert_eq!(names[&shared], format!("project:{slug}"));
                 assert_eq!(names[&overlap], format!("BlueLake, project:{slug}"));
             });
-            assert!(shared_recipient_receipts(shared).is_empty());
-            assert!(shared_recipient_receipts(untouched).is_empty());
-            assert!(recipient_receipts(shared).is_empty());
+            assert_eq!(
+                shared_recipient_receipts(shared),
+                Vec::<(String, Option<i64>, Option<i64>)>::new()
+            );
+            assert_eq!(
+                shared_recipient_receipts(untouched),
+                Vec::<(String, Option<i64>, Option<i64>)>::new()
+            );
+            assert_eq!(
+                recipient_receipts(shared),
+                Vec::<(String, bool, bool)>::new()
+            );
             assert_eq!(
                 recipient_receipts(overlap),
                 [("BlueLake".to_string(), false, false)]
@@ -11013,7 +11022,10 @@ first body
                 recipient_receipts(shared).is_empty(),
                 "ACK does not fan out direct deliveries"
             );
-            assert!(shared_recipient_receipts(untouched).is_empty());
+            assert_eq!(
+                shared_recipient_receipts(untouched),
+                Vec::<(String, Option<i64>, Option<i64>)>::new()
+            );
 
             with_operator_test_conn(|conn| {
                 conn.execute_raw(
@@ -11033,7 +11045,10 @@ first body
                 ],
                 "all selected deliveries are checked before the first write"
             );
-            assert!(shared_recipient_receipts(untouched).is_empty());
+            assert_eq!(
+                shared_recipient_receipts(untouched),
+                Vec::<(String, Option<i64>, Option<i64>)>::new()
+            );
         });
     }
 

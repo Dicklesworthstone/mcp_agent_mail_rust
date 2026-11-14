@@ -44,6 +44,7 @@ tempfile = "3"
 [features]
 default = ["mcp-agent-mail-db/default"]
 portable = ["mcp-agent-mail-db/portable"]
+test-internals = []
 
 [dev-dependencies]
 # Enable asupersync `test-internals` for TEST builds only so tests can

@@ -933,6 +933,16 @@ impl Drop for ArchiveMutationGuard {
     }
 }
 
+/// Run a cross-crate test action inside the real physical mutation window.
+/// The private guard remains on this thread and unwinds with the action.
+#[cfg(any(test, feature = "test-internals"))]
+#[doc(hidden)]
+#[track_caller]
+pub fn with_archive_mutation_for_test<T>(path: &Path, action: impl FnOnce() -> T) -> T {
+    let _mutation = ArchiveMutationGuard::begin_at(path);
+    action()
+}
+
 /// Run a non-blocking snapshot publication check while physical archive
 /// mutations are excluded. The callback must not initiate an archive write.
 #[track_caller]
