@@ -818,9 +818,6 @@ fn reclaim_empty_rotation_directories(
     report: &mut RotateReport,
     mut admit: impl FnMut(Option<Instant>) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    if *remaining == 0 {
-        return Ok(());
-    }
     let root = storage_root.join("doctor/reclaimable");
     for ancestor in [storage_root.join("doctor"), root.clone()] {
         match fs::symlink_metadata(&ancestor) {
@@ -835,6 +832,14 @@ fn reclaim_empty_rotation_directories(
         }
     }
     for entry in fs::read_dir(&root)?.take(MAX_INVENTORY_ENTRIES) {
+        if *remaining == 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            // The lookahead is unfinished, not evidence that every remaining
+            // directory is protected. Resume with a fresh attempt budget;
+            // do not spend another turn's CPU proving that here.
+            report.note_deadline();
+            report.defer_work();
+            break;
+        }
         let entry = entry?;
         if !is_native_rotation_directory(&entry.file_name()) {
             continue;
@@ -843,6 +848,14 @@ fn reclaim_empty_rotation_directories(
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_dir() || fs::read_dir(&path)?.next().transpose()?.is_some() {
             continue;
+        }
+        // While time remains, look for another eligible batch rather than
+        // infer deferred work from reaching the attempt cap alone. This also
+        // finds a batch emptied by the intervening payload sweep.
+        // No snapshot admission or deletion is attempted after this boundary.
+        if *remaining == 0 {
+            report.defer_work();
+            break;
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline)
             && first_unit_admitted_at.is_none()
@@ -865,9 +878,6 @@ fn reclaim_empty_rotation_directories(
                     break;
                 }
             }
-        }
-        if *remaining == 0 {
-            break;
         }
     }
     Ok(())
@@ -5782,6 +5792,243 @@ mod tests {
             kind.bytes_unlinked_with_unobserved_readers,
             report.bytes_unlinked_with_unobserved_readers
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_directory_limit_defers_only_remaining_native_batches() {
+        for count in [
+            MAX_RECLAIM_DIRECTORIES_PER_PASS,
+            MAX_RECLAIM_DIRECTORIES_PER_PASS + 1,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let primary = tmp.path().join("storage.sqlite3");
+            fs::write(&primary, b"live mailbox sentinel").unwrap();
+            let reclaimable = tmp.path().join("doctor/reclaimable");
+            create_fixture_directory(&reclaimable);
+            let unknown = reclaimable.join("operator-empty-evidence");
+            let recorded = reclaimable.join("rotation-20000101T000000Z");
+            let nested = reclaimable.join("rotation-20000101T000000Z-1");
+            create_fixture_directory(&unknown);
+            create_fixture_directory(&recorded);
+            fs::write(
+                recorded.join("manifest.json"),
+                b"recovery transaction evidence",
+            )
+            .unwrap();
+            create_fixture_directory(nested.join("unfinished-stage"));
+            for index in 0..count {
+                create_fixture_directory(
+                    reclaimable.join(format!("rotation-20000101T000000Z-{}", index + 10)),
+                );
+            }
+
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "true")],
+                || {
+                    // Isolate the original item bound from elapsed time. The
+                    // background deadline is covered by the spent-slice tests.
+                    let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+                    assert!(report.failures.is_empty(), "{report:?}");
+                    assert!(!report.inventory_incomplete);
+                    assert!(!report.admission_refused);
+                    assert_eq!(
+                        report.empty_directories_deleted,
+                        MAX_RECLAIM_DIRECTORIES_PER_PASS
+                    );
+                    assert_eq!(
+                        report.work_deferred(),
+                        count > MAX_RECLAIM_DIRECTORIES_PER_PASS,
+                        "the last permitted removal is not itself deferred work: {report:?}"
+                    );
+                    assert_eq!(report.deleted, 0);
+                    assert_eq!(report.bytes_reclaimed, 0);
+                    assert_eq!(
+                        fs::read_dir(&reclaimable).unwrap().count(),
+                        count - MAX_RECLAIM_DIRECTORIES_PER_PASS + 3
+                    );
+
+                    let finished = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+                    assert!(finished.failures.is_empty(), "{finished:?}");
+                    assert_eq!(
+                        finished.empty_directories_deleted,
+                        count - MAX_RECLAIM_DIRECTORIES_PER_PASS
+                    );
+                    assert!(
+                        !finished.work_deferred(),
+                        "protected and nonempty entries cannot keep continuation alive: {finished:?}"
+                    );
+                    assert_eq!(fs::read_dir(&reclaimable).unwrap().count(), 3);
+                },
+            );
+            assert_eq!(fs::read(&primary).unwrap(), b"live mailbox sentinel");
+            assert_eq!(
+                fs::read(recorded.join("manifest.json")).unwrap(),
+                b"recovery transaction evidence"
+            );
+            assert!(unknown.is_dir());
+            assert!(nested.join("unfinished-stage").is_dir());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_empty_directory_lookahead_preserves_continuation_after_progress() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let live = fs::read(&primary).unwrap();
+        let backup = mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary);
+        let reclaimable = tmp.path().join("doctor/reclaimable");
+        for index in 0..MAX_RECLAIM_DIRECTORIES_PER_PASS {
+            create_fixture_directory(
+                reclaimable.join(format!("rotation-20000101T000000Z-{}", index + 1)),
+            );
+        }
+        let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+        let mut remaining = MAX_RECLAIM_DIRECTORIES_PER_PASS;
+        let mut first_unit = None;
+        let mut report = RotateReport::default();
+        reclaim_empty_rotation_directories(
+            tmp.path(),
+            &mut remaining,
+            None,
+            &mut first_unit,
+            &mut report,
+            |_| guard.revalidate(),
+        )
+        .unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            report.empty_directories_deleted,
+            MAX_RECLAIM_DIRECTORIES_PER_PASS
+        );
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert!(!report.work_deferred());
+        assert!(fs::read_dir(&reclaimable).unwrap().next().is_none());
+
+        let recorded = reclaimable.join("rotation-20000101T000000Z");
+        let empty = reclaimable.join("rotation-20000102T000000Z");
+        create_fixture_directory(&recorded);
+        fs::write(
+            recorded.join("manifest.json"),
+            b"retained recovery evidence",
+        )
+        .unwrap();
+        create_fixture_directory(&empty);
+        let mut admissions = 0;
+        reclaim_empty_rotation_directories(
+            tmp.path(),
+            &mut remaining,
+            Some(Instant::now()),
+            &mut first_unit,
+            &mut report,
+            |_| {
+                admissions += 1;
+                guard.revalidate()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            admissions, 0,
+            "expired lookahead cannot reacquire deletion admission"
+        );
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            report.empty_directories_deleted,
+            MAX_RECLAIM_DIRECTORIES_PER_PASS
+        );
+        assert_eq!(
+            report.budget_state,
+            RotationBudgetState::DeadlineWithDeferredWork
+        );
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert!(empty.is_dir());
+        assert_eq!(fs::read_dir(&reclaimable).unwrap().count(), 2);
+        drop(guard);
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "true")],
+            || {
+                let finished = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+                assert!(finished.failures.is_empty(), "{finished:?}");
+                assert_eq!(finished.empty_directories_deleted, 1);
+                assert!(!finished.work_deferred());
+                assert!(!empty.exists());
+                assert_eq!(fs::read_dir(&reclaimable).unwrap().count(), 1);
+            },
+        );
+        assert_eq!(
+            fs::read(recorded.join("manifest.json")).unwrap(),
+            b"retained recovery evidence"
+        );
+        assert_eq!(fs::read(&primary).unwrap(), live);
+        assert_eq!(fs::read(backup).unwrap(), live);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spent_directory_limit_defers_a_batch_emptied_by_payload_reclamation() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let live = fs::read(&primary).unwrap();
+        let backup = mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary);
+        let metadata_path = mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary);
+        let metadata = fs::read(&metadata_path).unwrap();
+        let newer = ["20010101_000000", "20010102_000000"].map(|generation| {
+            let path = tmp.path().join(format!("storage.sqlite3.bak.{generation}"));
+            fs::copy(&primary, &path).unwrap();
+            path
+        });
+        let reclaimable = tmp.path().join("doctor/reclaimable");
+        for index in 0..MAX_RECLAIM_DIRECTORIES_PER_PASS {
+            create_fixture_directory(
+                reclaimable.join(format!("rotation-20000101T000000Z-{}", index + 1)),
+            );
+        }
+        let historical = reclaimable.join("rotation-19991231T235959Z");
+        create_fixture_directory(&historical);
+        let payload = historical.join("storage.sqlite3.bak.19990101_000000");
+        fs::copy(&primary, &payload).unwrap();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "true")],
+            || {
+                let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+                assert!(report.failures.is_empty(), "{report:?}");
+                assert!(!report.inventory_incomplete);
+                assert!(!report.admission_refused);
+                assert_eq!(
+                    report.empty_directories_deleted,
+                    MAX_RECLAIM_DIRECTORIES_PER_PASS
+                );
+                assert_eq!(
+                    report.deleted, 1,
+                    "the real historical payload is reclaimed"
+                );
+                assert!(!payload.exists());
+                assert!(historical.is_dir());
+                assert!(fs::read_dir(&historical).unwrap().next().is_none());
+                assert!(
+                    report.work_deferred(),
+                    "the post-payload sweep must report the new empty batch despite its spent item budget"
+                );
+                assert_eq!(fs::read_dir(&reclaimable).unwrap().count(), 1);
+
+                let finished = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+                assert!(finished.failures.is_empty(), "{finished:?}");
+                assert_eq!(finished.empty_directories_deleted, 1);
+                assert_eq!(finished.deleted, 0);
+                assert!(!finished.work_deferred());
+                assert!(!historical.exists());
+                assert!(fs::read_dir(&reclaimable).unwrap().next().is_none());
+            },
+        );
+        assert_eq!(fs::read(&primary).unwrap(), live);
+        assert_eq!(fs::read(&backup).unwrap(), live);
+        assert_eq!(fs::read(metadata_path).unwrap(), metadata);
+        for path in newer {
+            assert_eq!(fs::read(path).unwrap(), live);
+        }
     }
 
     #[cfg(unix)]
