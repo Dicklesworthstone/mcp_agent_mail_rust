@@ -132,9 +132,13 @@
   feature or release-readiness credit. First25/1, failed link101, invocation
   mistakes and improperly admitted diagnostic remain on record. Newer incoming
   origin86c peer code is outside this frozen3722+5d962da6 qualification.
-- [ ] Flush/validate tracker changes and empty dependency cycles; publish only
-  scoped changes while preserving peer work, verify both required remote refs,
-  and release only this review's own leases1844/1851/1852/1853.
+- [x] Flush/validate both2870-issue exports and empty dependency cycles;
+  publish scoped source5ee47668 normally and preserve all four incoming peer
+  commits through conflict-free merge47de230c. Both required remote refs are
+  actually47de at09:14:45UTC. Source5ee matches39 qualified code/config hashes;
+  newer merged peer additions remain outside the frozen qualification above.
+  Final tracking-publication/ref checks and exact own1844/1851/1852/1853 lease
+  release are recorded after execution in the existing external review audit.
 
 ## November 13 warmup deadline review — EmeraldEagle, 23:20 UTC
 
