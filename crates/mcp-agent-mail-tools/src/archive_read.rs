@@ -203,6 +203,15 @@ static WRITER_EPOCH: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static TEST_BUILD_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+static TEST_LIVE_DECISION_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static LIVE_READ_AFTER_COMPARISON_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn canonicalish(path: &Path) -> Result<PathBuf, AcquireError> {
     if let Ok(canonical) = path.canonicalize() {
         return Ok(canonical);
@@ -668,6 +677,122 @@ fn private_snapshot_probe(path: &Path) -> Result<mcp_agent_mail_db::DbConn, Stri
     conn.execute_raw("PRAGMA query_only = ON;")
         .map_err(|error| error.to_string())?;
     Ok(conn)
+}
+
+#[cfg(unix)]
+fn live_primary_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::symlink_metadata(path).ok()?;
+    // The guarded database connection retains the inode during comparison.
+    // Opening and closing an extra raw fd here could drop this process's
+    // SQLite fcntl locks, so identity sampling must stay descriptor-neutral.
+    metadata.is_file().then(|| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn live_primary_identity(path: &Path) -> Option<same_file::Handle> {
+    // Retain the Windows file identity with the existing no-follow opener.
+    // Neither size nor timestamps identify a file across ordinary writes.
+    let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path).ok()?;
+    same_file::Handle::from_file(file).ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn live_primary_identity(_path: &Path) -> Option<()> {
+    None
+}
+
+/// Compare the archive with one committed live database snapshot. A durable
+/// writer may remain active throughout this read: a deferred transaction
+/// requires no writer lease and keeps the separate inventory queries coherent.
+fn live_snapshot_requires_archive(
+    conn: &mcp_agent_mail_db::GuardedReadOnlyConn,
+    scope: &Scope,
+    database_url: &str,
+    inventory: &mcp_agent_mail_db::ArchiveMessageInventory,
+) -> Result<bool, AcquireError> {
+    conn.execute_raw("BEGIN").map_err(AcquireError::failed)?;
+    let result = (|| {
+        // Opening a SQLite file alone does not prove its message table can be
+        // read. This also pins the snapshot before the multi-query inventory.
+        conn.query_sync("SELECT id FROM messages LIMIT 1", &[])
+            .map_err(AcquireError::failed)?;
+        if crate::tool_util::read_archive_inventory_has_state(inventory)
+            && crate::tool_util::live_db_is_suspect(
+                database_url,
+                &scope.storage_root,
+                &scope.sqlite_path,
+            )
+        {
+            return Ok(true);
+        }
+        crate::tool_util::read_archive_is_ahead(
+            &scope.storage_root,
+            &scope.sqlite_path,
+            conn,
+            inventory,
+        )
+        .map_err(AcquireError::Failed)
+    })();
+    // This owned, query-only connection is never returned to a pool. Finish
+    // its transaction even if a query failed; no caller cancellation can skip
+    // cleanup or turn an incomplete comparison into a positive decision.
+    let finished = conn.execute_raw("ROLLBACK").map_err(AcquireError::failed);
+    result.and_then(|required| finished.map(|()| required))
+}
+
+/// Prove only that the existing live database is sufficient for this read.
+///
+/// GH#388: choosing the live source must not require every unrelated tool to
+/// drop its durable write lease. We still require a stable archive observation
+/// and a real live read snapshot. Missing, suspect or archive-ahead state, and
+/// ambiguous archive/probe results, retain the ordinary reconstruction path.
+/// No result is cached: a later archive publication or database replacement
+/// must be compared afresh rather than inheriting an earlier Live decision.
+fn live_read_is_sufficient(
+    scope: &Scope,
+    database_url: &str,
+    cx: &Cx,
+) -> Result<bool, AcquireError> {
+    if cx.is_cancel_requested() {
+        return Err(AcquireError::Cancelled);
+    }
+    let Ok(before) = archive_generation(scope) else {
+        return Ok(false);
+    };
+    let Some(primary_before) = live_primary_identity(&scope.sqlite_path) else {
+        return Ok(false);
+    };
+    let Ok(conn) = live_probe(&scope.sqlite_path) else {
+        return Ok(false);
+    };
+    if live_primary_identity(&scope.sqlite_path).as_ref() != Some(&primary_before) {
+        return Ok(false);
+    }
+    let inventory = crate::tool_util::read_archive_inventory(&scope.storage_root);
+    if cx.is_cancel_requested() {
+        return Err(AcquireError::Cancelled);
+    }
+    if inventory.parse_errors != 0
+        || !matches!(
+            live_snapshot_requires_archive(&conn, scope, database_url, &inventory),
+            Ok(false)
+        )
+    {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    if let Some(hook) = LIVE_READ_AFTER_COMPARISON_TEST_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    if cx.is_cancel_requested() {
+        return Err(AcquireError::Cancelled);
+    }
+    Ok(
+        live_primary_identity(&scope.sqlite_path).as_ref() == Some(&primary_before)
+            && archive_generation(scope).is_ok_and(|after| after == before),
+    )
 }
 
 fn snapshot_required(
@@ -1318,6 +1443,20 @@ pub fn acquire_if_needed(
             }
         }
 
+        // A transient physical archive mutation may have prevented the first
+        // live comparison. Retry it on every acquisition pass: otherwise a
+        // healthy read could remain trapped behind a long-lived durable writer
+        // even after that short archive window has ended.
+        let live = live_read_is_sufficient(&slot.scope, database_url, cx)?;
+        #[cfg(test)]
+        TEST_LIVE_DECISION_ATTEMPTS.fetch_add(1, Ordering::Release);
+        if cx.is_cancel_requested() {
+            return Err(AcquireError::Cancelled);
+        }
+        if live {
+            return Ok(None);
+        }
+
         let build = if let Some(build) = building {
             build
         } else {
@@ -1364,6 +1503,7 @@ pub fn reset_for_test() {
     registry.slots.clear();
     drop(registry);
     TEST_BUILD_DELAY_MS.store(0, Ordering::Release);
+    TEST_LIVE_DECISION_ATTEMPTS.store(0, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -1782,6 +1922,294 @@ mod tests {
             "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[],\"cc\":[],\"bcc\":[],\"subject\":\"hello\",\"body_md\":\"body\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-07-19T00:00:00Z\",\"attachments\":[]}\n---\n\nbody\n",
         )
         .expect("write message");
+    }
+
+    fn live_read_fixture() -> (tempfile::TempDir, Arc<Slot>, String) {
+        let (directory, slot, database_url) = retirement_fixture();
+        let stats = mcp_agent_mail_db::reconstruct_from_archive(
+            &slot.scope.sqlite_path,
+            &slot.scope.storage_root,
+        )
+        .expect("seed a real database matching the archive");
+        assert_eq!(stats.messages, 1);
+        (directory, slot, database_url)
+    }
+
+    fn add_second_archive_message(storage_root: &Path) {
+        let _mutation = mcp_agent_mail_storage::ArchiveMutationGuard::begin_at(storage_root);
+        fs::write(
+            storage_root.join(
+                "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-01Z__later__2.md",
+            ),
+            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[],\"cc\":[],\"bcc\":[],\"subject\":\"later\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-07-19T00:00:01Z\",\"attachments\":[]}\n---\n\narchive-only body\n",
+        )
+        .expect("publish a later canonical archive message");
+    }
+
+    #[test]
+    fn live_read_decision_ignores_same_and_unrelated_durable_writers() {
+        if isolated_retirement_test() {
+            return;
+        }
+        let (_directory, slot, database_url) = live_read_fixture();
+        for same_mailbox in [true, false] {
+            let other_root = slot.scope.storage_root.with_file_name("other-archive");
+            let other_path = slot.scope.sqlite_path.with_file_name("other.sqlite3");
+            let writer = if same_mailbox {
+                WriteGuard::begin(&slot.scope.storage_root, Some(&slot.scope.sqlite_path))
+            } else {
+                WriteGuard::begin(&other_root, Some(&other_path))
+            };
+            let cx = Cx::for_testing();
+            let cancelled = cx.clone();
+            let (finished, completion) = mpsc::channel();
+            let watchdog = std::thread::spawn(move || {
+                if completion.recv_timeout(Duration::from_secs(10)).is_err() {
+                    cancelled.set_cancel_requested(true);
+                }
+            });
+            let result = acquire_if_needed(
+                &slot.scope.storage_root,
+                &slot.scope.sqlite_path,
+                &database_url,
+                &cx,
+            );
+            let _ = finished.send(());
+            watchdog.join().expect("join bounded read watchdog");
+            let returned_while_writer_active = WRITERS_ACTIVE.load(Ordering::Acquire) != 0;
+            drop(writer);
+            assert!(returned_while_writer_active);
+            assert!(
+                matches!(result, Ok(None)),
+                "a current live database must remain readable with same_mailbox={same_mailbox}: {:?}",
+                result.err()
+            );
+            assert_eq!(slot.reconstructions.load(Ordering::Acquire), 0);
+            let state = slot.state.lock().unwrap();
+            assert!(state.building.is_none());
+            assert!(
+                state.ready.is_none(),
+                "the positive live proof is not cached"
+            );
+        }
+        reset_for_test();
+    }
+
+    #[test]
+    fn live_read_decision_retries_after_physical_archive_contention() {
+        if isolated_retirement_test() {
+            return;
+        }
+        let (_directory, slot, database_url) = live_read_fixture();
+        let writer = WriteGuard::begin(&slot.scope.storage_root, Some(&slot.scope.sqlite_path));
+        let mutation =
+            mcp_agent_mail_storage::ArchiveMutationGuard::begin_at(&slot.scope.storage_root);
+        let cx = Cx::for_testing();
+        let reader_cx = cx.clone();
+        let reader_scope = slot.scope.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = acquire_if_needed(
+                &reader_scope.storage_root,
+                &reader_scope.sqlite_path,
+                &database_url,
+                &reader_cx,
+            );
+            let _ = result_tx.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TEST_LIVE_DECISION_ATTEMPTS.load(Ordering::Acquire) == 0 && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let attempted_while_archive_busy = TEST_LIVE_DECISION_ATTEMPTS.load(Ordering::Acquire) != 0;
+        let premature = result_rx.try_recv();
+        drop(mutation);
+        let result = result_rx.recv_timeout(Duration::from_secs(10));
+        cx.set_cancel_requested(true);
+        reader.join().expect("join live decision reader");
+        let returned_while_writer_active = WRITERS_ACTIVE.load(Ordering::Acquire) != 0;
+        drop(writer);
+        assert!(attempted_while_archive_busy);
+        assert!(
+            premature.is_err(),
+            "physical archive ambiguity must not certify Live"
+        );
+        assert!(returned_while_writer_active);
+        assert!(
+            matches!(result, Ok(Ok(None))),
+            "the live read must complete before the durable writer releases its lease"
+        );
+        assert!(TEST_LIVE_DECISION_ATTEMPTS.load(Ordering::Acquire) >= 2);
+        assert_eq!(slot.reconstructions.load(Ordering::Acquire), 0);
+        reset_for_test();
+    }
+
+    #[test]
+    fn live_read_decision_rechecks_archive_after_a_cached_live_choice() {
+        if isolated_retirement_test() {
+            return;
+        }
+        let (_directory, slot, database_url) = live_read_fixture();
+        let build = claim_build(&slot, Instant::now() + BUILD_TIMEOUT)
+            .expect("claim the original live decision")
+            .expect("own the original live decision");
+        let output = run_build(&slot, &database_url, &build).expect("original live decision");
+        assert!(matches!(output.decision, Decision::Live));
+        finish_build(&slot, &build, Ok(output));
+        assert!(matches!(build.completion.result(), Some(Ok(()))));
+
+        // Advance the native epoch without committing Git. A previous Live
+        // decision must not hide durable archive-only mail at the next read.
+        add_second_archive_message(&slot.scope.storage_root);
+        let writer = WriteGuard::begin(&slot.scope.storage_root, Some(&slot.scope.sqlite_path));
+        let cx = Cx::for_testing();
+        assert!(!live_read_is_sufficient(&slot.scope, &database_url, &cx).unwrap());
+        assert!(matches!(
+            claim_build(&slot, Instant::now() + BUILD_TIMEOUT),
+            Err(AcquireError::Busy(_))
+        ));
+        drop(writer);
+        let snapshot = acquire_if_needed(
+            &slot.scope.storage_root,
+            &slot.scope.sqlite_path,
+            &database_url,
+            &cx,
+        )
+        .expect("archive-ahead recovery read")
+        .expect("archive-ahead evidence must still reconstruct");
+        let rows = private_snapshot_probe(snapshot.path())
+            .unwrap()
+            .query_sync("SELECT id FROM messages ORDER BY id", &[])
+            .unwrap();
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|row| row.get_named::<i64>("id").unwrap())
+            .collect();
+        assert_eq!(ids, [1, 2]);
+        let live_rows = live_probe(&slot.scope.sqlite_path)
+            .unwrap()
+            .query_sync("SELECT id FROM messages ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(
+            live_rows.len(),
+            1,
+            "read fallback must not repair the live database"
+        );
+        drop(snapshot);
+        reset_for_test();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_read_decision_rejects_replacement_epoch_change_and_cancellation() {
+        if isolated_retirement_test() {
+            return;
+        }
+        let (_directory, slot, database_url) = live_read_fixture();
+        let cx = Cx::for_testing();
+        let cancelled = cx.clone();
+        LIVE_READ_AFTER_COMPARISON_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || cancelled.set_cancel_requested(true)));
+        });
+        assert!(matches!(
+            live_read_is_sufficient(&slot.scope, &database_url, &cx),
+            Err(AcquireError::Cancelled)
+        ));
+
+        let cx = Cx::for_testing();
+        let replacement = slot.scope.sqlite_path.with_extension("replacement.sqlite3");
+        let retained = slot.scope.sqlite_path.with_extension("retained.sqlite3");
+        let replacement_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            replacement.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        replacement_conn
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        drop(replacement_conn);
+        let primary = slot.scope.sqlite_path.clone();
+        let retained_for_hook = retained.clone();
+        LIVE_READ_AFTER_COMPARISON_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&primary, &retained_for_hook).unwrap();
+                fs::rename(&replacement, &primary).unwrap();
+            }));
+        });
+        assert!(!live_read_is_sufficient(&slot.scope, &database_url, &cx).unwrap());
+        assert!(retained.exists(), "the earlier live family is retained");
+        assert!(!live_read_is_sufficient(&slot.scope, &database_url, &cx).unwrap());
+
+        // Restore by moving the smaller family aside, then change the archive
+        // during the comparison. The second archive marker must reject it.
+        fs::rename(
+            &slot.scope.sqlite_path,
+            slot.scope.sqlite_path.with_extension("smaller.sqlite3"),
+        )
+        .unwrap();
+        fs::rename(&retained, &slot.scope.sqlite_path).unwrap();
+        let archive_root = slot.scope.storage_root.clone();
+        LIVE_READ_AFTER_COMPARISON_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || add_second_archive_message(&archive_root)));
+        });
+        assert!(!live_read_is_sufficient(&slot.scope, &database_url, &cx).unwrap());
+        assert!(!live_read_is_sufficient(&slot.scope, &database_url, &cx).unwrap());
+        reset_for_test();
+    }
+
+    #[test]
+    fn live_read_decision_refuses_malformed_inventory_and_incomplete_live_schema() {
+        if isolated_retirement_test() {
+            return;
+        }
+        let (_directory, slot, database_url) = live_read_fixture();
+        {
+            let _mutation =
+                mcp_agent_mail_storage::ArchiveMutationGuard::begin_at(&slot.scope.storage_root);
+            fs::write(
+                slot.scope.storage_root.join(
+                    "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-02Z__malformed__3.md",
+                ),
+                "---json\n{malformed\n---\n\nretained evidence\n",
+            )
+            .unwrap();
+        }
+        let cx = Cx::for_testing();
+        assert!(!live_read_is_sufficient(&slot.scope, &database_url, &cx).unwrap());
+        reset_for_test();
+
+        // A readable SQLite file with no message table is not a positive Live
+        // proof, but remains recoverable by the original archive path.
+        let (_incomplete_directory, incomplete_slot, incomplete_url) = retirement_fixture();
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            incomplete_slot
+                .scope
+                .sqlite_path
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        conn.execute_raw("CREATE TABLE retained_evidence(value TEXT)")
+            .unwrap();
+        drop(conn);
+        assert!(live_probe(&incomplete_slot.scope.sqlite_path).is_ok());
+        assert!(!live_read_is_sufficient(&incomplete_slot.scope, &incomplete_url, &cx).unwrap());
+        let snapshot = acquire_if_needed(
+            &incomplete_slot.scope.storage_root,
+            &incomplete_slot.scope.sqlite_path,
+            &incomplete_url,
+            &cx,
+        )
+        .expect("recover the incomplete live schema")
+        .expect("retained archive truth still requires a snapshot");
+        let rows = private_snapshot_probe(snapshot.path())
+            .unwrap()
+            .query_sync("SELECT id FROM messages", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 1);
+        drop(snapshot);
+        reset_for_test();
     }
 
     fn snapshot_family(path: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {

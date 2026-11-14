@@ -1041,13 +1041,161 @@ mod tests {
     use fastmcp::McpContext;
     use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
 
-    /// Seeding pool for tests: the plain live pool WITHOUT a `WriteGuard`
-    /// lease. Holding `WriteDbPool`'s guard across the product-bus read
-    /// assertions starves the archive-read gate's claim admission for the
-    /// full 120s `BUILD_TIMEOUT` (br-lwwq5; same fix as
-    /// `resources::resource_shape_tests::seed_pool`).
+    /// Seeding pool without a retained writer lease, so ordinary tests also
+    /// exercise archive snapshot fallback when the live mailbox is behind.
     fn seed_pool() -> mcp_agent_mail_db::DbPool {
         get_db_pool().expect("db pool").clone()
+    }
+
+    #[test]
+    fn thread_and_product_reads_complete_while_a_durable_writer_remains_active() {
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+
+        // The held lease changes a process-global counter. Run this real-tool
+        // regression alone so parallel snapshot tests cannot mistake its
+        // deliberate writer for activity belonging to their own fixtures.
+        const CHILD: &str = "AM_TEST_ACTIVE_WRITER_PRODUCT_READS_CHILD";
+        let current = std::thread::current();
+        let name = current.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", name, "--nocapture"])
+                    .env(CHILD, name)
+                    .output()
+                    .expect("run isolated active-writer read test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "isolated {name} failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        static WRITER_READ_TEST_LOCK: Mutex<()> = Mutex::new(());
+        crate::test_support::with_isolated_mailbox(
+            &WRITER_READ_TEST_LOCK,
+            "thread and product reads with an active writer",
+            &[
+                ("WORKTREES_ENABLED", "1"),
+                ("MESSAGING_SESSION_IDENTITY", "0"),
+                ("AM_SEARCH_ENGINE", "lexical"),
+            ],
+            |mailbox| {
+                Config::reset_cached();
+                std::thread::scope(|scope| {
+                    RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("runtime")
+                        .block_on(async {
+                            let cx = Cx::current().expect("runtime context");
+                            let pool = seed_pool();
+                            let conn = pool.acquire(&cx).await.into_result().expect("seed connection");
+                            conn.execute_raw(
+                                r#"BEGIN IMMEDIATE;
+                                 INSERT INTO projects (id,slug,human_key,created_at)
+                                    VALUES (1,'writer-project','/writer-project',1);
+                                 INSERT INTO agents (id,project_id,name,program,model,inception_ts,last_active_ts)
+                                    VALUES (1,1,'RedFox','test','test',1,1),
+                                           (2,1,'BlueLake','test','test',1,1);
+                                 INSERT INTO products (id,product_uid,name,created_at)
+                                    VALUES (1,'0123456789abcdef0123456789abcdef','writer-product',1);
+                                 INSERT INTO product_project_links (product_id,project_id,created_at)
+                                    VALUES (1,1,1);
+                                 INSERT INTO messages (id,project_id,sender_id,thread_id,subject,body_md,created_ts,recipients_json)
+                                    VALUES (41,1,1,'ACTIVE-WRITERS','deploy safely','Writer-safe summary message',2,
+                                            '{"to":["BlueLake"],"cc":[],"bcc":[]}');
+                                 INSERT INTO message_recipients (message_id,agent_id,kind)
+                                    VALUES (41,2,'to');
+                                 COMMIT;"#,
+                            )
+                            .expect("seed thread and product delivery");
+                            drop(conn);
+
+                            let (started_tx, started_rx) = mpsc::channel();
+                            let (release_tx, release_rx) = mpsc::channel();
+                            let writer = scope.spawn(move || {
+                                let guard = crate::archive_read::WriteGuard::begin(
+                                    &mailbox.storage_root,
+                                    Some(&mailbox.database_path),
+                                );
+                                started_tx.send(()).expect("announce active writer");
+                                // On regression, release the writer so this test fails
+                                // without spending the 120-second snapshot deadline.
+                                let readers_finished =
+                                    release_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+                                drop(guard);
+                                readers_finished
+                            });
+                            started_rx
+                                .recv_timeout(Duration::from_secs(10))
+                                .expect("writer starts");
+                            let ctx = McpContext::new(cx, 1);
+                            let thread = crate::search::summarize_thread(
+                                &ctx,
+                                "/writer-project".into(),
+                                "ACTIVE-WRITERS".into(),
+                                Some(true),
+                                Some(false),
+                                None,
+                                None,
+                            )
+                            .await;
+                            let inbox = fetch_inbox_product(
+                                &ctx,
+                                "writer-product".into(),
+                                "BlueLake".into(),
+                                Some(10),
+                                Some(false),
+                                Some(true),
+                                None,
+                            )
+                            .await;
+                            let product_thread = summarize_thread_product(
+                                &ctx,
+                                "writer-product".into(),
+                                "ACTIVE-WRITERS".into(),
+                                Some(true),
+                                Some(false),
+                                None,
+                                None,
+                            )
+                            .await;
+                            let search =
+                                search_product_within(&ctx, "writer-product", "writer-project")
+                                    .await;
+                            let released_by_reader = release_tx.send(()).is_ok();
+                            let readers_finished = writer.join().expect("writer thread");
+                            assert!(
+                                released_by_reader && readers_finished,
+                                "read tools waited for the writer lease to end"
+                            );
+
+                            for response in [thread, product_thread] {
+                                let summary: serde_json::Value =
+                                    serde_json::from_str(&response.expect("thread summary"))
+                                        .expect("summary JSON");
+                                assert_eq!(summary["summary"]["total_messages"], 1);
+                                assert_eq!(summary["examples"][0]["id"], 41);
+                                assert_eq!(summary["examples"][0]["subject"], "deploy safely");
+                            }
+                            let inbox: serde_json::Value =
+                                serde_json::from_str(&inbox.expect("product inbox"))
+                                    .expect("inbox JSON");
+                            assert_eq!(inbox.as_array().expect("inbox array").len(), 1);
+                            assert_eq!(inbox[0]["id"], 41);
+                            assert_eq!(inbox[0]["body_md"], "Writer-safe summary message");
+                            let search: serde_json::Value =
+                                serde_json::from_str(&search.expect("product search"))
+                                    .expect("search JSON");
+                            assert_eq!(search["result"].as_array().expect("search results").len(), 1);
+                            assert_eq!(search["result"][0]["id"], 41);
+                        });
+                });
+            },
+        );
     }
 
     #[test]
