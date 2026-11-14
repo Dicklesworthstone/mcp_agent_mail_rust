@@ -7940,6 +7940,14 @@ fn atc_feature_vector_size(row: &ExperienceRow) -> usize {
 fn build_atc_experience_row(effect: &atc::AtcEffectPlan) -> Result<ExperienceRow, String> {
     let decision = atc::atc_decision_record(effect.decision_id)
         .ok_or_else(|| format!("missing ATC decision record {}", effect.decision_id))?;
+    // Numeric ledger IDs restart with the engine. A queued effect must never
+    // borrow a newer decision's evidence merely because its local ID was reused.
+    if decision.trace_id != effect.trace_id {
+        return Err(format!(
+            "ATC decision {} no longer matches the effect trace",
+            effect.decision_id
+        ));
+    }
     let effect_kind = atc_effect_kind(effect)?;
     let mut builder = ExperienceBuilder::new(
         decision.id,

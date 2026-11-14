@@ -1147,6 +1147,9 @@ pub enum AtcCommand {
         /// Decision ID from `atc_experiences.decision_id`.
         #[arg(value_name = "decision_id", value_parser = parse_positive_u64_arg)]
         decision_id: u64,
+        /// Select a decision trace when its numeric ID was reused after restart.
+        #[arg(long, value_name = "trace_id")]
+        trace_id: Option<String>,
         /// Output JSON instead of human-readable text.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -19244,6 +19247,7 @@ struct AtcSimulateStratumSummary {
 #[derive(Debug, Clone, serde::Serialize)]
 struct AtcSimulateDecisionDelta {
     decision_id: u64,
+    trace_id: String,
     subject: String,
     project_key: Option<String>,
     created_at: String,
@@ -19468,12 +19472,16 @@ fn format_atc_json_value(value: &serde_json::Value) -> String {
 fn query_atc_decision_rows(
     conn: &mcp_agent_mail_db::CanonicalDbConn,
     decision_id: u64,
+    trace_id: Option<&str>,
 ) -> CliResult<Vec<mcp_agent_mail_db::sqlmodel_core::Row>> {
     let sql_decision_id = i64::try_from(decision_id).map_err(|_| {
         CliError::InvalidArgument(format!(
             "decision_id exceeds SQLite INTEGER range: {decision_id}"
         ))
     })?;
+    let trace_value = trace_id.map_or(mcp_agent_mail_db::sqlmodel_core::Value::Null, |value| {
+        mcp_agent_mail_db::sqlmodel_core::Value::Text(value.to_string())
+    });
     conn.query_sync(
         "SELECT \
             experience_id, effect_id, state, subsystem, decision_class, subject, project_key, \
@@ -19483,11 +19491,13 @@ fn query_atc_decision_rows(
             resolved_ts, context_json, claim_id, evidence_id, trace_id, posterior_json, \
             non_execution_json \
          FROM atc_experiences \
-         WHERE decision_id = ? \
+         WHERE decision_id = ? AND (? IS NULL OR trace_id = ?) \
          ORDER BY experience_id ASC",
-        &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
-            sql_decision_id,
-        )],
+        &[
+            mcp_agent_mail_db::sqlmodel_core::Value::BigInt(sql_decision_id),
+            trace_value.clone(),
+            trace_value,
+        ],
     )
     .map_err(|error| {
         CliError::Other(format!(
@@ -19500,6 +19510,16 @@ fn build_atc_explain_report(
     decision_id: u64,
     rows: &[mcp_agent_mail_db::sqlmodel_core::Row],
 ) -> CliResult<AtcExplainReport> {
+    let trace_ids = rows
+        .iter()
+        .map(|row| atc_row_text_idx(row, 27))
+        .collect::<BTreeSet<_>>();
+    if trace_ids.len() > 1 {
+        return Err(CliError::InvalidArgument(format!(
+            "ATC decision {decision_id} matches multiple traces; select one with --trace-id: {}",
+            trace_ids.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
     let latest = rows
         .last()
         .ok_or_else(|| CliError::Other(format!("ATC decision {decision_id} not found")))?;
@@ -20071,7 +20091,8 @@ fn build_atc_simulation_report(
     let subject_filter = subject.map(str::trim).filter(|value| !value.is_empty());
     let simulated_policy = bundle.candidate.as_ref().unwrap_or(&bundle.incumbent);
 
-    let mut latest_by_decision = BTreeMap::<u64, mcp_agent_mail_core::ExperienceRow>::new();
+    let mut latest_by_decision =
+        BTreeMap::<(u64, String), mcp_agent_mail_core::ExperienceRow>::new();
     let mut experiences_considered = 0usize;
     for row in rows {
         if row.created_ts_micros < since_micros {
@@ -20085,7 +20106,7 @@ fn build_atc_simulation_report(
         }
         experiences_considered += 1;
         latest_by_decision
-            .entry(row.decision_id)
+            .entry((row.decision_id, row.trace_id.clone()))
             .and_modify(|current| {
                 if row.experience_id > current.experience_id {
                     *current = row.clone();
@@ -20159,6 +20180,7 @@ fn build_atc_simulation_report(
 
         deltas.push(AtcSimulateDecisionDelta {
             decision_id: row.decision_id,
+            trace_id: row.trace_id.clone(),
             subject: row.subject.clone(),
             project_key: row.project_key.clone(),
             created_at: mcp_agent_mail_db::micros_to_iso(row.created_ts_micros),
@@ -20205,6 +20227,7 @@ fn build_atc_simulation_report(
                     .total_cmp(&left.expected_loss_delta.abs())
             })
             .then_with(|| left.decision_id.cmp(&right.decision_id))
+            .then_with(|| left.trace_id.cmp(&right.trace_id))
     });
     let notable_divergences = deltas.iter().take(10).cloned().collect::<Vec<_>>();
 
@@ -20334,8 +20357,9 @@ fn render_atc_simulate_report(report: &AtcSimulateReport) {
         ftui_runtime::ftui_println!("Notable divergences");
         for delta in &report.notable_divergences {
             ftui_runtime::ftui_println!(
-                "  decision {} {} {} -> {} (delta {:.3})",
+                "  decision {} trace {} {} {} -> {} (delta {:.3})",
                 delta.decision_id,
+                delta.trace_id,
                 delta.subject,
                 delta.recorded_action,
                 delta.proposed_action,
@@ -20365,7 +20389,11 @@ fn render_atc_simulate_report(report: &AtcSimulateReport) {
 
 fn handle_atc(action: AtcCommand) -> CliResult<()> {
     match action {
-        AtcCommand::Explain { decision_id, json } => {
+        AtcCommand::Explain {
+            decision_id,
+            trace_id,
+            json,
+        } => {
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
             // Preserve the precondition that the mailbox DB is openable (fail
             // fast with the usual diagnostics if not), but read ATC telemetry
@@ -20378,17 +20406,22 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
                     mcp_agent_mail_db::pool::open_atc_sidecar_conn(&resolved.canonical_path)
                 });
             let rows = match atc_conn.as_ref() {
-                Some(conn) => query_atc_decision_rows(conn, decision_id)?,
+                Some(conn) => query_atc_decision_rows(conn, decision_id, trace_id.as_deref())?,
                 None => Vec::new(),
             };
             if rows.is_empty() {
+                let message = trace_id.as_ref().map_or_else(
+                    || format!("ATC decision not found: {decision_id}"),
+                    |trace_id| format!("ATC decision not found: {decision_id} (trace {trace_id})"),
+                );
                 let payload = serde_json::json!({
                     "decision_id": decision_id,
+                    "trace_id": trace_id,
                     "found": false,
-                    "error": format!("ATC decision not found: {decision_id}"),
+                    "error": message,
                 });
                 output::json_or_table(json, &payload, || {
-                    ftui_runtime::ftui_println!("ATC decision not found: {decision_id}");
+                    ftui_runtime::ftui_println!("{message}");
                 });
                 return Err(CliError::ExitCode(1));
             }
@@ -47851,6 +47884,49 @@ mod tests {
         );
     }
 
+    fn append_atc_decision_copy(
+        db_path: &Path,
+        storage_root: &Path,
+        decision_id: u64,
+        effect_id: u64,
+        trace_id: &str,
+    ) {
+        let pool = atc_explain_test_pool(db_path, storage_root);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build ATC fixture runtime");
+        let cx = asupersync::Cx::for_testing();
+        let stream = expect_db_outcome(
+            runtime.block_on(mcp_agent_mail_db::atc_queries::replay(
+                &cx,
+                &pool,
+                mcp_agent_mail_db::SequenceRange::default(),
+            )),
+            "read ATC fixture rows",
+        );
+        let mut row = stream
+            .rows
+            .into_iter()
+            .find(|row| row.decision_id == decision_id)
+            .expect("source decision");
+        row.experience_id = 0;
+        row.effect_id = effect_id;
+        row.trace_id = trace_id.to_string();
+        row.created_ts_micros += 10_000_000;
+        row.dispatched_ts_micros = row.dispatched_ts_micros.map(|ts| ts + 10_000_000);
+        row.executed_ts_micros = row.executed_ts_micros.map(|ts| ts + 10_000_000);
+        row.resolved_ts_micros = row.resolved_ts_micros.map(|ts| ts + 10_000_000);
+        if let Some(outcome) = row.outcome.as_mut() {
+            outcome.observed_ts_micros += 10_000_000;
+        }
+        expect_db_outcome(
+            runtime.block_on(mcp_agent_mail_db::queries::insert_experience(
+                &cx, &pool, row,
+            )),
+            "append ATC decision copy",
+        );
+    }
+
     fn write_atc_simulate_policy_bundle(
         path: &Path,
         release_losses: [f64; 3],
@@ -52816,12 +52892,45 @@ http_headers = { Authorization = "Bearer secret" }
             .expect("failed to parse atc explain");
         match cli.command.expect("expected command") {
             Commands::Atc { action } => match action {
-                AtcCommand::Explain { decision_id, json } => {
+                AtcCommand::Explain {
+                    decision_id,
+                    trace_id,
+                    json,
+                } => {
                     assert_eq!(decision_id, 77);
+                    assert_eq!(trace_id, None);
                     assert!(json);
                 }
                 other => panic!("unexpected atc action: {other:?}"),
             },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_atc_explain_trace_id() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "atc",
+            "explain",
+            "77",
+            "--trace-id",
+            "trc-atc-explain-77",
+            "--json",
+        ])
+        .expect("failed to parse trace-qualified atc explain");
+        match cli.command.expect("expected command") {
+            Commands::Atc {
+                action: AtcCommand::Explain {
+                    decision_id,
+                    trace_id,
+                    json,
+                },
+            } => {
+                assert_eq!(decision_id, 77);
+                assert_eq!(trace_id.as_deref(), Some("trc-atc-explain-77"));
+                assert!(json);
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -52850,6 +52959,7 @@ http_headers = { Authorization = "Bearer secret" }
         let (result, output) = run_atc_cmd_with_env_capture(
             AtcCommand::Explain {
                 decision_id: 77,
+                trace_id: None,
                 json: true,
             },
             &database_url,
@@ -52896,6 +53006,7 @@ http_headers = { Authorization = "Bearer secret" }
         let (result, output) = run_atc_cmd_with_env_capture(
             AtcCommand::Explain {
                 decision_id: 999,
+                trace_id: None,
                 json: false,
             },
             &database_url,
@@ -52910,6 +53021,70 @@ http_headers = { Authorization = "Bearer secret" }
             output.contains("ATC decision not found: 999"),
             "unexpected not-found output:\n{output}"
         );
+    }
+
+    #[test]
+    fn handle_atc_explain_requires_trace_for_reused_decision_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("atc-explain-restart.sqlite3");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        seed_atc_explain_db(&db_path, &storage_root);
+        let first_trace = "trc-atc-explain-77";
+        let second_trace = "trc-atc-explain-77-restarted";
+        append_atc_decision_copy(&db_path, &storage_root, 77, 178, second_trace);
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+
+        let (result, _) = run_atc_cmd_with_env_capture(
+            AtcCommand::Explain {
+                decision_id: 77,
+                trace_id: None,
+                json: true,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+        let error = result.expect_err("numeric ID alone is ambiguous").to_string();
+        assert!(error.contains("--trace-id"));
+        assert!(error.contains(first_trace));
+        assert!(error.contains(second_trace));
+
+        for (trace_id, experience_id) in [(first_trace, 1), (second_trace, 2)] {
+            let (result, output) = run_atc_cmd_with_env_capture(
+                AtcCommand::Explain {
+                    decision_id: 77,
+                    trace_id: Some(trace_id.to_string()),
+                    json: true,
+                },
+                &database_url,
+                &storage_root_text,
+            );
+            assert!(result.is_ok(), "trace-qualified explain failed: {result:?}");
+            let parsed: serde_json::Value =
+                serde_json::from_str(extract_json_block(&output).expect("explain JSON"))
+                    .expect("parse explain JSON");
+            assert_eq!(parsed["inputs"]["trace_id"], trace_id);
+            assert_eq!(parsed["effect_count"], 1);
+            assert_eq!(parsed["latest_experience_id"], experience_id);
+            assert_eq!(parsed["ledger"][0]["experience_id"], experience_id);
+        }
+
+        let (result, output) = run_atc_cmd_with_env_capture(
+            AtcCommand::Explain {
+                decision_id: 77,
+                trace_id: Some("missing-trace".to_string()),
+                json: true,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+        assert!(matches!(result, Err(CliError::ExitCode(1))));
+        let parsed: serde_json::Value =
+            serde_json::from_str(extract_json_block(&output).expect("missing trace JSON"))
+                .expect("parse missing trace JSON");
+        assert_eq!(parsed["found"], false);
+        assert_eq!(parsed["trace_id"], "missing-trace");
     }
 
     #[test]
@@ -53007,6 +53182,56 @@ http_headers = { Authorization = "Bearer secret" }
             report_path.exists(),
             "simulation artifact should be written"
         );
+    }
+
+    #[test]
+    fn handle_atc_simulate_keeps_restarted_decisions_and_deduplicates_their_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("atc-sim-restart.sqlite3");
+        let storage_root = temp.path().join("storage");
+        let policy_path = temp.path().join("policy.json");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        seed_atc_simulate_db(&db_path, &storage_root);
+        let first_trace = "trc-atc-sim-100";
+        let second_trace = "trc-atc-sim-100-restarted";
+        append_atc_decision_copy(&db_path, &storage_root, 100, 2100, first_trace);
+        append_atc_decision_copy(&db_path, &storage_root, 100, 2101, second_trace);
+        write_atc_simulate_policy_bundle(&policy_path, [8.0, 3.0, 0.2], None);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let (result, output) = run_atc_cmd_with_env_capture(
+            AtcCommand::Simulate {
+                scenario_id: "restart-identity".to_string(),
+                policy: policy_path.display().to_string(),
+                since: "2025-11-01T00:00:00Z".to_string(),
+                until: Some("2027-01-01T00:00:00Z".to_string()),
+                subject: None,
+                dry_run_confidence: 0.0,
+                output: None,
+                format: Some(output::CliOutputFormat::Json),
+                json: false,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+        assert!(result.is_ok(), "restart simulation failed: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(extract_json_block(&output).expect("simulate JSON"))
+                .expect("parse simulate JSON");
+        assert_eq!(parsed["experiences_considered"], 5);
+        assert_eq!(parsed["decisions_evaluated"], 3);
+        assert_eq!(parsed["same_action"], 3);
+        assert_eq!(parsed["different_action"], 0);
+        assert_eq!(parsed["rows_skipped_non_liveness"], 1);
+        let traces = parsed["notable_divergences"]
+            .as_array()
+            .expect("decision deltas")
+            .iter()
+            .filter(|delta| delta["decision_id"] == 100)
+            .map(|delta| delta["trace_id"].as_str().expect("trace ID"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(traces, BTreeSet::from([first_trace, second_trace]));
     }
 
     #[test]
@@ -75650,6 +75875,7 @@ startup_timeout_sec = 42
             || {
                 handle_atc(AtcCommand::Explain {
                     decision_id: 77,
+                    trace_id: None,
                     json: true,
                 })
             },
