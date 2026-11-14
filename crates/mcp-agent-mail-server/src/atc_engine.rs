@@ -709,13 +709,17 @@ pub struct EventDecisionBuilder<'a> {
 impl EvidenceLedger {
     fn make_trace_id(
         id: u64,
+        timestamp_micros: i64,
         subsystem: AtcSubsystem,
         decision_class: &str,
         subject: &str,
         action: &str,
         policy_id: Option<&str>,
     ) -> String {
-        let mut seed = format!("{id}:{subsystem}:{decision_class}:{subject}:{action}");
+        // Numeric IDs are local to one ledger lifetime. Bind durable identity to
+        // the recorded decision time while keeping replay of that event stable.
+        let mut seed =
+            format!("{id}:{timestamp_micros}:{subsystem}:{decision_class}:{subject}:{action}");
         if let Some(policy_id) = policy_id {
             seed.push(':');
             seed.push_str(policy_id);
@@ -764,6 +768,7 @@ impl EvidenceLedger {
         let policy_id = builder.policy_id.map(ToOwned::to_owned);
         let trace_id = Self::make_trace_id(
             id,
+            builder.timestamp_micros,
             builder.subsystem,
             builder.decision_class,
             builder.subject,
@@ -806,6 +811,7 @@ impl EvidenceLedger {
         self.next_id += 1;
         let trace_id = Self::make_trace_id(
             id,
+            builder.timestamp_micros,
             builder.subsystem,
             builder.decision_class,
             builder.subject,
@@ -1065,6 +1071,44 @@ mod tests {
             policy_id: None,
             fallback_reason: None,
             timestamp_micros: ts,
+        }
+    }
+
+    #[test]
+    fn restarted_ledgers_distinguish_new_decisions_and_preserve_replay_identity() {
+        let core = default_liveness_core();
+        for event_style in [false, true] {
+            let record_at = |timestamp_micros| {
+                let mut ledger = EvidenceLedger::new(1);
+                let id = if event_style {
+                    ledger.record_event(&EventDecisionBuilder {
+                        subsystem: AtcSubsystem::Liveness,
+                        decision_class: "test",
+                        subject: "RestartAgent",
+                        policy_id: None,
+                        posterior: core.posterior_summary(),
+                        action: "DeclareAlive",
+                        expected_loss: 1.0,
+                        runner_up_loss: 2.0,
+                        loss_table: Vec::new(),
+                        evidence_summary: "test",
+                        calibration_healthy: true,
+                        safe_mode_active: false,
+                        fallback_reason: None,
+                        timestamp_micros,
+                    })
+                } else {
+                    ledger.record(&test_decision(&core, "RestartAgent", timestamp_micros))
+                };
+                ledger.get(id).expect("recorded decision").clone()
+            };
+
+            let first = record_at(1_000_000);
+            let restarted = record_at(2_000_000);
+            let replayed = record_at(1_000_000);
+            assert_eq!(first.id, restarted.id, "numeric IDs restart with the ledger");
+            assert_ne!(first.trace_id, restarted.trace_id);
+            assert_eq!(first.trace_id, replayed.trace_id);
         }
     }
 
@@ -15285,6 +15329,164 @@ mod alien_enhancement_tests {
         assert!(release.semantics.high_risk_intervention);
         assert_eq!(release.semantics.family, "reservation_release");
         assert_eq!(advisory.semantics.family, "release_notice");
+    }
+
+    fn restarted_identity_effect(
+        config: &mcp_agent_mail_core::Config,
+        timestamp_micros: i64,
+    ) -> AtcEffectPlan {
+        reset_global_atc_state_for_test(config);
+        let mut engine = ATC_ENGINE
+            .get()
+            .expect("engine initialized")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        engine.register_agent("RestartAgent", "claude-code", Some("/tmp/atc-restart"));
+        let core = default_liveness_core();
+        let decision_id = engine.ledger.record(&DecisionBuilder {
+            subsystem: AtcSubsystem::Liveness,
+            decision_class: "liveness_transition",
+            subject: "RestartAgent",
+            core: &core,
+            action: LivenessAction::ReleaseReservations,
+            expected_loss: 0.5,
+            runner_up_loss: 1.5,
+            evidence_summary: "posterior dead state crossed release threshold",
+            calibration_healthy: true,
+            safe_mode_active: false,
+            policy_id: Some("policy-test"),
+            fallback_reason: None,
+            timestamp_micros,
+        });
+        engine
+            .effect_plan_for_decision_id(
+                decision_id,
+                timestamp_micros,
+                "release_reservations_requested",
+                "liveness",
+                "reservation_release",
+                "RestartAgent".to_string(),
+                Some("/tmp/atc-restart".to_string()),
+                None,
+            )
+            .expect("release effect")
+    }
+
+    fn reopened_identity_rows(
+        db_path: &std::path::Path,
+    ) -> Vec<mcp_agent_mail_db::sqlmodel_core::Row> {
+        let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(&db_path.to_string_lossy());
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(sidecar.as_str())
+            .expect("reopen durable experience sidecar");
+        conn.query_sync(
+            "SELECT experience_id, decision_id, trace_id, state, outcome_json \
+             FROM atc_experiences ORDER BY experience_id",
+            &[],
+        )
+        .expect("read persisted decision lifetimes")
+    }
+
+    #[test]
+    fn restarted_decisions_preserve_independent_durable_outcomes() {
+        use mcp_agent_mail_core::{AtcWriteMode, ExperienceOutcome, ExperienceState};
+
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            atc_write_mode: AtcWriteMode::Live,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("atc-restart.sqlite3");
+        let pool = mcp_agent_mail_db::DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create file-backed pool");
+        assert!(crate::atc_durable_writes_enabled(
+            config.atc_write_mode,
+            crate::AtcExecutorMode::Live,
+            Some(&pool),
+            false,
+        ));
+
+        let first_ts = 1_700_000_000_000_000;
+        let first_effect = restarted_identity_effect(&config, first_ts);
+        let first = crate::append_atc_experience_for_effect(&pool, &first_effect)
+            .expect("append first lifetime");
+        assert_eq!(first.state, ExperienceState::Planned);
+        crate::capture_atc_execution_result(
+            &pool,
+            Some(first.experience_id),
+            "live",
+            "executed",
+            first_ts + 1_000,
+        );
+        let outcome = ExperienceOutcome {
+            observed_ts_micros: first_ts + 2_000,
+            label: "clean_release".to_string(),
+            correct: true,
+            actual_loss: Some(0.0),
+            regret: Some(0.0),
+            evidence: None,
+        };
+        crate::block_on(mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
+            &asupersync::Cx::for_testing(),
+            &pool,
+            first.experience_id,
+            &outcome,
+        ))
+        .into_result()
+        .expect("resolve first lifetime");
+        let first_rows = reopened_identity_rows(&db_path);
+        assert_eq!(first_rows.len(), 1);
+        let first_outcome = first_rows[0]
+            .get_named::<String>("outcome_json")
+            .expect("persisted first outcome");
+
+        let second_ts = first_ts + 1_000_000;
+        let second_effect = restarted_identity_effect(&config, second_ts);
+        assert_eq!(first_effect.decision_id, second_effect.decision_id);
+        assert_ne!(first_effect.trace_id, second_effect.trace_id);
+        assert_ne!(first_effect.effect_id, second_effect.effect_id);
+        let stale_error = crate::append_atc_experience_for_effect(&pool, &first_effect)
+            .expect_err("a stale effect cannot attach to a reused decision ID");
+        assert!(stale_error.contains("no longer matches"));
+        let second = crate::append_atc_experience_for_effect(&pool, &second_effect)
+            .expect("append second lifetime");
+        assert_ne!(first.experience_id, second.experience_id);
+        assert_eq!(second.state, ExperienceState::Planned);
+        let repeated = crate::append_atc_experience_for_effect(&pool, &second_effect)
+            .expect("repeated append is idempotent");
+        assert_eq!(repeated.experience_id, second.experience_id);
+        crate::capture_atc_execution_result(
+            &pool,
+            Some(second.experience_id),
+            "live",
+            "executed",
+            second_ts + 1_000,
+        );
+        drop(pool);
+
+        let rows = reopened_identity_rows(&db_path);
+        assert_eq!(rows.len(), 2);
+        let old = &rows[0];
+        let new = &rows[1];
+        let old_outcome: String = old.get_named("outcome_json").unwrap();
+        let new_outcome: Option<String> = new.get_named("outcome_json").unwrap();
+        let old_trace: String = old.get_named("trace_id").unwrap();
+        let new_trace: String = new.get_named("trace_id").unwrap();
+        assert_eq!(old.get_named::<String>("state").unwrap(), "resolved");
+        assert_eq!(old_outcome, first_outcome);
+        assert_eq!(new.get_named::<String>("state").unwrap(), "executed");
+        assert_eq!(new_outcome, None);
+        assert_eq!(old_trace, first_effect.trace_id);
+        assert_eq!(new_trace, second_effect.trace_id);
     }
 
     #[test]
