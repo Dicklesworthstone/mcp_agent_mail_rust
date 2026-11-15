@@ -743,7 +743,6 @@ pub const ARCHIVE_EPOCH_FILE_NAME: &str = "agent-mail-archive-epoch";
 const ARCHIVE_EPOCH_FORMAT_VERSION: u8 = b'1';
 const ARCHIVE_EPOCH_GIT_DIR_CACHE_CAP: usize = 64;
 
-static ARCHIVE_EPOCH_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 static ARCHIVE_EPOCH_GIT_DIR_CACHE: LazyLock<Mutex<HashMap<PathBuf, PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -806,6 +805,44 @@ fn resolve_archive_epoch_git_dir(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Atomically publish an advisory control file using a private, newly created
+/// staging file inside the Git directory. This must not use the ordinary
+/// archive atomic writer: that writer enters a mutation guard and would
+/// recursively rewrite the epoch marker.
+fn write_archive_control_file(git_dir: &Path, file_name: &str, content: &[u8]) -> std::io::Result<()> {
+    let destination = git_dir.join(file_name);
+    let validate_destination = || -> std::io::Result<()> {
+        if path_existing_prefix_has_symlink(&destination)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive control path must not include symlinks",
+            ));
+        }
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if !metadata.is_file() => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive control path must be a regular file",
+            )),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    };
+    validate_destination()?;
+    // A predictable PID/counter path can already belong to another file or
+    // symlink. create_new staging owns its name and cleans up only that file
+    // when writing or publishing fails; it never truncates a foreign entry.
+    let mut staged = tempfile::Builder::new()
+        .prefix("agent-mail-control.tmp-")
+        .tempfile_in(git_dir)?;
+    staged.write_all(content)?;
+    validate_destination()?;
+    staged.persist(&destination).map_err(|error| error.error)?;
+    // These markers are advisory, not durability receipts. Preserve their
+    // existing no-fsync contract; archive payload publication owns durability.
+    Ok(())
+}
+
 /// Rewrite the persisted mutation-epoch token inside `git_dir` with fresh
 /// randomness, via temp-file-in-git-dir + atomic rename. Best-effort: any
 /// failure is logged and swallowed — the in-process
@@ -822,15 +859,8 @@ fn rewrite_archive_epoch_file(git_dir: &Path) {
     let mut content = String::with_capacity(33);
     content.push(char::from(ARCHIVE_EPOCH_FORMAT_VERSION));
     content.push_str(&token[..32]);
-    let seq = ARCHIVE_EPOCH_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = git_dir.join(format!(
-        "{ARCHIVE_EPOCH_FILE_NAME}.tmp-{}-{seq}",
-        std::process::id()
-    ));
-    let result = fs::write(&tmp, content.as_bytes())
-        .and_then(|()| fs::rename(&tmp, git_dir.join(ARCHIVE_EPOCH_FILE_NAME)));
+    let result = write_archive_control_file(git_dir, ARCHIVE_EPOCH_FILE_NAME, content.as_bytes());
     if let Err(error) = result {
-        let _ = fs::remove_file(&tmp);
         tracing::warn!(
             "archive epoch token rewrite failed at {}: {error}",
             git_dir.display()
@@ -16122,17 +16152,8 @@ fn write_archive_index_sync_record(
     tree: git2::Oid,
     identity: &str,
 ) -> std::io::Result<()> {
-    let seq = ARCHIVE_EPOCH_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = git_dir.join(format!(
-        "{ARCHIVE_INDEX_SYNC_FILE_NAME}.tmp-{}-{seq}",
-        std::process::id()
-    ));
     let content = format!("{ARCHIVE_INDEX_SYNC_FORMAT_VERSION}\n{tree}\n{identity}\n");
-    fs::write(&tmp, content)
-        .and_then(|()| fs::rename(&tmp, git_dir.join(ARCHIVE_INDEX_SYNC_FILE_NAME)))
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })
+    write_archive_control_file(git_dir, ARCHIVE_INDEX_SYNC_FILE_NAME, content.as_bytes())
 }
 
 /// Whether `tree` is the tree of `head` or of one of its recent first-parent
@@ -25749,6 +25770,223 @@ mod tests {
             token_begin, token_end,
             "outermost drop edge must rewrite the persisted epoch token"
         );
+    }
+
+    fn write_archive_control_marker_for_test(
+        git_dir: &Path,
+        file_name: &str,
+    ) -> std::io::Result<()> {
+        match file_name {
+            ARCHIVE_EPOCH_FILE_NAME => {
+                rewrite_archive_epoch_file(git_dir);
+                Ok(())
+            }
+            ARCHIVE_INDEX_SYNC_FILE_NAME => {
+                write_archive_index_sync_record(git_dir, git2::Oid::zero(), "test-index-identity")
+            }
+            _ => panic!("unexpected archive control marker: {file_name}"),
+        }
+    }
+
+    fn assert_archive_control_marker_is_valid(git_dir: &Path, file_name: &str) {
+        match file_name {
+            ARCHIVE_EPOCH_FILE_NAME => {
+                assert!(read_archive_epoch_token(git_dir).is_some());
+            }
+            ARCHIVE_INDEX_SYNC_FILE_NAME => {
+                assert_eq!(
+                    read_archive_index_sync_record(git_dir),
+                    Some((git2::Oid::zero(), "test-index-identity".to_string()))
+                );
+            }
+            _ => panic!("unexpected archive control marker: {file_name}"),
+        }
+    }
+
+    #[test]
+    fn archive_control_publish_preserves_preexisting_staging_files() {
+        if !isolated_coalescer_regression(
+            "tests::archive_control_publish_preserves_preexisting_staging_files",
+        ) {
+            return;
+        }
+        for (seq, file_name) in [ARCHIVE_EPOCH_FILE_NAME, ARCHIVE_INDEX_SYNC_FILE_NAME]
+            .into_iter()
+            .enumerate()
+        {
+            let tmp = TempDir::new().unwrap();
+            let git_dir = tmp.path().canonicalize().unwrap().join(".git");
+            fs::create_dir(&git_dir).unwrap();
+            // The old shared counter starts at zero in the isolated child.
+            // Leave an unrelated file exactly where that writer would stage.
+            let legacy_staging =
+                git_dir.join(format!("{file_name}.tmp-{}-{seq}", std::process::id()));
+            fs::write(&legacy_staging, b"retained staging evidence").unwrap();
+            let destination = git_dir.join(file_name);
+            fs::write(&destination, b"previous marker").unwrap();
+
+            write_archive_control_marker_for_test(&git_dir, file_name).unwrap();
+
+            assert_eq!(
+                fs::read(&legacy_staging).unwrap(),
+                b"retained staging evidence",
+                "publishing {file_name} must not consume or truncate a foreign staging file"
+            );
+            assert_archive_control_marker_is_valid(&git_dir, file_name);
+            assert_eq!(fs::read_dir(&git_dir).unwrap().count(), 2);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "published control markers must retain private staging permissions"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_control_publish_preserves_staging_link_targets() {
+        use std::os::unix::fs::symlink;
+
+        if !isolated_coalescer_regression(
+            "tests::archive_control_publish_preserves_staging_link_targets",
+        ) {
+            return;
+        }
+        for (marker_index, file_name) in [ARCHIVE_EPOCH_FILE_NAME, ARCHIVE_INDEX_SYNC_FILE_NAME]
+            .into_iter()
+            .enumerate()
+        {
+            for (link_index, hardlink) in [false, true].into_iter().enumerate() {
+                let tmp = TempDir::new().unwrap();
+                let root = tmp.path().canonicalize().unwrap();
+                let git_dir = root.join(".git");
+                fs::create_dir(&git_dir).unwrap();
+                let sentinel = root.join("foreign-sentinel");
+                fs::write(&sentinel, b"foreign bytes must survive").unwrap();
+                let seq = marker_index * 2 + link_index;
+                let legacy_staging =
+                    git_dir.join(format!("{file_name}.tmp-{}-{seq}", std::process::id()));
+                if hardlink {
+                    fs::hard_link(&sentinel, &legacy_staging).unwrap();
+                } else {
+                    symlink(&sentinel, &legacy_staging).unwrap();
+                }
+
+                write_archive_control_marker_for_test(&git_dir, file_name).unwrap();
+
+                assert_eq!(
+                    fs::read(&sentinel).unwrap(),
+                    b"foreign bytes must survive",
+                    "publishing {file_name} must not write through a planted staging link"
+                );
+                assert_eq!(
+                    fs::read(&legacy_staging).unwrap(),
+                    b"foreign bytes must survive"
+                );
+                assert_eq!(
+                    fs::symlink_metadata(&legacy_staging)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    !hardlink
+                );
+                assert_archive_control_marker_is_valid(&git_dir, file_name);
+                assert_eq!(fs::read_dir(&git_dir).unwrap().count(), 2);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_control_publish_refuses_symlinked_destinations_and_parents() {
+        use std::os::unix::fs::symlink;
+
+        for file_name in [ARCHIVE_EPOCH_FILE_NAME, ARCHIVE_INDEX_SYNC_FILE_NAME] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let git_dir = root.join(".git");
+            fs::create_dir(&git_dir).unwrap();
+            let sentinel = root.join("foreign-sentinel");
+            fs::write(&sentinel, b"foreign control bytes").unwrap();
+            let destination = git_dir.join(file_name);
+            symlink(&sentinel, &destination).unwrap();
+
+            let result = write_archive_control_marker_for_test(&git_dir, file_name);
+            if file_name == ARCHIVE_INDEX_SYNC_FILE_NAME {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            } else {
+                result.unwrap();
+            }
+            assert!(
+                fs::symlink_metadata(&destination)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read(&sentinel).unwrap(), b"foreign control bytes");
+            assert_eq!(fs::read_dir(&git_dir).unwrap().count(), 1);
+
+            let real_git = root.join("real-git");
+            fs::create_dir(&real_git).unwrap();
+            let retained = real_git.join(file_name);
+            fs::write(&retained, b"retained marker bytes").unwrap();
+            let alias = root.join("git-alias");
+            symlink(&real_git, &alias).unwrap();
+
+            let result = write_archive_control_marker_for_test(&alias, file_name);
+            if file_name == ARCHIVE_INDEX_SYNC_FILE_NAME {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(fs::read(&retained).unwrap(), b"retained marker bytes");
+            assert_eq!(fs::read_dir(&real_git).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn archive_control_publish_failure_preserves_foreign_staging_and_destination() {
+        if !isolated_coalescer_regression(
+            "tests::archive_control_publish_failure_preserves_foreign_staging_and_destination",
+        ) {
+            return;
+        }
+        for (seq, file_name) in [ARCHIVE_EPOCH_FILE_NAME, ARCHIVE_INDEX_SYNC_FILE_NAME]
+            .into_iter()
+            .enumerate()
+        {
+            let tmp = TempDir::new().unwrap();
+            let git_dir = tmp.path().canonicalize().unwrap().join(".git");
+            fs::create_dir(&git_dir).unwrap();
+            let legacy_staging =
+                git_dir.join(format!("{file_name}.tmp-{}-{seq}", std::process::id()));
+            fs::write(&legacy_staging, b"retained staging evidence").unwrap();
+            // A nonempty directory makes the old rename fail after it has
+            // already truncated the foreign staging file. Its error cleanup
+            // then unlinks that foreign file; neither action is ours to take.
+            let destination = git_dir.join(file_name);
+            fs::create_dir(&destination).unwrap();
+            let retained = destination.join("owner-data");
+            fs::write(&retained, b"retained destination evidence").unwrap();
+
+            let result = write_archive_control_marker_for_test(&git_dir, file_name);
+
+            if file_name == ARCHIVE_INDEX_SYNC_FILE_NAME {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                fs::read(&legacy_staging).unwrap(),
+                b"retained staging evidence"
+            );
+            assert_eq!(fs::read(&retained).unwrap(), b"retained destination evidence");
+            assert_eq!(fs::read_dir(&git_dir).unwrap().count(), 2);
+        }
     }
 
     #[test]

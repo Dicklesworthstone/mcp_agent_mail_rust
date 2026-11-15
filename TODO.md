@@ -2,6 +2,9 @@
 
 ## Current operational reliability improvements
 
+- [x] Publish archive epoch and index-sync control markers through private,
+  exclusively created staging files; preserve foreign staging entries and reject
+  symlinked control paths and nonregular destinations.
 - [x] Make glob reservation discovery lazy and bounded without hashing tracked
   file contents; honor Git ignore rules and preserve unknown activity for partial
   scans, nested repositories, and submodules before force-release decisions.
