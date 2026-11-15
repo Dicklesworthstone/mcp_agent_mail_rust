@@ -1,5 +1,90 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 Review31 public reservation recovery — EmeraldEagle
+
+- [x] Fresh reread of the latest progress helper, both producers and callers:
+  no new concrete defect established in the published repair.
+- [x] Read current graph and original owned Bead acceptance. Prioritize the
+  missing populated public release/restart/guard/health probe over more status
+  machinery; preserve unrelated release and peer work.
+- [x] Inspect existing E2E and real-process fixtures. Find missing MCP
+  initialized notification and legacy-only artifact lookup in parity suite.
+- [x] Repair setup assumptions, including the CLI-mode override leaking into
+  stdio sessions, while preserving every original
+  assertion, incident case and timeout; derive names from real DB generation.
+- [x] Reuse existing stdio fixture with unchanged pressure-test behavior;
+  add public reservation release with a witnessed real archive-write fault.
+- [x] Implement restart probe without client-read healing, requiring committed background repair,
+  verify SQLite/guard agreement and unchanged foreign-generation evidence.
+- [x] Implement temporary project-lock contention; require real doctor health to
+  fail before worker progress, then report reconciling during productive repair,
+  and return parity healthy after automatic completion. Do not fake progress.
+- [ ] Execute the exact predeclared native cases against Cargo-built am;
+  run the repaired shell suite with the same binary and retain populated counts.
+- [x] Execute the existing bounded real-DB/Git worker case: run
+  dc7b4ebb-637b-4479-b22e-b9757dd20247, terminal0/1PASS/5660skipped,
+  1.116s after Cargo22m42s on hz2, base48a/overlay079fe544. This is bounded
+  worker evidence; the separate public restart/guard/health probe is pending.
+- [ ] Fix concrete failures, preserve failed receipts and reread final diffs.
+- [x] First formatted public cohort ran all five predeclared names:
+  run9b04d079-87cd-4aa9-8ebf-1e8493dec41e, terminal100/4PASS/1FAIL/
+  325skipped,181.463s after Cargo16m49s on hz3, overlay079fe544.
+  Public reservation recovery passes13.185s; all three message controls pass.
+  Shell setup fails before any MCP response: cold DB initialization exceeds
+  the existing10s pool checkout budget. Preserve full startup stderr and ELF
+  identities; no inference that the sequencing correction fixes that timeout.
+- [x] Correct dependent shell calls to await their actual responses, including
+  initialization before its notification; retain the original finite parent
+  session budget and all incident assertions. Bash syntax0 and shell UBS0/0/0.
+- [x] Replace the new permission-only fault with a witnessed real NotADirectory
+  obstruction for privileged and unprivileged runners. Preserve original active
+  artifacts and obstruction bytes by rename; keep every DB/restart/Git/guard/
+  health/foreign-generation assertion. Original EACCES pass remains historical.
+- [x] Check portable baseline48a/overlay7d05ad9f on worker114: workspace/all-targets0
+  (Cargo11m01s), separate production lib+bins0 (7m45s), strict workspace/all-target
+  Clippy0 (3m35s); direct fmt0/Bash syntax0. Retain proc-macro-error2 notice.
+  Final full-file UBS scans0/statusok/no failed modules: Rust critical0/
+  warning1886/info457, shell0/0/0. Source/lock/toolchain manifest matches.
+- [x] Stop the superseded48a native build before any tests; exact wrapper
+  rchw-04baeb19-ffe7-4f70-b0bd-7e4d6a164146, local143, recovered delivery120
+  (daemon130), terminal acknowledged. No native verdict or pass is inferred.
+- [x] Inspect three incoming commits and fast-forward to9783f4cc without overlap
+  or file deletion; import Beads0 immediately. Preserve own patch and all seven
+  untracked roots. Read updated engine pin585f8464 and incoming source diffs.
+  Short metadata leases2110/2111 released after import.
+- [x] Manually fix five formatting expressions in three incoming cfg(test)
+  modules, preserving all assertions and runtime semantics. Final fmt0;
+  three-file UBS0/statusok/no failed modules/critical0/warning1020/info206.
+- [ ] Qualify integrated base9783f4cc against all original five public names plus
+  both WAL-certificate regressions (seven names declared before execution).
+  Retain source scope before the test-only formatting corrections; do not
+  present the older48a gates as checks of the new engine pin.
+- [x] Check final base9783f4cc/five-file overlay362f4d64 on worker1156:
+  workspace/all-targets0/Cargo12m46s; separate production lib+bins0/6m25s;
+  strict all-target Clippy0/3m29s. Final fmt0 and source/lock/toolchain
+  manifest match; retain proc-macro-error2 future notice. First integrated
+  compiler attempt103/queue timeout did not execute Cargo and earns no pass.
+- [x] Inspect actual running native tools: rustc908501772/Cargo e8cb624d5 from
+  pinned nightly2026-08-31 and cargo-nextest0.9.143. Keep native results pending.
+- [ ] Re-execute the original public acceptance case in a fresh solo pass on
+  the final formatted source. No independent reviewer is available or claimed.
+- [x] Formatted candidate workspace/all-targets0/Cargo1m36s on hz2,
+  base48a1810f/overlay079fe544; direct formatting0 and Bash syntax0. UBS full
+  files terminal0/statusok/no failed modules: Rust critical0/warning1883/info456,
+  shell0/0/0. Local ShellCheck unavailable127, not a passing lint claim.
+- [x] Separate production lib+bins0/Cargo7m47s and strict workspace/all-target
+  Clippy0/Cargo4m22s on hz4, same base48a1810f/two-file overlay079fe544.
+  Retain the proc-macro-error2 future-compatibility notice. No feature,
+  dependency, timeout, profile, assertion or gate relaxation.
+- [x] Preserve the initial development probe's disk-monitor scan-deadline
+  failure: recover exact wrapper rchw-9fc1d799-a0f9-494c-a2c2-220dad34548a,
+  acknowledged delivery255 (daemon130), no test result. Launch final formatted
+  source only after recovery and a fresh successful disk admission check.
+- [ ] Compare all original acceptance predicates to executed evidence before
+  any Bead closure; preserve all prior records, flush and check graph cycles.
+- [ ] Publish owned changes, verify refs and release owned reservations;
+  retain actual operational receipts in the existing review audit.
+
 ## November 14 Review30 reconciliation progress — EmeraldEagle
 
 - [x] Reread recent source diffs and callers; inventory accounting, cursor
