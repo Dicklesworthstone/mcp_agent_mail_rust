@@ -13457,12 +13457,14 @@ fn verify_idle_health_family(
             return Err(changed());
         }
     }
-    let after = capture_idle_health_family(source)?.ok_or_else(changed)?;
-    for ((_, expected), (_, observed)) in before.iter().zip(&after) {
-        match (expected, observed) {
-            (None, None) => {}
-            (Some(expected), Some(observed)) if expected.unchanged_at_path(observed) => {}
-            _ => return Err(changed()),
+    for (suffix, expected) in before {
+        let path = sqlite_sidecar_path(source, suffix);
+        if let Some(expected) = expected {
+            if !expected.unchanged_at_path(&path).map_err(|_| changed())? {
+                return Err(changed());
+            }
+        } else if path_is_occupied(&path) {
+            return Err(changed());
         }
     }
     Ok(())
@@ -13567,28 +13569,18 @@ fn stage_sqlite_family_for_health_probe_with_copy_hook(
         None => CanonicalSnapshotTempDir::new(&prefix)?,
     };
     let staged_path = directory.path().join(HEALTH_PROBE_STAGED_STEM);
-    copy_file_without_overwrite(source, &staged_path)?;
+    let main = before
+        .first()
+        .and_then(|(_, witness)| witness.as_ref())
+        .ok_or_else(|| {
+            std::io::Error::other("physical health copy has no retained main witness")
+        })?;
+    main.copy_without_overwrite(&staged_path)?;
     after_main_copy();
 
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        let source_sidecar = sqlite_sidecar_path(source, suffix);
-        match std::fs::symlink_metadata(&source_sidecar) {
-            Ok(metadata) if metadata.file_type().is_file() => {
-                #[cfg(unix)]
-                if metadata.nlink() != 1 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "physical health copying refuses a hard-linked recovery sidecar",
-                    ));
-                }
-                copy_file_without_overwrite(
-                    &source_sidecar,
-                    &sqlite_sidecar_path(&staged_path, suffix),
-                )?;
-            }
-            Ok(_) => return Ok(None),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+    for (suffix, witness) in before.iter().skip(1) {
+        if let Some(witness) = witness {
+            witness.copy_without_overwrite(&sqlite_sidecar_path(&staged_path, suffix))?;
         }
     }
 
@@ -17503,18 +17495,6 @@ fn restore_candidate_path(primary_path: &Path, timestamp: &str) -> PathBuf {
     candidate
 }
 
-fn copy_file_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let mut source_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(source)?;
-    let mut destination_file =
-        mcp_agent_mail_core::disk::create_new_private_file_no_follow(destination)?;
-    // Normalize the empty destination before any mailbox bytes are copied.
-    // Source permissions are untrusted recovery input and must never make the
-    // promoted database world-readable or read-only.
-    mcp_agent_mail_core::disk::set_private_writable_file_permissions(&destination_file)?;
-    std::io::copy(&mut source_file, &mut destination_file)?;
-    destination_file.sync_all()
-}
-
 /// Atomically move one filesystem object without replacing an occupied target.
 ///
 /// Linux and Apple targets use the kernel's no-replace rename primitive;
@@ -17880,16 +17860,113 @@ impl SqliteFileWitness {
             && self.sha256 == observed.sha256
     }
 
-    fn unchanged_at_path(&self, observed: &Self) -> bool {
-        #[cfg(unix)]
-        if self.changed != observed.changed {
-            return false;
+    fn unchanged_at_path(&self, path: &Path) -> std::io::Result<bool> {
+        if !self.matches_regular_at(path)? {
+            return Ok(false);
         }
-        self.same_generation(observed) && self.modified == observed.modified
+        let observed = self.identity.as_file().metadata()?;
+        #[cfg(unix)]
+        if self.changed != (observed.ctime(), observed.ctime_nsec()) {
+            return Ok(false);
+        }
+        Ok(self.modified == observed.modified().ok())
+    }
+
+    /// Revalidate a known generation without opening a possible replacement.
+    /// Closing such a probe on Unix would erase this process's POSIX locks on
+    /// the replacement. Hash the retained descriptor instead, with positional
+    /// reads so validation does not share a cursor with a staging copy.
+    fn matches_regular_at(&self, path: &Path) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, FileType, fstat, statat};
+            use sha2::Digest as _;
+            use std::os::unix::fs::FileExt as _;
+
+            let anchor = AnchoredRecoveryParent::capture(path, "SQLite witness revalidation")
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let matches_path = || -> std::io::Result<bool> {
+                anchor
+                    .verify_parent_only("SQLite witness revalidation")
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let expected = fstat(self.identity.as_file())?;
+                let observed = statat(
+                    &anchor.parent_dir,
+                    &anchor.file_name,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )?;
+                Ok(
+                    FileType::from_raw_mode(observed.st_mode) == FileType::RegularFile
+                        && AnchoredRecoveryParent::same_inode(&expected, &observed),
+                )
+            };
+            if !matches_path()? {
+                return Ok(false);
+            }
+            let file = self.identity.as_file();
+            let before = file.metadata()?;
+            if before.len() != self.len {
+                return Ok(false);
+            }
+            let mut digest = sha2::Sha256::new();
+            let mut offset = 0_u64;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            let limit = self.len.saturating_add(1);
+            while offset < limit {
+                let capacity = usize::try_from(limit - offset)
+                    .unwrap_or(usize::MAX)
+                    .min(buffer.len());
+                let count = match file.read_at(&mut buffer[..capacity], offset) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
+                if count == 0 {
+                    break;
+                }
+                offset = offset.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                digest.update(&buffer[..count]);
+            }
+            let after = file.metadata()?;
+            let observed_digest: [u8; 32] = digest.finalize().into();
+            Ok(offset == self.len
+                && after.len() == before.len()
+                && after.modified().ok() == before.modified().ok()
+                && after.ctime() == before.ctime()
+                && after.ctime_nsec() == before.ctime_nsec()
+                && observed_digest == self.sha256
+                && matches_path()?)
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows file locks belong to handles, not process-wide inodes.
+            Ok(self.same_generation(&Self::capture_regular(path)?))
+        }
+    }
+
+    fn copy_without_overwrite(&self, destination: &Path) -> std::io::Result<()> {
+        use std::io::{Read as _, Seek as _};
+
+        let mut source = self.identity.as_file();
+        source.rewind()?;
+        let mut source = source.take(self.len.saturating_add(1));
+        let mut destination_file =
+            mcp_agent_mail_core::disk::create_new_private_file_no_follow(destination)?;
+        mcp_agent_mail_core::disk::set_private_writable_file_permissions(&destination_file)?;
+        if std::io::copy(&mut source, &mut destination_file)? != self.len {
+            return Err(std::io::Error::other(
+                "witnessed SQLite source length changed during copy",
+            ));
+        }
+        destination_file.sync_all()
     }
 
     fn verify(&self, path: &Path) -> DbResult<()> {
-        if self.same_generation(&Self::capture_standalone(path)?) {
+        if sqlite_recovery_candidate_is_standalone(path)
+            && self
+                .matches_regular_at(path)
+                .map_err(|error| DbError::Sqlite(error.to_string()))?
+            && sqlite_recovery_candidate_is_standalone(path)
+        {
             Ok(())
         } else {
             Err(DbError::Sqlite(format!(
@@ -18294,31 +18371,35 @@ where
         }
         before_copy(&restore_candidate);
         parent_anchor.verify_parent_only("sqlite backup restore staging")?;
-        let current_source = SqliteFileWitness::capture_regular(backup_path).map_err(|error| {
-            SqlError::Custom(format!(
-                "failed to stage sqlite backup {} into {}: {error}",
-                backup_path.display(),
-                restore_candidate.display()
-            ))
-        })?;
-        if !source_witness.same_generation(&current_source) {
+        let source_matches = source_witness
+            .matches_regular_at(backup_path)
+            .map_err(|error| {
+                SqlError::Custom(format!(
+                    "failed to stage sqlite backup {} into {}: {error}",
+                    backup_path.display(),
+                    restore_candidate.display()
+                ))
+            })?;
+        if !source_matches {
             return Err(SqlError::Custom(format!(
                 "failed to stage sqlite backup {} into {}: source changed identity or bytes before copy",
                 backup_path.display(),
                 restore_candidate.display()
             )));
         }
-        match copy_file_without_overwrite(backup_path, &restore_candidate) {
+        match source_witness.copy_without_overwrite(&restore_candidate) {
             Ok(()) => {
-                let after_source =
-                    SqliteFileWitness::capture_regular(backup_path).map_err(|error| {
-                        cleanup_sqlite_candidate_artifact(&restore_candidate);
-                        SqlError::Custom(format!(
-                            "failed to stage sqlite backup {} into {}: {error}",
-                            backup_path.display(),
-                            restore_candidate.display()
-                        ))
-                    })?;
+                let source_still_matches =
+                    source_witness
+                        .matches_regular_at(backup_path)
+                        .map_err(|error| {
+                            cleanup_sqlite_candidate_artifact(&restore_candidate);
+                            SqlError::Custom(format!(
+                                "failed to stage sqlite backup {} into {}: {error}",
+                                backup_path.display(),
+                                restore_candidate.display()
+                            ))
+                        })?;
                 let staged_witness = SqliteFileWitness::capture_regular(&restore_candidate)
                     .map_err(|error| {
                         cleanup_sqlite_candidate_artifact(&restore_candidate);
@@ -18328,7 +18409,7 @@ where
                             restore_candidate.display()
                         ))
                     })?;
-                if !source_witness.same_generation(&after_source)
+                if !source_still_matches
                     || staged_witness.len != source_witness.len
                     || staged_witness.sha256 != source_witness.sha256
                 {
@@ -18550,13 +18631,13 @@ where
         parent_anchor.verify_unchanged("quarantine reconstruction candidate")?;
         destination_anchor.verify_parent_only("quarantine reconstruction destination")?;
         if let Some(ref witness) = candidate_witness {
-            let current = SqliteFileWitness::capture_regular(candidate_path).map_err(|error| {
+            let current_matches = witness.matches_regular_at(candidate_path).map_err(|error| {
                 SqlError::Custom(format!(
                     "reconstructed SQLite candidate {} disappeared or became unreadable before quarantine: {error}",
                     candidate_path.display()
                 ))
             })?;
-            if !witness.same_generation(&current) {
+            if !current_matches {
                 return Err(SqlError::Custom(format!(
                     "reconstructed SQLite candidate {} changed identity or bytes before quarantine; refusing to move an unclassified generation",
                     candidate_path.display()
@@ -18566,8 +18647,7 @@ where
         match rename_noreplace_preserving_source(candidate_path, &candidate) {
             Ok(()) => {
                 if let Some(ref witness) = candidate_witness {
-                    let moved_ok = SqliteFileWitness::capture_regular(&candidate)
-                        .is_ok_and(|observed| witness.same_generation(&observed));
+                    let moved_ok = witness.matches_regular_at(&candidate).unwrap_or(false);
                     if !moved_ok {
                         let rollback = rollback_quarantined_candidate_moves(&[(
                             candidate_path.to_path_buf(),
@@ -28949,6 +29029,191 @@ mod tests {
         for source_existed in [false, true] {
             check_recovery_rollback_foreign_generation(source_existed, false, false);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn backup_lock_child_observes_conflict(path: &Path) -> bool {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "pool_impl::tests::recovery_rollback_identity_refusal_preserves_foreign_posix_locks",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("AM_RECOVERY_ROLLBACK_IDENTITY_LOCK_PATH", path)
+                .output()
+                .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "lock child must execute: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if stdout.contains("rollback-identity-lock-conflict=true") {
+            true
+        } else {
+            assert!(stdout.contains("rollback-identity-lock-conflict=false"));
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backup_staging_identity_refusal_preserves_foreign_posix_locks() {
+        let probe = backup_lock_child_observes_conflict;
+        let directory = tempfile::tempdir().unwrap().keep();
+        let primary = directory.join("storage.sqlite3");
+        let backup = directory.join("storage.sqlite3.bak");
+        let displaced = directory.join("original-backup.sqlite3");
+        let foreign = directory.join("foreign.sqlite3");
+        write_marker_db(&backup, "original-backup");
+        write_marker_db(&foreign, "foreign-generation");
+        let foreign_bytes = std::fs::read(&foreign).unwrap();
+        let original_bytes = std::fs::read(&backup).unwrap();
+        let foreign_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&foreign)
+            .unwrap();
+        let mut lock = nix::libc::flock {
+            l_type: i16::try_from(nix::libc::F_WRLCK).unwrap(),
+            l_whence: i16::try_from(nix::libc::SEEK_SET).unwrap(),
+            l_start: 0,
+            l_len: 1,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(&foreign_file, nix::fcntl::FcntlArg::F_SETLK(&lock)).unwrap();
+        assert!(probe(&foreign), "child must observe the held foreign lock");
+        let timestamp = "20261115_143600_000";
+        let staged = restore_candidate_path(&primary, timestamp);
+        let error = stage_backup_restore_candidate_with_hook(&backup, &primary, timestamp, |_| {
+            std::fs::rename(&backup, &displaced).unwrap();
+            std::fs::rename(&foreign, &backup).unwrap();
+        })
+        .expect_err("a substituted backup must refuse staging");
+        assert!(
+            error
+                .to_string()
+                .contains("source changed identity or bytes")
+        );
+        assert!(
+            probe(&backup),
+            "staging refusal must not erase the foreign generation's POSIX lock"
+        );
+        lock.l_type = i16::try_from(nix::libc::F_UNLCK).unwrap();
+        nix::fcntl::fcntl(&foreign_file, nix::fcntl::FcntlArg::F_SETLK(&lock)).unwrap();
+        assert!(!probe(&backup), "explicit unlock must be observed");
+        assert_eq!(std::fs::read(&backup).unwrap(), foreign_bytes);
+        assert_eq!(std::fs::read(&displaced).unwrap(), original_bytes);
+        assert!(
+            std::fs::symlink_metadata(&staged)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn backup_witness_retains_content_and_refuses_same_length_rewrite() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let backup = directory.join("storage.sqlite3.bak");
+        let displaced = directory.join("original.sqlite3");
+        let foreign = directory.join("foreign.sqlite3");
+        let staged = directory.join("staged.sqlite3");
+        write_marker_db(&backup, "original-backup");
+        write_marker_db(&foreign, "foreign-generation");
+        let original_bytes = std::fs::read(&backup).unwrap();
+        let witness = SqliteFileWitness::capture_regular(&backup).unwrap();
+        std::fs::rename(&backup, &displaced).unwrap();
+        std::fs::rename(&foreign, &backup).unwrap();
+        assert!(!witness.matches_regular_at(&backup).unwrap());
+        assert!(
+            witness.matches_regular_at(&displaced).unwrap(),
+            "a rename changes ctime without changing the witnessed generation"
+        );
+        witness.copy_without_overwrite(&staged).unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), original_bytes);
+        let foreign_bytes = std::fs::read(&backup).unwrap();
+        let occupied = directory.join("occupied.sqlite3");
+        std::fs::write(&occupied, b"collision sentinel").unwrap();
+        assert_eq!(
+            witness
+                .copy_without_overwrite(&occupied)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"collision sentinel");
+
+        let before = std::fs::metadata(&displaced).unwrap();
+        let conn = crate::CanonicalDbConn::open_file(displaced.to_str().unwrap()).unwrap();
+        conn.execute_raw("UPDATE marker SET value = 'rewritten-backup'")
+            .unwrap();
+        drop(conn);
+        std::fs::File::options()
+            .write(true)
+            .open(&displaced)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        assert_eq!(std::fs::metadata(&displaced).unwrap().len(), before.len());
+        assert_eq!(
+            std::fs::metadata(&displaced).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        assert!(
+            !witness.matches_regular_at(&displaced).unwrap(),
+            "retained identity, length and restored mtime cannot admit changed bytes"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), foreign_bytes);
+        assert_eq!(std::fs::read(&staged).unwrap(), original_bytes);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_health_copy_identity_refusal_preserves_foreign_posix_locks() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let primary = directory.join("storage.sqlite3");
+        let displaced = directory.join("original.sqlite3");
+        let foreign = directory.join("foreign.sqlite3");
+        let staging_root = directory.join("staging");
+        std::fs::create_dir_all(&staging_root).unwrap();
+        write_marker_db(&primary, "original-generation");
+        write_marker_db(&foreign, "foreign-generation");
+        let original_bytes = std::fs::read(&primary).unwrap();
+        let foreign_bytes = std::fs::read(&foreign).unwrap();
+        let foreign_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&foreign)
+            .unwrap();
+        let mut lock = nix::libc::flock {
+            l_type: i16::try_from(nix::libc::F_WRLCK).unwrap(),
+            l_whence: i16::try_from(nix::libc::SEEK_SET).unwrap(),
+            l_start: 0,
+            l_len: 1,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(&foreign_file, nix::fcntl::FcntlArg::F_SETLK(&lock)).unwrap();
+        assert!(backup_lock_child_observes_conflict(&foreign));
+        let result = stage_sqlite_family_for_health_probe_with_copy_hook(
+            &primary,
+            Some(&staging_root),
+            || {
+                std::fs::rename(&primary, &displaced).unwrap();
+                std::fs::rename(&foreign, &primary).unwrap();
+            },
+        );
+        let Err(error) = result else {
+            panic!("a replaced health-copy source must refuse its family seal");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            backup_lock_child_observes_conflict(&primary),
+            "health-copy refusal must not erase the foreign generation's POSIX lock"
+        );
+        lock.l_type = i16::try_from(nix::libc::F_UNLCK).unwrap();
+        nix::fcntl::fcntl(&foreign_file, nix::fcntl::FcntlArg::F_SETLK(&lock)).unwrap();
+        assert!(!backup_lock_child_observes_conflict(&primary));
+        assert_eq!(std::fs::read(&primary).unwrap(), foreign_bytes);
+        assert_eq!(std::fs::read(&displaced).unwrap(), original_bytes);
     }
 
     #[cfg(unix)]

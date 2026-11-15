@@ -1,5 +1,99 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review39 retain backup and health-copy source authority — EmeraldEagle
+
+- [x] Reread Review38's complete test diff and real finalizer/promotion callers;
+  no new defect in that change. Compare ready Beads with actual implementation
+  and original acceptance; preserve peer claims and platform/soak requirements.
+- [x] Find legacy backup staging reopening a substituted source while rejecting
+  its identity, potentially erasing foreign process-owned POSIX locks. Reserve
+  existing files and record work on already-owned br-cxsgx without closing it.
+- [x] Add a Linux child-lock regression for the real staging boundary; retain
+  old-runtime failure and valid-staging/explicit-unlock controls.
+- [x] Revalidate known witness paths with anchored metadata and retained-handle
+  byte reads; copy backup bytes from the retained source, not its pathname.
+  Review other witness revalidation consumers for the same concrete defect.
+- [x] Find the same reopen defect in the idle health-copy family seal; use
+  retained witnesses for both copying and final source-family verification.
+  Preserve the original presence, content, mtime and ctime requirements.
+- [x] Add a real health-copy replacement/child-lock regression. Execute it
+  against the old health implementation: two controls pass, new case fails.
+- [x] Reread changed implementation and callers; verify same-length content
+  mutation is still refused and successful staging/collision retry still works.
+- [x] Run both workspace compiler graphs, strict Clippy, formatting and diff
+  checks on the expanded source; triage full changed-file strict UBS without
+  suppressing its remaining findings or claiming a warning-clean result.
+- [x] Run the frozen, predeclared 79-case recovery cohort; verify its exact
+  case census and actual source/dependency/toolchain/worker/executable identity.
+- [x] Reexecute the five original decisive controls in a fresh solo pass;
+  distinguish self-review from independent or full-platform qualification.
+- [x] Prepare original Bead, existing TODO/audit and exact-path publication;
+  preserve all peer records/history and verify cycles. Record terminal pushes,
+  ref checks and owned-lease release after execution in `review-audit.md`.
+  Keep unmet full-platform/crash acceptance open.
+
+Old-runtime comparison on immutable private test-only object `6147971b`
+(parent `9cc0777f`, no branch change or working-tree overlay) terminated100:
+**2 controls passed, 1 new staging-lock test failed, 4,094 outside selection**
+(0.216 s; cold native Cargo9m46s on ovh-a). The independent child sees the
+held foreign lock before staging and loses it after the legacy refusal.
+Stable baseline ELF SHA-256
+`5e4fd638771921f908cd0715e40736ffa11c283ac4d9d9a9e2d95dbac65b81a8`;
+all five actual worker inputs match the saved baseline manifest. This private
+source object is retained proof, not a published implementation commit.
+
+The intermediate staging repair `561786f8` passed **78 predeclared named cases**,
+including the prior56 recovery cases, backup/rotation controls and two new
+regressions. The new witness control preserves the original after a pathname
+swap, refuses an occupied destination and detects a same-length real SQLite
+rewrite with restored mtime. That intermediate full-file strict UBS was red:
+zero critical, 5,431 warnings, 2,622 informational findings; changed-range
+findings were reviewed without suppression. Intermediate worker input probes
+matched all five frozen files. Intermediate Nextest execution passed **78/78**, with
+4,020 tests outside selection (35.910 s; Cargo4m26s on hz2). Exact declared-name
+census matched; stable native ELF SHA-256
+`1e571f59ebdd3fe564c22e6bc6369510a662f67080f15b5837071e119d3c43e6`.
+That intermediate source was base `9cc0777f` plus pool-only overlay
+`c107a51358939f7b4f8cd3dec65199bfc549f6fc7029ae3ed7e965137453c234`.
+Both intermediate workspace compiler graphs and Clippy passed on ovh-a.
+These results do not qualify the subsequent health-copy change.
+
+The supplemental health comparison on immutable private object `8adfe0b4`
+(staging repair plus new health test, old health runtime) terminated101:
+**2 controls passed, 1 new health-lock test failed, 4,096 outside selection**
+(0.15 s). The failure is the independently observed lost foreign POSIX lock.
+The real compiled native ELF SHA-256 is
+`f26b5a6ef0560af08f16a375e15f5ab5777e1acbf492afcfba9d072e37c3577a`.
+
+Expanded source `f8d5ce58`, base `9cc0777f` plus pool-only overlay
+`73bbfe409f4496a9573fffb92974aa5c1dbcf61ba4fc23654a2f45218a2725f1`,
+passes both mandatory compiler graphs and strict all-target Clippy. Formatting
+and diff checks pass. Full-file strict UBS remains red: zero critical,
+5,450 warnings and 2,628 informational findings. All 105 changed-range
+findings were reviewed; the two production slice warnings have bounded
+indices, three equality findings contain no floats, and the rest concern
+test assertions/fixtures. No suppression or gate change was added.
+
+Expanded native Cargo execution passed **79/79**, with 4,020 outside selection
+(6.09 s; Cargo6m26s on ovh-a). Fresh solo reexecution passed **5/5**, with
+4,094 outside selection (0.28 s). Both exact-name censuses match their
+predeclared sets, actual worker probes match all five frozen inputs, and the
+stable native ELF is unchanged between invocations:
+`efd76d4f9a8e3b5c9dfd422413dfc0baaa83312a26ee2517dc50e3ef33d7d599`.
+This is self-review, not independent certification. No full-workspace test,
+warning-clean UBS, release, production-soak or non-Linux qualification is claimed.
+
+Nextest admission103/zero-test receipts remain environmental refusals.
+The supported native Cargo lane admits one build job with its default 30 GiB
+reservation; no budget or floor was lowered. The unused scratch runner and
+archive experiment were abandoned; native Cargo results will be labeled as
+such, without claiming Nextest's process isolation or leak checks. The test
+tooling investigation took too long; no custom runner was added to the repo.
+All original `br-cxsgx` acceptance remains in force and the issue stays
+`in_progress`; initial/unclassified opens and broader platform/crash acceptance
+are not qualified by this known-witness repair. Retained receipts are under
+`/data/tmp/am-archive-reader-20261110.t7ueMuTt/review39-*` and the existing audit.
+
 ## November 15 Review38 compact candidate through promotion — EmeraldEagle
 
 - [x] Reread Review37 identity helpers, rollback, committed follow-up and
