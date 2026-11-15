@@ -1057,8 +1057,46 @@ pub const DESCRIPTOR_FLOOR_MIN_RISE: u64 = 64;
 pub struct DescriptorFloorGrowth {
     /// Floors (minimum open descriptors) of the last windows, oldest first.
     pub floors: Vec<u64>,
-    /// Growth of the floor per hour across those windows.
+    /// Elapsed microseconds between the observations of the first and last
+    /// minima. Sampling jitter must not inflate the inferred growth rate.
+    pub observed_span_us: u64,
+    /// Growth of the floor per hour across those observations, rounded down.
     pub per_hour: u64,
+}
+
+impl DescriptorFloorGrowth {
+    /// Project seconds until the soft descriptor limit at the observed rate.
+    ///
+    /// This is a linear extrapolation of a rising floor, not a leak diagnosis
+    /// or a statistical confidence bound. Unknown/unlimited headroom or invalid
+    /// observations yield no estimate. Use the unrounded rate so a slow leak
+    /// can still have an estimate when `per_hour` rounds to zero.
+    #[must_use]
+    pub fn projected_exhaustion_seconds(
+        &self,
+        open_fds: Option<u64>,
+        soft_limit: Option<u64>,
+    ) -> Option<u64> {
+        let open_fds = open_fds?;
+        let soft_limit = soft_limit.filter(|limit| *limit > 0 && *limit != u64::MAX)?;
+        let rise = self.floors.last()?.checked_sub(*self.floors.first()?)?;
+        if rise == 0
+            || self.observed_span_us == 0
+            || !self.floors.windows(2).all(|pair| pair[1] > pair[0])
+        {
+            return None;
+        }
+        let headroom = u128::from(soft_limit.saturating_sub(open_fds));
+        let numerator = headroom * u128::from(self.observed_span_us);
+        let denominator = u128::from(rise) * 1_000_000;
+        u64::try_from(numerator.div_ceil(denominator)).ok()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DescriptorFloorObservation {
+    count: u64,
+    observed_us: u64,
 }
 
 /// Floors of one process's open-descriptor count over consecutive windows.
@@ -1073,9 +1111,10 @@ pub struct DescriptorFloorTracker {
     window_us: u64,
     windows: usize,
     min_rise: u64,
-    /// Start of the open window and the lowest count seen in it.
-    current: Option<(u64, u64)>,
-    floors: std::collections::VecDeque<u64>,
+    /// Monotonic window number and the earliest observation of its minimum.
+    current: Option<(u64, DescriptorFloorObservation)>,
+    last_sample_us: Option<u64>,
+    floors: std::collections::VecDeque<DescriptorFloorObservation>,
 }
 
 impl DescriptorFloorTracker {
@@ -1086,24 +1125,47 @@ impl DescriptorFloorTracker {
             windows: windows.max(2),
             min_rise,
             current: None,
+            last_sample_us: None,
             floors: std::collections::VecDeque::new(),
         }
     }
 
     /// Record one sample taken at `now_us` on a monotonic microsecond clock.
     pub fn record(&mut self, now_us: u64, open_fds: u64) {
+        let window = now_us / self.window_us;
+        let observation = DescriptorFloorObservation {
+            count: open_fds,
+            observed_us: now_us,
+        };
+        // A restarted monitor has a fresh elapsed-time origin. A missed whole
+        // window also breaks consecutive evidence: never interpolate missing
+        // minima or keep a stale alert until the new clock catches the old one.
+        if self.last_sample_us.is_some_and(|last| now_us < last)
+            || self
+                .current
+                .is_some_and(|(previous, _)| window > previous.saturating_add(1))
+        {
+            self.floors.clear();
+            self.current = None;
+        }
+        self.last_sample_us = Some(now_us);
         self.current = match self.current {
-            Some((start, floor)) if now_us.saturating_sub(start) < self.window_us => {
-                Some((start, floor.min(open_fds)))
-            }
+            Some((previous, floor)) if window == previous => Some((
+                window,
+                if open_fds < floor.count {
+                    observation
+                } else {
+                    floor
+                },
+            )),
             Some((_, floor)) => {
                 self.floors.push_back(floor);
                 while self.floors.len() > self.windows {
                     self.floors.pop_front();
                 }
-                Some((now_us, open_fds))
+                Some((window, observation))
             }
-            None => Some((now_us, open_fds)),
+            None => Some((window, observation)),
         };
     }
 
@@ -1117,18 +1179,27 @@ impl DescriptorFloorTracker {
             .floors
             .iter()
             .zip(self.floors.iter().skip(1))
-            .all(|(earlier, later)| later > earlier);
-        let rise = self.floors.back()? - self.floors.front()?;
-        if !rising || rise < self.min_rise {
+            .all(|(earlier, later)| later.count > earlier.count);
+        if !rising {
             return None;
         }
-        let span_us = self
-            .window_us
-            .saturating_mul(u64::try_from(self.windows - 1).unwrap_or(u64::MAX));
-        let per_hour = u64::try_from(u128::from(rise) * 3_600_000_000 / u128::from(span_us.max(1)))
+        let first = self.floors.front()?;
+        let last = self.floors.back()?;
+        let rise = last.count.checked_sub(first.count)?;
+        // A new low invalidates the warning immediately, without waiting for
+        // several more completed windows after descriptors have been released.
+        if rise < self.min_rise || self.current?.1.count <= last.count {
+            return None;
+        }
+        let span_us = last.observed_us.checked_sub(first.observed_us)?;
+        if span_us == 0 {
+            return None;
+        }
+        let per_hour = u64::try_from(u128::from(rise) * 3_600_000_000 / u128::from(span_us))
             .unwrap_or(u64::MAX);
         Some(DescriptorFloorGrowth {
-            floors: self.floors.iter().copied().collect(),
+            floors: self.floors.iter().map(|floor| floor.count).collect(),
+            observed_span_us: span_us,
             per_hour,
         })
     }
@@ -2811,8 +2882,10 @@ mod tests {
         feed_floor_windows(&mut tracker, &[100, 130, 170, 220]);
         let growth = tracker.growth().expect("rising floor is growth");
         assert_eq!(growth.floors, vec![100, 130, 170, 220]);
-        // 120 descriptors over 3 one-minute intervals.
-        assert_eq!(growth.per_hour, 2_400);
+        // The churn fixture observes its first minimum at 0s and its last
+        // minimum at 200s. Nominal bucket boundaries would overstate the rate.
+        assert_eq!(growth.observed_span_us, 200_000_000);
+        assert_eq!(growth.per_hour, 2_160);
     }
 
     #[test]
@@ -2835,6 +2908,171 @@ mod tests {
         let mut tracker = floor_tracker();
         feed_floor_windows(&mut tracker, &[100, 200, 300]);
         assert_eq!(tracker.growth(), None, "three windows are not enough");
+    }
+
+    #[test]
+    fn descriptor_floor_tracker_accepts_recovery_without_panicking() {
+        let mut tracker = floor_tracker();
+        feed_floor_windows(&mut tracker, &[400, 300, 200, 100]);
+        assert_eq!(tracker.growth(), None, "releasing descriptors is recovery");
+    }
+
+    #[test]
+    fn descriptor_floor_tracker_clears_growth_on_current_window_recovery() {
+        let mut tracker = floor_tracker();
+        feed_floor_windows(&mut tracker, &[100, 130, 170, 220]);
+        assert!(tracker.growth().is_some());
+
+        tracker.record(245_000_000, 110);
+        assert_eq!(
+            tracker.growth(),
+            None,
+            "fresh recovery supersedes old growth"
+        );
+    }
+
+    #[test]
+    fn descriptor_floor_tracker_restarts_after_a_backwards_clock() {
+        let mut tracker = floor_tracker();
+        feed_floor_windows(&mut tracker, &[100, 130, 170, 220]);
+        assert!(tracker.growth().is_some());
+
+        tracker.record(250_000_000, 300);
+        tracker.record(245_000_000, 400);
+        assert_eq!(
+            tracker.growth(),
+            None,
+            "even an in-window rollback resets history"
+        );
+
+        feed_floor_windows(&mut tracker, &[200, 240, 280, 320]);
+        assert_eq!(tracker.growth().unwrap().floors, vec![200, 240, 280, 320]);
+    }
+
+    #[test]
+    fn descriptor_floor_tracker_does_not_bridge_unsampled_windows() {
+        let mut tracker = floor_tracker();
+        feed_floor_windows(&mut tracker, &[100, 130, 170, 220]);
+        assert!(tracker.growth().is_some());
+
+        tracker.record(365_000_000, 400);
+        assert_eq!(
+            tracker.growth(),
+            None,
+            "an unobserved window is not growth evidence"
+        );
+    }
+
+    #[test]
+    fn descriptor_floor_tracker_uses_observed_minimum_timestamps() {
+        let mut tracker = DescriptorFloorTracker::new(std::time::Duration::from_secs(60), 3, 10);
+        for (seconds, count) in [(55, 100), (65, 130), (119, 120), (125, 150), (180, 160)] {
+            tracker.record(seconds * 1_000_000, count);
+        }
+        let growth = tracker.growth().expect("three consecutive rising minima");
+        assert_eq!(growth.floors, vec![100, 120, 150]);
+        assert_eq!(growth.observed_span_us, 70_000_000);
+        assert_eq!(growth.per_hour, 2_571);
+        assert_eq!(
+            growth.projected_exhaustion_seconds(Some(160), Some(260)),
+            Some(140)
+        );
+    }
+
+    #[test]
+    fn descriptor_floor_tracker_recovers_after_a_gap_with_bounded_history() {
+        let mut tracker = floor_tracker();
+        feed_floor_windows(&mut tracker, &[100, 130, 170, 220]);
+        tracker.record(600_000_000, 200);
+        for (seconds, count) in [(660, 240), (720, 280), (780, 320), (840, 360)] {
+            tracker.record(seconds * 1_000_000, count);
+        }
+        assert_eq!(tracker.growth().unwrap().floors, vec![200, 240, 280, 320]);
+        for seconds in (900..=1_500).step_by(60) {
+            tracker.record(seconds * 1_000_000, seconds);
+        }
+        assert_eq!(tracker.floors.len(), 4);
+    }
+
+    #[test]
+    fn descriptor_growth_projects_exact_headroom_and_handles_unknown_limits() {
+        let growth = DescriptorFloorGrowth {
+            floors: vec![100, 110, 120],
+            observed_span_us: 200_000_000,
+            per_hour: 360,
+        };
+        assert_eq!(
+            growth.projected_exhaustion_seconds(Some(125), Some(225)),
+            Some(1_000)
+        );
+        assert_eq!(
+            growth.projected_exhaustion_seconds(Some(225), Some(225)),
+            Some(0)
+        );
+        assert_eq!(
+            growth.projected_exhaustion_seconds(Some(226), Some(225)),
+            Some(0)
+        );
+        for limit in [None, Some(0), Some(u64::MAX)] {
+            assert_eq!(growth.projected_exhaustion_seconds(Some(125), limit), None);
+        }
+        assert_eq!(growth.projected_exhaustion_seconds(None, Some(225)), None);
+
+        let slow = DescriptorFloorGrowth {
+            floors: vec![100, 101],
+            observed_span_us: 7_200_000_001,
+            per_hour: 0,
+        };
+        assert_eq!(
+            slow.projected_exhaustion_seconds(Some(101), Some(102)),
+            Some(7_201)
+        );
+
+        let declining = DescriptorFloorGrowth {
+            floors: vec![200, 100],
+            ..growth
+        };
+        assert_eq!(
+            declining.projected_exhaustion_seconds(Some(100), Some(200)),
+            None
+        );
+        let flat = DescriptorFloorGrowth {
+            floors: vec![100, 100],
+            ..growth
+        };
+        assert_eq!(
+            flat.projected_exhaustion_seconds(Some(100), Some(200)),
+            None
+        );
+        let interrupted = DescriptorFloorGrowth {
+            floors: vec![100, 90, 120],
+            ..growth
+        };
+        assert_eq!(
+            interrupted.projected_exhaustion_seconds(Some(125), Some(225)),
+            None
+        );
+        let no_time = DescriptorFloorGrowth {
+            observed_span_us: 0,
+            ..growth
+        };
+        assert_eq!(
+            no_time.projected_exhaustion_seconds(Some(125), Some(225)),
+            None
+        );
+    }
+
+    #[test]
+    fn descriptor_growth_projection_does_not_overflow_at_large_limits() {
+        let growth = DescriptorFloorGrowth {
+            floors: vec![0, u64::MAX],
+            observed_span_us: u64::MAX,
+            per_hour: 3_600_000_000,
+        };
+        assert_eq!(
+            growth.projected_exhaustion_seconds(Some(0), Some(u64::MAX - 1)),
+            Some((u64::MAX - 1).div_ceil(1_000_000)),
+        );
     }
 
     #[test]

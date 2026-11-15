@@ -1,5 +1,13 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## Current operational reliability improvements
+
+- [x] Keep descriptor-floor monitoring safe during declining counts, sampler
+  restarts, and missed windows; use observed minima timestamps for growth and
+  expose a conditional soft-limit exhaustion estimate in health and logs.
+- [ ] Complete the broader `br-kp1in.29` operation-normalized resource-growth,
+  statistical calibration, shared soak predicates, and release-overhead acceptance.
+
 ## 0. Coordination / Meta
 - [x] Read `AGENTS.md` and `README.md` (baseline orientation).
 - [x] Register with MCP Agent Mail and announce to active agents.

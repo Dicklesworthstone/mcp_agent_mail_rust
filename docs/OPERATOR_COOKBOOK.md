@@ -709,6 +709,26 @@ If that reconciler is not running or has stopped making progress, health exits
 operation to finish and retry. Run repair commands only after reading the doctor
 output; diagnosis should come before mutation.
 
+### Interpreting descriptor growth
+
+The daemon's MCP `health_check` includes a `descriptors` health contributor
+with its current open-file count and soft limit. A rising descriptor floor
+also raises a warning before the limit is close: the minimum count must rise
+in six consecutive completed 30-minute windows, by at least 64 descriptors
+overall. Releasing descriptors clears that growth warning immediately when
+the sampler observes the recovery. A sampler restart or an unobserved window
+starts a new history instead of treating missing samples as evidence of growth.
+
+When both a rising floor and a finite limit are available, the contributor
+estimates the seconds to exhaust the remaining headroom at the observed rate.
+For example, 1,900 open descriptors, a limit of 2,048, and growth of 200 per hour
+produce an estimate of 2,664 seconds. The resource-monitor warning logs also
+include `observed_span_us` and `projected_exhaustion_seconds`. The rate uses the
+actual times at which the window minima were observed. This is a linear
+projection, not proof of a leak or a guaranteed deadline; a workload change
+can change it. Unknown or unlimited headroom produces no estimate. The
+existing pressure thresholds remain yellow at 70% and red at 90% utilization.
+
 ### Controlling background archive repair
 
 The daemon has three independent repair lanes for file-backed mailboxes. Each

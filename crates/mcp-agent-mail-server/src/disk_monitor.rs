@@ -313,10 +313,14 @@ fn sample_descriptors(elapsed: Duration, reported: bool) -> bool {
     );
     let growth = mcp_agent_mail_core::descriptor_floor_growth();
     if let Some(growth) = growth.as_ref().filter(|_| !reported) {
+        let (soft_limit, _) = mcp_agent_mail_core::read_fd_limits();
         tracing::warn!(
             open_fds,
+            soft_limit,
             floors = ?growth.floors,
+            observed_span_us = growth.observed_span_us,
             per_hour = growth.per_hour,
+            projected_exhaustion_seconds = growth.projected_exhaustion_seconds(Some(open_fds), soft_limit),
             "open descriptor floor rose in every recent window: possible descriptor leak"
         );
     }

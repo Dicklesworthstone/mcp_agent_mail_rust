@@ -2003,10 +2003,20 @@ fn descriptor_health_detail(
     let floor = growth.map_or_else(
         || "floor not rising".to_string(),
         |growth| {
-            format!(
+            let mut detail = format!(
                 "floor rose in every window {:?} (+{}/h): possible descriptor leak",
                 growth.floors, growth.per_hour
-            )
+            );
+            if let Some(seconds) =
+                growth.projected_exhaustion_seconds(descriptors.open_fds, descriptors.soft_limit)
+            {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    detail,
+                    "; estimated soft-limit exhaustion in {seconds}s if observed growth continues"
+                );
+            }
+            detail
         },
     );
     format!("{open} open of soft limit {soft}{pct}; {floor}")
@@ -7038,6 +7048,7 @@ mod tests {
         };
         let growth = mcp_agent_mail_core::DescriptorFloorGrowth {
             floors: vec![1500, 1600, 1700],
+            observed_span_us: 3_600_000_000,
             per_hour: 200,
         };
         let detail = descriptor_health_detail(&snapshot, Some(&growth));
@@ -7046,6 +7057,15 @@ mod tests {
             "{detail}"
         );
         assert!(detail.contains("possible descriptor leak"), "{detail}");
+        assert!(
+            detail.contains("exhaustion in 2664s if observed growth continues"),
+            "{detail}"
+        );
+        let unknown_limit = mcp_agent_mail_core::FdMetricsSnapshot {
+            soft_limit: None,
+            ..snapshot.clone()
+        };
+        assert!(!descriptor_health_detail(&unknown_limit, Some(&growth)).contains("exhaustion"));
         let steady = descriptor_health_detail(&snapshot, None);
         assert!(steady.ends_with("floor not rising"), "{steady}");
     }
