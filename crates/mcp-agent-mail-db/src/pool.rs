@@ -9691,6 +9691,8 @@ impl AnchoredRecoveryParent {
 
     #[allow(clippy::result_large_err)]
     fn quarantine_self_to(&self, quarantined_source: &Path) -> Result<(), SqlError> {
+        use rustix::fs::{AtFlags, FileType, statat};
+
         let context = "quarantine live database";
         self.verify_unchanged(context)?;
         let quarantined_name = quarantined_source
@@ -9709,6 +9711,47 @@ impl AnchoredRecoveryParent {
             quarantined_name,
             context,
         )?;
+        // NOREPLACE protects the destination, not the source name. Another
+        // actor can replace that name after verify_unchanged and before the
+        // rename. Never accept a different inode as the locked generation.
+        let verified = self.verify_parent_only(context).and_then(|()| {
+            let moved = statat(
+                &self.parent_dir,
+                quarantined_name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|error| {
+                SqlError::Custom(format!(
+                    "{context}: failed to verify moved source identity: {error}"
+                ))
+            })?;
+            if self.initial_leaf_stat.as_ref().is_none_or(|expected| {
+                !Self::same_inode(expected, &moved)
+                    || (FileType::from_raw_mode(moved.st_mode) == FileType::RegularFile
+                        && moved.st_nlink != 1)
+            }) {
+                return Err(SqlError::Custom(format!(
+                    "{context}: source identity changed during quarantine; refusing the unverified generation"
+                )));
+            }
+            Ok(())
+        });
+        if let Err(error) = verified {
+            // Keep using the anchored directory even if its pathname moved.
+            // A new source leaf must survive; a failed no-replace restore
+            // leaves the unverified object at the quarantine name instead.
+            let restored = Self::rename_noreplace_between_parents(
+                &self.parent_dir,
+                quarantined_name,
+                &self.parent_dir,
+                &self.file_name,
+                "restore unverified quarantine source",
+            );
+            let synced = self.sync_parent("sync unverified quarantine restoration");
+            return Err(SqlError::Custom(format!(
+                "{error}; restoring unverified source: {restored:?}; parent durability: {synced:?}"
+            )));
+        }
         self.sync_parent(context)
     }
 
@@ -29091,6 +29134,81 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&second_source).unwrap(), b"second generation");
         assert_eq!(std::fs::read(&destination).unwrap(), b"new generation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_quarantine_preserves_a_source_swapped_at_the_rename_boundary() {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        for rollback_collision in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let primary = dir.path().join("source.sqlite3");
+            let quarantine = dir.path().join("source.sqlite3.corrupt");
+            let displaced = dir.path().join("source.sqlite3.original");
+            std::fs::write(&primary, b"locked original generation").unwrap();
+            let anchor = AnchoredRecoveryParent::capture(&primary, "source swap fixture").unwrap();
+            let mut locked = anchor
+                .open_regular_read_write("source swap fixture")
+                .unwrap();
+            fs2::FileExt::try_lock_exclusive(&locked).unwrap();
+            let original = locked.metadata().unwrap();
+            let hook_primary = primary.clone();
+            let hook_displaced = displaced.clone();
+            let mut swapped = false;
+            let error = with_anchored_recovery_rename_hook(
+                move |_context, from, to| {
+                    if !swapped
+                        && from == std::ffi::OsStr::new("source.sqlite3")
+                        && to == std::ffi::OsStr::new("source.sqlite3.corrupt")
+                    {
+                        std::fs::rename(&hook_primary, &hook_displaced).unwrap();
+                        std::fs::write(&hook_primary, b"raced replacement generation").unwrap();
+                        swapped = true;
+                    } else if rollback_collision
+                        && from == std::ffi::OsStr::new("source.sqlite3.corrupt")
+                        && to == std::ffi::OsStr::new("source.sqlite3")
+                    {
+                        std::fs::write(&hook_primary, b"newer rollback collision").unwrap();
+                    }
+                    None
+                },
+                || anchor.quarantine_self_to(&quarantine),
+            )
+            .expect_err("quarantine must not accept an inode other than the locked source");
+            assert!(error.to_string().contains("identity"), "{error}");
+            let mut held_bytes = Vec::new();
+            locked.read_to_end(&mut held_bytes).unwrap();
+            assert_eq!(held_bytes, b"locked original generation");
+            assert_eq!(std::fs::read(&displaced).unwrap(), held_bytes);
+            let retained = std::fs::metadata(&displaced).unwrap();
+            assert_eq!(
+                (retained.dev(), retained.ino()),
+                (original.dev(), original.ino())
+            );
+            if rollback_collision {
+                assert_eq!(
+                    std::fs::read(&primary).unwrap(),
+                    b"newer rollback collision"
+                );
+                assert_eq!(
+                    std::fs::read(&quarantine).unwrap(),
+                    b"raced replacement generation"
+                );
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+            } else {
+                assert_eq!(
+                    std::fs::read(&primary).unwrap(),
+                    b"raced replacement generation"
+                );
+                assert!(matches!(
+                    std::fs::symlink_metadata(&quarantine),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ));
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+            }
+        }
     }
 
     #[test]

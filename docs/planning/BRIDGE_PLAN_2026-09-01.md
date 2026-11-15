@@ -1,5 +1,63 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review33 recovery source identity — EmeraldEagle
+
+- [x] Reread all Review32 runtime/test changes and real publication callers;
+  no further concrete reservation defect established. Preserve its scoped
+  evidence, red scanner result, prior comments and original issue acceptance.
+- [x] Triage ready/owned Beads. Return to owned br-cxsgx: anchored quarantine
+  validates its source before a no-replace rename but does not verify the
+  moved inode. Reuse its existing exact-boundary rename hook to exercise a
+  real source replacement after validation, while retaining a locked original.
+- [x] Extend existing pool tests in place: require refusal, original FD/inode
+  and bytes preserved, raced source restored; independently plant a rollback
+  destination collision and require all three generations remain untouched.
+- [ ] Actual unchanged-runtime counterfactual remains unexecuted: both bounded
+  test-only attempts exit103/queue_timeout before Cargo. Retain the exact
+  patch/manifest and original controls; no old-runtime failure is claimed.
+- [x] Retain baseline103/queue timeout before Cargo; no counterfactual native
+  result is claimed. Preserve the exact test-only patch/manifest. Two further
+  native disk guards refuse admission; do not lower budgets or delete caches.
+- [x] Repair the anchored quarantine path using retained directory descriptors
+  and post-rename identity validation. Roll back with no replacement on a
+  mismatch, retain every generation on collision, and report/sync outcomes.
+- [x] Reread implementation and both production callers; preserve source-type,
+  namespace, durability, admission and destination-collision behavior.
+- [x] Execute original29 recovery cases plus the new populated source-swap
+  regression on final0e7/f7cf: run664565f8-c5b5-4698-82a9-f27fe259e449,
+  terminal0/30PASS/4054skipped/16.505s, Cargo23m04s on hz4. Exact30-name
+  census matches; the new locked-FD/source-swap and rollback-collision case
+  passes0.035s. Selected stable test ELF SHA256
+  649d59f98b011df33050f488b8b6c61ef9c04b3b40d0c04dfff967ea39c0cce6.
+- [x] Complete all-target and separate production checks, strict Clippy,
+  formatting, full changed-file UBS and diff checks through strict RCH.
+- [x] Final frozen0e7/f7cf source passes workspace/all-target check0/Cargo12m11s
+  on1156 and separate production lib+bins0/4m49s on129. Four actual input
+  hashes on both workers match. Formatting0/diff-check0; full pool UBS0,
+  critical0/warning5202/info2473, no failed modules. Retain future notice.
+- [x] Preserve129 Clippy103/queue timeout and1156 native-budget guard refusal;
+  no Clippy pass inferred. New2480/1153651 guards0 permit another allowed-set
+  strict run without changing any policy. Native30 executes on hz4 after
+  hz2 hard disk refusal and an unrelated owned daemon maintenance pause;
+  executing-worker four-input hashes match the same frozen source.
+- [x] Strict Clippy on the same final source actually completes0/Cargo12m49s
+  on1153651; its four worker hashes match. Earlier129103 remains a refusal.
+- [x] After these fixed-source results and a fresh hz4 guard0, make one bounded
+  counterfactual replay with the saved identical test-only baseline input.
+  Preserve the qualified fixed patch and ELF first; restore and verify its
+  exact four-input manifest before publication. Do not infer failure from a
+  queued, refused or compiler-only attempt.
+- [x] Second baseline attempt exits103 before execution. Manually restore the
+  qualified fix and verify all four input hashes against the passing source;
+  fresh formatting0/whole-file UBS0 with the same disclosed warning counts.
+- [x] Audit original all-path acceptance and update only owned br-cxsgx. Keep
+  IN_PROGRESS: selected Unix/Linux repair is not every legacy rename/copy or
+  platform path. No independent verifier, full-native, crash-fault, installed
+  mailbox or release clearance. Flush0/cycles0; preserve all prior comments.
+- [x] Prepare one scoped implementation publication, preserving peer history
+  and seven original untracked roots. Actual commit/push/ref and exact owned
+  lease-release receipts follow in the existing external review-audit.md.
+
 ## November 15 Review32 reservation decisions — EmeraldEagle
 
 - [x] Reread Review31 code and actual callers; preserve shared history and the
