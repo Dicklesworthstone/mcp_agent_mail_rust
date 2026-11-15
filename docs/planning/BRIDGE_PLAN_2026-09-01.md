@@ -1,5 +1,80 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review34 promotion receipt authority — EmeraldEagle
+
+- [x] Trace Review33 quarantine errors through promotion and the receipt abort
+  contract. The helper preserves generations, but its caller wrongly clears
+  pending intent when the original authority was not restored. Prior caller
+  review did not establish this receipt precondition.
+- [x] Add a real promotion regression using the existing exact rename hook:
+  replace the original with a foreign database; separately collide with its
+  restoration. Assert independent original/foreign/candidate bytes and inodes,
+  exact pending receipt bytes, and actual readiness refusal.
+- [x] Preserve the exact test-only baseline and four-input manifest. Its ovh
+  attempt exits120 at disk admission before Cargo; no old-runtime failure is
+  claimed. The fixed hz3 native request exits103 at admission, also unexecuted.
+- [x] Obtain native execution of the regression and positive controls; current
+  RCH native budget is63GiB plus10GiB floor and live competing reservations.
+  Fresh hz4/1153651/1227854 guards refuse; no budget or gate was relaxed.
+- [x] Require original primary identity before aborting prepared intent;
+  retain pending evidence and actionable failure if identity is unresolved.
+- [x] Fresh reread also makes the existing durability obligation explicit:
+  on Unix, sync the retained primary parent and recheck original identity
+  before clearing intent. Final source76f68aa2 needs fresh compiler/scanner
+  qualification; earlier020e compiler results are preserved at their scope.
+- [x] Reread every abort caller and rollback path, including absent primary
+  and unsupported rename behavior; preserve ordinary safe-abort controls.
+- [x] Initial source020e320f is synced to the actual all-target, production and
+  Clippy workers; all four source/config hashes match. Formatting0 and whole
+  changed-file UBS0/critical0/warning5231/info2493. Warnings remain visible;
+  this is neither strict-warning nor whole-workspace scanner clearance.
+- [x] Run the declared recovery cohort, all-target and separate production
+  checks, strict Clippy, formatting, changed-file UBS and diff checks.
+- [x] Production check0/Cargo3m28s and strict Clippy0 on the same frozen
+  source (ovh/hz3 respectively, Clippy8m16s); retain the proc-macro-error2
+  future notice. Workspace/all-target check also completes0 on1156.
+  The admitted test-only baseline is now executing Cargo on ovh with all
+  four actual inputs matched; the local fixed source was restored exactly.
+- [x] Fixed native cohort was declared before baseline outcomes: prior30
+  recovery cases plus this new receipt regression, unsupported-NOREPLACE
+  controls, pre/post receipt-finalization cases, parent-swap rejection,
+  recovery after renewed corruption, and stale FSQLite sidecars (37 total).
+- [x] Actual unchanged-runtime baseline2 on ovh exits100: two tests run,
+  safe-refusal control passes, new regression fails because actual receipt
+  is `.aborted` rather than required `.pending`. Four actual worker inputs
+  match the saved test-only baseline. Stable DB test ELF SHA256
+  d9284ce36d7c513dcb231c0f7182b935378af0fc0e1b3516d8b673c1d1c421e1.
+- [x] Final76f/overlay3dc8 source passes workspace/all-target check0/Cargo
+  11m59s on129, strict Clippy0/1m40s on hz3, and separate production
+  check0/51.51s on ovh. All-target actual four-input hashes match. Short
+  Clippy/production checkouts retired before late direct hash capture;
+  retain their matching strict-RCH overlay receipts and failed late probes,
+  without claiming unavailable worker-byte cross-checks. Preserve2480
+  Clippy103/queue timeout and the earlier020e results at their own scope.
+- [x] After a fresh full63GiB/10GiB guard0, final native37 is admitted on
+  ovh. Four actual source/config hashes match76f. This exact run now exits0:
+  b95ade8d-7e54-44a9-b8aa-0a8e3de4efaa, Cargo2m00s,37PASS/4048skipped/
+  1.838s. New receipt regression passes0.213s and executes both collision
+  variants. Stable test ELF c3957d88f3f6d7d505536b8b74f2fb8fde02136df8b7796505a8f10d416ece4c.
+- [x] Reconcile every predeclared name with native output. Initial receipt
+  parser missed padded counters1-9; whitespace correction admits the actual
+  37 names while missing/failure/extra-case controls still reject. Runner
+  expectations, selection, features and budgets remain unchanged.
+- [x] Freshly reread the complete final runtime/test diff and all abort
+  callers. No further concrete defect found. Solo review and native Linux
+  controls do not close original all-path/platform or physical-crash gates.
+- [x] Record exact outcomes and unchanged original br-cxsgx acceptance in
+  comments4406/4407. All2871 issue IDs and all16 prior comments survive;
+  only this issue's comments/updated_at change,16to18 comments. Original
+  status/assignee/acceptance remain unchanged; no other issue changed.
+- [x] Normal pull is already current at029d8e0b; immediate import and flush
+  complete0, graph cycles0, exact final four-input hashes and diff checks0.
+  Preserve all seven original untracked roots and prepare only the runtime,
+  existing TODO and two tracker-export files for publication.
+- Publication commit/ref verification and lease-release results are appended
+  after execution to the existing session audit at
+  `/data/tmp/am-archive-reader-20261110.t7ueMuTt/review-audit.md`.
+
 ## November 15 Review33 recovery source identity — EmeraldEagle
 
 - [x] Reread all Review32 runtime/test changes and real publication callers;

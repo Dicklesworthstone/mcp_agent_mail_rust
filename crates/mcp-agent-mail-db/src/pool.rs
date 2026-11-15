@@ -18859,9 +18859,32 @@ fn rollback_recovery_candidate_promotion(
 }
 
 fn abort_prepared_recovery_after_safe_rollback(
+    primary_anchor: &AnchoredRecoveryParent,
     prepared: &crate::forensics::PreparedRecoveryReceipt,
     error: SqlError,
 ) -> ReconstructionCandidateFailure {
+    // A failed quarantine can restore a raced replacement, or leave it under
+    // quarantine when another file occupies the source. Neither outcome proves
+    // that the original authority is live again. Keep the durable intent until
+    // that identity precondition for aborting it has actually been established.
+    // A previous restoration may also have failed its directory sync; establish
+    // durability here before allowing the receipt's terminal transition.
+    let authority_verified = primary_anchor
+        .verify_unchanged("verify original authority before aborting recovery intent");
+    #[cfg(unix)]
+    let authority_verified = authority_verified
+        .and_then(|()| {
+            primary_anchor.sync_parent("sync original authority before aborting recovery intent")
+        })
+        .and_then(|()| {
+            primary_anchor
+                .verify_unchanged("recheck original authority before aborting recovery intent")
+        });
+    if let Err(authority_error) = authority_verified {
+        return ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+            "{error}; cannot verify the original database authority after refusal or rollback: {authority_error}; leaving the pending receipt in place so readiness fails closed"
+        )));
+    }
     match crate::forensics::abort_recovery_receipt(prepared) {
         Ok(aborted_path) => {
             tracing::warn!(
@@ -18891,6 +18914,7 @@ fn abort_prepared_recovery_after_safe_rollback(
 #[allow(clippy::result_large_err)]
 fn rollback_and_abort_recovery_promotion(
     primary_path: &Path,
+    primary_anchor: &AnchoredRecoveryParent,
     candidate_path: &Path,
     quarantined_source: Option<&Path>,
     timestamp: &str,
@@ -18903,7 +18927,7 @@ fn rollback_and_abort_recovery_promotion(
         quarantined_source,
         timestamp,
     ) {
-        Ok(()) => abort_prepared_recovery_after_safe_rollback(prepared, error),
+        Ok(()) => abort_prepared_recovery_after_safe_rollback(primary_anchor, prepared, error),
         Err(rollback_error) => {
             ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
                 "{error}; rollback also failed: {rollback_error}; leaving the pending receipt in place so readiness fails closed"
@@ -19299,10 +19323,11 @@ where
         candidate_path,
     )
     .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
-    if !sqlite_recovery_candidate_passes_full_integrity_check(candidate_path)
-        .map_err(|error| abort_prepared_recovery_after_safe_rollback(&prepared, error))?
-    {
+    if !sqlite_recovery_candidate_passes_full_integrity_check(candidate_path).map_err(|error| {
+        abort_prepared_recovery_after_safe_rollback(&primary_anchor, &prepared, error)
+    })? {
         return Err(abort_prepared_recovery_after_safe_rollback(
+            &primary_anchor,
             &prepared,
             SqlError::Custom(format!(
                 "recovery candidate {} failed full integrity after its durable intent was prepared",
@@ -19315,7 +19340,9 @@ where
         .and_then(|()| candidate_anchor.verify_unchanged("recovery candidate promotion"))
     {
         return Err(abort_prepared_recovery_after_safe_rollback(
-            &prepared, error,
+            &primary_anchor,
+            &prepared,
+            error,
         ));
     }
 
@@ -19325,6 +19352,7 @@ where
         && let Err(error) = primary_anchor.quarantine_self_to(quarantined_source)
     {
         return Err(abort_prepared_recovery_after_safe_rollback(
+            &primary_anchor,
             &prepared,
             SqlError::Custom(format!(
                 "failed to quarantine live database {} as {}: {error}",
@@ -19343,7 +19371,9 @@ where
         "recovery candidate promotion",
     ) {
         return Err(abort_prepared_recovery_after_safe_rollback(
-            &prepared, error,
+            &primary_anchor,
+            &prepared,
+            error,
         ));
     }
 
@@ -19352,6 +19382,7 @@ where
     {
         return Err(rollback_and_abort_recovery_promotion(
             primary_path,
+            &primary_anchor,
             candidate_path,
             quarantined_source.as_deref(),
             timestamp,
@@ -19365,6 +19396,7 @@ where
             crate::forensics::RecoveryReceiptPublicationStage::BeforeMarkerMove => {
                 return Err(rollback_and_abort_recovery_promotion(
                     primary_path,
+                    &primary_anchor,
                     candidate_path,
                     quarantined_source.as_deref(),
                     timestamp,
@@ -28360,6 +28392,99 @@ mod tests {
         );
         crate::forensics::verify_recovery_receipt_state(directory, primary)
             .expect("safe rollback and durable abort must leave receipt admission clear");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_keeps_pending_intent_when_quarantine_restores_another_generation() {
+        use std::rc::Rc;
+
+        for rollback_collision in [false, true] {
+            let directory = tempfile::tempdir()
+                .expect("recovery receipt fixture")
+                .keep();
+            let primary = directory.join("storage.sqlite3");
+            let candidate = directory.join("storage.sqlite3.candidate");
+            let displaced = directory.join("original.sqlite3");
+            let replacement = directory.join("replacement.sqlite3");
+            write_marker_db(&primary, "original-generation");
+            write_marker_db(&candidate, "candidate-generation");
+            write_marker_db(&replacement, "foreign-generation");
+            let primary_bytes = std::fs::read(&primary).unwrap();
+            let primary_inode = primary_identity(&primary);
+            let replacement_bytes = std::fs::read(&replacement).unwrap();
+            let replacement_inode = primary_identity(&replacement);
+            let candidate_inode = primary_identity(&candidate);
+            let witness = Rc::new(RefCell::new(None));
+            let quarantine = Rc::new(RefCell::new(None));
+            let hook_witness = Rc::clone(&witness);
+            let hook_quarantine = Rc::clone(&quarantine);
+            let hook_directory = directory.clone();
+            let hook_primary = primary.clone();
+            let hook_candidate = candidate.clone();
+            let hook_displaced = displaced.clone();
+            let hook_replacement = replacement.clone();
+            let error = with_anchored_recovery_rename_hook(
+                move |context, _from_name, to_name| {
+                    if context == "quarantine live database" {
+                        *hook_witness.borrow_mut() =
+                            Some(capture_recovery_promotion_rename_witness(
+                                &hook_directory,
+                                &hook_candidate,
+                            ));
+                        *hook_quarantine.borrow_mut() = Some(hook_directory.join(to_name));
+                        std::fs::rename(&hook_primary, &hook_displaced).unwrap();
+                        std::fs::rename(&hook_replacement, &hook_primary).unwrap();
+                    } else if rollback_collision
+                        && context == "restore unverified quarantine source"
+                    {
+                        std::fs::write(&hook_primary, b"newer rollback collision").unwrap();
+                    }
+                    None
+                },
+                || promote_recovery_candidate(&primary, &candidate, &directory),
+            )
+            .expect_err("a different live generation must refuse promotion");
+            assert!(error.to_string().contains("identity"), "{error}");
+            assert_eq!(std::fs::read(&displaced).unwrap(), primary_bytes);
+            assert_eq!(primary_identity(&displaced), primary_inode);
+            let quarantine = quarantine.borrow_mut().take().expect("quarantine reached");
+            if rollback_collision {
+                assert_eq!(
+                    std::fs::read(&primary).unwrap(),
+                    b"newer rollback collision"
+                );
+                assert_eq!(std::fs::read(&quarantine).unwrap(), replacement_bytes);
+                assert_eq!(primary_identity(&quarantine), replacement_inode);
+            } else {
+                assert_eq!(std::fs::read(&primary).unwrap(), replacement_bytes);
+                assert_eq!(primary_identity(&primary), replacement_inode);
+                assert!(
+                    std::fs::symlink_metadata(&quarantine)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                );
+                assert_eq!(
+                    sqlite_marker_value(&primary).as_deref(),
+                    Some("foreign-generation")
+                );
+            }
+            let witness = witness
+                .borrow_mut()
+                .take()
+                .expect("prepared receipt reached");
+            assert_eq!(std::fs::read(&candidate).unwrap(), witness.candidate_bytes);
+            assert_eq!(primary_identity(&candidate), candidate_inode);
+            let receipts = recovery_promotion_receipt_artifacts(&directory);
+            assert_eq!(receipts.len(), 1, "one retained intent: {receipts:?}");
+            assert_eq!(
+                receipts[0].extension(),
+                Some(OsStr::new("pending")),
+                "restoring a foreign generation cannot justify aborting the durable intent"
+            );
+            assert_eq!(std::fs::read(&receipts[0]).unwrap(), witness.intent_bytes);
+            crate::forensics::verify_recovery_receipt_state(&directory, &primary)
+                .expect_err("an unresolved promotion must keep readiness fail-closed");
+        }
     }
 
     #[cfg(unix)]
