@@ -6,17 +6,38 @@
   compare ready Beads with landed implementation and retained acceptance.
 - [x] Find post-commit follow-up using the live pathname without candidate
   identity revalidation; reserve existing files and keep br-cxsgx in progress.
-- [ ] Add real SQLite controls for live-generation replacement after successful
+- [x] Add real SQLite controls for live-generation replacement after successful
   finalization, post-rename verification failure and receipt-directory sync failure;
   cover original-primary presence/absence, preserved bytes/inodes/receipt, and
   refusal to create ATC follow-up artifacts for a foreign primary.
-- [ ] Execute unchanged-production baseline with both new negative cases and
-  existing post-commit positive control; preserve exact source and test identity.
-- [ ] Revalidate committed candidate identity before follow-up mutation; keep
+- [x] Execute unchanged-production baseline9cfd1088-44dd-46c9-b925-20c0aef68e3e:
+  exit100/4run/2PASS2FAIL/4091skipped/4.131s, Cargo3m53s. Both foreign-generation
+  cases create forbidden ATC follow-up artifacts; new own-generation schema
+  control and existing post-receipt control pass. Source6059030a; stable ELF
+  5793e2ff37f0291aab79b82e27795200bad12674ae212957df47cb44d0784614.
+- [x] Revalidate committed candidate identity before follow-up mutation; keep
   committed-receipt error classification, preserve every generation, and refuse
   success when current authority cannot be proven.
-- [ ] Reread the fix and consumers; run the prior47 cases plus new controls,
-  mandatory workspace/production checks, strict Clippy, formatting and scanner.
+- [x] Find a second defect in the prior repair: opening/closing a foreign main
+  inode to compare identity can erase this process's classic POSIX record locks.
+  Add a Linux child F_GETLK regression with a real held F_SETLK lock and explicit
+  unlock control; use metadata-only Unix verification against the retained FD.
+- [x] Supplementary unchanged-production baselinef58f8047-1f44-41df-860a-e8576e687939:
+  exit100/2run/1PASS1FAIL/4094skipped/1.203s, Cargo4m35s. Child observes the
+  lock before refusal and loses it afterward; existing real FrankenSQLite SHM
+  lock control passes. Sourcec005bc9d; stable ELF
+  0e2617d74928bbf4b3e549f31e42811e25b004e864514c3cf3caf379a47c0661.
+- [x] Reread all changed helpers, flags, tests and callers; initial final source
+  c574d3ff/overlaye90f7978 passes workspace all-target check on ovh, with matching
+  four actual worker inputs. Formatting/diff checks pass. Preserve prior hz3
+  admission120/startedfalse and Clippy/native queue-timeout103; these are not tests.
+- [ ] Run predeclared final52 (prior47, three post-commit cases, new lock case,
+  existing FrankenSQLite lock control), production lib+bins check and strict
+  workspace Clippy on the frozen source, with actual terminal outcomes.
+- [x] Run strict whole-file UBS: exit1/statusok/critical0/warning5382/info2594/
+  no failed modules. Read92 findings in bounded changed ranges: test assertions,
+  unwrap/panic checks, fixture clones, child probe and informational matches.
+  No UBS suppression added; strict scanner convergence remains unclaimed.
 - [ ] Record actual outcomes and unmet original acceptance in existing TODO,
   owned Bead and audit; preserve tracker history, prepare exact-path publication,
   verify remote refs/shared tree and release only owned leases.
