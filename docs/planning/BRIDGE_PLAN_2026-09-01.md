@@ -1,5 +1,103 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review40 health-copy retry authority — EmeraldEagle
+
+- [x] Reread the latest complete source/test diff, witness consumers and public
+  retry/fallback callers; inspect ready Beads without changing peer ownership.
+- [x] Identify the retry gap: a single-attempt replacement refusal can be
+  retried through an unclassified pathname, reopening and unlocking it.
+- [x] Add thread-local, test-only copy injection to exercise the actual public
+  retry loop. Preserve all existing tests and single-attempt error assertions.
+- [x] Execute old-runtime main/sidecar replacement regressions and transient
+  WAL-appearance/disappearance/same-inode-rewrite controls on frozen source.
+- [x] Propagate a typed replacement refusal while retained witnesses still
+  prove identity; stop public retries and prevent erroneous live-read fallback.
+- [x] Trace generic revalidation errors and staged-copy seal failures: neither
+  may hide a simultaneous parent/source replacement. Check all retained source
+  identities on every retryable validation exit, without opening those files.
+- [x] Execute supplemental parent-swap and staged-drift-plus-parent-swap
+  regressions against the intermediate runtime, keeping its passing controls.
+- [x] Reread all edits and health/recovery callers. Preserve the complete
+  content/metadata seal and check final identity even after a content mismatch.
+- [x] Reexecute valid transient retries, byte preservation and explicit unlock
+  on the repaired source, including existing live/native health controls.
+- [x] Formatting/diff checks pass; review all 108 expanded changed-range UBS findings
+  without suppression. Full-file strict UBS remains red.
+- [x] Run both expanded-source workspace compiler graphs and all-target Clippy
+  with `-D warnings`; retain exact source and terminal results.
+- [x] Run the predeclared 93-case final cohort; retain exact case census,
+  actual worker inputs and stable executable identity.
+- [x] Reexecute ten decisive original controls in a fresh solo pass; update only
+  owned br-cxsgx evidence, retain broader acceptance, and prepare publication.
+
+Old-runtime object `3bb655b7` (parent `2ec85201`, test-only injection and three
+new regressions) executed **4 named cases: 2 controls passed, 2 replacement
+cases failed**, 4,098 outside selection (0.30 s, Cargo6m28s on ovh-a).
+Both failures are independently observed lost foreign POSIX locks after the
+public retry. Exact names and all five actual worker inputs match. Baseline
+native ELF SHA-256 is
+`e8179f74d8322facd8835a41654b161d3d5dbdd7cadf3c3b35612bb7ac9b652b`.
+
+The intermediate candidate was base `2ec85201` plus pool-only overlay
+`8c4f1140a7e2538fb118c90747a463b1e2099413c6e3ac70dd989e605119f0ca`,
+pool SHA-256 `a9f19ff6afea23bfe9d31079c35cab31ccbd62327efbed98828dbc828eb5e087`.
+Its **91-case cohort passed**, 4,011 outside selection (6.43 s); workspace
+all-target check passed on hz4. These do not qualify the later parent/error-path
+repair. Intermediate full-file strict UBS reports zero critical, 5,489 warnings and
+2,651 informational findings; changed-line findings are test fixtures/assertions
+and non-float equality comparisons. The hz3 disk preflight refused before any
+build; normal admitted hz4/ovh-a lanes retain their original budgets/floors.
+
+The expanded source is pool SHA-256
+`3f6e63fd532d07758d43434a6b54e9ad7ea47ae4fa96863fe1619640a7503b1d`.
+The supplemental comparison `0c57c4d8` includes the first repair and new parent
+regressions before the error-path repair. Its exact five-case execution
+terminated101: **3 controls passed, both parent cases failed**, 4,099 outside
+selection (1.11 s, Cargo6m28s). Both failures lose the held foreign POSIX lock;
+all five actual worker input hashes match. Stable native ELF SHA-256 is
+`bfdae40ccdf134b1135b77c6352511f8f3e6919582f69502391fa96fffdd48fa`.
+One parent
+fixture also rewrites the retained WAL with the same length, exercising a
+staged-byte mismatch that previously hid invalid source authority. The expanded
+source keeps transient sidecar absence retryable while refusing missing main,
+unsafe parent, replacement or unverifiable identity on validation failures.
+Both expanded-source workspace compiler graphs pass on vmi1293453:
+all-target terminal0/Cargo25m00s and production lib/bins terminal0/Cargo7m57s;
+actual five worker inputs match each. Expanded-source all-target Clippy
+with `-D warnings` also passes on that worker (terminal0); its actual five
+worker inputs match. The final native cohort passes all **93 declared cases**
+(zero failed/ignored, 4,011 outside selection, 121.67 s; cold Cargo68m18s on
+hz4). Exact case census and actual five worker inputs match. Stable native ELF
+SHA-256 is `56c64e4862edf7fffc3ff5c4f64b4567e76cb94b5b2a6ad70cbb3da4931c3a01`.
+The fresh solo pass also executes all **10 declared controls successfully**
+(zero failed/ignored, 4,094 outside selection, 6.49 s; warm Cargo0.39s).
+Its actual five worker inputs match and the native ELF hash is unchanged.
+The first fresh attempt ended120 before Cargo: the worker's disk monitor
+timed out, reporting `monitor_unavailable` and `started:false`. It executed
+zero tests. A new normal-budget/floor admission check passes before the
+successful retry; no limits or configuration were changed.
+The expanded pool-only overlay is
+`6d9b62ebba0a7e5258bcc53a7b58ecb19396724cc7cfacb008f5884ca528193a`.
+Expanded strict UBS is still red: zero critical, 5,515 warnings and 2,668
+informational findings, with no failed modules or added suppressions.
+The first expanded all-target request ended in admission103 before compilation;
+its unavailable byte-watcher receipt is not a source match or a passing check.
+Native Cargo is admitted under its advertised default 30 GiB reservation and
+10 GiB floor; compiler checks retain their advertised 31 GiB reservation.
+Supplemental preflights match each command's real reservation. No RCH budget,
+floor, worker configuration or project test gate was changed.
+
+The new tests use real files, canonical SQLite writes and kernel locks;
+thread-local injection only selects the copy boundary and its scoped guard
+resets it on success or panic. Existing assertions, Nextest configuration and
+the three-attempt transient retry limit remain unchanged. This qualifies only
+the known-replacement retry boundary; the complete original startup artifact
+path inventory/collision/durability acceptance remains open. Raw receipts reuse
+`/data/tmp/am-archive-reader-20261110.t7ueMuTt/review40-*` and the existing audit.
+This is solo Linux verification; other platforms, full workspace tests,
+production soak and release remain unqualified. Terminal publication/ref/lease
+observations are recorded in the existing audit after execution.
+
 ## November 15 Review39 retain backup and health-copy source authority — EmeraldEagle
 
 - [x] Reread Review38's complete test diff and real finalizer/promotion callers;
