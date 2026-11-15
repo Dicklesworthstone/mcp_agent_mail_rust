@@ -899,6 +899,21 @@ The interactive TUI has 16 screens. Jump directly with `1`-`9`, `0` (screen 10),
 
 **Screen-specific highlights:** Messages uses `g` for Local/Global inbox; Threads uses `e/c` for expand/collapse-all in conversation view; Timeline uses `V` for Events/Commits/Combined/Log and `v` for visual selection; Search uses `f` + facet rail navigation for scope/sort/field controls; Contacts uses `n` to cycle Table/Graph/Matrix (sender × recipient heatmap); batch-capable screens share `Space`/`v`/`A`/`C`; preset-enabled screens use `Ctrl+S`/`Ctrl+L`.
 
+**Compose from any screen:** Press `Ctrl+N`, choose the project with the arrow
+keys, then use `Tab` to reach recipients and the remaining fields. Existing
+active agents are loaded from that project's live mailbox. A mailbox with more
+than one project requires an explicit choice. Select recipients with `Space`
+and cycle their To/Cc/Bcc role with `Ctrl+T`; the Acknowledgement field can
+request a receipt. `Ctrl+R` refreshes projects and recipients, and
+`Ctrl+Enter` sends.
+
+Loading and delivery run in the background. A failed send keeps the draft;
+retrying it unchanged reuses its delivery key to avoid duplicate mail. While
+sending, the form prevents edits and duplicate submissions. `Esc` dismisses a
+pending form while delivery continues. Changing project clears its recipients
+and thread, preserving the message text; refreshing the same project keeps
+selected unavailable recipients visible until you explicitly remove them.
+
 **Command palette:** Press `Ctrl+P` (or `:` outside text-entry) to open a searchable action launcher that includes screen navigation, transport/layout controls, and dynamic entities (agents/projects/threads/tools/reservations).
 
 **Themes:** 42 named palettes are in the `Ctrl+T`/`Shift+T` cycle (Cyberpunk Aurora, Darcula, Lumen Light, Nordic Frost, High Contrast, Dracula, Monokai, Nord, and more; see `NAMED_THEMES` in `crates/mcp-agent-mail-server/src/tui_theme.rs`). The five config-level themes are selectable through `TUI_THEME`. Accessibility support includes high-contrast mode and reduced motion.

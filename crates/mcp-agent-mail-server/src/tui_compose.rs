@@ -2,8 +2,8 @@
 //! and sending messages from the TUI.
 //!
 //! Opened via `Ctrl+N` from any screen. The panel floats over the active
-//! screen at 70% width / 80% height and provides fields for recipients,
-//! subject, body, importance, and thread ID.
+//! screen at 70% width / 80% height and provides a project selector plus
+//! recipients, subject, body, importance, thread ID, and acknowledgement fields.
 //!
 //! ## Integration
 //!
@@ -79,21 +79,25 @@ fn compose_palette() -> ComposePalette {
 /// Identifies the active input field in the compose panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ComposeField {
+    Project,
     Recipients,
     Subject,
     Body,
     Importance,
     ThreadId,
+    AckRequired,
 }
 
 impl ComposeField {
     /// All fields in tab order.
     pub const ALL: &[Self] = &[
+        Self::Project,
         Self::Recipients,
         Self::Subject,
         Self::Body,
         Self::Importance,
         Self::ThreadId,
+        Self::AckRequired,
     ];
 
     /// Advance to the next field (wraps).
@@ -115,11 +119,13 @@ impl ComposeField {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Project => "Project",
             Self::Recipients => "To",
             Self::Subject => "Subject",
             Self::Body => "Body",
             Self::Importance => "Importance",
             Self::ThreadId => "Thread ID",
+            Self::AckRequired => "Acknowledgement",
         }
     }
 }
@@ -195,6 +201,9 @@ pub struct RecipientEntry {
     pub selected: bool,
     /// Recipient kind: To, Cc, or Bcc.
     pub kind: RecipientKind,
+    /// Whether the latest authoritative roster still permits this recipient.
+    /// Selected unavailable entries remain visible until explicitly removed.
+    pub available: bool,
 }
 
 /// Recipient addressing kind.
@@ -231,10 +240,27 @@ impl RecipientKind {
 // ComposeState — full form state
 // ──────────────────────────────────────────────────────────────────────
 
+/// Exact project identity captured from the live mailbox for a compose draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeProject {
+    /// Database identity captured with the project catalog.
+    pub id: i64,
+    /// Canonical project slug shown in the selector.
+    pub slug: String,
+    /// Canonical workspace path passed to messaging tools.
+    pub human_key: String,
+}
+
 /// State for the message compose overlay.
+// These flags describe independent concerns: draft edits, background work,
+// explicit project choice, and the outgoing acknowledgement option.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ComposeState {
     /// Currently active field.
     pub active_field: ComposeField,
+    available_projects: Vec<ComposeProject>,
+    selected_project_index: Option<usize>,
+    project_choice_required: bool,
     /// Available agents for the recipient list.
     pub recipients: Vec<RecipientEntry>,
     /// Cursor position in the recipients list (for navigation).
@@ -259,12 +285,16 @@ pub struct ComposeState {
     pub thread_id: String,
     /// Thread ID cursor position.
     pub thread_id_cursor: usize,
+    /// Request an explicit acknowledgement from each recipient.
+    pub ack_required: bool,
     /// Validation error, if any.
     pub error: Option<String>,
     /// Whether the panel has unsaved changes.
     pub dirty: bool,
     /// Whether a send is in flight.
     pub sending: bool,
+    /// Whether the live project list or selected project's roster is loading.
+    pub loading: bool,
 }
 
 impl ComposeState {
@@ -272,7 +302,10 @@ impl ComposeState {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            active_field: ComposeField::Recipients,
+            active_field: ComposeField::Project,
+            available_projects: Vec::new(),
+            selected_project_index: None,
+            project_choice_required: false,
             recipients: Vec::new(),
             recipient_cursor: 0,
             recipient_filter: String::new(),
@@ -285,9 +318,11 @@ impl ComposeState {
             importance: Importance::Normal,
             thread_id: String::new(),
             thread_id_cursor: 0,
+            ack_required: false,
             error: None,
             dirty: false,
             sending: false,
+            loading: false,
         }
     }
 
@@ -299,39 +334,114 @@ impl ComposeState {
             name: agent_name.to_string(),
             selected: true,
             kind: RecipientKind::To,
+            available: false,
         });
         state.active_field = ComposeField::Subject;
         state
     }
 
-    /// Populate the agent list from known agents (fetched from DB).
-    pub fn set_available_agents(&mut self, agents: Vec<String>) {
-        // Preserve existing selections
-        let selected: std::collections::HashSet<String> = self
-            .recipients
-            .iter()
-            .filter(|r| r.selected)
-            .map(|r| r.name.clone())
-            .collect();
-        let kinds: std::collections::HashMap<String, RecipientKind> = self
-            .recipients
-            .iter()
-            .filter(|r| r.selected)
-            .map(|r| (r.name.clone(), r.kind))
-            .collect();
+    /// Replace the authoritative project list, preserving an exact selection.
+    /// A new draft selects automatically only when one project is available.
+    pub fn set_available_projects(&mut self, projects: Vec<ComposeProject>) {
+        if self.sending {
+            return;
+        }
+        let previous = self.selected_project().cloned();
+        self.available_projects = projects;
+        self.selected_project_index = previous
+            .as_ref()
+            .and_then(|selected| self.available_projects.iter().position(|p| p == selected))
+            .or_else(|| {
+                (previous.is_none()
+                    && !self.project_choice_required
+                    && self.available_projects.len() == 1)
+                    .then_some(0)
+            });
+        if self.selected_project() != previous.as_ref() {
+            self.clear_project_recipients(previous.is_some());
+            if previous.is_some() && self.selected_project().is_none() {
+                self.project_choice_required = true;
+                self.error = Some(
+                    "The selected project is no longer available; choose a project and recipients again"
+                        .to_string(),
+                );
+            }
+        }
+    }
 
+    /// The project whose roster and message thread this draft addresses.
+    #[must_use]
+    pub fn selected_project(&self) -> Option<&ComposeProject> {
+        self.selected_project_index
+            .and_then(|index| self.available_projects.get(index))
+    }
+
+    /// Select an exact identity already present in the authoritative list.
+    /// Returns whether the selection changed and a new roster must be loaded.
+    pub fn set_selected_project(&mut self, project: &ComposeProject) -> bool {
+        if self.sending || self.selected_project() == Some(project) {
+            return false;
+        }
+        let Some(index) = self.available_projects.iter().position(|p| p == project) else {
+            return false;
+        };
+        let had_project = self.selected_project().is_some();
+        self.selected_project_index = Some(index);
+        self.project_choice_required = false;
+        self.clear_project_recipients(had_project);
+        self.dirty = true;
+        true
+    }
+
+    fn clear_project_recipients(&mut self, clear_thread: bool) {
+        self.recipients.clear();
+        self.recipient_filter.clear();
+        self.recipient_cursor = 0;
+        self.error = None;
+        self.loading = false;
+        if clear_thread {
+            self.thread_id.clear();
+            self.thread_id_cursor = 0;
+        }
+    }
+
+    /// Populate the selected project's authoritative agent list.
+    /// Missing selected recipients stay in the draft as unavailable, so a
+    /// failed send followed by a refresh cannot silently shrink its audience.
+    pub fn set_available_agents(&mut self, agents: Vec<String>) {
+        if self.sending || self.selected_project().is_none() {
+            return;
+        }
+        let previous = std::mem::take(&mut self.recipients);
+        let kinds: std::collections::HashMap<String, RecipientKind> = previous
+            .iter()
+            .filter(|r| r.selected)
+            .map(|r| (r.name.to_ascii_lowercase(), r.kind))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
         self.recipients = agents
             .into_iter()
+            .filter(|name| !name.trim().is_empty() && seen.insert(name.to_ascii_lowercase()))
             .map(|name| {
-                let was_selected = selected.contains(&name);
-                let kind = kinds.get(&name).copied().unwrap_or(RecipientKind::To);
+                let selected_kind = kinds.get(&name.to_ascii_lowercase()).copied();
                 RecipientEntry {
                     name,
-                    selected: was_selected,
-                    kind,
+                    selected: selected_kind.is_some(),
+                    kind: selected_kind.unwrap_or(RecipientKind::To),
+                    available: true,
                 }
             })
             .collect();
+        for mut recipient in previous {
+            if recipient.selected && seen.insert(recipient.name.to_ascii_lowercase()) {
+                recipient.available = false;
+                self.recipients.push(recipient);
+            }
+        }
+        self.recipient_cursor = self
+            .recipient_cursor
+            .min(self.filtered_recipients().len().saturating_sub(1));
+        self.loading = false;
     }
 
     /// Return the filtered list of recipient indices.
@@ -351,8 +461,13 @@ impl ComposeState {
 
     /// Toggle selection of the recipient at the current cursor position.
     pub fn toggle_recipient(&mut self) {
+        if self.sending || self.loading {
+            return;
+        }
         let filtered = self.filtered_recipients();
-        if let Some(&idx) = filtered.get(self.recipient_cursor) {
+        if let Some(&idx) = filtered.get(self.recipient_cursor)
+            && (self.recipients[idx].available || self.recipients[idx].selected)
+        {
             self.recipients[idx].selected = !self.recipients[idx].selected;
             self.dirty = true;
         }
@@ -360,6 +475,9 @@ impl ComposeState {
 
     /// Cycle the recipient kind (To/Cc/Bcc) at the current cursor position.
     pub fn cycle_recipient_kind(&mut self) {
+        if self.sending || self.loading {
+            return;
+        }
         let filtered = self.filtered_recipients();
         if let Some(&idx) = filtered.get(self.recipient_cursor)
             && self.recipients[idx].selected
@@ -371,15 +489,23 @@ impl ComposeState {
 
     /// Select all visible recipients.
     pub fn select_all_recipients(&mut self) {
+        if self.sending || self.loading {
+            return;
+        }
         let filtered = self.filtered_recipients();
         for &idx in &filtered {
-            self.recipients[idx].selected = true;
+            if self.recipients[idx].available {
+                self.recipients[idx].selected = true;
+            }
         }
         self.dirty = true;
     }
 
     /// Deselect all recipients.
     pub fn clear_all_recipients(&mut self) {
+        if self.sending || self.loading {
+            return;
+        }
         for r in &mut self.recipients {
             r.selected = false;
         }
@@ -419,6 +545,30 @@ impl ComposeState {
     /// Validate the form before sending. Returns `Ok(())` if valid.
     pub fn validate(&mut self) -> Result<(), String> {
         self.error = None;
+
+        if self.sending || self.loading {
+            let msg = if self.sending {
+                "A send is already in progress"
+            } else {
+                "Wait for the live project and recipient list to finish loading"
+            }
+            .to_string();
+            self.error = Some(msg.clone());
+            return Err(msg);
+        }
+        if self.selected_project().is_none() {
+            let msg = "Choose a project before sending".to_string();
+            self.error = Some(msg.clone());
+            return Err(msg);
+        }
+        if let Some(recipient) = self.recipients.iter().find(|r| r.selected && !r.available) {
+            let msg = format!(
+                "Recipient {} is unavailable in this project; deselect it before sending",
+                recipient.name
+            );
+            self.error = Some(msg.clone());
+            return Err(msg);
+        }
 
         let has_any_recipient = self.recipients.iter().any(|r| r.selected);
         if !has_any_recipient {
@@ -465,6 +615,7 @@ impl ComposeState {
             || !self.subject.is_empty()
             || !self.body.is_empty()
             || !self.thread_id.is_empty()
+            || self.ack_required
             || self.recipients.iter().any(|r| r.selected)
     }
 
@@ -511,9 +662,19 @@ impl ComposeState {
         if key.kind != KeyEventKind::Press {
             return ComposeAction::Consumed;
         }
+        if self.sending {
+            return if key.code == KeyCode::Escape {
+                ComposeAction::Close
+            } else {
+                ComposeAction::Consumed
+            };
+        }
 
         // Global keybindings (work in any field)
         match (key.code, key.modifiers) {
+            (KeyCode::Char('r'), m) if m.contains(Modifiers::CTRL) => {
+                return ComposeAction::Reload;
+            }
             // Ctrl+Enter: send
             (KeyCode::Enter, m) if m.contains(Modifiers::CTRL) => {
                 return ComposeAction::Send;
@@ -541,11 +702,37 @@ impl ComposeState {
 
         // Field-specific handling
         match self.active_field {
+            ComposeField::Project => self.handle_project_key(key),
             ComposeField::Recipients => self.handle_recipients_key(key),
             ComposeField::Subject => self.handle_text_input_key(key, TextTarget::Subject),
             ComposeField::Body => self.handle_body_key(key),
             ComposeField::Importance => self.handle_importance_key(key),
             ComposeField::ThreadId => self.handle_text_input_key(key, TextTarget::ThreadId),
+            ComposeField::AckRequired => self.handle_ack_required_key(key),
+        }
+    }
+
+    fn handle_project_key(&mut self, key: &KeyEvent) -> ComposeAction {
+        let backwards = match key.code {
+            KeyCode::Left | KeyCode::Up => true,
+            KeyCode::Right | KeyCode::Down | KeyCode::Enter | KeyCode::Char(' ') => false,
+            _ => return ComposeAction::Ignored,
+        };
+        let count = self.available_projects.len();
+        if count == 0 {
+            return ComposeAction::Consumed;
+        }
+        let index = match self.selected_project_index {
+            Some(index) if backwards => (index + count - 1) % count,
+            Some(index) => (index + 1) % count,
+            None if backwards => count - 1,
+            None => 0,
+        };
+        let project = self.available_projects[index].clone();
+        if self.set_selected_project(&project) {
+            ComposeAction::ProjectChanged
+        } else {
+            ComposeAction::Consumed
         }
     }
 
@@ -759,6 +946,17 @@ impl ComposeState {
         }
     }
 
+    fn handle_ack_required_key(&mut self, key: &KeyEvent) -> ComposeAction {
+        match key.code {
+            KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Left | KeyCode::Right => {
+                self.ack_required = !self.ack_required;
+                self.dirty = true;
+                ComposeAction::Consumed
+            }
+            _ => ComposeAction::Ignored,
+        }
+    }
+
     /// Compute the byte offset into `self.body` for the current cursor position.
     fn body_offset(&self) -> usize {
         let mut offset = 0;
@@ -840,6 +1038,10 @@ pub enum ComposeAction {
     Consumed,
     /// The key was not relevant to the compose panel.
     Ignored,
+    /// A new project was selected; load its authoritative roster asynchronously.
+    ProjectChanged,
+    /// Retry the live project and recipient observation (Ctrl+R).
+    Reload,
     /// User wants to send the message (Ctrl+Enter).
     Send,
     /// User wants to close without sending (Esc, no unsaved changes).
@@ -858,6 +1060,8 @@ pub enum ComposeAction {
 /// The caller (typically `tui_app`) passes this to the async send path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposeEnvelope {
+    /// Exact selected project identity; never inferred from recent events.
+    pub project: ComposeProject,
     /// Sender agent name (always [`OVERSEER_AGENT_NAME`]).
     pub sender_name: String,
     /// Primary recipients (To).
@@ -874,6 +1078,8 @@ pub struct ComposeEnvelope {
     pub importance: String,
     /// Optional thread ID for threading.
     pub thread_id: Option<String>,
+    /// Whether recipients must explicitly acknowledge this message.
+    pub ack_required: bool,
 }
 
 impl ComposeState {
@@ -883,6 +1089,10 @@ impl ComposeState {
     /// captures all fields needed by `send_message` in the tools layer.
     pub fn build_envelope(&mut self) -> Result<ComposeEnvelope, String> {
         self.validate()?;
+        let project = self
+            .selected_project()
+            .cloned()
+            .ok_or_else(|| "Choose a project before sending".to_string())?;
 
         let to: Vec<String> = self
             .to_recipients()
@@ -907,6 +1117,7 @@ impl ComposeState {
         };
 
         Ok(ComposeEnvelope {
+            project,
             sender_name: OVERSEER_AGENT_NAME.to_owned(),
             to,
             cc,
@@ -915,6 +1126,7 @@ impl ComposeState {
             body_md: self.body.clone(),
             importance: self.importance.as_str().to_owned(),
             thread_id,
+            ack_required: self.ack_required,
         })
     }
 }
@@ -943,8 +1155,8 @@ impl<'a> ComposePanel<'a> {
         let height = ((u32::from(terminal.height) * 80) / 100) as u16;
         let width = width.max(40).min(terminal.width);
         let height = height.max(15).min(terminal.height);
-        let x = (terminal.width.saturating_sub(width)) / 2;
-        let y = (terminal.height.saturating_sub(height)) / 2;
+        let x = terminal.x + (terminal.width.saturating_sub(width)) / 2;
+        let y = terminal.y + (terminal.height.saturating_sub(height)) / 2;
         Rect::new(x, y, width, height)
     }
 
@@ -954,6 +1166,10 @@ impl<'a> ComposePanel<'a> {
         let area = Self::overlay_area(terminal_area);
         let cp = compose_palette();
         let tp = crate::tui_theme::TuiThemePalette::current();
+
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
 
         // Fill background
         for row in area.y..area.bottom() {
@@ -966,18 +1182,28 @@ impl<'a> ComposePanel<'a> {
 
         // Draw border
         self.draw_border(area, &cp, frame);
+        if area.width < 4 || area.height < 4 {
+            return;
+        }
 
         // Title bar
-        let title = " Compose Message (Ctrl+Enter: Send | Esc: Cancel) ";
+        let title = " Compose Message ";
         self.draw_text(
             area.x + 2,
             area.y,
             title,
             cp.title_fg,
             cp.bg,
-            area.right(),
+            area.right().saturating_sub(1),
             frame,
         );
+
+        // Small terminals show the current field instead of hiding fields
+        // below the body. Project identity remains visible while tabbing.
+        if area.height < 28 || area.width < 40 {
+            self.render_compact(area, &cp, frame);
+            return;
+        }
 
         // Inner content area
         let inner = Rect::new(
@@ -990,6 +1216,28 @@ impl<'a> ComposePanel<'a> {
         let mut y = inner.y;
         let max_y = inner.bottom();
         let inner_w = inner.width as usize;
+
+        // ── Project field ──────────────────────────────────────
+        if y < max_y {
+            let is_active = self.state.active_field == ComposeField::Project;
+            let label = self.project_label();
+            self.draw_text(
+                inner.x,
+                y,
+                &label,
+                if is_active { cp.active_border } else { cp.value_fg },
+                cp.bg,
+                inner.right(),
+                frame,
+            );
+            y += 1;
+            let detail = self.state.selected_project().map_or(
+                "Left/Right or Space: choose a project",
+                |project| project.human_key.as_str(),
+            );
+            self.draw_text(inner.x, y, detail, cp.hint_fg, cp.bg, inner.right(), frame);
+            y += 1;
+        }
 
         // ── Recipients field ───────────────────────────────────
         if y < max_y {
@@ -1033,7 +1281,17 @@ impl<'a> ComposePanel<'a> {
             // Recipient list (show up to 4 rows)
             let filtered = self.state.filtered_recipients();
             let max_rows = if is_active { 4 } else { 2 };
-            for (vi, &ri) in filtered.iter().enumerate().take(max_rows) {
+            let start = if is_active {
+                self.state.recipient_cursor.saturating_sub(max_rows - 1)
+            } else {
+                0
+            };
+            if filtered.is_empty() && y < max_y {
+                let hint = self.empty_roster_hint();
+                self.draw_text(inner.x, y, hint, cp.hint_fg, cp.bg, inner.right(), frame);
+                y += 1;
+            }
+            for (vi, &ri) in filtered.iter().enumerate().skip(start).take(max_rows) {
                 if y >= max_y {
                     break;
                 }
@@ -1044,10 +1302,13 @@ impl<'a> ComposePanel<'a> {
                 } else {
                     String::new()
                 };
-                let line = format!(" {checkbox} {}{kind_label}", r.name);
+                let unavailable = if r.available { "" } else { " [unavailable]" };
+                let line = format!(" {checkbox} {}{kind_label}{unavailable}", r.name);
 
                 let (fg, bg) = if is_active && vi == self.state.recipient_cursor {
                     (cp.value_fg, cp.selected_recipient_bg)
+                } else if !r.available {
+                    (cp.error_fg, cp.bg)
                 } else if r.selected {
                     (cp.value_fg, cp.bg)
                 } else {
@@ -1059,7 +1320,12 @@ impl<'a> ComposePanel<'a> {
             }
 
             if filtered.len() > max_rows && y < max_y {
-                let more = format!("  ... +{} more", filtered.len() - max_rows);
+                let more = format!(
+                    "  {}-{} of {} (Up/Down)",
+                    start + 1,
+                    (start + max_rows).min(filtered.len()),
+                    filtered.len()
+                );
                 self.draw_text(inner.x, y, &more, cp.hint_fg, cp.bg, inner.right(), frame);
                 y += 1;
             }
@@ -1150,9 +1416,9 @@ impl<'a> ComposePanel<'a> {
             );
             y += 1;
 
-            // Body area: use remaining space minus 4 lines (for importance, thread, hints, error)
-            let body_rows = (max_y.saturating_sub(y).saturating_sub(5)) as usize;
-            let body_rows = body_rows.max(3);
+            // Reserve both body borders, importance, thread, ACK and status.
+            let body_rows = (max_y.saturating_sub(y).saturating_sub(7)) as usize;
+            let body_rows = body_rows.max(1);
             let lines = self.state.body_lines();
             let body_scroll = self.state.effective_body_scroll(body_rows, lines.len());
 
@@ -1311,6 +1577,26 @@ impl<'a> ComposePanel<'a> {
             }
         }
 
+        // ── Acknowledgement field ───────────────────────────────
+        if y < max_y {
+            let active = self.state.active_field == ComposeField::AckRequired;
+            let value = if self.state.ack_required {
+                "Acknowledgement: required"
+            } else {
+                "Acknowledgement: optional"
+            };
+            self.draw_text(
+                inner.x,
+                y,
+                value,
+                if active { cp.active_border } else { cp.value_fg },
+                cp.bg,
+                inner.right(),
+                frame,
+            );
+            y += 1;
+        }
+
         // ── Error / hints ──────────────────────────────────────
         if y < max_y {
             if let Some(err) = &self.state.error {
@@ -1319,17 +1605,245 @@ impl<'a> ComposePanel<'a> {
                 self.draw_text(
                     inner.x,
                     y,
-                    "Sending...",
+                    "Sending... Esc closes the panel; delivery continues.",
+                    cp.hint_fg,
+                    cp.bg,
+                    inner.right(),
+                    frame,
+                );
+            } else if self.state.loading {
+                self.draw_text(
+                    inner.x,
+                    y,
+                    "Loading live project/recipient list...",
                     cp.hint_fg,
                     cp.bg,
                     inner.right(),
                     frame,
                 );
             } else {
-                let hint = "Tab: next field | Ctrl+Enter: send | Esc: cancel";
+                let hint = self.field_hint();
                 self.draw_text(inner.x, y, hint, cp.hint_fg, cp.bg, inner.right(), frame);
             }
         }
+    }
+
+    fn project_label(&self) -> String {
+        self.state.selected_project().map_or_else(
+            || "Project: choose with Left/Right or Space".to_string(),
+            |project| format!("Project: {}", project.slug),
+        )
+    }
+
+    fn empty_roster_hint(&self) -> &'static str {
+        if self.state.loading {
+            "Loading recipients..."
+        } else if self.state.selected_project().is_none() {
+            "Choose a project to load recipients"
+        } else if self.state.recipient_filter.is_empty() {
+            "No active recipients in this project"
+        } else {
+            "No recipients match this filter"
+        }
+    }
+
+    fn field_hint(&self) -> &'static str {
+        match self.state.active_field {
+            ComposeField::Project => "Left/Right: project | Ctrl+R: reload | Tab: next",
+            ComposeField::Recipients => "Space: select | Ctrl+T: To/Cc/Bcc | Ctrl+R: reload",
+            ComposeField::Importance => "Space/Enter: importance | Tab: next | Ctrl+Enter: send",
+            ComposeField::AckRequired => "Space/Enter: toggle ACK | Tab: next | Ctrl+Enter: send",
+            _ => "Tab: next field | Ctrl+Enter: send | Esc: cancel",
+        }
+    }
+
+    /// Keep the focused editor and its project visible when the complete form
+    /// cannot fit. Every field remains reachable through the same tab order.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    fn render_compact(&self, area: Rect, cp: &ComposePalette, frame: &mut Frame<'_>) {
+        let left = area.x + 1;
+        let right = area.right() - 1;
+        let top = area.y + 1;
+        let bottom = area.bottom() - 1;
+        let width = usize::from(right.saturating_sub(left));
+        self.draw_text(
+            left,
+            top,
+            &self.project_label(),
+            cp.value_fg,
+            cp.bg,
+            right,
+            frame,
+        );
+        if bottom.saturating_sub(top) < 4 {
+            if top + 1 < bottom {
+                self.draw_text(
+                    left,
+                    top + 1,
+                    self.state.active_field.label(),
+                    cp.active_border,
+                    cp.bg,
+                    right,
+                    frame,
+                );
+            }
+            return;
+        }
+        self.draw_text(
+            left,
+            top + 1,
+            self.state.active_field.label(),
+            cp.active_border,
+            cp.bg,
+            right,
+            frame,
+        );
+        let mut y = top + 2;
+        let content_bottom = bottom - 2;
+        match self.state.active_field {
+            ComposeField::Project => {
+                if let Some(project) = self.state.selected_project() {
+                    self.draw_text(left, y, &project.human_key, cp.value_fg, cp.bg, right, frame);
+                    y += 1;
+                }
+                if y < content_bottom {
+                    let hint = format!(
+                        "{} projects; Left/Right to choose",
+                        self.state.available_projects.len()
+                    );
+                    self.draw_text(left, y, &hint, cp.hint_fg, cp.bg, right, frame);
+                }
+            }
+            ComposeField::Recipients => {
+                let filter = format!("Filter: {}", self.state.recipient_filter);
+                self.draw_text(left, y, &filter, cp.hint_fg, cp.bg, right, frame);
+                y += 1;
+                let filtered = self.state.filtered_recipients();
+                let rows = usize::from(content_bottom.saturating_sub(y));
+                if filtered.is_empty() && y < content_bottom {
+                    self.draw_text(
+                        left,
+                        y,
+                        self.empty_roster_hint(),
+                        cp.hint_fg,
+                        cp.bg,
+                        right,
+                        frame,
+                    );
+                }
+                let start = self
+                    .state
+                    .recipient_cursor
+                    .saturating_sub(rows.saturating_sub(1));
+                for (visible, &index) in filtered.iter().enumerate().skip(start).take(rows) {
+                    let recipient = &self.state.recipients[index];
+                    let line = format!(
+                        "[{}] {} ({}){}",
+                        if recipient.selected { "x" } else { " " },
+                        recipient.name,
+                        recipient.kind.label(),
+                        if recipient.available { "" } else { " [unavailable]" },
+                    );
+                    self.draw_text(
+                        left,
+                        y,
+                        &line,
+                        if recipient.available { cp.value_fg } else { cp.error_fg },
+                        if visible == self.state.recipient_cursor {
+                            cp.selected_recipient_bg
+                        } else {
+                            cp.bg
+                        },
+                        right,
+                        frame,
+                    );
+                    y += 1;
+                }
+            }
+            ComposeField::Subject | ComposeField::ThreadId => {
+                let (value, cursor) = if self.state.active_field == ComposeField::Subject {
+                    (&self.state.subject, self.state.subject_cursor)
+                } else {
+                    (&self.state.thread_id, self.state.thread_id_cursor)
+                };
+                self.draw_text(left, y, value, cp.value_fg, cp.bg, right, frame);
+                let cursor_x = left
+                    .saturating_add(display_width_up_to_char_index(value, cursor) as u16);
+                if cursor_x < right {
+                    self.set_cursor_cell(cursor_x, y, cp, frame);
+                }
+            }
+            ComposeField::Body => {
+                let rows = usize::from(content_bottom.saturating_sub(y));
+                let lines = self.state.body_lines();
+                let scroll = self.state.effective_body_scroll(rows, lines.len());
+                for (line_index, line) in lines.iter().enumerate().skip(scroll).take(rows) {
+                    self.draw_text(
+                        left,
+                        y,
+                        &truncate_to_display_width(line, width),
+                        cp.value_fg,
+                        cp.bg,
+                        right,
+                        frame,
+                    );
+                    if line_index == self.state.body_cursor_line {
+                        let cursor_x = left.saturating_add(
+                            display_width_up_to_char_index(line, self.state.body_cursor_col) as u16,
+                        );
+                        if cursor_x < right {
+                            self.set_cursor_cell(cursor_x, y, cp, frame);
+                        }
+                    }
+                    y += 1;
+                }
+            }
+            ComposeField::Importance => self.draw_text(
+                left,
+                y,
+                self.state.importance.display(),
+                cp.value_fg,
+                cp.bg,
+                right,
+                frame,
+            ),
+            ComposeField::AckRequired => self.draw_text(
+                left,
+                y,
+                if self.state.ack_required { "Required" } else { "Optional" },
+                cp.value_fg,
+                cp.bg,
+                right,
+                frame,
+            ),
+        }
+        let status = self.state.error.as_deref().unwrap_or_else(|| {
+            if self.state.sending {
+                "Sending; Esc closes, delivery continues"
+            } else if self.state.loading {
+                "Loading live project/recipient list..."
+            } else {
+                self.field_hint()
+            }
+        });
+        self.draw_text(
+            left,
+            bottom - 2,
+            status,
+            if self.state.error.is_some() { cp.error_fg } else { cp.hint_fg },
+            cp.bg,
+            right,
+            frame,
+        );
+        self.draw_text(
+            left,
+            bottom - 1,
+            "Tab: next | Ctrl+Enter: send | Esc: close",
+            cp.hint_fg,
+            cp.bg,
+            right,
+            frame,
+        );
     }
 
     // ── Drawing helpers ────────────────────────────────────────
@@ -1382,7 +1896,7 @@ impl<'a> ComposePanel<'a> {
         let mut col = x;
         for ch in text.chars() {
             let w = char_display_width(ch) as u16;
-            if col + w > max_x {
+            if col.saturating_add(w) > max_x || frame.buffer.get(col, y).is_none() {
                 break;
             }
             let mut cell = Cell::from_char(ch);
@@ -1488,8 +2002,17 @@ mod tests {
 
     fn state_with_agents(names: &[&str]) -> ComposeState {
         let mut s = ComposeState::new();
+        s.set_available_projects(vec![project(1)]);
         s.set_available_agents(names.iter().map(std::string::ToString::to_string).collect());
         s
+    }
+
+    fn project(id: i64) -> ComposeProject {
+        ComposeProject {
+            id,
+            slug: format!("project-{id}"),
+            human_key: format!("/workspace/project-{id}"),
+        }
     }
 
     #[test]
@@ -1607,9 +2130,12 @@ mod tests {
     #[test]
     fn new_state_is_clean() {
         let s = ComposeState::new();
-        assert_eq!(s.active_field, ComposeField::Recipients);
+        assert_eq!(s.active_field, ComposeField::Project);
+        assert!(s.selected_project().is_none());
         assert!(!s.dirty);
         assert!(!s.sending);
+        assert!(!s.loading);
+        assert!(!s.ack_required);
         assert_eq!(s.subject, "");
         assert_eq!(s.body, "");
         assert_eq!(s.importance, Importance::Normal);
@@ -1627,8 +2153,7 @@ mod tests {
 
     #[test]
     fn set_available_agents_preserves_selections() {
-        let mut s = ComposeState::new();
-        s.set_available_agents(vec!["Red".into(), "Blue".into(), "Green".into()]);
+        let mut s = state_with_agents(&["Red", "Blue", "Green"]);
         s.recipients[1].selected = true; // Select Blue
         s.recipients[1].kind = RecipientKind::Cc;
 
@@ -1645,6 +2170,226 @@ mod tests {
         assert_eq!(blue.kind, RecipientKind::Cc);
         let gold = s.recipients.iter().find(|r| r.name == "Gold").unwrap();
         assert!(!gold.selected);
+    }
+
+    #[test]
+    fn projects_require_a_choice_unless_exactly_one_is_available() {
+        let mut s = ComposeState::new();
+        s.set_available_projects(vec![project(1), project(2)]);
+        assert!(s.selected_project().is_none());
+        assert_eq!(
+            s.handle_key(&make_key(KeyCode::Right)),
+            ComposeAction::ProjectChanged
+        );
+        assert_eq!(s.selected_project(), Some(&project(1)));
+        assert_eq!(
+            s.handle_key(&make_key(KeyCode::Left)),
+            ComposeAction::ProjectChanged
+        );
+        assert_eq!(s.selected_project(), Some(&project(2)));
+
+        let mut single = ComposeState::new();
+        single.set_available_projects(vec![project(1)]);
+        assert_eq!(single.selected_project(), Some(&project(1)));
+        assert_eq!(
+            single.handle_key(&make_key(KeyCode::Enter)),
+            ComposeAction::Consumed
+        );
+    }
+
+    #[test]
+    fn project_switch_discards_old_scope_but_keeps_the_message_draft() {
+        let mut s = state_with_agents(&["GoldHawk", "SilverFox"]);
+        s.set_available_projects(vec![project(1), project(2)]);
+        s.recipients[0].selected = true;
+        s.recipients[0].kind = RecipientKind::Bcc;
+        s.recipient_filter = "Gold".into();
+        s.recipient_cursor = 1;
+        s.subject = "Keep this subject".into();
+        s.body = "Keep this body".into();
+        s.importance = Importance::Urgent;
+        s.ack_required = true;
+        s.thread_id = "project-one-thread".into();
+        s.thread_id_cursor = s.thread_id.len();
+
+        assert!(s.set_selected_project(&project(2)));
+        assert!(s.recipients.is_empty());
+        assert!(s.recipient_filter.is_empty());
+        assert_eq!(s.recipient_cursor, 0);
+        assert!(s.thread_id.is_empty());
+        assert_eq!(s.thread_id_cursor, 0);
+        assert_eq!(s.subject, "Keep this subject");
+        assert_eq!(s.body, "Keep this body");
+        assert_eq!(s.importance, Importance::Urgent);
+        assert!(s.ack_required);
+
+        s.set_available_agents(vec!["GoldHawk".into()]);
+        assert!(!s.recipients[0].selected);
+        assert_eq!(s.recipients[0].kind, RecipientKind::To);
+        assert!(s.build_envelope().unwrap_err().contains("recipient"));
+    }
+
+    #[test]
+    fn project_refresh_preserves_only_the_exact_selected_identity() {
+        let mut s = state_with_agents(&["GoldHawk"]);
+        s.recipients[0].selected = true;
+        s.recipients[0].kind = RecipientKind::Cc;
+        s.thread_id = "keep-thread".into();
+        s.set_available_projects(vec![project(2), project(1)]);
+        assert_eq!(s.selected_project(), Some(&project(1)));
+        assert!(s.recipients[0].selected);
+        assert_eq!(s.recipients[0].kind, RecipientKind::Cc);
+        assert_eq!(s.thread_id, "keep-thread");
+
+        let mut wrong_identity = project(1);
+        wrong_identity.human_key = "/workspace/different-project".into();
+        assert!(!s.set_selected_project(&wrong_identity));
+        assert_eq!(s.selected_project(), Some(&project(1)));
+    }
+
+    #[test]
+    fn vanished_project_never_auto_selects_a_remaining_project_on_retry() {
+        let mut s = state_with_agents(&["GoldHawk"]);
+        s.recipients[0].selected = true;
+        s.subject = "Retain this draft".into();
+        s.body = "Retain this body".into();
+        for _ in 0..2 {
+            s.set_available_projects(vec![project(2)]);
+            assert!(s.selected_project().is_none());
+            assert!(s.build_envelope().is_err());
+        }
+        assert_eq!(s.subject, "Retain this draft");
+        assert!(s.recipients.is_empty());
+        assert_eq!(
+            s.handle_key(&make_key(KeyCode::Right)),
+            ComposeAction::ProjectChanged
+        );
+        assert_eq!(s.selected_project(), Some(&project(2)));
+    }
+
+    #[test]
+    fn roster_refresh_retains_unavailable_selected_targets_and_addressing() {
+        let mut s = state_with_agents(&["GoldHawk", "SilverFox", "RedLake"]);
+        for (recipient, kind) in s.recipients.iter_mut().zip([
+            RecipientKind::To,
+            RecipientKind::Cc,
+            RecipientKind::Bcc,
+        ]) {
+            recipient.selected = true;
+            recipient.kind = kind;
+        }
+        s.subject = "All intended recipients".into();
+        s.body = "Do not silently drop missing recipients".into();
+
+        s.set_available_agents(vec!["GoldHawk".into()]);
+        assert_eq!(s.to_recipients(), vec!["GoldHawk"]);
+        assert_eq!(s.cc_recipients(), vec!["SilverFox"]);
+        assert_eq!(s.bcc_recipients(), vec!["RedLake"]);
+        assert!(s.build_envelope().unwrap_err().contains("unavailable"));
+        assert!(!s.recipients[1].available);
+
+        s.recipient_cursor = 1;
+        s.toggle_recipient();
+        assert!(!s.recipients[1].selected);
+        s.toggle_recipient();
+        assert!(!s.recipients[1].selected);
+        s.select_all_recipients();
+        assert!(!s.recipients[1].selected);
+
+        s.set_available_agents(vec!["GoldHawk".into(), "RedLake".into()]);
+        let envelope = s.build_envelope().unwrap();
+        assert_eq!(envelope.to, vec!["GoldHawk"]);
+        assert!(envelope.cc.is_empty());
+        assert_eq!(envelope.bcc, vec!["RedLake"]);
+    }
+
+    #[test]
+    fn authoritative_roster_deduplicates_case_insensitive_names() {
+        let mut s = state_with_agents(&["GoldHawk", "goldhawk", "", "SilverFox"]);
+        assert_eq!(s.recipients.len(), 2);
+        s.recipients[0].selected = true;
+        s.recipients[0].kind = RecipientKind::Bcc;
+        s.set_available_agents(vec!["GOLDHAWK".into(), "goldhawk".into()]);
+        assert_eq!(s.recipients.len(), 1);
+        assert_eq!(s.bcc_recipients(), vec!["GOLDHAWK"]);
+    }
+
+    #[test]
+    fn validation_rejects_unscoped_or_loading_drafts() {
+        let mut s = ComposeState::reply_to("GoldHawk");
+        s.subject = "Scoped draft".into();
+        s.body = "Body".into();
+        assert!(s.build_envelope().unwrap_err().contains("project"));
+        s.set_available_agents(vec!["SilverFox".into()]);
+        assert_eq!(s.recipients[0].name, "GoldHawk");
+
+        s.set_available_projects(vec![project(1)]);
+        s.set_available_agents(vec!["GoldHawk".into()]);
+        s.recipients[0].selected = true;
+        s.loading = true;
+        assert!(s.build_envelope().unwrap_err().contains("loading"));
+        s.toggle_recipient();
+        assert!(s.recipients[0].selected);
+        s.loading = false;
+        assert!(s.build_envelope().is_ok());
+    }
+
+    #[test]
+    fn pending_send_blocks_every_edit_and_duplicate_submission() {
+        let mut s = state_with_agents(&["GoldHawk"]);
+        s.set_available_projects(vec![project(1), project(2)]);
+        s.recipients[0].selected = true;
+        s.subject = "Frozen subject".into();
+        s.body = "Frozen body".into();
+        let original = s.build_envelope().unwrap();
+        s.sending = true;
+
+        for &field in ComposeField::ALL {
+            s.active_field = field;
+            for key in [
+                make_key(KeyCode::Char('x')),
+                make_key(KeyCode::Char(' ')),
+                make_key(KeyCode::Backspace),
+                make_key(KeyCode::Right),
+                make_key_ctrl(KeyCode::Enter),
+                make_key_ctrl(KeyCode::Char('r')),
+            ] {
+                assert_eq!(s.handle_key(&key), ComposeAction::Consumed);
+            }
+        }
+        assert!(!s.set_selected_project(&project(2)));
+        s.set_available_projects(vec![project(2)]);
+        s.set_available_agents(vec!["SilverFox".into()]);
+        s.clear_all_recipients();
+        s.cycle_recipient_kind();
+        assert!(s.build_envelope().unwrap_err().contains("in progress"));
+        assert_eq!(
+            s.handle_key(&make_key(KeyCode::Escape)),
+            ComposeAction::Close
+        );
+
+        s.sending = false;
+        assert_eq!(s.build_envelope().unwrap(), original);
+    }
+
+    #[test]
+    fn acknowledgement_toggle_and_roster_reload_are_explicit_actions() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::AckRequired;
+        assert_eq!(
+            s.handle_key(&make_key(KeyCode::Char(' '))),
+            ComposeAction::Consumed
+        );
+        assert!(s.ack_required);
+        assert!(s.has_unsaved_changes());
+        s.handle_key(&make_key(KeyCode::Enter));
+        assert!(!s.ack_required);
+
+        s.loading = true;
+        assert_eq!(
+            s.handle_key(&make_key_ctrl(KeyCode::Char('r'))),
+            ComposeAction::Reload
+        );
     }
 
     // ── Recipient filtering ────────────────────────────────────
@@ -1717,7 +2462,7 @@ mod tests {
 
     #[test]
     fn validate_requires_recipient() {
-        let mut s = ComposeState::new();
+        let mut s = state_with_agents(&[]);
         s.subject = "Hello".into();
         s.body = "World".into();
         assert!(s.validate().is_err());
@@ -1789,6 +2534,8 @@ mod tests {
     #[test]
     fn tab_advances_field() {
         let mut s = ComposeState::new();
+        assert_eq!(s.active_field, ComposeField::Project);
+        s.handle_key(&make_key(KeyCode::Tab));
         assert_eq!(s.active_field, ComposeField::Recipients);
         s.handle_key(&make_key(KeyCode::Tab));
         assert_eq!(s.active_field, ComposeField::Subject);
@@ -2033,6 +2780,77 @@ mod tests {
         panel.render(terminal, &mut frame, &shared);
     }
 
+    #[test]
+    fn compact_panel_keeps_each_focused_field_and_project_visible() {
+        let config = mcp_agent_mail_core::Config::default();
+        let shared = crate::tui_bridge::TuiSharedState::new(&config);
+        let mut state = state_with_agents(&[
+            "GoldHawk",
+            "SilverFox",
+            "RedLake",
+            "BluePeak",
+            "GreenField",
+            "LastTarget",
+        ]);
+        state.subject = "Focused subject".into();
+        state.body = "Focused body".into();
+        state.thread_id = "focused-thread".into();
+        state.ack_required = true;
+
+        for &field in ComposeField::ALL {
+            state.active_field = field;
+            state.recipient_cursor = 5;
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = ftui::Frame::new(80, 24, &mut pool);
+            ComposePanel::new(&state).render(Rect::new(0, 0, 80, 24), &mut frame, &shared);
+            let mut visible = String::new();
+            for y in 0..24 {
+                for x in 0..80 {
+                    visible.push(
+                        frame
+                            .buffer
+                            .get(x, y)
+                            .and_then(|cell| cell.content.as_char())
+                            .unwrap_or(' '),
+                    );
+                }
+                visible.push('\n');
+            }
+            assert!(visible.contains("Project: project-1"), "{field:?}: {visible}");
+            assert!(visible.contains(field.label()), "{field:?}: {visible}");
+            let expected = match field {
+                ComposeField::Project => "/workspace/project-1",
+                ComposeField::Recipients => "LastTarget",
+                ComposeField::Subject => "Focused subject",
+                ComposeField::Body => "Focused body",
+                ComposeField::Importance => "Normal",
+                ComposeField::ThreadId => "focused-thread",
+                ComposeField::AckRequired => "Required",
+            };
+            assert!(visible.contains(expected), "{field:?}: {visible}");
+        }
+    }
+
+    #[test]
+    fn panel_handles_tiny_terminals_and_preserves_nonzero_origin() {
+        let config = mcp_agent_mail_core::Config::default();
+        let shared = crate::tui_bridge::TuiSharedState::new(&config);
+        let state = ComposeState::new();
+        let panel = ComposePanel::new(&state);
+        for (width, height) in [(1, 1), (2, 3), (4, 4), (12, 6), (20, 8)] {
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = ftui::Frame::new(width, height, &mut pool);
+            panel.render(Rect::new(0, 0, width, height), &mut frame, &shared);
+        }
+
+        let terminal = Rect::new(10, 5, 40, 20);
+        let area = ComposePanel::overlay_area(terminal);
+        assert!(area.x >= terminal.x);
+        assert!(area.y >= terminal.y);
+        assert!(area.right() <= terminal.right());
+        assert!(area.bottom() <= terminal.bottom());
+    }
+
     // ── has_unsaved_changes ────────────────────────────────────
 
     #[test]
@@ -2058,8 +2876,11 @@ mod tests {
         s.body = "Hello world".into();
         s.importance = Importance::High;
         s.thread_id = "br-123".into();
+        s.ack_required = true;
 
         let env = s.build_envelope().unwrap();
+        assert_eq!(env.project, project(1));
+        assert!(env.ack_required);
         assert_eq!(env.sender_name, OVERSEER_AGENT_NAME);
         assert_eq!(env.to, vec!["RedLake"]);
         assert_eq!(env.cc, [] as [String; 0]);

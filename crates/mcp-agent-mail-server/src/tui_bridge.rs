@@ -109,8 +109,6 @@ pub enum ServerControlMsg {
     Shutdown,
     ToggleTransportBase,
     SetTransportBase(TransportBase),
-    /// Send a composed message from the TUI compose panel.
-    ComposeEnvelope(crate::tui_compose::ComposeEnvelope),
 }
 
 /// Independent server settings mirrored for rendering and `/mail/ws-state`.
