@@ -18810,6 +18810,53 @@ fn sync_recovery_parent(path: &Path) -> Result<(), SqlError> {
 }
 
 #[allow(clippy::result_large_err)]
+fn verify_recovery_candidate_identity_at(
+    anchor: &AnchoredRecoveryParent,
+    candidate_identity: &same_file::Handle,
+    context: &str,
+) -> Result<(), SqlError> {
+    anchor.verify_parent_only(context)?;
+    #[cfg(unix)]
+    {
+        use rustix::fs::{AtFlags, FileType, fstat, statat};
+
+        // Never open/close a foreign main inode to identify it: that close
+        // would erase this process's classic POSIX locks on that generation.
+        // The retained candidate descriptor prevents inode recycling.
+        let expected = fstat(candidate_identity.as_file()).map_err(|error| {
+            SqlError::Custom(format!("{context}: cannot inspect retained candidate identity: {error}"))
+        })?;
+        let observed = statat(&anchor.parent_dir, &anchor.file_name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| {
+                SqlError::Custom(format!("{context}: cannot inspect live candidate identity: {error}"))
+            })?;
+        if FileType::from_raw_mode(observed.st_mode) != FileType::RegularFile
+            || observed.st_nlink != 1
+            || !AnchoredRecoveryParent::same_inode(&expected, &observed)
+        {
+            return Err(SqlError::Custom(format!(
+                "{context}: {} no longer matches the retained recovery candidate identity",
+                anchor.target_path.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&anchor.target_path)
+            .map_err(|error| SqlError::Custom(format!("{context}: cannot inspect live candidate identity: {error}")))?;
+        let observed = same_file::Handle::from_file(file)
+            .map_err(|error| SqlError::Custom(format!("{context}: cannot identify live candidate: {error}")))?;
+        if &observed != candidate_identity {
+            return Err(SqlError::Custom(format!(
+                "{context}: {} no longer matches the retained recovery candidate identity",
+                anchor.target_path.display()
+            )));
+        }
+    }
+    anchor.verify_parent_only(context)
+}
+
+#[allow(clippy::result_large_err)]
 fn rollback_recovery_candidate_promotion(
     primary_anchor: &AnchoredRecoveryParent,
     candidate_anchor: &AnchoredRecoveryParent,
@@ -18829,18 +18876,7 @@ fn rollback_recovery_candidate_promotion(
         }
         let context = "retreat activated recovery candidate";
         let activated_anchor = AnchoredRecoveryParent::capture(primary_path, context)?;
-        let activated_file = activated_anchor.open_regular_read_only(context)?;
-        let activated_identity = same_file::Handle::from_file(activated_file).map_err(|error| {
-            SqlError::Custom(format!(
-                "{context}: failed to identify live database: {error}"
-            ))
-        })?;
-        if &activated_identity != candidate_identity {
-            return Err(SqlError::Custom(format!(
-                "{context}: live database {} no longer has the prepared candidate identity; preserving the foreign generation",
-                primary_path.display()
-            )));
-        }
+        verify_recovery_candidate_identity_at(&activated_anchor, candidate_identity, context)?;
         primary_anchor.verify_parent_only(context)?;
         candidate_anchor.verify_parent_only(context)?;
         #[cfg(unix)]
@@ -18896,24 +18932,8 @@ fn rollback_recovery_candidate_promotion(
         rename(&activated_anchor, candidate_anchor, context)?;
         // NOREPLACE does not pin the source leaf. Verify the actual moved
         // generation before touching the original family or aborting intent.
-        let verified = candidate_anchor
-            .open_regular_read_only(context)
-            .and_then(|file| {
-                same_file::Handle::from_file(file).map_err(|error| {
-                    SqlError::Custom(format!(
-                        "{context}: failed to identify retreated file: {error}"
-                    ))
-                })
-            })
-            .and_then(|observed| {
-                if &observed == candidate_identity {
-                    primary_anchor.verify_parent_only(context)
-                } else {
-                    Err(SqlError::Custom(format!(
-                        "{context}: candidate identity changed at the rollback rename boundary"
-                    )))
-                }
-            });
+        let verified = verify_recovery_candidate_identity_at(candidate_anchor, candidate_identity, context)
+            .and_then(|()| primary_anchor.verify_parent_only(context));
         if let Err(error) = verified {
             let restored = rename(
                 candidate_anchor,
@@ -19487,7 +19507,36 @@ where
         ));
     }
 
-    if let Err(error) = finalize_receipt(&prepared) {
+    let finalization = finalize_receipt(&prepared);
+    let verify_committed_identity = || {
+        verify_recovery_candidate_identity_at(
+            &primary_anchor,
+            &candidate_identity,
+            "verify committed recovery candidate",
+        )
+        .map_err(|error| ReconstructionCandidateFailure {
+            error: SqlError::Custom(format!(
+                "recovery finalized receipt marker was committed for {}, but the live candidate identity cannot be verified: {error}; preserving filesystem state and refusing promotion success",
+                primary_path.display()
+            )),
+            finalized_receipt_committed: true,
+            receipt_durability_proven: false,
+        })
+    };
+    let receipt_committed = match &finalization {
+        Ok(()) => true,
+        Err(error) => error.publication_stage()
+            != crate::forensics::RecoveryReceiptPublicationStage::BeforeMarkerMove,
+    };
+    if receipt_committed && let Err(mut failure) = verify_committed_identity() {
+        if let Err(error) = &finalization {
+            failure.error = SqlError::Custom(format!(
+                "{}; receipt finalization also failed: {error}", failure.error
+            ));
+        }
+        return Err(failure);
+    }
+    if let Err(error) = finalization {
         let stage_detail = match error.publication_stage() {
             crate::forensics::RecoveryReceiptPublicationStage::BeforeMarkerMove => {
                 return Err(rollback_and_abort_recovery_promotion(
@@ -19527,7 +19576,9 @@ where
         "durable recovery promotion",
         initializing_owner,
     );
-    if let Err(error) = crate::reconstruct::recreate_atc_sidecar_schema(primary_path) {
+    let atc_result = crate::reconstruct::recreate_atc_sidecar_schema(primary_path);
+    verify_committed_identity()?;
+    if let Err(error) = atc_result {
         return Err(ReconstructionCandidateFailure {
             error: SqlError::Custom(format!(
                 "recovery candidate {} was durably promoted and receipted, but post-promotion ATC sidecar initialization failed: {error}",
@@ -28556,6 +28607,321 @@ mod tests {
         );
         crate::forensics::verify_recovery_receipt_state(directory, primary)
             .expect("safe rollback and durable abort must leave receipt admission clear");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_refuses_a_foreign_generation_after_receipt_success() {
+        check_post_commit_foreign_generation(crate::forensics::finalize_recovery_receipt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_preserves_a_foreign_generation_after_committed_receipt_errors() {
+        for finalize in [
+            crate::forensics::finalize_recovery_receipt_with_injected_post_rename_failure,
+            crate::forensics::finalize_recovery_receipt_with_injected_directory_sync_failure,
+        ] {
+            check_post_commit_foreign_generation(finalize);
+        }
+    }
+
+    #[cfg(unix)]
+    type RecoveryReceiptTestFinalizer =
+        fn(
+            &crate::forensics::PreparedRecoveryReceipt,
+        ) -> Result<(), crate::forensics::RecoveryReceiptFinalizeError>;
+
+    #[cfg(unix)]
+    fn check_post_commit_foreign_generation(finalize: RecoveryReceiptTestFinalizer) {
+        use std::rc::Rc;
+
+        for source_existed in [false, true] {
+            for atc_existed in [false, true] {
+                let directory = tempfile::tempdir()
+                    .expect("post-commit identity fixture")
+                    .keep();
+                let primary = directory.join("storage.sqlite3");
+                let candidate = directory.join("candidate.sqlite3");
+                let displaced = directory.join("activated.sqlite3");
+                let foreign = directory.join("foreign.sqlite3");
+                let atc = directory.join(ATC_SIDECAR_FILE_NAME);
+                if source_existed {
+                    write_marker_db(&primary, "original-generation");
+                }
+                let original = source_existed
+                    .then(|| (std::fs::read(&primary).unwrap(), primary_identity(&primary)));
+                if atc_existed {
+                    write_marker_db(&atc, "foreign-atc-generation");
+                }
+                let atc_before =
+                    atc_existed.then(|| (std::fs::read(&atc).unwrap(), primary_identity(&atc)));
+                write_marker_db(&candidate, "candidate-generation");
+                write_marker_db(&foreign, "foreign-generation");
+                let candidate_inode = primary_identity(&candidate);
+                let foreign_bytes = std::fs::read(&foreign).unwrap();
+                let foreign_inode = primary_identity(&foreign);
+                let witness = Rc::new(RefCell::new(None));
+                let quarantine = Rc::new(RefCell::new(None));
+                let hook_witness = Rc::clone(&witness);
+                let hook_quarantine = Rc::clone(&quarantine);
+                let hook_directory = directory.clone();
+                let hook_candidate = candidate.clone();
+                let outcome = with_anchored_recovery_rename_hook(
+                    move |context, _from_name, to_name| {
+                        if context == "quarantine live database" {
+                            *hook_quarantine.borrow_mut() = Some(hook_directory.join(to_name));
+                        }
+                        if (source_existed && context == "quarantine live database")
+                            || (!source_existed && context == "activate reconstructed candidate")
+                        {
+                            *hook_witness.borrow_mut() =
+                                Some(capture_recovery_promotion_rename_witness(
+                                    &hook_directory,
+                                    &hook_candidate,
+                                ));
+                        }
+                        None
+                    },
+                    || {
+                        promote_recovery_candidate_with_finalizer(
+                            &primary,
+                            &candidate,
+                            &directory,
+                            "20261115_130000_000",
+                            |prepared| {
+                                let result = finalize(prepared);
+                                if let Err(error) = &result {
+                                    assert_ne!(error.publication_stage(), crate::forensics::RecoveryReceiptPublicationStage::BeforeMarkerMove);
+                                }
+                                std::fs::rename(&primary, &displaced).unwrap();
+                                std::fs::rename(&foreign, &primary).unwrap();
+                                result
+                            },
+                        )
+                    },
+                );
+                assert_eq!(std::fs::read(&primary).unwrap(), foreign_bytes);
+                assert_eq!(primary_identity(&primary), foreign_inode);
+                assert_eq!(
+                    sqlite_marker_value(&primary).as_deref(),
+                    Some("foreign-generation")
+                );
+                if let Some((bytes, inode)) = atc_before {
+                    assert_eq!(
+                        std::fs::read(&atc).unwrap(),
+                        bytes,
+                        "foreign ATC state must remain untouched"
+                    );
+                    assert_eq!(primary_identity(&atc), inode);
+                } else {
+                    assert!(
+                        std::fs::symlink_metadata(&atc)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                        "a foreign live generation must not receive ATC follow-up artifacts"
+                    );
+                }
+                let failure = outcome
+                    .expect_err("a displaced committed candidate cannot report promotion success");
+                assert!(failure.finalized_receipt_committed);
+                assert!(!failure.receipt_durability_proven);
+                let witness = witness
+                    .borrow_mut()
+                    .take()
+                    .expect("prepared intent reached");
+                assert_eq!(std::fs::read(&displaced).unwrap(), witness.candidate_bytes);
+                assert_eq!(primary_identity(&displaced), candidate_inode);
+                assert!(
+                    std::fs::symlink_metadata(&candidate)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                );
+                if let Some((bytes, inode)) = original {
+                    let quarantine = quarantine
+                        .borrow_mut()
+                        .take()
+                        .expect("original quarantined");
+                    assert_eq!(std::fs::read(&quarantine).unwrap(), bytes);
+                    assert_eq!(primary_identity(&quarantine), inode);
+                }
+                let receipts = recovery_promotion_receipt_artifacts(&directory);
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(receipts[0].extension(), Some(OsStr::new("json")));
+                assert_eq!(std::fs::read(&receipts[0]).unwrap(), witness.intent_bytes);
+                crate::forensics::verify_recovery_receipt_state(&directory, &primary)
+                    .expect_err("foreign live generation must fail committed-receipt verification");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_initializes_atc_for_its_committed_generation() {
+        for source_existed in [false, true] {
+            for (expect_success, finalize) in [
+                (
+                    true,
+                    crate::forensics::finalize_recovery_receipt as RecoveryReceiptTestFinalizer,
+                ),
+                (
+                    false,
+                    crate::forensics::finalize_recovery_receipt_with_injected_post_rename_failure,
+                ),
+                (
+                    false,
+                    crate::forensics::finalize_recovery_receipt_with_injected_directory_sync_failure,
+                ),
+            ] {
+                let directory = tempfile::tempdir().expect("committed ATC fixture").keep();
+                let primary = directory.join("storage.sqlite3");
+                let candidate = directory.join("candidate.sqlite3");
+                if source_existed {
+                    write_marker_db(&primary, "original-generation");
+                }
+                write_marker_db(&candidate, "candidate-generation");
+                let candidate_inode = primary_identity(&candidate);
+                let outcome = promote_recovery_candidate_with_finalizer(
+                    &primary,
+                    &candidate,
+                    &directory,
+                    "20261115_130100_000",
+                    finalize,
+                );
+                assert_eq!(outcome.is_ok(), expect_success);
+                if let Err(failure) = outcome {
+                    assert!(failure.finalized_receipt_committed);
+                }
+                assert_eq!(primary_identity(&primary), candidate_inode);
+                assert_eq!(
+                    sqlite_marker_value(&primary).as_deref(),
+                    Some("candidate-generation")
+                );
+                crate::forensics::verify_recovery_receipt_state(&directory, &primary)
+                    .expect("committed candidate must remain the verified live authority");
+                let atc = directory.join(ATC_SIDECAR_FILE_NAME);
+                assert!(atc.is_file());
+                let connection = open_immutable_canonical_sqlite(&atc).unwrap();
+                let rows = connection.query_sync(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('atc_experiences', 'atc_leader_lease', 'atc_rollup_snapshots') ORDER BY name", &[],
+                ).unwrap();
+                let names: Vec<String> = rows
+                    .iter()
+                    .map(|row| row.get_named("name").unwrap())
+                    .collect();
+                assert_eq!(
+                    names,
+                    [
+                        "atc_experiences",
+                        "atc_leader_lease",
+                        "atc_rollup_snapshots"
+                    ]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_rollback_identity_refusal_preserves_foreign_posix_locks() {
+        const CHILD_PATH_ENV: &str = "AM_RECOVERY_ROLLBACK_IDENTITY_LOCK_PATH";
+        const CHILD_TEST: &str =
+            "pool_impl::tests::recovery_rollback_identity_refusal_preserves_foreign_posix_locks";
+        const WITNESS: &str = "rollback-identity-lock-conflict=";
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            println!(
+                "{WITNESS}{}",
+                fd_close_lock_probe_reports_foreign_conflict(Path::new(&path), 0, 1)
+            );
+            return;
+        }
+        let probe = |path: &Path| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(CHILD_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CHILD_PATH_ENV, path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let observed = stdout
+                .lines()
+                .find_map(|line| line.split_once(WITNESS).map(|(_, value)| value))
+                .unwrap_or_else(|| panic!("child ran no lock probe: {stdout}"));
+            match observed.split_whitespace().next() {
+                Some("true") => true,
+                Some("false") => false,
+                other => panic!("invalid lock witness: {other:?}"),
+            }
+        };
+        let directory = tempfile::tempdir().expect("rollback lock fixture").keep();
+        let primary = directory.join("storage.sqlite3");
+        let candidate = directory.join("candidate.sqlite3");
+        let displaced = directory.join("displaced.sqlite3");
+        let foreign = directory.join("foreign.sqlite3");
+        let primary_anchor = AnchoredRecoveryParent::capture(&primary, "fixture primary").unwrap();
+        write_marker_db(&candidate, "candidate-generation");
+        write_marker_db(&foreign, "foreign-generation");
+        let foreign_bytes = std::fs::read(&foreign).unwrap();
+        let candidate_anchor =
+            AnchoredRecoveryParent::capture(&candidate, "fixture candidate").unwrap();
+        let candidate_identity = same_file::Handle::from_file(
+            candidate_anchor
+                .open_regular_read_only("retain candidate")
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(&candidate, &displaced).unwrap();
+        std::fs::rename(&foreign, &primary).unwrap();
+        let foreign_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&primary)
+            .unwrap();
+        let mut lock = nix::libc::flock {
+            l_type: i16::try_from(nix::libc::F_WRLCK).unwrap(),
+            l_whence: i16::try_from(nix::libc::SEEK_SET).unwrap(),
+            l_start: 0,
+            l_len: 1,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(&foreign_file, nix::fcntl::FcntlArg::F_SETLK(&lock)).unwrap();
+        assert!(
+            probe(&primary),
+            "precondition: the independent child observes the live lock"
+        );
+        let error = rollback_recovery_candidate_promotion(
+            &primary_anchor,
+            &candidate_anchor,
+            &candidate_identity,
+            &[],
+            "20261115_130500_000",
+        )
+        .expect_err("a foreign live generation must refuse rollback");
+        assert!(error.to_string().contains("identity"), "{error}");
+        assert!(
+            probe(&primary),
+            "identity refusal must not erase the foreign generation's POSIX lock"
+        );
+        lock.l_type = i16::try_from(nix::libc::F_UNLCK).unwrap();
+        nix::fcntl::fcntl(&foreign_file, nix::fcntl::FcntlArg::F_SETLK(&lock)).unwrap();
+        assert!(
+            !probe(&primary),
+            "negative control: explicit unlock is observed"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), foreign_bytes);
+        assert_eq!(
+            sqlite_marker_value(&displaced).as_deref(),
+            Some("candidate-generation")
+        );
+        assert!(
+            std::fs::symlink_metadata(&candidate)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
     }
 
     #[cfg(unix)]
