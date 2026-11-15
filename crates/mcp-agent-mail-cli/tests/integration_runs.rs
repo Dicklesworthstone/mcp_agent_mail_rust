@@ -860,20 +860,29 @@ struct ArchivePressureServer {
 
 impl ArchivePressureServer {
     fn start(env: &TestEnv) -> Self {
+        Self::start_with_env(
+            env,
+            &[
+                ("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED", "false"),
+                ("AM_WBQ_CHANNEL_CAPACITY", "256"),
+                ("AM_WBQ_DRAIN_BATCH_CAP", "16"),
+                ("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10"),
+                ("AM_ARCHIVE_BACKLOG_CAP", "1"),
+            ],
+        )
+    }
+
+    fn start_with_env(env: &TestEnv, extra: &[(&str, &str)]) -> Self {
         let stdout_path = env.tmp.path().join("archive-pressure.stdout");
         let stderr_path = env.tmp.path().join("archive-pressure.stderr");
         let child = Command::new(am_bin())
             .env_clear()
             .envs(env.isolated_env())
             .env("AM_ATC_ENABLED", "false")
-            .env("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED", "false")
             .env("RETENTION_REPORT_ENABLED", "false")
             .env("QUOTA_ENABLED", "false")
-            .env("AM_WBQ_CHANNEL_CAPACITY", "256")
-            .env("AM_WBQ_DRAIN_BATCH_CAP", "16")
-            .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
-            .env("AM_ARCHIVE_BACKLOG_CAP", "1")
             .env("RUST_LOG", "warn")
+            .envs(extra.iter().copied())
             .current_dir(env.hostile_repo())
             .arg("serve-stdio")
             .stdin(Stdio::piped())
@@ -967,6 +976,387 @@ impl ArchivePressureServer {
 impl Drop for ArchivePressureServer {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_stdio_recovers_released_reservations_after_restart_and_reports_real_progress() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let env = TestEnv::new();
+    let second_project = env.tmp.path().join("second-project");
+    std::fs::create_dir(&second_project).unwrap();
+    git2::Repository::init(env.hostile_repo()).unwrap();
+    git2::Repository::init(&second_project).unwrap();
+    let project_keys = [
+        env.hostile_repo.display().to_string(),
+        second_project.display().to_string(),
+    ];
+    let patterns = ["src/recover.rs", "src/contended.rs"];
+    let mut first = ArchivePressureServer::start_with_env(
+        &env,
+        &[("AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED", "false")],
+    );
+    let mut artifacts = Vec::new();
+    let mut ids = Vec::new();
+    for (project_key, pattern) in project_keys.iter().zip(patterns) {
+        let project = first.request("ensure_project", json!({"human_key": project_key}));
+        first.request(
+            "register_agent",
+            json!({
+                "project_key": project_key, "name": "BlueLake",
+                "program": "reservation-recovery-e2e", "model": "test"
+            }),
+        );
+        let granted = first.request(
+            "file_reservation_paths",
+            json!({
+                "project_key": project_key, "agent_name": "BlueLake", "paths": [pattern],
+                "ttl_seconds": 3600, "exclusive": true, "reason": "public restart recovery"
+            }),
+        );
+        assert_eq!(granted["granted"].as_array().unwrap().len(), 1, "{granted}");
+        assert_eq!(granted["conflicts"], json!([]), "{granted}");
+        let id = granted["granted"][0]["id"].as_i64().unwrap();
+        let directory = env
+            .storage_root
+            .join("projects")
+            .join(project["slug"].as_str().unwrap())
+            .join("file_reservations");
+        let paths: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&format!("id-{id}-g"))
+            })
+            .collect();
+        assert_eq!(
+            paths.len(),
+            1,
+            "exactly one current generation artifact: {paths:?}"
+        );
+        let active: Value = serde_json::from_slice(&std::fs::read(&paths[0]).unwrap()).unwrap();
+        assert_eq!(active["id"], id);
+        assert_eq!(active["path_pattern"], pattern);
+        assert!(active["released_ts"].is_null(), "{active}");
+        ids.push(id);
+        artifacts.push(paths[0].clone());
+    }
+    let mut cli_env = env.isolated_env();
+    for (key, value) in [
+        ("AGENT_MAIL_BYPASS", "0"),
+        ("AGENT_MAIL_GUARD_MODE", "block"),
+        ("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", "true"),
+        ("AM_ATC_ENABLED", "false"),
+    ] {
+        cli_env.push((key.to_string(), value.to_string()));
+    }
+    let check_guard = |index: usize, expected: i32| {
+        let out = run_am(
+            &cli_env,
+            Some(env.hostile_repo()),
+            &["guard", "check", "--repo", &project_keys[index]],
+            Some(format!("{}\n", patterns[index]).as_bytes()),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(expected),
+            "guard stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    check_guard(0, 1);
+    check_guard(1, 1);
+
+    let before: Vec<_> = artifacts
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    // A real non-directory obstruction fails even for a privileged runner.
+    // Preserve both the old ACTIVE artifacts and the obstructing bytes.
+    let obstruction = b"retain real reservation archive obstruction";
+    let mut blocked_directories = Vec::new();
+    for artifact in &artifacts {
+        let directory = artifact.parent().unwrap().to_path_buf();
+        let saved = directory.with_file_name("file_reservations.before-release");
+        let retained = directory.with_file_name("file_reservations.obstruction.saved");
+        assert!(!saved.exists() && !retained.exists());
+        std::fs::rename(&directory, &saved).unwrap();
+        std::fs::write(&directory, obstruction).unwrap();
+        let error = std::fs::File::create(directory.join(".release-write-probe"))
+            .expect_err("the private archive path must actually reject writes");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        blocked_directories.push((directory, saved, retained));
+    }
+    for (project_key, pattern) in project_keys.iter().zip(patterns) {
+        let released = first.request(
+            "release_file_reservations",
+            json!({
+                "project_key": project_key, "agent_name": "BlueLake", "paths": [pattern]
+            }),
+        );
+        assert_eq!(released["released"], 1, "{released}");
+    }
+    first.stop().unwrap();
+    for (directory, saved, retained) in &blocked_directories {
+        assert_eq!(std::fs::read(directory).unwrap(), obstruction);
+        std::fs::rename(directory, retained).unwrap();
+        std::fs::rename(saved, directory).unwrap();
+        assert_eq!(std::fs::read(retained).unwrap(), obstruction);
+    }
+    for (path, bytes) in artifacts.iter().zip(&before) {
+        assert_eq!(
+            &std::fs::read(path).unwrap(),
+            bytes,
+            "failed write changed old artifact"
+        );
+    }
+    for path in [&first.stdout_path, &first.stderr_path] {
+        let saved = path.with_file_name(format!(
+            "{}.before-restart.saved",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::rename(path, saved).unwrap();
+    }
+
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    let generation = mcp_agent_mail_db::queries::db_generation_id_conn(&conn).unwrap();
+    let mut releases = Vec::new();
+    for (id, artifact) in ids.iter().zip(&artifacts) {
+        assert_eq!(
+            artifact.file_name().unwrap().to_str().unwrap(),
+            format!("id-{id}-g{generation}.json")
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT COALESCE((SELECT released_ts FROM file_reservation_releases l \
+             WHERE l.reservation_id=r.id), r.released_ts) AS released_ts \
+             FROM file_reservations r WHERE r.id=?",
+                &[SqlValue::BigInt(*id)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let timestamp = rows[0].get_named::<i64>("released_ts").unwrap();
+        assert!(timestamp > 0, "a real committed release is required");
+        releases.push(timestamp);
+    }
+    conn.close_sync().unwrap();
+    let mut foreign: Value = serde_json::from_slice(&before[0]).unwrap();
+    assert_ne!(generation, "ffff");
+    foreign["db_generation"] = json!("ffff");
+    foreign["path_pattern"] = json!("foreign/untouched.rs");
+    let foreign_path = artifacts[0]
+        .parent()
+        .unwrap()
+        .join(format!("id-{}-gffff.json", ids[0]));
+    let foreign_bytes = serde_json::to_vec_pretty(&foreign).unwrap();
+    std::fs::write(&foreign_path, &foreign_bytes).unwrap();
+    let foreign_metadata = std::fs::metadata(&foreign_path).unwrap();
+    let foreign_identity = (
+        foreign_metadata.ino(),
+        foreign_metadata.modified().unwrap(),
+        foreign_metadata.mode(),
+    );
+
+    let stalled = run_am(
+        &cli_env,
+        Some(env.hostile_repo()),
+        &["doctor", "health"],
+        None,
+    );
+    let stalled_text = String::from_utf8_lossy(&stalled.stdout);
+    assert_eq!(stalled.status.code(), Some(1), "{stalled_text}");
+    assert!(!stalled_text.contains("reconciling"), "{stalled_text}");
+
+    let mut busy = mcp_agent_mail_storage::FileLock::new(
+        artifacts[1]
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".archive.lock"),
+    );
+    busy.acquire().unwrap();
+    // Default-on production maintenance, not a read or operator repair. The
+    // first project must converge while an independent project remains busy.
+    let mut restarted = ArchivePressureServer::start_with_env(&env, &[]);
+    let committed_release = |index: usize| {
+        let path = &artifacts[index];
+        let Ok(bytes) = std::fs::read(path) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            return false;
+        };
+        if value["released_ts"]
+            .as_str()
+            .and_then(mcp_agent_mail_core::iso_to_micros)
+            != Some(releases[index])
+        {
+            return false;
+        }
+        let Ok(repo) = git2::Repository::open(&env.storage_root) else {
+            return false;
+        };
+        let Ok(tree) = repo.head().and_then(|head| head.peel_to_tree()) else {
+            return false;
+        };
+        let Ok(entry) = tree.get_path(path.strip_prefix(&env.storage_root).unwrap()) else {
+            return false;
+        };
+        repo.find_blob(entry.id())
+            .is_ok_and(|blob| blob.content() == bytes)
+    };
+    let deadline = Instant::now() + Duration::from_secs(105);
+    loop {
+        let progress = mcp_agent_mail_storage::recovery::reservation_reconcile::read_progress(
+            &env.storage_root,
+        );
+        if committed_release(0) && progress.is_some_and(|value| value.last_repair_us.is_some()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline
+                && restarted
+                    .child
+                    .as_mut()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_none(),
+            "idle repair did not progress: {}",
+            std::fs::read_to_string(&restarted.stderr_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        std::fs::read(&artifacts[1]).unwrap(),
+        before[1],
+        "busy project changed prematurely"
+    );
+    let converging = run_am(
+        &cli_env,
+        Some(env.hostile_repo()),
+        &["doctor", "health"],
+        None,
+    );
+    let health = String::from_utf8_lossy(&converging.stdout);
+    assert!(
+        converging.status.success(),
+        "health stdout={health} stderr={}",
+        String::from_utf8_lossy(&converging.stderr)
+    );
+    assert!(
+        health.contains("reconciling") && health.contains("released reservation"),
+        "{health}"
+    );
+    check_guard(0, 0);
+    check_guard(1, 1);
+    drop(busy);
+    let deadline = Instant::now() + Duration::from_secs(105);
+    while !committed_release(1) {
+        assert!(
+            Instant::now() < deadline
+                && restarted
+                    .child
+                    .as_mut()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_none(),
+            "contended repair did not converge: {}",
+            std::fs::read_to_string(&restarted.stderr_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    check_guard(1, 0);
+    let healthy = run_am(
+        &cli_env,
+        Some(env.hostile_repo()),
+        &["doctor", "health"],
+        None,
+    );
+    assert!(
+        healthy.status.success(),
+        "health stdout={} stderr={}",
+        String::from_utf8_lossy(&healthy.stdout),
+        String::from_utf8_lossy(&healthy.stderr)
+    );
+    assert!(String::from_utf8_lossy(&healthy.stdout).contains("reservation_parity: ok"));
+    assert_eq!(std::fs::read(&foreign_path).unwrap(), foreign_bytes);
+    let metadata = std::fs::metadata(&foreign_path).unwrap();
+    assert_eq!(
+        (
+            metadata.ino(),
+            metadata.modified().unwrap(),
+            metadata.mode()
+        ),
+        foreign_identity
+    );
+    restarted.stop().unwrap();
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    let rows = conn
+        .query_sync("SELECT COUNT(*) AS total FROM file_reservations", &[])
+        .unwrap();
+    assert_eq!(rows[0].get_named::<i64>("total").unwrap(), 2);
+    for (id, expected) in ids.iter().zip(&releases) {
+        let rows = conn
+            .query_sync(
+                "SELECT COALESCE((SELECT released_ts FROM file_reservation_releases l \
+                 WHERE l.reservation_id=r.id), r.released_ts) AS released_ts \
+                 FROM file_reservations r WHERE r.id=?",
+                &[SqlValue::BigInt(*id)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("released_ts").unwrap(), *expected);
+    }
+    conn.close_sync().unwrap();
+    eprintln!(
+        "public release/restart/guard/health recovery passed: ids={ids:?} generation={generation}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reservation_parity_shell_suite_uses_cargo_built_binary() {
+    let env = TestEnv::new();
+    let binary = am_bin();
+    let target = binary.parent().unwrap().parent().unwrap();
+    assert_eq!(
+        target.join("debug/am").canonicalize().unwrap(),
+        binary.canonicalize().unwrap()
+    );
+    let out = Command::new("bash")
+        .arg(repo_root().join("tests/e2e/test_reservation_parity.sh"))
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("CARGO_TARGET_DIR", target)
+        .env("E2E_FORCE_BUILD", "0")
+        .env("RCH_REQUIRE_REMOTE", "1")
+        .env("E2E_CARGO_REQUIRE_RCH", "1")
+        .env("AM_E2E_KEEP_TMP", "1")
+        .current_dir(env.hostile_repo())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    eprintln!("reservation parity suite stdout={stdout}\nstderr={stderr}");
+    assert!(out.status.success(), "reservation parity suite failed");
+    for required in [
+        "setup: GoldFox reservation granted through the MCP tool surface",
+        "F1: missing artifact was healed back onto disk by reconcile-on-read",
+        "F3: second identical release is a clean released=0 no-op",
+    ] {
+        assert!(
+            stdout.contains(required),
+            "missing populated case: {required}"
+        );
     }
 }
 

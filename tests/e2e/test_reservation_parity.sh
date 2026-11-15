@@ -7,7 +7,7 @@
 # disagreeing about who holds a lease):
 #
 #   F1 — reconcile-on-read: an active DB reservation whose archive artifact
-#        (`projects/<slug>/file_reservations/id-<id>.json`) vanished in a
+#        (`projects/<slug>/file_reservations/id-<id>-g<generation>.json`) vanished in a
 #        crash gap (DB commit landed, archive write did not) is HEALED on the
 #        next `file_reservation_paths` read — the artifact reappears with the
 #        correct holder. Divergent artifacts (wrong path_pattern) are healed
@@ -131,16 +131,29 @@ stdio_session() {
     fifo="${srv_work}/stdin_fifo"
     mkfifo "${fifo}"
 
-    DATABASE_URL="${db_url}" RUST_LOG=error INTEGRITY_CHECK_ON_STARTUP=false \
+    env -u AM_INTERFACE_MODE DATABASE_URL="${db_url}" RUST_LOG=error INTEGRITY_CHECK_ON_STARTUP=false \
         "${AM_BIN}" serve-stdio <"${fifo}" >"${out}" 2>"${srv_work}/stderr.txt" &
     srv_pid=$!
     sleep 0.3
 
     {
-        local req
+        local req req_id
         for req in "$@"; do
             printf '%s\n' "${req}"
-            sleep 0.4
+            req_id="$(jq -er '.id' <<<"${req}")" || break
+            # Keep dependent calls in response order, including initialize.
+            # The parent retains the original finite session budget.
+            while kill -0 "${srv_pid}" 2>/dev/null; do
+                if jq -es --argjson id "${req_id}" 'any(.[]; .id == $id)' \
+                    "${out}" >/dev/null 2>>"${srv_work}/client.stderr.txt"; then
+                    break
+                fi
+                sleep 0.05
+            done
+            if ! kill -0 "${srv_pid}" 2>/dev/null; then break; fi
+            if [ "${req}" = "${INIT_REQ}" ]; then
+                printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+            fi
         done
         sleep 0.5
     } >"${fifo}" &
@@ -153,9 +166,9 @@ stdio_session() {
         elapsed=$((elapsed + 1))
     done
 
-    wait "${write_pid}" 2>/dev/null || true
     kill "${srv_pid}" 2>/dev/null || true
     wait "${srv_pid}" 2>/dev/null || true
+    wait "${write_pid}" 2>/dev/null || true
     cp "${srv_work}/stderr.txt" "${out}.stderr" 2>/dev/null || true
     return 0
 }
@@ -218,9 +231,37 @@ else
 fi
 
 FR_DIR="$(find "${STORAGE_ROOT}/projects" -maxdepth 2 -type d -name file_reservations 2>/dev/null | head -1)"
-ALPHA_ARTIFACT="${FR_DIR}/id-${RES_ID}.json"
+GENERATION_QUERY='SELECT generation_id FROM db_identity WHERE singleton = 0;'
+DB_GENERATION=""
+DB_GENERATION_RC=0
+if command -v sqlite3 >/dev/null 2>&1; then
+    DB_GENERATION="$(sqlite3 -readonly "${DB_PATH}" "${GENERATION_QUERY}" 2>"${ART}/generation.stderr")" || DB_GENERATION_RC=$?
+elif command -v python3 >/dev/null 2>&1; then
+    DB_GENERATION="$(python3 - "${DB_PATH}" "${GENERATION_QUERY}" 2>"${ART}/generation.stderr" <<'PY'
+from contextlib import closing
+from pathlib import Path
+import sqlite3
+import sys
+
+with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as conn:
+    rows = conn.execute(sys.argv[2]).fetchall()
+    if len(rows) != 1 or not isinstance(rows[0][0], str):
+        raise SystemExit("expected one authoritative database generation")
+    print(rows[0][0])
+PY
+)" || DB_GENERATION_RC=$?
+fi
+if [ "${DB_GENERATION_RC}" -ne 0 ] || [[ ! "${DB_GENERATION}" =~ ^[[:xdigit:]]{1,128}$ ]]; then
+    e2e_fail "setup: could not read the seeded mailbox generation (see ${ART}/generation.stderr)"
+    e2e_summary
+    exit 1
+fi
+printf '%s\n' "${DB_GENERATION}" >"${ART}/generation.txt"
+ALPHA_ARTIFACT="${FR_DIR}/id-${RES_ID}-g${DB_GENERATION}.json"
 if [ -n "${FR_DIR}" ] && [ -f "${ALPHA_ARTIFACT}" ]; then
-    e2e_pass "setup: archive artifact id-${RES_ID}.json written by the grant"
+    e2e_pass "setup: generation-stamped archive artifact written by the grant"
+    check "setup: artifact carries the live database generation" "${ALPHA_ARTIFACT}" \
+        --arg generation "${DB_GENERATION}" '.db_generation == $generation'
     check "setup: artifact holder is GoldFox" "${ALPHA_ARTIFACT}" '.agent == "GoldFox"'
     check "setup: artifact carries the reserved pattern" "${ALPHA_ARTIFACT}" '.path_pattern == "src/alpha/**"'
 else
