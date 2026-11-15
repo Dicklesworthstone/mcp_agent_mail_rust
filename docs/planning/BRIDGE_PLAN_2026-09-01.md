@@ -31,16 +31,28 @@
   c574d3ff/overlaye90f7978 passes workspace all-target check on ovh, with matching
   four actual worker inputs. Formatting/diff checks pass. Preserve prior hz3
   admission120/startedfalse and Clippy/native queue-timeout103; these are not tests.
-- [ ] Run predeclared final52 (prior47, three post-commit cases, new lock case,
-  existing FrankenSQLite lock control), production lib+bins check and strict
-  workspace Clippy on the frozen source, with actual terminal outcomes.
+- [x] Run predeclared final52 (prior47, three post-commit cases, new lock case,
+  existing FrankenSQLite lock control): run4bf35678-9a8b-4904-ae20-11cb97ff494f
+  exits0/52PASS/4044skipped/28.181s, Cargo4m03s on hz2; exact52-name census
+  and actual four worker inputs match. Stable ELF
+  7ddaf9660ebfbcdbfea26123658b051ee59196bd36deb2cbce6cf6df7a2c4696.
+- [x] Complete production lib+bins check (exit0/Cargo5m27s) and strict workspace
+  Clippy (exit0/Cargo1m43s) on hz2, on the same frozen source. Actual four-input
+  worker hashes match both; retain all prior admission/queue refusals as non-tests.
 - [x] Run strict whole-file UBS: exit1/statusok/critical0/warning5382/info2594/
   no failed modules. Read92 findings in bounded changed ranges: test assertions,
   unwrap/panic checks, fixture clones, child probe and informational matches.
   No UBS suppression added; strict scanner convergence remains unclaimed.
-- [ ] Record actual outcomes and unmet original acceptance in existing TODO,
-  owned Bead and audit; preserve tracker history, prepare exact-path publication,
-  verify remote refs/shared tree and release only owned leases.
+- [x] Record actual outcomes and unmet original acceptance in existing TODO,
+  owned Bead and audit; preserve tracker history and prepare exact-path evidence
+  publication. Normal remote-ref/shared-tree verification and release of only
+  owned leases2206–2209 are terminal actions recorded in the existing audit
+  after observation. Original br-cxsgx acceptance/status remain unchanged.
+
+Shared-checkout event: another process committed the in-progress changes through
+6f98854c while qualification was waiting. Preserve that history; its pool.rs and
+all frozen build inputs remain unchanged. This pass does not claim those Git
+actions or repackage them as a single implementation commit.
 
 ## November 15 Review36 activated-candidate rollback identity — EmeraldEagle
 
