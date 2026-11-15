@@ -66,6 +66,19 @@
   compiler attempt103/queue timeout did not execute Cargo and earns no pass.
 - [x] Inspect actual running native tools: rustc908501772/Cargo e8cb624d5 from
   pinned nightly2026-08-31 and cargo-nextest0.9.143. Keep native results pending.
+- [x] Detect concurrent shared-checkout publication through c062f04f: the two
+  functional Review31 files, plan and start comment are already committed and
+  pushed by another session. Preserve that history; import Beads0. Source
+  hashes for the two tests remain unchanged, but the engine pin is now e7ffeff4;
+  earlier978 compiler passes and its running native job retain their old scope.
+- [ ] Execute the seven unchanged predeclared cases and mandatory compiler
+  gates on frozen c062f04f plus three test-format overlays eeffef13. Native
+  admission on114 and compiler admission on1156 pass before submission;
+  no result is credited while queued or compiling.
+- [ ] Correct the new workspace fmt1 mechanically in the five incoming files,
+  using manual parallel edits as AGENTS.md directs. Review every diff and
+  re-execute formatting; preserve the exact source scope of already-running
+  compiler/native jobs rather than relabeling their inputs after formatting.
 - [ ] Re-execute the original public acceptance case in a fresh solo pass on
   the final formatted source. No independent reviewer is available or claimed.
 - [x] Formatted candidate workspace/all-targets0/Cargo1m36s on hz2,
