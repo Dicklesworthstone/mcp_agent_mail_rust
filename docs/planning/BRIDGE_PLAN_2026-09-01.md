@@ -1,5 +1,26 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review37 post-commit generation authority — EmeraldEagle
+
+- [x] Reread the prior rollback repair, promotion callers and ATC follow-up;
+  compare ready Beads with landed implementation and retained acceptance.
+- [x] Find post-commit follow-up using the live pathname without candidate
+  identity revalidation; reserve existing files and keep br-cxsgx in progress.
+- [ ] Add real SQLite controls for live-generation replacement after successful
+  finalization, post-rename verification failure and receipt-directory sync failure;
+  cover original-primary presence/absence, preserved bytes/inodes/receipt, and
+  refusal to create ATC follow-up artifacts for a foreign primary.
+- [ ] Execute unchanged-production baseline with both new negative cases and
+  existing post-commit positive control; preserve exact source and test identity.
+- [ ] Revalidate committed candidate identity before follow-up mutation; keep
+  committed-receipt error classification, preserve every generation, and refuse
+  success when current authority cannot be proven.
+- [ ] Reread the fix and consumers; run the prior47 cases plus new controls,
+  mandatory workspace/production checks, strict Clippy, formatting and scanner.
+- [ ] Record actual outcomes and unmet original acceptance in existing TODO,
+  owned Bead and audit; preserve tracker history, prepare exact-path publication,
+  verify remote refs/shared tree and release only owned leases.
+
 ## November 15 Review36 activated-candidate rollback identity — EmeraldEagle
 
 - [x] Reread the latest ownership repair and promotion/finalizer callers;
