@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::document::DocKind;
 use crate::error::{SearchError, SearchResult};
@@ -413,39 +413,47 @@ impl VectorIndex {
             )));
         }
 
-        if self.entries.is_empty() {
+        if k == 0 || self.entries.is_empty() {
             return Ok(Vec::new());
         }
 
         // Normalize query vector
         let query_normalized = crate::embedder::normalize_l2(query);
 
-        // Compute similarities and collect candidates
-        let mut candidates: Vec<VectorHit> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| filter.is_none_or(|f| f.matches(&entry.metadata)))
-            .map(|(pos, entry)| {
-                // Dot product of normalized vectors = cosine similarity
-                let score = dot_product(&query_normalized, &entry.vector);
+        // VectorHit orders best first, so the max-heap exposes the worst
+        // retained candidate. Keep only k hits instead of sorting the corpus.
+        // The position preserves the old stable sort when distinct document
+        // kinds share both a score and a numeric ID, including after removal.
+        let mut candidates = BinaryHeap::new();
+        for (pos, entry) in self.entries.iter().enumerate() {
+            if filter.is_some_and(|f| !f.matches(&entry.metadata)) {
+                continue;
+            }
+            let score = dot_product(&query_normalized, &entry.vector);
+            let candidate = (
                 VectorHit::new(
                     entry.metadata.doc_id,
                     entry.metadata.doc_kind,
                     entry.metadata.project_id,
                     score,
                     pos,
-                )
-            })
-            .collect();
+                ),
+                pos,
+            );
+            if candidates.len() < k {
+                candidates.push(candidate);
+            } else if let Some(mut worst) = candidates.peek_mut()
+                && candidate < *worst
+            {
+                *worst = candidate;
+            }
+        }
 
-        // Sort by score descending, then doc_id ascending (deterministic tie-breaking)
-        candidates.sort();
-
-        // Take top k
-        candidates.truncate(k);
-
-        Ok(candidates)
+        Ok(candidates
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(hit, _)| hit)
+            .collect())
     }
 
     /// Get a vector by document reference.
@@ -570,6 +578,149 @@ mod tests {
             vector,
             VectorMetadata::new(doc_id, kind, "test-model").with_project(project_id),
         )
+    }
+
+    fn assert_search_matches_full_sort(
+        index: &VectorIndex,
+        query: &[f32],
+        k: usize,
+        filter: Option<&VectorFilter>,
+    ) {
+        // Retain the old full-sort algorithm as an independent reference.
+        let normalized = IndexEntry::new(query, VectorMetadata::default()).vector;
+        let mut expected = Vec::new();
+        for (pos, entry) in index.entries.iter().enumerate() {
+            if filter.is_some_and(|f| !f.matches(&entry.metadata)) {
+                continue;
+            }
+            let score = normalized
+                .iter()
+                .zip(&entry.vector)
+                .map(|(left, right)| left * right)
+                .sum();
+            expected.push(VectorHit::new(
+                entry.metadata.doc_id,
+                entry.metadata.doc_kind,
+                entry.metadata.project_id,
+                score,
+                pos,
+            ));
+        }
+        expected.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
+        });
+        expected.truncate(k);
+
+        let actual = index.search(query, k, filter).expect("valid search");
+        assert_eq!(actual.len(), expected.len(), "result count for k={k}");
+        // VectorHit's own equality deliberately ignores kind and position.
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual.doc_id, expected.doc_id);
+            assert_eq!(actual.doc_kind, expected.doc_kind);
+            assert_eq!(actual.project_id, expected.project_id);
+            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+            assert_eq!(actual.index_position, expected.index_position);
+        }
+    }
+
+    #[test]
+    fn search_top_k_matches_full_sort_for_scopes_and_limits() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+        for ordinal in (0_u16..257).map(|i| (i * 73) % 257) {
+            let kind = match ordinal % 4 {
+                0 => DocKind::Message,
+                1 => DocKind::Agent,
+                2 => DocKind::Project,
+                _ => DocKind::Thread,
+            };
+            let model = if ordinal % 2 == 0 { "model-a" } else { "model-b" };
+            let metadata = VectorMetadata::new(i64::from((ordinal * 37) % 97) - 48, kind, model)
+                .with_project(i64::from(ordinal % 3));
+            let vector = [
+                f32::from(ordinal % 7) - 3.0,
+                f32::from(ordinal % 11) - 5.0,
+                f32::from(ordinal % 5) - 2.0,
+            ];
+            index.upsert(IndexEntry::new(&vector, metadata)).unwrap();
+        }
+        assert_eq!(index.len(), 257);
+        let filters = [
+            None,
+            Some(VectorFilter::new()),
+            Some(VectorFilter::new().with_project(2)),
+            Some(VectorFilter::new().with_model("model-b")),
+            Some(VectorFilter::new().with_doc_kinds(vec![DocKind::Message, DocKind::Thread])),
+            Some(VectorFilter::new().with_exclusions(vec![-48, 0, 48])),
+            Some(
+                VectorFilter::new()
+                    .with_project(1)
+                    .with_model("model-b")
+                    .with_doc_kinds(vec![DocKind::Agent, DocKind::Thread])
+                    .with_exclusions(vec![-15, 0, 12]),
+            ),
+            Some(VectorFilter::new().with_project(999)),
+        ];
+        for query in [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, -1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ] {
+            for filter in &filters {
+                for k in [0, 1, 2, 7, 31, 256, 257, 258, usize::MAX] {
+                    assert_search_matches_full_sort(&index, &query, k, filter.as_ref());
+                }
+            }
+        }
+        // A zero result budget must not suppress existing query validation.
+        assert!(index.search(&[1.0, 0.0], 0, None).is_err());
+    }
+
+    #[test]
+    fn search_top_k_preserves_cross_kind_ties_after_swap_remove() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+        for (id, kind) in [
+            (99, DocKind::Message),
+            (7, DocKind::Agent),
+            (7, DocKind::Message),
+            (7, DocKind::Project),
+            (7, DocKind::Thread),
+        ] {
+            index
+                .upsert(make_entry(id, kind, &[1.0, 0.0, 0.0]))
+                .unwrap();
+        }
+        assert!(index.remove(99, DocKind::Message));
+        let hits = index.search(&[1.0, 0.0, 0.0], 2, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].doc_kind, DocKind::Thread);
+        assert_eq!(hits[0].index_position, 0);
+        assert_eq!(hits[1].doc_kind, DocKind::Agent);
+        assert_eq!(hits[1].index_position, 1);
+        for k in 0..=5 {
+            assert_search_matches_full_sort(&index, &[1.0, 0.0, 0.0], k, None);
+        }
+    }
+
+    #[test]
+    fn vector_hit_ordering_remains_transitive_with_nan() {
+        let nan = VectorHit::new(2, DocKind::Message, None, f32::NAN, 0);
+        let high = VectorHit::new(3, DocKind::Message, None, 1.0, 1);
+        let low = VectorHit::new(1, DocKind::Message, None, 0.0, 2);
+        // Falling back to doc_id for unordered floats made nan < high and
+        // high < low, but nan > low: invalid for both sorting and a heap.
+        assert!(nan < high);
+        assert!(high < low);
+        assert!(nan < low);
     }
 
     // ── VectorHit ordering ──
@@ -924,7 +1075,7 @@ mod tests {
     fn vector_hit_ordering_nan_score() {
         let a = VectorHit::new(1, DocKind::Message, None, f32::NAN, 0);
         let b = VectorHit::new(2, DocKind::Message, None, 0.5, 1);
-        // NaN comparison falls through to doc_id tiebreak
+        // The total float order puts this positive NaN before finite scores.
         let _ = a.cmp(&b); // Should not panic
     }
 
