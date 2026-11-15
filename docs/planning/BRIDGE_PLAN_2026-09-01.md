@@ -1,5 +1,105 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review41 synchronous pool retirement — EmeraldEagle
+
+- [x] Inspect ready/owned Beads and current source; preserve already-landed
+  fixes that still await platform, release or soak evidence.
+- [x] Claim existing F7 `br-oiok2` and reserve the exact upstream/downstream
+  files. Confirm the mailbox pool uses `FrankenConnection` directly.
+- [x] Add an explicit consuming synchronous driver-close hook; defer untouched
+  connections to the existing asynchronous hook without polling/dropping it.
+- [x] Implement the FrankenSQLite hook through its existing no-checkpoint
+  close, preserving committed data and avoiding close-time contention.
+- [x] Use synchronous retirement before constructing a runtime for both owned
+  batches and orphaned lease returns. Preserve deadlines, unwinding behavior,
+  resource-before-accounting destruction, errors and drain failure latches.
+- [x] Exercise successful close, close failure, asynchronous fallback,
+  expired lease/idle eviction, shutdown and interrupted cleanup. Preserve all
+  existing tests and add a direct observable for runtime construction.
+- [x] Verify real FrankenSQLite close/reopen durability and representative
+  existing pool/cancellation scenarios; label substitute-driver controls.
+- [x] Review all upstream edits and run required upstream compiler/lint/format
+  and affected real-driver gates. Publish one coherent upstream repair.
+- [x] Adopt only the required immutable SQLModel crates in Agent Mail;
+  generate Cargo.lock with Cargo and review every dependency/source delta.
+- [x] Strengthen the existing Agent Mail journal-limit test: its old retune
+  held every handle, so add genuine two-idle-handle eviction, exact accounting,
+  committed-row survival and reopened pragma assertions without removing any.
+- [x] Run both Agent Mail compiler graphs, strict Clippy, formatting and UBS;
+  execute unchanged real pool and original HTTP cancellation controls.
+- [x] Fresh solo reread/reexecution, update the original Bead from actual
+  results, preserve unmet acceptance and prepare the exact scoped publication.
+
+This implements the observed F7 retirement cost, not a performance win claim.
+The existing native async-driver retirement path remains the fallback.
+Raw commands/source/terminal evidence reuse
+`/data/tmp/am-archive-reader-20261110.t7ueMuTt/review41-*` and the existing audit.
+
+Upstream repair `ca959f899b98fbea7af19e942e687dae9b71f258` is published to
+both remote branches; its tracked tree is clean and all five own leases are
+released. The old-pool comparison executes five declared cases: two controls
+pass and three synchronous-close cases fail with one runtime instead of zero.
+These substitute-driver cases support the dispatch claim, not a performance
+win. Final full pool/Session libraries pass all 285 registered cases (120+165;
+zero failed/ignored/filtered); fresh solo eleven-case execution also passes
+with identical pool and Session executable hashes.
+
+The complete real-driver/E2E run initially reports 135 pass, one existing
+ignore and one failure: the unchanged doc-truth guard catches a stale packaged
+Session guide. Synchronizing it with the unchanged canonical root fixes that
+failure without changing the guard. The final complete run passes 136 cases,
+with the original retained-file test still ignored. A separate fresh five-case
+run supplies an isolated retained file and actually executes that original
+manual test, three close controls and the original pool E2E: all five pass.
+Real C SQLite and FrankenSQLite run; nine pool and three Session PostgreSQL
+cases return for unavailable services, and MySQL/MariaDB are absent. Their
+statuses do not establish live network coverage. Actual final nine worker
+inputs match. Both compiler graphs, strict Clippy, formatting and diff checks
+pass on the final upstream source. One narrow test-helper `result_large_err`
+allowance follows the existing public-error callback policy; untouched upstream
+Clippy reproduces its two closure diagnostics plus the helper borrowing lint.
+All assertions remain. Strict upstream UBS stays red: zero critical, 2,052
+warnings, 166 informational; all 53 changed-range findings were reviewed.
+The documented default scan returns zero with the same findings. Its exact
+upstream invocation ran after publication; the stricter scan ran beforehand.
+That timing miss is recorded, not represented as a passing precommit check.
+
+Agent Mail now pins only SQLModel core/pool/FrankenSQLite driver to that exact
+revision. Cargo generated the lockfile, then nine incidental edge reselections
+were manually restored after checking their published version constraints.
+Cargo accepts the complete graph with `--locked`: all 824 packages remain,
+821 package records are identical, and only the three intended sources change.
+All dependency versions/edges, the Asupersync family and the existing engine
+family/patch remain unchanged. The registry driver production diff contains
+only the new hook. Both application workspace compiler graphs and strict
+Clippy pass. The native ten-DB-case plus original HTTP cancellation cohort
+passes all eleven unique cases, without failures or ignores. The HTTP timeout
+is 30,001 ms, the permit drains while the connection remains held, both pending
+counts are zero, and follow-up reads take 15 and 4 ms. Child harness output is
+not an additional case. Seven source/config inputs are frozen, and both compiler
+and native workers match them. Fresh solo execution repeats all eleven passes
+with identical DB/server executable hashes: timeout 30,000 ms, zero pending
+waiters, follow-up reads 14 and 4 ms. The final reread finds no further defect;
+F7 closes on these scoped results. The application source is base `6c359a39`
+plus overlay `82ef76c7`; final commit/ref publication receipts are recorded in
+the existing audit after execution. No running server was upgraded.
+
+The expanded Agent Mail pool test passes formatting/diff checks; full-file
+strict UBS stays red (zero critical, 5,527 warnings, 2,668 informational).
+All twelve changed-range findings are deliberate test assertions/expectations.
+The documented default application scan returns zero with those same findings;
+the supplemental warning-fatal scan remains red. No scanner setting changed.
+Earlier queue/disk/namespace refusals, the corrected 30-versus-32-GiB preflight
+mistake and failed supplemental byte probes are retained in the existing audit;
+none is counted as execution. The upstream tracker import/flush still refuses
+existing database read admission; its full state and truth JSONL are preserved,
+with no recovery/pruning. The MCP Bead is the task authority. The read-only
+installed health probe independently reports one orphaned page (rows readable)
+and an approximately 188-hour-old proactive backup; this repair does not
+qualify or repair that live state. This is solo Linux qualification, not
+independent, cross-platform, full-application-suite, production-soak or release
+certification.
+
 ## November 15 Review40 health-copy retry authority — EmeraldEagle
 
 - [x] Reread the latest complete source/test diff, witness consumers and public

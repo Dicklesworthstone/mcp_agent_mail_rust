@@ -7251,7 +7251,7 @@ dependencies = [
 [[package]]
 name = "sqlmodel-core"
 version = "0.5.1"
-source = "git+https://github.com/Dicklesworthstone/sqlmodel_rust?rev=c996710674d92c00d23f30fe17ecc5d9644818c7#c996710674d92c00d23f30fe17ecc5d9644818c7"
+source = "git+https://github.com/Dicklesworthstone/sqlmodel_rust?rev=ca959f899b98fbea7af19e942e687dae9b71f258#ca959f899b98fbea7af19e942e687dae9b71f258"
 dependencies = [
  "asupersync",
  "regex",
@@ -7263,8 +7263,7 @@ dependencies = [
 [[package]]
 name = "sqlmodel-frankensqlite"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "038e6863a5ebb58c420afe8d29334217f7dbd6b51c207cd6c7cfcd3a4b27261c"
+source = "git+https://github.com/Dicklesworthstone/sqlmodel_rust?rev=ca959f899b98fbea7af19e942e687dae9b71f258#ca959f899b98fbea7af19e942e687dae9b71f258"
 dependencies = [
  "asupersync",
  "fsqlite",
@@ -7291,7 +7290,7 @@ dependencies = [
 [[package]]
 name = "sqlmodel-pool"
 version = "0.5.1"
-source = "git+https://github.com/Dicklesworthstone/sqlmodel_rust?rev=c996710674d92c00d23f30fe17ecc5d9644818c7#c996710674d92c00d23f30fe17ecc5d9644818c7"
+source = "git+https://github.com/Dicklesworthstone/sqlmodel_rust?rev=ca959f899b98fbea7af19e942e687dae9b71f258#ca959f899b98fbea7af19e942e687dae9b71f258"
 dependencies = [
  "asupersync",
  "sqlmodel-core",

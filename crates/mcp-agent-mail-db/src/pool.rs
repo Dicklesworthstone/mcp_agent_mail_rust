@@ -27425,6 +27425,63 @@ mod tests {
                     );
                     drop(recycled_original);
                     drop(newly_opened);
+
+                    // Retune with real idle inventory too: the earlier change
+                    // only exercised repair of a handle that was checked out.
+                    let witness = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("acquire committed retirement witness");
+                    witness
+                        .execute_raw(
+                            "CREATE TABLE retirement_witness (value INTEGER); \
+                             INSERT INTO retirement_witness VALUES (42);",
+                        )
+                        .expect("commit witness before idle retirement");
+                    drop(witness);
+                    let before_retirement = pool.pool.stats();
+                    assert_eq!(before_retirement.idle_connections, 2);
+                    pool.set_journal_size_limit(CONFIGURED_LIMIT.unsigned_abs())
+                        .expect("retune and retire both idle connections");
+                    let retired = pool.pool.stats();
+                    assert_eq!(
+                        retired.connections_closed - before_retirement.connections_closed,
+                        2
+                    );
+                    assert_eq!(
+                        (
+                            retired.total_connections,
+                            retired.active_connections,
+                            retired.idle_connections
+                        ),
+                        (0, 0, 0)
+                    );
+                    let reopened = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("reopen after synchronous idle retirement");
+                    let rows = reopened
+                        .query_sync("SELECT value FROM retirement_witness", &[])
+                        .expect("read committed witness after retirement");
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 42);
+                    assert_eq!(
+                        read_pragma_i64(
+                            &reopened,
+                            "PRAGMA journal_size_limit;",
+                            "journal_size_limit"
+                        )
+                        .expect("read limit after reopening"),
+                        CONFIGURED_LIMIT
+                    );
+                    drop(reopened);
+                    pool.pool
+                        .close_and_drain(&cx)
+                        .await
+                        .into_result()
+                        .expect("idle retirement must not leave a sticky close failure");
                 });
             },
         );
