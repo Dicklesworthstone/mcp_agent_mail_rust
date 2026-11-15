@@ -5901,16 +5901,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn wal_certificate_failure_preserves_family_and_gives_actionable_triage() {
-        use std::io::Write as _;
-
-        let _guard = DOCTOR_HEALTH_STDIO_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let source_root = tempfile::tempdir().expect("source mailbox");
-        let source = source_root.path().join("storage.sqlite3");
-        seed_healthy_live_mailbox(&source);
+    fn seed_native_wal_certificate_mailbox(source: &Path) -> mcp_agent_mail_db::DbConn {
+        seed_healthy_live_mailbox(source);
         {
             let settle =
                 mcp_agent_mail_db::CanonicalDbConn::open_file(source.display().to_string())
@@ -5928,9 +5920,9 @@ mod tests {
             )
             .expect("commit data that must stay in the WAL");
 
-        // A real native-engine control proves that the staged family includes
-        // the committed row before injecting GH#387's zero-filled extension.
-        let control = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(&source)
+        // Keep the writer open so every staged family has an uncheckpointed
+        // committed row, as it would after the process crashes (GH#387).
+        let control = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(source)
             .unwrap()
             .expect("stage healthy control");
         let control_reader =
@@ -5944,8 +5936,145 @@ mod tests {
             "certificate-commit"
         );
         mcp_agent_mail_db::close_db_conn(control_reader, "close certificate test control");
+        writer
+    }
 
-        for fill in [0_u8, 0xa5] {
+    #[cfg(unix)]
+    #[test]
+    fn zero_filled_wal_certificate_suffix_allows_startup_and_later_commits() {
+        use std::io::Write as _;
+
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let source_root = tempfile::tempdir().expect("source mailbox");
+        let source = source_root.path().join("storage.sqlite3");
+        let writer = seed_native_wal_certificate_mailbox(&source);
+        let source_certificate = fs::read(crate::sqlite_sidecar_path(&source, "-wal-cert"))
+            .expect("native commit certificate");
+        let record_len = u32::from_le_bytes(
+            source_certificate[source_certificate.len() - 4..]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert!(record_len >= 8 && record_len <= source_certificate.len());
+
+        for (zero_bytes, replace_certificate) in [
+            (7, false),
+            (8, false),
+            (record_len, false),
+            (record_len, true),
+        ] {
+            let family = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(&source)
+                .unwrap()
+                .expect("stage crash image");
+            let db_path = family.path();
+            let storage_root = db_path.parent().unwrap();
+            let cert_path = crate::sqlite_sidecar_path(db_path, "-wal-cert");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .append(!replace_certificate)
+                .truncate(replace_certificate)
+                .open(&cert_path)
+                .unwrap()
+                .write_all(&vec![0; zero_bytes])
+                .expect("inject unwritten certificate tail");
+
+            let snapshot = || {
+                [
+                    "",
+                    "-journal",
+                    "-wal",
+                    "-shm",
+                    "-wal-cert",
+                    "-wal-cert-head",
+                    "-fsqlite-ns-gate",
+                    "-fsqlite-ns-use",
+                ]
+                .into_iter()
+                .map(|suffix| fs::read(crate::sqlite_sidecar_path(db_path, suffix)).ok())
+                .collect::<Vec<_>>()
+            };
+            let before = snapshot();
+            let database_url = format!("sqlite:///{}", db_path.display());
+            let storage_root_s = storage_root.display().to_string();
+            let target = tempfile::tempdir().unwrap();
+            let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", &database_url),
+                    ("STORAGE_ROOT", &storage_root_s),
+                    ("HTTP_PORT", "47351"),
+                ],
+                || {
+                    for _ in 0..2 {
+                        crate::run_startup_database_self_heal_with(
+                            &database_url,
+                            storage_root,
+                            || panic!("an unwritten certificate tail does not need repair"),
+                            |_| panic!("an unwritten certificate tail must not reconstruct"),
+                        )
+                        .expect("zero-filled suffix must pass the server's startup gate");
+                    }
+                    triage_envelope(target.path(), false).expect("triage with unwritten suffix")
+                },
+            );
+            assert_eq!(report["live_health"]["status"], "ok", "{report}");
+            assert_eq!(
+                snapshot(),
+                before,
+                "health probes must preserve source bytes"
+            );
+            assert!(
+                !mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(db_path).exists(),
+                "a healthy startup must not enter recovery admission"
+            );
+
+            let reopened = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("runtime mailbox opens after successful preflight");
+            let rows = reopened
+                .query_sync("SELECT slug FROM projects ORDER BY id", &[])
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].get_named::<String>("slug").unwrap(),
+                "certificate-commit"
+            );
+            reopened
+                .execute_raw(
+                    "INSERT INTO projects (id, slug, human_key, created_at) \
+                     VALUES (2, 'after-zero-tail', '/after-zero-tail', 1)",
+                )
+                .expect("append a commit after the engine repairs only unwritten space");
+            mcp_agent_mail_db::close_db_conn(reopened, "close recovered certificate mailbox");
+
+            let reader = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("reopen after recovered append");
+            let rows = reader
+                .query_sync("SELECT slug FROM projects ORDER BY id", &[])
+                .unwrap();
+            let slugs = rows
+                .iter()
+                .map(|row| row.get_named::<String>("slug").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(slugs, ["certificate-commit", "after-zero-tail"]);
+            mcp_agent_mail_db::close_db_conn(reader, "close recovered certificate reader");
+        }
+        mcp_agent_mail_db::close_db_conn(writer, "close source certificate fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_certificate_failure_preserves_family_and_gives_actionable_triage() {
+        use std::io::Write as _;
+
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let source_root = tempfile::tempdir().expect("source mailbox");
+        let source = source_root.path().join("storage.sqlite3");
+        let writer = seed_native_wal_certificate_mailbox(&source);
+
+        for mixed_with_zeros in [false, true] {
             let family = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(&source)
                 .unwrap()
                 .expect("stage crash image");
@@ -5962,11 +6091,18 @@ mod tests {
                 fs::metadata(wal_path).unwrap().len()
                     > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
             );
+            // Unlike unwritten all-zero space, arbitrary nonzero bytes must
+            // still fail closed, including a single nonzero byte amid zeros.
+            let mut suffix = vec![0xa5; record_len];
+            if mixed_with_zeros {
+                suffix.fill(0);
+                suffix[record_len / 2] = 0xa5;
+            }
             std::fs::OpenOptions::new()
                 .append(true)
                 .open(&cert_path)
                 .unwrap()
-                .write_all(&vec![fill; record_len])
+                .write_all(&suffix)
                 .expect("append unrecognized certificate suffix");
 
             let snapshot = || {

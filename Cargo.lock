@@ -2482,7 +2482,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-core"
 version = "0.4.14"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=4314e8880f61e23210435283041c0f5e78e97e6e#4314e8880f61e23210435283041c0f5e78e97e6e"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=585f846488896082b18f407728b79df85a8d1e54#585f846488896082b18f407728b79df85a8d1e54"
 dependencies = [
  "asupersync",
  "blake3",
