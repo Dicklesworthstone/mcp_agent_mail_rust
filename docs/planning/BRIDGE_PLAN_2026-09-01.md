@@ -1,5 +1,52 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review36 activated-candidate rollback identity — EmeraldEagle
+
+- [x] Reread the latest ownership repair and promotion/finalizer callers;
+  identify name-based candidate retreat after a foreign live-path replacement.
+- [x] Reserve existing source/TODO/tracker files; keep br-cxsgx in progress
+  with unchanged acceptance and preserve all peer files and tracker history.
+- [x] Reproduce with real SQLite generations, present/absent original primary,
+  exact retained pending intent, independent byte/inode and readiness checks.
+- [x] Execute unchanged-production run31e1a619-cd5a-42fe-a29b-92eceeea2ee4:
+  exit100/2run/1PASS/1FAIL/4088skipped/1.632s, Cargo23m18s. The first
+  initially-absent-primary case fails at the independent live foreign-file
+  read with NotFound; the existing late-unowned-sidecar/safe-rollback control
+  passes. Retain the exact test-only patch, four actual worker input hashes,
+  stderr and stable baseline ELF d2436b6b7480558db00e74da211b82c0b75ee926c54f43164873da533e12c1da.
+- [x] Verify the activated candidate before rollback; preserve foreign generations
+  and pending intent on uncertainty, including a rename-boundary source swap.
+- [x] Reread the fix and callers again; verify normal rollback still restores
+  the original family and durably aborts its intent.
+- [x] Run the prior44 selected cases plus three new identity/normal-rollback
+  regressions: run19255201-597e-4910-bdea-1c8b1c83978b passes47/47,
+  4045skipped/31.464s, Cargo5m12s; exact47-name census matches. Foreign live
+  replacement, rename-boundary swap with/without a restoration collision, and
+  safe initially-absent-primary rollback pass1.994s/3.769s/0.415s respectively.
+- [x] Workspace/all-target and production lib+bins checks pass on ovh; formatting
+  and diff checks pass. Actual four-input worker hashes match frozen source.
+- [x] Complete strict workspace Clippy against the same frozen source: exit0,
+  Cargo12m59s on vmi1156319; no lint suppression or configuration change.
+- [x] Scan the full changed pool.rs: UBS0/statusok/critical0/warning5318/
+  info2569/no failed modules. Read the55 findings in changed ranges: test
+  assertions/unwraps and informational matches; no suppression or gate edit.
+  Warnings remain; this is neither strict warning clearance nor a workspace scan.
+- [x] Bind final source733b74a7/strict-RCH overlay54fa9f84 to the passing
+  cohort and stable ELF9b83f0833f623006cfe3f433a52f4e30629bd96124ee74f19bd78f2c8898988e.
+  All four actual worker inputs match for baseline, final native, workspace
+  check, production check and Clippy. Binary hashes describe mutable worker
+  cache executables; no immutable binary archive or performance ratio is claimed.
+- [x] Update this TODO and existing audit; preserve original Bead acceptance,
+  all2871 issue IDs/prior comments and seven nonempty untracked roots; prepare
+  one exact-path implementation commit with tracker import/flush/cycle checks.
+
+Terminal publication actions are recorded in the existing external review-audit.md
+after observation: normal main/mirror pushes, remote-ref/shared-tree verification,
+and release of owned leases2197–2200. br-cxsgx stays in progress: all legacy rename/
+copy/platform paths, full stable-family fingerprinting and physical crash behavior
+remain outside this scoped Linux qualification. No release clearance or independent
+verification is claimed; installed-mailbox health findings remain unrepaired.
+
 ## November 15 Review35 sidecar rollback ownership — EmeraldEagle
 
 - [x] Reread Review34 abort guards and every family rollback caller. Find

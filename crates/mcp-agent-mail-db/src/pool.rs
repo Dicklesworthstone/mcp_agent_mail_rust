@@ -18811,11 +18811,14 @@ fn sync_recovery_parent(path: &Path) -> Result<(), SqlError> {
 
 #[allow(clippy::result_large_err)]
 fn rollback_recovery_candidate_promotion(
-    primary_path: &Path,
-    candidate_path: &Path,
+    primary_anchor: &AnchoredRecoveryParent,
+    candidate_anchor: &AnchoredRecoveryParent,
+    candidate_identity: &same_file::Handle,
     quarantined_moves: &[(PathBuf, PathBuf)],
     timestamp: &str,
 ) -> Result<(), SqlError> {
+    let primary_path = &primary_anchor.target_path;
+    let candidate_path = &candidate_anchor.target_path;
     if path_is_occupied(primary_path) {
         if path_is_occupied(candidate_path) {
             return Err(SqlError::Custom(format!(
@@ -18824,12 +18827,106 @@ fn rollback_recovery_candidate_promotion(
                 candidate_path.display()
             )));
         }
-        // Undo activation durably before restoring any old family members.
-        // A failed candidate retreat must leave that family quarantined.
-        rollback_quarantined_candidate_moves(&[(
-            candidate_path.to_path_buf(),
-            primary_path.to_path_buf(),
-        )])?;
+        let context = "retreat activated recovery candidate";
+        let activated_anchor = AnchoredRecoveryParent::capture(primary_path, context)?;
+        let activated_file = activated_anchor.open_regular_read_only(context)?;
+        let activated_identity = same_file::Handle::from_file(activated_file).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: failed to identify live database: {error}"
+            ))
+        })?;
+        if &activated_identity != candidate_identity {
+            return Err(SqlError::Custom(format!(
+                "{context}: live database {} no longer has the prepared candidate identity; preserving the foreign generation",
+                primary_path.display()
+            )));
+        }
+        primary_anchor.verify_parent_only(context)?;
+        candidate_anchor.verify_parent_only(context)?;
+        #[cfg(unix)]
+        if !AnchoredRecoveryParent::same_inode(
+            &activated_anchor.parent_stat,
+            &primary_anchor.parent_stat,
+        ) {
+            return Err(SqlError::Custom(format!(
+                "{context}: live database parent identity changed during rollback admission"
+            )));
+        }
+        let rename = |from: &AnchoredRecoveryParent,
+                      to: &AnchoredRecoveryParent,
+                      operation: &str|
+         -> Result<(), SqlError> {
+            #[cfg(unix)]
+            {
+                AnchoredRecoveryParent::rename_noreplace_between_parents(
+                    &from.parent_dir,
+                    &from.file_name,
+                    &to.parent_dir,
+                    &to.file_name,
+                    operation,
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                rename_noreplace_preserving_source(&from.target_path, &to.target_path)
+                    .map_err(|error| SqlError::Custom(format!("{operation}: {error}")))
+            }
+        };
+        let sync_parents = || -> Result<(), SqlError> {
+            #[cfg(unix)]
+            let synced = [
+                primary_anchor.sync_parent(context),
+                candidate_anchor.sync_parent(context),
+            ];
+            #[cfg(not(unix))]
+            let synced = [
+                sync_recovery_parent(primary_path),
+                sync_recovery_parent(candidate_path),
+            ];
+            let errors: Vec<_> = synced.into_iter().filter_map(Result::err).collect();
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(SqlError::Custom(format!(
+                    "{context}: failed to sync rollback parents: {errors:?}"
+                )))
+            }
+        };
+        activated_anchor.verify_unchanged(context)?;
+        rename(&activated_anchor, candidate_anchor, context)?;
+        // NOREPLACE does not pin the source leaf. Verify the actual moved
+        // generation before touching the original family or aborting intent.
+        let verified = candidate_anchor
+            .open_regular_read_only(context)
+            .and_then(|file| {
+                same_file::Handle::from_file(file).map_err(|error| {
+                    SqlError::Custom(format!(
+                        "{context}: failed to identify retreated file: {error}"
+                    ))
+                })
+            })
+            .and_then(|observed| {
+                if &observed == candidate_identity {
+                    primary_anchor.verify_parent_only(context)
+                } else {
+                    Err(SqlError::Custom(format!(
+                        "{context}: candidate identity changed at the rollback rename boundary"
+                    )))
+                }
+            });
+        if let Err(error) = verified {
+            let restored = rename(
+                candidate_anchor,
+                &activated_anchor,
+                "restore unverified rollback source",
+            );
+            let synced = sync_parents();
+            return Err(SqlError::Custom(format!(
+                "{error}; restoring unverified rollback source: {restored:?}; parent durability: {synced:?}"
+            )));
+        }
+        // Retreat must be durable before any old family members are restored.
+        sync_parents()?;
     }
     let quarantined_primary = quarantined_moves
         .iter()
@@ -18898,17 +18995,18 @@ fn abort_prepared_recovery_after_safe_rollback(
 
 #[allow(clippy::result_large_err)]
 fn rollback_and_abort_recovery_promotion(
-    primary_path: &Path,
     primary_anchor: &AnchoredRecoveryParent,
-    candidate_path: &Path,
+    candidate_anchor: &AnchoredRecoveryParent,
+    candidate_identity: &same_file::Handle,
     quarantined_moves: &[(PathBuf, PathBuf)],
     timestamp: &str,
     prepared: &crate::forensics::PreparedRecoveryReceipt,
     error: SqlError,
 ) -> ReconstructionCandidateFailure {
     match rollback_recovery_candidate_promotion(
-        primary_path,
-        candidate_path,
+        primary_anchor,
+        candidate_anchor,
+        candidate_identity,
         quarantined_moves,
         timestamp,
     ) {
@@ -19254,7 +19352,13 @@ where
             )))
         })?
         .len();
-    drop(candidate_sync);
+    // Retain the prepared inode through activation and every rollback branch;
+    // a pathname or an inode number alone is not a live ownership witness.
+    let candidate_identity = same_file::Handle::from_file(candidate_sync).map_err(|error| {
+        ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+            "failed to retain prepared recovery candidate identity: {error}"
+        )))
+    })?;
     ensure_recovery_disk_headroom(
         primary_path,
         candidate_bytes,
@@ -19373,9 +19477,9 @@ where
         candidate_anchor.activate_into(&primary_anchor, candidate_path, primary_path)
     {
         return Err(rollback_and_abort_recovery_promotion(
-            primary_path,
             &primary_anchor,
-            candidate_path,
+            &candidate_anchor,
+            &candidate_identity,
             &quarantined_moves,
             timestamp,
             &prepared,
@@ -19387,9 +19491,9 @@ where
         let stage_detail = match error.publication_stage() {
             crate::forensics::RecoveryReceiptPublicationStage::BeforeMarkerMove => {
                 return Err(rollback_and_abort_recovery_promotion(
-                    primary_path,
                     &primary_anchor,
-                    candidate_path,
+                    &candidate_anchor,
+                    &candidate_identity,
                     &quarantined_moves,
                     timestamp,
                     &prepared,
@@ -28452,6 +28556,208 @@ mod tests {
         );
         crate::forensics::verify_recovery_receipt_state(directory, primary)
             .expect("safe rollback and durable abort must leave receipt admission clear");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_rollback_preserves_a_foreign_live_generation() {
+        for source_existed in [false, true] {
+            check_recovery_rollback_foreign_generation(source_existed, false, false);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_rollback_preserves_a_source_swapped_at_the_rename_boundary() {
+        for source_existed in [false, true] {
+            for rollback_collision in [false, true] {
+                check_recovery_rollback_foreign_generation(
+                    source_existed,
+                    true,
+                    rollback_collision,
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn check_recovery_rollback_foreign_generation(
+        source_existed: bool,
+        swap_at_boundary: bool,
+        rollback_collision: bool,
+    ) {
+        use std::rc::Rc;
+
+        let directory = tempfile::tempdir()
+            .expect("rollback identity fixture")
+            .keep();
+        let primary = directory.join("storage.sqlite3");
+        let candidate = directory.join("storage.sqlite3.candidate");
+        let displaced = directory.join("activated-candidate.sqlite3");
+        let foreign = directory.join("foreign.sqlite3");
+        if source_existed {
+            write_marker_db(&primary, "original-generation");
+        }
+        let original =
+            source_existed.then(|| (std::fs::read(&primary).unwrap(), primary_identity(&primary)));
+        write_marker_db(&candidate, "candidate-generation");
+        write_marker_db(&foreign, "foreign-generation");
+        let candidate_inode = primary_identity(&candidate);
+        let foreign_bytes = std::fs::read(&foreign).unwrap();
+        let foreign_inode = primary_identity(&foreign);
+        let witness = Rc::new(RefCell::new(None));
+        let quarantine = Rc::new(RefCell::new(None));
+        let collision_inode = Rc::new(RefCell::new(None));
+        let hook_witness = Rc::clone(&witness);
+        let hook_quarantine = Rc::clone(&quarantine);
+        let hook_collision_inode = Rc::clone(&collision_inode);
+        let hook_directory = directory.clone();
+        let hook_candidate = candidate.clone();
+        let hook_primary = primary.clone();
+        let hook_displaced = displaced.clone();
+        let hook_foreign = foreign.clone();
+        let error = with_anchored_recovery_rename_hook(
+                move |context, _from_name, to_name| {
+                    if context == "quarantine live database" {
+                        *hook_quarantine.borrow_mut() = Some(hook_directory.join(to_name));
+                    }
+                    if (source_existed && context == "quarantine live database")
+                        || (!source_existed && context == "activate reconstructed candidate")
+                    {
+                        *hook_witness.borrow_mut() = Some(capture_recovery_promotion_rename_witness(
+                            &hook_directory,
+                            &hook_candidate,
+                        ));
+                    }
+                    if swap_at_boundary && context == "retreat activated recovery candidate" {
+                        std::fs::rename(&hook_primary, &hook_displaced).unwrap();
+                        std::fs::rename(&hook_foreign, &hook_primary).unwrap();
+                    } else if rollback_collision && context == "restore unverified rollback source" {
+                        std::fs::write(&hook_primary, b"newer rollback collision").unwrap();
+                        *hook_collision_inode.borrow_mut() = Some(primary_identity(&hook_primary));
+                    }
+                    None
+                },
+                || {
+                    promote_recovery_candidate_with_finalizer(
+                        &primary,
+                        &candidate,
+                        &directory,
+                        "20261115_122000_000",
+                        |prepared| {
+                            if !swap_at_boundary {
+                                std::fs::rename(&primary, &displaced).unwrap();
+                                std::fs::rename(&foreign, &primary).unwrap();
+                            }
+                            crate::forensics::finalize_recovery_receipt_with_injected_pre_rename_failure(prepared)
+                        },
+                    )
+                },
+            )
+            .expect_err("an uncommitted receipt must refuse a foreign-generation rollback");
+        let foreign_location = if rollback_collision {
+            assert_eq!(
+                std::fs::read(&primary).unwrap(),
+                b"newer rollback collision"
+            );
+            assert_eq!(
+                primary_identity(&primary),
+                collision_inode
+                    .borrow_mut()
+                    .take()
+                    .expect("collision reached")
+            );
+            &candidate
+        } else {
+            &primary
+        };
+        assert_eq!(
+            std::fs::read(foreign_location).unwrap(),
+            foreign_bytes,
+            "{error}"
+        );
+        assert_eq!(primary_identity(foreign_location), foreign_inode);
+        assert_eq!(
+            sqlite_marker_value(foreign_location).as_deref(),
+            Some("foreign-generation")
+        );
+        let witness = witness
+            .borrow_mut()
+            .take()
+            .expect("prepared intent reached");
+        assert_eq!(std::fs::read(&displaced).unwrap(), witness.candidate_bytes);
+        assert_eq!(primary_identity(&displaced), candidate_inode);
+        if !rollback_collision {
+            assert!(
+                std::fs::symlink_metadata(&candidate)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
+        }
+        if let Some((original_bytes, original_inode)) = original {
+            let quarantine = quarantine
+                .borrow_mut()
+                .take()
+                .expect("original quarantined");
+            assert_eq!(std::fs::read(&quarantine).unwrap(), original_bytes);
+            assert_eq!(primary_identity(&quarantine), original_inode);
+        }
+        let receipts = recovery_promotion_receipt_artifacts(&directory);
+        assert_eq!(receipts.len(), 1, "one retained intent: {receipts:?}");
+        assert_eq!(receipts[0].extension(), Some(OsStr::new("pending")));
+        assert_eq!(std::fs::read(&receipts[0]).unwrap(), witness.intent_bytes);
+        crate::forensics::verify_recovery_receipt_state(&directory, &primary)
+            .expect_err("unresolved candidate ownership must keep readiness fail-closed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_rollback_restores_initial_absence() {
+        use std::rc::Rc;
+
+        let directory = tempfile::tempdir().expect("absent primary fixture").keep();
+        let primary = directory.join("storage.sqlite3");
+        let candidate = directory.join("storage.sqlite3.candidate");
+        write_marker_db(&candidate, "candidate-generation");
+        let candidate_inode = primary_identity(&candidate);
+        let witness = Rc::new(RefCell::new(None));
+        let hook_witness = Rc::clone(&witness);
+        let hook_directory = directory.clone();
+        let hook_candidate = candidate.clone();
+        with_anchored_recovery_rename_hook(
+            move |context, _from_name, _to_name| {
+                if context == "activate reconstructed candidate" {
+                    *hook_witness.borrow_mut() = Some(capture_recovery_promotion_rename_witness(
+                        &hook_directory,
+                        &hook_candidate,
+                    ));
+                }
+                None
+            },
+            || {
+                promote_recovery_candidate_with_finalizer(
+                    &primary,
+                    &candidate,
+                    &directory,
+                    "20261115_123000_000",
+                    crate::forensics::finalize_recovery_receipt_with_injected_pre_rename_failure,
+                )
+            },
+        )
+        .expect_err("injected pre-commit failure must roll activation back");
+        assert!(
+            std::fs::symlink_metadata(&primary)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(primary_identity(&candidate), candidate_inode);
+        assert_eq!(
+            sqlite_marker_value(&candidate).as_deref(),
+            Some("candidate-generation")
+        );
+        let witness = witness
+            .borrow_mut()
+            .take()
+            .expect("prepared intent reached");
+        assert_recovery_promotion_aborted(&directory, &primary, &candidate, &witness);
     }
 
     #[cfg(unix)]
