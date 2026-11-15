@@ -1351,6 +1351,8 @@ fn reservation_parity_shell_suite_uses_cargo_built_binary() {
     for required in [
         "setup: GoldFox reservation granted through the MCP tool surface",
         "F1: missing artifact was healed back onto disk by reconcile-on-read",
+        "F1: compatible artifact advances to the authoritative intent revision",
+        "F2: reconcile-on-read preserves conflicting identity byte for byte",
         "F3: second identical release is a clean released=0 no-op",
     ] {
         assert!(

@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::DbConn;
-use mcp_agent_mail_db::pool::SyncQuery;
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 
@@ -18,14 +17,14 @@ use crate::tui_compose::{ComposeEnvelope, ComposeProject, OVERSEER_AGENT_NAME};
 use crate::tui_screens::{OperatorTaskResult, operator_tool_context};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ComposeAgentStatus {
+pub enum ComposeAgentStatus {
     Active,
     Retired,
     Deregistered,
 }
 
 #[derive(Debug)]
-pub(crate) struct ComposeAgent {
+pub struct ComposeAgent {
     pub(crate) id: i64,
     pub(crate) name: String,
     pub(crate) status: ComposeAgentStatus,
@@ -52,7 +51,7 @@ impl ComposeAgent {
 /// lifecycle ledger in the same statement as the profile. Read-only legacy
 /// snapshots may predate the ledger and retirement column, so retain their
 /// task-description tombstones without attempting a migration here.
-pub(crate) fn query_compose_agent_rows(
+pub fn query_compose_agent_rows(
     mut query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
     source_filter: &str,
     params: &[Value],
@@ -129,7 +128,7 @@ pub(crate) fn query_compose_agent_rows(
     Ok(agents)
 }
 
-pub(crate) fn active_compose_agent_names(agents: &[ComposeAgent]) -> Vec<String> {
+pub fn active_compose_agent_names(agents: &[ComposeAgent]) -> Vec<String> {
     let mut names: Vec<_> = agents
         .iter()
         .filter(|agent| agent.status == ComposeAgentStatus::Active)
@@ -139,10 +138,7 @@ pub(crate) fn active_compose_agent_names(agents: &[ComposeAgent]) -> Vec<String>
     names
 }
 
-pub(crate) fn require_active_compose_recipient(
-    agents: &[ComposeAgent],
-    name: &str,
-) -> Result<(), String> {
+pub fn require_active_compose_recipient(agents: &[ComposeAgent], name: &str) -> Result<(), String> {
     agents
         .iter()
         .find(|agent| agent.name.eq_ignore_ascii_case(name))
@@ -150,7 +146,7 @@ pub(crate) fn require_active_compose_recipient(
         .require_active()
 }
 
-pub(crate) fn open_live_recipient_connection(
+pub fn open_live_recipient_connection(
     config: &Config,
 ) -> Result<mcp_agent_mail_db::GuardedReadOnlyConn, String> {
     let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
@@ -163,7 +159,7 @@ pub(crate) fn open_live_recipient_connection(
     .map_err(|error| format!("Cannot verify current agent lifecycle: {error}"))
 }
 
-pub(crate) fn open_live_mutation_db_connection(config: &Config) -> Result<DbConn, String> {
+pub fn open_live_mutation_db_connection(config: &Config) -> Result<DbConn, String> {
     let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
         .ok_or_else(|| "Database connection unavailable".to_string())?;
     if !sqlite_path.exists() {
@@ -176,7 +172,7 @@ pub(crate) fn open_live_mutation_db_connection(config: &Config) -> Result<DbConn
 /// The caller holds the recovery write lease and has verified the project and
 /// recipients before entering this helper. Existing profiles are never replaced
 /// by a compose heartbeat, and retired/deregistered identities stay inactive.
-pub(crate) fn ensure_compose_sender_on_connection(
+pub fn ensure_compose_sender_on_connection(
     conn: &DbConn,
     config: &Config,
     project_id: i64,
@@ -250,7 +246,7 @@ pub(crate) fn ensure_compose_sender_on_connection(
     Ok(())
 }
 
-pub(crate) fn verify_form_mailbox_source(
+pub fn verify_form_mailbox_source(
     config: &Config,
     displayed_source: Option<&(String, PathBuf)>,
 ) -> Result<(), String> {
@@ -309,14 +305,17 @@ fn verify_compose_project(
 
 /// Read all real projects from the captured live mailbox, independent of the
 /// event ring. The UI must select a concrete project before asking for a roster.
-pub(crate) fn load_projects(
+pub fn load_projects(
     config: &Config,
     displayed_source: Option<&(String, PathBuf)>,
 ) -> Result<Vec<ComposeProject>, String> {
     require_compose_mailbox_source(config, displayed_source)?;
     let conn = open_live_recipient_connection(config)?;
     let rows = conn
-        .query_sync("SELECT id, slug, human_key FROM projects ORDER BY slug, id", &[])
+        .query_sync(
+            "SELECT id, slug, human_key FROM projects ORDER BY slug, id",
+            &[],
+        )
         .map_err(|error| format!("Cannot load compose projects: {error}"))?;
     rows.into_iter()
         .map(|row| {
@@ -330,7 +329,7 @@ pub(crate) fn load_projects(
         .map_err(|error| format!("Cannot load compose projects: {error}"))
 }
 
-pub(crate) fn load_recipients(
+pub fn load_recipients(
     config: &Config,
     displayed_source: Option<&(String, PathBuf)>,
     project: &ComposeProject,
@@ -349,7 +348,7 @@ pub(crate) fn load_recipients(
 /// Called on an operator worker, never on the UI or server supervisor thread.
 /// Reusing the idempotency key with the same envelope makes uncertain sends safe
 /// to retry without duplicating the message or its archive files.
-pub(crate) fn send_compose(
+pub fn send_compose(
     config: &Config,
     displayed_source: Option<&(String, PathBuf)>,
     envelope: ComposeEnvelope,
@@ -373,7 +372,10 @@ pub(crate) fn send_compose(
         // entire envelope before the first sender or archive mutation.
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         let conn = open_live_mutation_db_connection(config)?;
-        verify_compose_project(|sql, params| conn.query_sync(sql, params), &envelope.project)?;
+        verify_compose_project(
+            |sql, params| conn.query_sync(sql, params),
+            &envelope.project,
+        )?;
         let agents = query_compose_agent_rows(
             |sql, params| conn.query_sync(sql, params),
             "project_id = ?",
@@ -412,11 +414,11 @@ pub(crate) fn send_compose(
         Some(idempotency_key),
     ))
     .map_err(|error| error.to_string())?;
-    let data = serde_json::from_str(&response)
-        .map_err(|error| format!("Cannot read delivery receipt; retry this draft safely: {error}"))?;
+    let data = serde_json::from_str(&response).map_err(|error| {
+        format!("Cannot read delivery receipt; retry this draft safely: {error}")
+    })?;
     Ok(OperatorTaskResult { summary, data })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -708,9 +710,7 @@ mod tests {
                     "human_key" => stale.project.human_key.push_str("-replaced"),
                     _ => unreachable!(),
                 }
-                assert!(
-                    load_recipients(&config, Some(&displayed_source), &stale.project).is_err()
-                );
+                assert!(load_recipients(&config, Some(&displayed_source), &stale.project).is_err());
                 let error = send_compose(
                     &config,
                     Some(&displayed_source),

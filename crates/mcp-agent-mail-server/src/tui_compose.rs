@@ -1225,16 +1225,22 @@ impl<'a> ComposePanel<'a> {
                 inner.x,
                 y,
                 &label,
-                if is_active { cp.active_border } else { cp.value_fg },
+                if is_active {
+                    cp.active_border
+                } else {
+                    cp.value_fg
+                },
                 cp.bg,
                 inner.right(),
                 frame,
             );
             y += 1;
-            let detail = self.state.selected_project().map_or(
-                "Left/Right or Space: choose a project",
-                |project| project.human_key.as_str(),
-            );
+            let detail = self
+                .state
+                .selected_project()
+                .map_or("Left/Right or Space: choose a project", |project| {
+                    project.human_key.as_str()
+                });
             self.draw_text(inner.x, y, detail, cp.hint_fg, cp.bg, inner.right(), frame);
             y += 1;
         }
@@ -1589,7 +1595,11 @@ impl<'a> ComposePanel<'a> {
                 inner.x,
                 y,
                 value,
-                if active { cp.active_border } else { cp.value_fg },
+                if active {
+                    cp.active_border
+                } else {
+                    cp.value_fg
+                },
                 cp.bg,
                 inner.right(),
                 frame,
@@ -1703,7 +1713,15 @@ impl<'a> ComposePanel<'a> {
         match self.state.active_field {
             ComposeField::Project => {
                 if let Some(project) = self.state.selected_project() {
-                    self.draw_text(left, y, &project.human_key, cp.value_fg, cp.bg, right, frame);
+                    self.draw_text(
+                        left,
+                        y,
+                        &project.human_key,
+                        cp.value_fg,
+                        cp.bg,
+                        right,
+                        frame,
+                    );
                     y += 1;
                 }
                 if y < content_bottom {
@@ -1742,13 +1760,21 @@ impl<'a> ComposePanel<'a> {
                         if recipient.selected { "x" } else { " " },
                         recipient.name,
                         recipient.kind.label(),
-                        if recipient.available { "" } else { " [unavailable]" },
+                        if recipient.available {
+                            ""
+                        } else {
+                            " [unavailable]"
+                        },
                     );
                     self.draw_text(
                         left,
                         y,
                         &line,
-                        if recipient.available { cp.value_fg } else { cp.error_fg },
+                        if recipient.available {
+                            cp.value_fg
+                        } else {
+                            cp.error_fg
+                        },
                         if visible == self.state.recipient_cursor {
                             cp.selected_recipient_bg
                         } else {
@@ -1767,8 +1793,8 @@ impl<'a> ComposePanel<'a> {
                     (&self.state.thread_id, self.state.thread_id_cursor)
                 };
                 self.draw_text(left, y, value, cp.value_fg, cp.bg, right, frame);
-                let cursor_x = left
-                    .saturating_add(display_width_up_to_char_index(value, cursor) as u16);
+                let cursor_x =
+                    left.saturating_add(display_width_up_to_char_index(value, cursor) as u16);
                 if cursor_x < right {
                     self.set_cursor_cell(cursor_x, y, cp, frame);
                 }
@@ -1788,9 +1814,10 @@ impl<'a> ComposePanel<'a> {
                         frame,
                     );
                     if line_index == self.state.body_cursor_line {
-                        let cursor_x = left.saturating_add(
-                            display_width_up_to_char_index(line, self.state.body_cursor_col) as u16,
-                        );
+                        let cursor_x = left.saturating_add(display_width_up_to_char_index(
+                            line,
+                            self.state.body_cursor_col,
+                        ) as u16);
                         if cursor_x < right {
                             self.set_cursor_cell(cursor_x, y, cp, frame);
                         }
@@ -1810,7 +1837,11 @@ impl<'a> ComposePanel<'a> {
             ComposeField::AckRequired => self.draw_text(
                 left,
                 y,
-                if self.state.ack_required { "Required" } else { "Optional" },
+                if self.state.ack_required {
+                    "Required"
+                } else {
+                    "Optional"
+                },
                 cp.value_fg,
                 cp.bg,
                 right,
@@ -1830,7 +1861,11 @@ impl<'a> ComposePanel<'a> {
             left,
             bottom - 2,
             status,
-            if self.state.error.is_some() { cp.error_fg } else { cp.hint_fg },
+            if self.state.error.is_some() {
+                cp.error_fg
+            } else {
+                cp.hint_fg
+            },
             cp.bg,
             right,
             frame,
@@ -2214,9 +2249,9 @@ mod tests {
 
         assert!(s.set_selected_project(&project(2)));
         assert!(s.recipients.is_empty());
-        assert!(s.recipient_filter.is_empty());
+        assert_eq!(s.recipient_filter, "");
         assert_eq!(s.recipient_cursor, 0);
-        assert!(s.thread_id.is_empty());
+        assert_eq!(s.thread_id, "");
         assert_eq!(s.thread_id_cursor, 0);
         assert_eq!(s.subject, "Keep this subject");
         assert_eq!(s.body, "Keep this body");
@@ -2270,11 +2305,11 @@ mod tests {
     #[test]
     fn roster_refresh_retains_unavailable_selected_targets_and_addressing() {
         let mut s = state_with_agents(&["GoldHawk", "SilverFox", "RedLake"]);
-        for (recipient, kind) in s.recipients.iter_mut().zip([
-            RecipientKind::To,
-            RecipientKind::Cc,
-            RecipientKind::Bcc,
-        ]) {
+        for (recipient, kind) in
+            s.recipients
+                .iter_mut()
+                .zip([RecipientKind::To, RecipientKind::Cc, RecipientKind::Bcc])
+        {
             recipient.selected = true;
             recipient.kind = kind;
         }
@@ -2299,7 +2334,7 @@ mod tests {
         s.set_available_agents(vec!["GoldHawk".into(), "RedLake".into()]);
         let envelope = s.build_envelope().unwrap();
         assert_eq!(envelope.to, vec!["GoldHawk"]);
-        assert!(envelope.cc.is_empty());
+        assert_eq!(envelope.cc, Vec::<String>::new());
         assert_eq!(envelope.bcc, vec!["RedLake"]);
     }
 
@@ -2816,7 +2851,10 @@ mod tests {
                 }
                 visible.push('\n');
             }
-            assert!(visible.contains("Project: project-1"), "{field:?}: {visible}");
+            assert!(
+                visible.contains("Project: project-1"),
+                "{field:?}: {visible}"
+            );
             assert!(visible.contains(field.label()), "{field:?}: {visible}");
             let expected = match field {
                 ComposeField::Project => "/workspace/project-1",

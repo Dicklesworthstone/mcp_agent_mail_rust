@@ -6170,7 +6170,8 @@ mod reservation_activity_tests {
         }
         std::fs::write(root.join(".gitignore"), "ignored/\n").expect("repository ignores");
         std::fs::write(root.join("src/.gitignore"), "*.log\n").expect("nested ignores");
-        std::fs::write(repo.path().join("info/exclude"), "from-info.txt\n").expect("local excludes");
+        std::fs::write(repo.path().join("info/exclude"), "from-info.txt\n")
+            .expect("local excludes");
         let global = tmp.path().join("global-excludes");
         std::fs::write(&global, "from-global.txt\n").expect("global excludes");
         repo.config()
@@ -6287,7 +6288,8 @@ mod reservation_activity_tests {
             .expect("create literal backslash filename");
         recent
             .set_times(
-                std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_100)),
+                std::fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH + Duration::from_mins(28_333_335)),
             )
             .expect("more recent untracked mtime");
 
@@ -6334,7 +6336,10 @@ mod reservation_activity_tests {
         run_git(tmp.path(), &["add", "nested"]);
         let index = repo.index().expect("outer index");
         assert_eq!(
-            index.get_path(Path::new("nested"), 0).expect("gitlink").mode,
+            index
+                .get_path(Path::new("nested"), 0)
+                .expect("gitlink")
+                .mode,
             0o160_000
         );
 

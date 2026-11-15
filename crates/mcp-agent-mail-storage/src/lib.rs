@@ -809,7 +809,11 @@ fn resolve_archive_epoch_git_dir(path: &Path) -> Option<PathBuf> {
 /// staging file inside the Git directory. This must not use the ordinary
 /// archive atomic writer: that writer enters a mutation guard and would
 /// recursively rewrite the epoch marker.
-fn write_archive_control_file(git_dir: &Path, file_name: &str, content: &[u8]) -> std::io::Result<()> {
+fn write_archive_control_file(
+    git_dir: &Path,
+    file_name: &str,
+    content: &[u8],
+) -> std::io::Result<()> {
     let destination = git_dir.join(file_name);
     let validate_destination = || -> std::io::Result<()> {
         if path_existing_prefix_has_symlink(&destination)? {
@@ -25781,9 +25785,11 @@ mod tests {
                 rewrite_archive_epoch_file(git_dir);
                 Ok(())
             }
-            ARCHIVE_INDEX_SYNC_FILE_NAME => {
-                write_archive_index_sync_record(git_dir, git2::Oid::zero(), "test-index-identity")
-            }
+            ARCHIVE_INDEX_SYNC_FILE_NAME => write_archive_index_sync_record(
+                git_dir,
+                git2::Oid::ZERO_SHA1,
+                "test-index-identity",
+            ),
             _ => panic!("unexpected archive control marker: {file_name}"),
         }
     }
@@ -25796,7 +25802,7 @@ mod tests {
             ARCHIVE_INDEX_SYNC_FILE_NAME => {
                 assert_eq!(
                     read_archive_index_sync_record(git_dir),
-                    Some((git2::Oid::zero(), "test-index-identity".to_string()))
+                    Some((git2::Oid::ZERO_SHA1, "test-index-identity".to_string()))
                 );
             }
             _ => panic!("unexpected archive control marker: {file_name}"),
@@ -25984,7 +25990,10 @@ mod tests {
                 fs::read(&legacy_staging).unwrap(),
                 b"retained staging evidence"
             );
-            assert_eq!(fs::read(&retained).unwrap(), b"retained destination evidence");
+            assert_eq!(
+                fs::read(&retained).unwrap(),
+                b"retained destination evidence"
+            );
             assert_eq!(fs::read_dir(&git_dir).unwrap().count(), 2);
         }
     }

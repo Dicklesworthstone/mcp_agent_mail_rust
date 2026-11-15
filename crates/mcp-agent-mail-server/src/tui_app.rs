@@ -46,7 +46,9 @@ use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
 use crate::tui_bridge::{
     RemoteTerminalEvent, ServerControlMsg, TransportBase, TuiLoopHeartbeatKind, TuiSharedState,
 };
-use crate::tui_compose::{ComposeAction, ComposeEnvelope, ComposePanel, ComposeProject, ComposeState};
+use crate::tui_compose::{
+    ComposeAction, ComposeEnvelope, ComposePanel, ComposeProject, ComposeState,
+};
 use crate::tui_decision::{BayesianDiffStrategy, DiffAction, FrameState as TuiDiffFrameState};
 use crate::tui_events::{EventSeverity, MailEvent};
 use crate::tui_focus::{FocusManager, FocusTarget, focus_graph_for_screen, focus_ring_for_screen};
@@ -2645,9 +2647,11 @@ impl MailAppModel {
                 Cmd::none()
             }
             "compose_discard" => {
-                if self.compose_context.as_ref().is_some_and(|draft| {
-                    context.parse::<u64>().ok() == Some(draft.draft_id)
-                }) {
+                if self
+                    .compose_context
+                    .as_ref()
+                    .is_some_and(|draft| context.parse::<u64>().ok() == Some(draft.draft_id))
+                {
                     self.dismiss_compose();
                 }
                 Cmd::none()
@@ -3791,7 +3795,8 @@ impl MailAppModel {
         {
             context.loading = None;
             form.loading = false;
-            form.error = Some("Recipient loading did not start. Press Ctrl+R to retry.".to_string());
+            form.error =
+                Some("Recipient loading did not start. Press Ctrl+R to retry.".to_string());
         }
         if context
             .submitting
@@ -3805,12 +3810,12 @@ impl MailAppModel {
     }
 
     fn load_compose_projects(&mut self) -> Cmd<MailMsg> {
-        if self
-            .compose_state
-            .as_ref()
-            .is_none_or(|form| form.sending)
+        if self.compose_state.as_ref().is_none_or(|form| form.sending)
             || self.compose_context.as_ref().is_some_and(|context| {
-                context.loading.as_ref().is_some_and(PendingOperatorTask::is_active)
+                context
+                    .loading
+                    .as_ref()
+                    .is_some_and(PendingOperatorTask::is_active)
             })
         {
             return Cmd::none();
@@ -3968,7 +3973,9 @@ impl MailAppModel {
             Err(error) => return self.compose_error(error),
         };
         let Some(context) = self.compose_context.as_mut() else {
-            return self.compose_error("The draft has no mailbox source. Reopen compose before sending.".to_string());
+            return self.compose_error(
+                "The draft has no mailbox source. Reopen compose before sending.".to_string(),
+            );
         };
         let snapshot = self.state.config_snapshot();
         if crate::resolve_server_database_url_sqlite_path(&snapshot.raw_database_url)
@@ -3982,7 +3989,13 @@ impl MailAppModel {
             .as_ref()
             .filter(|(previous, _)| previous == &envelope)
             .map_or_else(
-                || format!("tui-compose-{}-{}-{request_id}", std::process::id(), now_micros()),
+                || {
+                    format!(
+                        "tui-compose-{}-{}-{request_id}",
+                        std::process::id(),
+                        now_micros()
+                    )
+                },
                 |(_, key)| key.clone(),
             );
         context.last_submission = Some((envelope.clone(), idempotency_key.clone()));
@@ -4046,11 +4059,8 @@ impl MailAppModel {
                 (format!("Compose: {error}"), ToastIcon::Error)
             }
         };
-        self.notifications.notify(
-            Toast::new(text)
-                .icon(icon)
-                .duration(Duration::from_secs(6)),
-        );
+        self.notifications
+            .notify(Toast::new(text).icon(icon).duration(Duration::from_secs(6)));
         Cmd::none()
     }
 
@@ -5003,18 +5013,17 @@ impl Model for MailAppModel {
                                         if matches!(result, DialogResult::Ok) {
                                             let _ = action_tx.send((
                                                 "compose_discard".to_string(),
-                                                draft_id.map_or_else(String::new, |id| id.to_string()),
+                                                draft_id
+                                                    .map_or_else(String::new, |id| id.to_string()),
                                             ));
                                         }
                                     },
                                 );
                             }
-                            ComposeAction::Send => {
-                                match compose.build_envelope() {
-                                    Ok(envelope) => return self.dispatch_compose_send(envelope),
-                                    Err(error) => return self.compose_error(error),
-                                }
-                            }
+                            ComposeAction::Send => match compose.build_envelope() {
+                                Ok(envelope) => return self.dispatch_compose_send(envelope),
+                                Err(error) => return self.compose_error(error),
+                            },
                         }
                     }
                     return Cmd::none();
@@ -9509,7 +9518,14 @@ mod tests {
         model.refresh_compose_admission();
         assert!(!model.compose_state.as_ref().unwrap().loading);
         assert!(
-            model.compose_state.as_ref().unwrap().error.as_ref().unwrap().contains("Ctrl+R")
+            model
+                .compose_state
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Ctrl+R")
         );
 
         let retry = model.update(MailMsg::Terminal(Event::Key(
@@ -9524,17 +9540,30 @@ mod tests {
         let mut model = ready_global_compose_model();
         let alpha = compose_test_project(1, "alpha");
         let beta = compose_test_project(2, "beta");
-        model.compose_state.as_mut().unwrap().set_available_projects(vec![
-            alpha.clone(),
-            beta.clone(),
-        ]);
+        model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .set_available_projects(vec![alpha.clone(), beta.clone()]);
 
         let first = model.load_compose_recipients();
         let (draft_id, first_id) = compose_pending_ids(&model, false);
-        assert!(model.compose_state.as_mut().unwrap().set_selected_project(&beta));
+        assert!(
+            model
+                .compose_state
+                .as_mut()
+                .unwrap()
+                .set_selected_project(&beta)
+        );
         let second = model.load_compose_recipients();
         let (_, second_id) = compose_pending_ids(&model, false);
-        assert!(model.compose_state.as_mut().unwrap().set_selected_project(&alpha));
+        assert!(
+            model
+                .compose_state
+                .as_mut()
+                .unwrap()
+                .set_selected_project(&alpha)
+        );
         let third = model.load_compose_recipients();
         let (_, third_id) = compose_pending_ids(&model, false);
 
@@ -9554,7 +9583,10 @@ mod tests {
             project: alpha,
             result: Ok(vec!["BlueLake".to_string()]),
         });
-        assert_eq!(model.compose_state.as_ref().unwrap().recipients[0].name, "BlueLake");
+        assert_eq!(
+            model.compose_state.as_ref().unwrap().recipients[0].name,
+            "BlueLake"
+        );
 
         let old_catalog = model.load_compose_projects();
         let (old_draft, old_request) = compose_pending_ids(&model, false);
@@ -9567,7 +9599,14 @@ mod tests {
             request_id: old_request,
             result: Ok(vec![compose_test_project(99, "wrong-project")]),
         });
-        assert!(model.compose_state.as_ref().unwrap().selected_project().is_none());
+        assert!(
+            model
+                .compose_state
+                .as_ref()
+                .unwrap()
+                .selected_project()
+                .is_none()
+        );
         assert!(model.compose_state.as_ref().unwrap().loading);
         drop((first, second, third, old_catalog, new_catalog));
     }
@@ -9582,15 +9621,35 @@ mod tests {
             form.ack_required = true;
             form.importance = crate::tui_compose::Importance::Urgent;
         }
-        let envelope = model.compose_state.as_mut().unwrap().build_envelope().unwrap();
-        assert!(envelope.thread_id.is_none(), "blank threads stay stable across retries");
+        let envelope = model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .build_envelope()
+            .unwrap();
+        assert!(
+            envelope.thread_id.is_none(),
+            "blank threads stay stable across retries"
+        );
         let first = model.dispatch_compose_send(envelope.clone());
         let (draft_id, request_id) = compose_pending_ids(&model, true);
-        let first_key = model.compose_context.as_ref().unwrap()
-            .last_submission.as_ref().unwrap().1.clone();
+        let first_key = model
+            .compose_context
+            .as_ref()
+            .unwrap()
+            .last_submission
+            .as_ref()
+            .unwrap()
+            .1
+            .clone();
         assert!(model.compose_state.as_ref().unwrap().sending);
-        assert!(matches!(model.dispatch_compose_send(envelope.clone()), Cmd::None));
-        let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char('x')))));
+        assert!(matches!(
+            model.dispatch_compose_send(envelope.clone()),
+            Cmd::None
+        ));
+        let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+            'x',
+        )))));
         assert_eq!(model.compose_state.as_ref().unwrap().body, envelope.body_md);
 
         let _ = model.update(MailMsg::ComposeSent {
@@ -9600,32 +9659,68 @@ mod tests {
         });
         assert!(!model.compose_state.as_ref().unwrap().sending);
         assert_eq!(
-            model.compose_state.as_mut().unwrap().build_envelope().unwrap(),
+            model
+                .compose_state
+                .as_mut()
+                .unwrap()
+                .build_envelope()
+                .unwrap(),
             envelope
         );
         drop(first);
 
         let retry = model.dispatch_compose_send(envelope.clone());
         assert_eq!(
-            model.compose_context.as_ref().unwrap().last_submission.as_ref().unwrap().1,
+            model
+                .compose_context
+                .as_ref()
+                .unwrap()
+                .last_submission
+                .as_ref()
+                .unwrap()
+                .1,
             first_key
         );
         drop(retry);
         model.refresh_compose_admission();
         assert!(!model.compose_state.as_ref().unwrap().sending);
-        let retry_after_drop = model.dispatch_compose_send(envelope.clone());
+        let retry_after_drop = model.dispatch_compose_send(envelope);
         assert_eq!(
-            model.compose_context.as_ref().unwrap().last_submission.as_ref().unwrap().1,
+            model
+                .compose_context
+                .as_ref()
+                .unwrap()
+                .last_submission
+                .as_ref()
+                .unwrap()
+                .1,
             first_key
         );
         drop(retry_after_drop);
         model.refresh_compose_admission();
 
-        model.compose_state.as_mut().unwrap().body.push_str(" (edited)");
-        let edited = model.compose_state.as_mut().unwrap().build_envelope().unwrap();
+        model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .body
+            .push_str(" (edited)");
+        let edited = model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .build_envelope()
+            .unwrap();
         let edited_send = model.dispatch_compose_send(edited);
         assert_ne!(
-            model.compose_context.as_ref().unwrap().last_submission.as_ref().unwrap().1,
+            model
+                .compose_context
+                .as_ref()
+                .unwrap()
+                .last_submission
+                .as_ref()
+                .unwrap()
+                .1,
             first_key,
             "a deliberate payload change starts a different delivery"
         );
@@ -9635,10 +9730,17 @@ mod tests {
     #[test]
     fn global_compose_late_send_results_and_discard_cannot_replace_a_new_draft() {
         let mut model = ready_global_compose_model();
-        let envelope = model.compose_state.as_mut().unwrap().build_envelope().unwrap();
+        let envelope = model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .build_envelope()
+            .unwrap();
         let old_send = model.dispatch_compose_send(envelope);
         let (old_draft, old_request) = compose_pending_ids(&model, true);
-        let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Escape))));
+        let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(
+            KeyCode::Escape,
+        ))));
         assert!(model.compose_state.is_none());
 
         let new_load = model.open_compose();
@@ -9668,14 +9770,27 @@ mod tests {
     #[test]
     fn global_compose_refuses_changed_displayed_mailbox_without_dropping_draft() {
         let mut model = ready_global_compose_model();
-        let envelope = model.compose_state.as_mut().unwrap().build_envelope().unwrap();
+        let envelope = model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .build_envelope()
+            .unwrap();
         let mut snapshot = model.state.config_snapshot();
         snapshot.storage_root.push_str("-other");
         model.state.update_config_snapshot(snapshot);
-        assert!(matches!(model.dispatch_compose_send(envelope.clone()), Cmd::None));
+        assert!(matches!(
+            model.dispatch_compose_send(envelope.clone()),
+            Cmd::None
+        ));
         assert!(!model.compose_state.as_ref().unwrap().sending);
         assert_eq!(
-            model.compose_state.as_mut().unwrap().build_envelope().unwrap(),
+            model
+                .compose_state
+                .as_mut()
+                .unwrap()
+                .build_envelope()
+                .unwrap(),
             envelope
         );
         assert!(model.compose_context.as_ref().unwrap().submitting.is_none());
@@ -9684,7 +9799,11 @@ mod tests {
     #[test]
     fn global_compose_task_panics_settle_as_errors() {
         let result: Result<(), String> = compose_task_result(|| panic!("operator worker failed"));
-        assert!(result.unwrap_err().contains("Check mailbox state before retrying"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Check mailbox state before retrying")
+        );
     }
 
     #[test]
@@ -9692,8 +9811,6 @@ mod tests {
         use crate::tui_screens::{
             seed_operator_test_project, with_operator_test_conn, with_operator_test_mailbox,
         };
-        use mcp_agent_mail_db::pool::SyncQuery;
-
         with_operator_test_mailbox(|project_key| {
             let slug = seed_operator_test_project(project_key, &["BlueLake"]);
             let config = Config::from_env();
@@ -9701,11 +9818,24 @@ mod tests {
             let mut model = MailAppModel::new(state);
 
             let catalog = model.open_compose();
-            assert!(model.compose_state.as_ref().unwrap().selected_project().is_none());
+            assert!(
+                model
+                    .compose_state
+                    .as_ref()
+                    .unwrap()
+                    .selected_project()
+                    .is_none()
+            );
             let catalog_result = run_global_compose_task(catalog);
             let roster = model.update(catalog_result);
             assert_eq!(
-                model.compose_state.as_ref().unwrap().selected_project().unwrap().slug,
+                model
+                    .compose_state
+                    .as_ref()
+                    .unwrap()
+                    .selected_project()
+                    .unwrap()
+                    .slug,
                 slug
             );
             let roster_result = run_global_compose_task(roster);
@@ -9724,24 +9854,37 @@ mod tests {
             with_operator_test_conn(|conn| {
                 assert_eq!(
                     conn.query_sync("SELECT COUNT(*) AS n FROM messages", &[])
-                        .unwrap()[0].get_named::<i64>("n").unwrap(),
+                        .unwrap()[0]
+                        .get_named::<i64>("n")
+                        .unwrap(),
                     0,
                     "the UI must not execute delivery while building the command"
                 );
             });
             let completion = run_global_compose_task(queued);
-            assert!(matches!(&completion, MailMsg::ComposeSent { result: Ok(_), .. }));
-            assert!(model.compose_state.is_some(), "confirmation settles the draft on update");
+            assert!(matches!(
+                &completion,
+                MailMsg::ComposeSent { result: Ok(_), .. }
+            ));
+            assert!(
+                model.compose_state.is_some(),
+                "confirmation settles the draft on update"
+            );
             let _ = model.update(completion);
             assert!(model.compose_state.is_none());
             with_operator_test_conn(|conn| {
-                let rows = conn.query_sync(
-                    "SELECT m.subject, m.ack_required, p.slug FROM messages m \
+                let rows = conn
+                    .query_sync(
+                        "SELECT m.subject, m.ack_required, p.slug FROM messages m \
                      JOIN projects p ON p.id = m.project_id",
-                    &[],
-                ).unwrap();
+                        &[],
+                    )
+                    .unwrap();
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].get_named::<String>("subject").unwrap(), "Deferred operator delivery");
+                assert_eq!(
+                    rows[0].get_named::<String>("subject").unwrap(),
+                    "Deferred operator delivery"
+                );
                 assert_eq!(rows[0].get_named::<i64>("ack_required").unwrap(), 1);
                 assert_eq!(rows[0].get_named::<String>("slug").unwrap(), slug);
             });

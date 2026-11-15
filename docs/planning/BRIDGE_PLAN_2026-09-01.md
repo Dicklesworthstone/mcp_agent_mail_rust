@@ -19,13 +19,16 @@
 - [x] Implement temporary project-lock contention; require real doctor health to
   fail before worker progress, then report reconciling during productive repair,
   and return parity healthy after automatic completion. Do not fake progress.
-- [ ] Execute the exact predeclared native cases against Cargo-built am;
-  run the repaired shell suite with the same binary and retain populated counts.
+- [x] Execute all seven predeclared CLI/WAL cases against Cargo-built am on
+  c062f04f/overlay96585ad3: runaf07d5df-121e-455a-8c79-b4ff469609e8,
+  terminal0/7PASS/3576skipped/149.994s, Cargo7m27s on hz2. The public
+  release/restart/guard/health case passes13.873s; shell36PASS/0FAIL/2SKIP.
 - [x] Execute the existing bounded real-DB/Git worker case: run
   dc7b4ebb-637b-4479-b22e-b9757dd20247, terminal0/1PASS/5660skipped,
   1.116s after Cargo22m42s on hz2, base48a/overlay079fe544. This is bounded
   worker evidence; the separate public restart/guard/health probe is pending.
-- [ ] Fix concrete failures, preserve failed receipts and reread final diffs.
+- [x] Fix the concrete failures described below; preserve failed receipts and
+  reread final diffs. Native server execution and fresh final CLI pass pending.
 - [x] First formatted public cohort ran all five predeclared names:
   run9b04d079-87cd-4aa9-8ebf-1e8493dec41e, terminal100/4PASS/1FAIL/
   325skipped,181.463s after Cargo16m49s on hz3, overlay079fe544.
@@ -55,10 +58,9 @@
 - [x] Manually fix five formatting expressions in three incoming cfg(test)
   modules, preserving all assertions and runtime semantics. Final fmt0;
   three-file UBS0/statusok/no failed modules/critical0/warning1020/info206.
-- [ ] Qualify integrated base9783f4cc against all original five public names plus
-  both WAL-certificate regressions (seven names declared before execution).
-  Retain source scope before the test-only formatting corrections; do not
-  present the older48a gates as checks of the new engine pin.
+- [x] Supersede the9783f4cc native job without a test verdict when the engine
+  pin advances; execute all seven unchanged names on the current e7ffeff4 pin
+  instead. Preserve older source scopes rather than relabeling their results.
 - [x] Check final base9783f4cc/five-file overlay362f4d64 on worker1156:
   workspace/all-targets0/Cargo12m46s; separate production lib+bins0/6m25s;
   strict all-target Clippy0/3m29s. Final fmt0 and source/lock/toolchain
@@ -71,16 +73,73 @@
   pushed by another session. Preserve that history; import Beads0. Source
   hashes for the two tests remain unchanged, but the engine pin is now e7ffeff4;
   earlier978 compiler passes and its running native job retain their old scope.
-- [ ] Execute the seven unchanged predeclared cases and mandatory compiler
-  gates on frozen c062f04f plus three test-format overlays eeffef13. Native
-  admission on114 and compiler admission on1156 pass before submission;
-  no result is credited while queued or compiling.
-- [ ] Correct the new workspace fmt1 mechanically in the five incoming files,
+- [x] Preserve c062f04f/eight-file5a58b199 native failure: runc90e122b,
+  terminal100/6PASS/1FAIL/3576skipped/150.536s after Cargo35m32s on hz2.
+  Public recovery and all message/WAL controls pass; shell26PASS/3FAIL/2SKIP.
+  Its path-conflict fixture contradicts the explicit no-clobber identity rule,
+  then contaminates later release checks. Retain failed output and actual ELFs.
+- [x] Correct the new workspace fmt1 mechanically in the five incoming files,
   using manual parallel edits as AGENTS.md directs. Review every diff and
   re-execute formatting; preserve the exact source scope of already-running
   compiler/native jobs rather than relabeling their inputs after formatting.
+- [x] Recheck all eight mechanical edits against the canonical read-only
+  rendering of c062f04f; all eight comparisons pass, then workspace fmt0.
+  Agents changed only their five assigned files; read every diff independently.
+- [x] Preserve current-source three-overlay all-target check0/Cargo11m35s and
+  its actual deprecation/unused warnings. Replace two zero-OID calls with the
+  same zero-SHA1 constant and remove two unused SyncQuery imports.
+- [x] Trace the unused compose test lock to a removed transaction-boundary
+  regression. The normal tool has its own write admission and re-resolves its
+  inputs; no runtime handoff defect is established. Restore the original real
+  blocked-writer/promotion-refusal/commit/drain predicates against that delegate,
+  with isolated actual DB state and a bounded completion channel. Do not extend
+  the preparatory lease into a nested-admission deadlock.
+- [x] Fix the new regression's missing Config qualification after actual
+  compiler101/E0433; retain that failed receipt. Final nine-file overlay6467ba07
+  passes all-target workspace check0/Cargo1m07s on1156; direct fmt0/diff-check0.
+- [ ] Execute the restored write-lease case plus the two existing real compose
+  controls and the existing bounded reservation-worker case on final source.
+  Declare all four names before execution. First three-name attempt103:
+  hz4 is draining/unavailable, no tests ran; no prior result is relabeled.
+- [x] Preserve6467ba07 production0/Cargo6m46s and actual strict Clippy101:
+  18 diagnostics. Manually fix redundant nested visibility, last-use moves,
+  equivalent empty expectations and exact-duration spelling. No suppressions.
+- [x] All mandatory checks pass on c062f04f/eleven-file96585ad3:
+  workspace/all-targets0/Cargo11m51s; separate production lib+bins0/8m14s;
+  strict all-target Clippy0/4m38s. Retain proc-macro-error2 notice. Full-file
+  UBS0/statusok/no failed modules: Rust10 files/0critical/14058warning/4461info;
+  shell1 file/0/0/0. Formatting0, Bash syntax0 and diff-check0.
+- [x] Correct the shell fixture's faulty overwrite expectation: advance a
+  compatible old revision while preserving identity; move the original
+  path-conflict report after positive lifecycle checks and add byte-identical
+  preservation after an actual MCP read. This changes the test expectation,
+  not runtime no-clobber policy. Preserve old26/3/2 versus new36/0/2 receipts;
+  two unavailable-path skips and F4 manifest-only limits remain visible.
+- [x] Require both new positive/negative markers in the Cargo-built CLI
+  wrapper, in addition to its original three populated markers. These two
+  string assertions are the only later source change after96585ad3 checks.
+  Final whole-file CLI UBS0/statusok/0critical/1886warning/457info; fmt0.
+- [ ] Execute the final wrapper's five required markers and unchanged public
+  acceptance in a fresh solo pass; do not relabel older seven-case input.
+  Capacity prevents this final rerun this pass; the seven-case execution above
+  includes the repaired shell's actual positive/negative cases, before the
+  wrapper acquired the two additional required-marker strings.
+- [x] Complete whole-file UBS on final6467ba07: terminal0/statusok/no failed
+  modules, nine files/critical0/warning13228/info4229, Rust module189s.
+  Retain all warnings; test bodies included and no cache, rule suppression or
+  partial-result override. Source/lock/toolchain manifest still matches.
+- [x] Stop the obsolete978/585f8464 native job only after the current-pin seven
+  names are executing on hz2. Exact wrapper67b79a2b, local143, recovered120
+  (daemon130), terminal acknowledged; no native tests or pass. Preserve all
+  seven names on current-pin source5a58b199, whose15 captured hashes match its
+  original manifest. Later lint/test edits are outside that running input.
 - [ ] Re-execute the original public acceptance case in a fresh solo pass on
   the final formatted source. No independent reviewer is available or claimed.
+  Four-case server attempts also remain unexecuted: optional RCH source-content
+  receipt mode refuses the selected namespace before Cargo; the standard hz2
+  lane expires in the queue; worker1156 refuses disk admission. Worker114's
+  unchanged30GiB/10GiB disk preflight refuses, so no job is submitted there.
+  Keep all predicates and resource policies; no refused job earns test credit.
 - [x] Formatted candidate workspace/all-targets0/Cargo1m36s on hz2,
   base48a1810f/overlay079fe544; direct formatting0 and Bash syntax0. UBS full
   files terminal0/statusok/no failed modules: Rust critical0/warning1883/info456,
@@ -93,10 +152,23 @@
   failure: recover exact wrapper rchw-9fc1d799-a0f9-494c-a2c2-220dad34548a,
   acknowledged delivery255 (daemon130), no test result. Launch final formatted
   source only after recovery and a fresh successful disk admission check.
-- [ ] Compare all original acceptance predicates to executed evidence before
-  any Bead closure; preserve all prior records, flush and check graph cycles.
-- [ ] Publish owned changes, verify refs and release owned reservations;
-  retain actual operational receipts in the existing review audit.
+- [x] Compare original acceptance and refinements to executed evidence. The
+  combined public workflow passes, but original per-decision runtime logging
+  is not established and the existing16-row host-shape fixture has no current-pin
+  execution this pass. Keep br-kp1in.19 in_progress with its original criteria.
+- [ ] Complete per-decision runtime logging (id/project/DB state/archive state/
+  generation/action/outcome), then qualify the unchanged16-row real fixture
+  and remaining original refinements before considering closure.
+- [x] Refresh installed health: exit1, orphan1/all rows readable, descriptors
+  62/65536, proactive backup174h49m old. Diagnostic-copy migrations only;
+  no live repair, install or service restart. Full release gates remain open.
+- [x] Preserve all2871 IDs and17 prior comments in both tracker exports; only
+  owned br-kp1in.19 comments4400/4401 and updated_at change. Original criteria,
+  notes/status/assignee remain intact. Flush0 and dependency cycles0; final
+  workspace formatting0, Bash syntax0 and diff-check0.
+- [x] Prepare one owned source/test/TODO/tracker publication. Actual normal
+  push/ref/lease-release receipts are finalized in existing review-audit.md
+  after execution; no additional status-only commit or release claim.
 
 ## November 14 Review30 reconciliation progress — EmeraldEagle
 

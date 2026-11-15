@@ -1936,8 +1936,7 @@ mod tests {
             write_lease_json(&second, &make_lease("BlueLake", Some("two"), true)).unwrap();
             let expired_path = dir.path().join("expired.json");
             let mut expired = make_lease("BlueLake", Some("expired"), true);
-            expired.expires_ts =
-                (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+            expired.expires_ts = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
             write_lease_json(&expired_path, &expired).unwrap();
             let released_path = dir.path().join("released.json");
             let mut released = make_lease("BlueLake", Some("released"), true);
@@ -1982,8 +1981,7 @@ mod tests {
                 assert_eq!(std::fs::read(path).unwrap(), bytes);
             }
             let next =
-                acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, false)
-                    .unwrap();
+                acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, false).unwrap();
             assert!(
                 next.conflicts.is_empty(),
                 "superseded exclusive aliases must not block a shared peer"
@@ -2001,8 +1999,7 @@ mod tests {
             )
             .unwrap();
             let next =
-                acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, false)
-                    .unwrap();
+                acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, false).unwrap();
             assert_eq!(next.conflicts.len(), 1);
             assert_eq!(next.conflicts[0].agent, "BlueLake");
             assert_eq!(next.conflicts[0].branch.as_deref(), Some("another-branch"));

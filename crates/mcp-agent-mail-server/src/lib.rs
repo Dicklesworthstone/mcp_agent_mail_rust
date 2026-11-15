@@ -19380,6 +19380,152 @@ mod tests {
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     #[test]
+    fn compose_delivery_tool_holds_write_lease_through_transaction_completion() {
+        const CHILD: &str = "AM_COMPOSE_DELIVERY_WRITE_LEASE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::compose_delivery_tool_holds_write_lease_through_transaction_completion",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "compose delivery child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("compose-delivery-write-lease-executed")
+            );
+            return;
+        }
+        let _serial = COMPOSE_WRITE_BARRIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = crate::tui_screens::seed_operator_test_project(project_key, &["BlueLake"]);
+            let config = mcp_agent_mail_core::Config::from_env();
+            let displayed_source = (config.database_url.clone(), config.storage_root.clone());
+            let projects =
+                crate::tui_operator_message::load_projects(&config, Some(&displayed_source))
+                    .unwrap();
+            assert_eq!(projects.len(), 1);
+            crate::tui_screens::with_operator_test_conn(|conn| {
+                crate::tui_operator_message::ensure_compose_sender_on_connection(
+                    conn,
+                    &config,
+                    projects[0].id,
+                    &slug,
+                )
+                .unwrap();
+            });
+
+            // Compose now delegates delivery to the normal messaging tool.
+            // Exercise that real transaction, retaining the old blocked-write,
+            // promotion-refusal, commit and post-completion drain assertions.
+            let db_path = resolve_server_database_url_sqlite_path(&config.database_url).unwrap();
+            let lock_conn =
+                mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+            // Allow the normal tool's read-only receipt observation, but hold
+            // the real writer slot so its delivery transaction cannot commit.
+            lock_conn.execute_sync("BEGIN IMMEDIATE", &[]).unwrap();
+            let baseline_writers = mcp_agent_mail_db::write_barrier::active_writer_count();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let dispatch = std::thread::spawn(move || {
+                let result = block_on(mcp_agent_mail_tools::messaging::send_message(
+                    &crate::tui_screens::operator_tool_context(),
+                    slug,
+                    tui_compose::OVERSEER_AGENT_NAME.to_string(),
+                    vec!["BlueLake".to_string()],
+                    "compose write lease".to_string(),
+                    "compose write lease body".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("normal".to_string()),
+                    Some(false),
+                    Some("compose-write-lease".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("compose-write-lease-delivery".to_string()),
+                ));
+                done_tx.send(()).unwrap();
+                result
+            });
+            let wait_deadline = Instant::now() + Duration::from_secs(2);
+            while mcp_agent_mail_db::write_barrier::active_writer_count() <= baseline_writers {
+                assert!(
+                    !dispatch.is_finished(),
+                    "delivery returned before writer admission"
+                );
+                assert!(
+                    Instant::now() < wait_deadline,
+                    "delivery never acquired its write lease"
+                );
+                std::thread::yield_now();
+            }
+            let (barrier, outcome) =
+                mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
+                    Duration::ZERO,
+                );
+            assert!(
+                matches!(
+                    outcome,
+                    mcp_agent_mail_db::write_barrier::DrainOutcome::TimedOut {
+                        remaining_writers
+                    } if remaining_writers > 0
+                ),
+                "promotion must refuse the admitted delivery: {outcome:?}"
+            );
+            let rows = lock_conn
+                .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                .unwrap();
+            assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 0);
+            lock_conn.execute_sync("ROLLBACK", &[]).unwrap();
+            // Drop the barrier before joining even on failure, so a broken
+            // nested admission cannot strand the private dispatch thread.
+            let completed = done_rx.recv_timeout(Duration::from_secs(5));
+            drop(barrier);
+            let response = dispatch
+                .join()
+                .unwrap()
+                .expect("normal delivery must commit");
+            assert!(
+                completed.is_ok(),
+                "admitted delivery did not finish while promotion was excluded: {completed:?}"
+            );
+            let receipt: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(receipt["deliveries"].as_array().unwrap().len(), 1);
+            let rows = lock_conn
+                .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                .unwrap();
+            assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
+            let (after, outcome) =
+                mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
+                    Duration::from_secs(5),
+                );
+            assert!(
+                matches!(
+                    outcome,
+                    mcp_agent_mail_db::write_barrier::DrainOutcome::Idle
+                        | mcp_agent_mail_db::write_barrier::DrainOutcome::Drained { .. }
+                ),
+                "delivery must release its write lease: {outcome:?}"
+            );
+            drop(after);
+        });
+        println!("compose-delivery-write-lease-executed");
+    }
+
+    #[test]
     fn crash_marker_hook_records_real_panic_in_isolated_process() {
         const CHILD_ROOT: &str = "AM_TEST_CRASH_MARKER_ROOT";
         if let Some(root) = std::env::var_os(CHILD_ROOT) {

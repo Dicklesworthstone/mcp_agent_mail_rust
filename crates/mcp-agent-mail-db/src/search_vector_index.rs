@@ -697,7 +697,11 @@ mod tests {
                 2 => DocKind::Project,
                 _ => DocKind::Thread,
             };
-            let model = if ordinal % 2 == 0 { "model-a" } else { "model-b" };
+            let model = if ordinal % 2 == 0 {
+                "model-a"
+            } else {
+                "model-b"
+            };
             let metadata = VectorMetadata::new(i64::from((ordinal * 37) % 97) - 48, kind, model)
                 .with_project(i64::from(ordinal % 3));
             let vector = [

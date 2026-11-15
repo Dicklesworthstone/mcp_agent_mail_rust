@@ -7063,7 +7063,7 @@ mod tests {
         );
         let unknown_limit = mcp_agent_mail_core::FdMetricsSnapshot {
             soft_limit: None,
-            ..snapshot.clone()
+            ..snapshot
         };
         assert!(!descriptor_health_detail(&unknown_limit, Some(&growth)).contains("exhaustion"));
         let steady = descriptor_health_detail(&snapshot, None);

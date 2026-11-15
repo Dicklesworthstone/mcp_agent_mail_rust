@@ -10,8 +10,8 @@
 #        (`projects/<slug>/file_reservations/id-<id>-g<generation>.json`) vanished in a
 #        crash gap (DB commit landed, archive write did not) is HEALED on the
 #        next `file_reservation_paths` read — the artifact reappears with the
-#        correct holder. Divergent artifacts (wrong path_pattern) are healed
-#        back to DB truth the same way.
+#        correct holder. A compatible older intent revision is advanced to DB
+#        truth; conflicting lease identity is preserved and reported by F2.
 #   F2 — parity checker: per-field DB↔archive drift is reported by
 #        `am doctor health` (`reservation_parity:` line naming the drifted
 #        field) and by the per-FM registry view
@@ -309,63 +309,38 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# F2: per-field drift is reported by doctor health + the per-FM registry view.
+# F1b: a compatible stale revision converges without changing lease identity.
 # ---------------------------------------------------------------------------
-e2e_case_banner "F2: parity checker reports per-field drift in doctor surfaces"
+e2e_case_banner "F1: reconcile-on-read advances a compatible stale artifact to DB truth"
 if [ -n "${RES_ID}" ] && [ -f "${ALPHA_ARTIFACT}" ]; then
-    # Corrupt one archive-side field. path_pattern drift is detect-only (never
-    # auto-reconciled by doctor), so it is a stable probe for the reporting path.
-    jq '.path_pattern = "src/DRIFT-INJECTED/**"' "${ALPHA_ARTIFACT}" >"${ALPHA_ARTIFACT}.tmp" &&
-        mv "${ALPHA_ARTIFACT}.tmp" "${ALPHA_ARTIFACT}"
-    e2e_log "F2: injected path_pattern drift into ${ALPHA_ARTIFACT}"
-
-    amrun "${ART}/f2_health.txt" doctor health
-    if grep -q "reservation_parity: drift" "${ART}/f2_health.txt" "${ART}/f2_health.txt.err" 2>/dev/null; then
-        e2e_pass "F2: doctor health surfaces reservation_parity drift"
-    else
-        e2e_fail "F2: doctor health did not report reservation_parity drift"
-        printf '      out: %s\n' "$(head -c 240 "${ART}/f2_health.txt" 2>/dev/null | tr '\n' ' ')"
+    check "F1: grant carries a positive durable intent revision" "${ALPHA_ARTIFACT}" \
+        '.revision >= 1'
+    if ! { jq '.reason = "stale compatible archive reason" | .revision = 0' \
+        "${ALPHA_ARTIFACT}" >"${ALPHA_ARTIFACT}.tmp" &&
+        mv "${ALPHA_ARTIFACT}.tmp" "${ALPHA_ARTIFACT}"; }; then
+        e2e_fail "F1: could not stage the compatible stale artifact"
+        e2e_summary
+        exit 1
     fi
-    if grep -q "path_pattern" "${ART}/f2_health.txt" "${ART}/f2_health.txt.err" 2>/dev/null; then
-        e2e_pass "F2: doctor health names the drifted field (path_pattern)"
-    else
-        e2e_fail "F2: doctor health did not name the drifted field"
-    fi
-
-    amrun "${ART}/f2_fm_list.json" doctor fix \
-        --only fm-db-state-files-reservation-db-archive-parity --list
-    if jq -e . "${ART}/f2_fm_list.json" >/dev/null 2>&1; then
-        check "F2: per-FM list is scoped to the parity FM" "${ART}/f2_fm_list.json" \
-            '.fm_id == "fm-db-state-files-reservation-db-archive-parity"'
-        check "F2: per-FM list detects at least one finding" "${ART}/f2_fm_list.json" \
-            '.findings_count >= 1'
-        if jq -c '.findings' "${ART}/f2_fm_list.json" | grep -q "path_pattern"; then
-            e2e_pass "F2: per-FM finding evidence carries the path_pattern drift"
-        else
-            e2e_fail "F2: per-FM finding evidence does not mention path_pattern"
-        fi
-    else
-        e2e_fail "F2: doctor fix --only <parity-fm> --list emitted no JSON"
-    fi
-else
-    e2e_skip "F2 skipped: no healed artifact available to drift"
-fi
-
-# ---------------------------------------------------------------------------
-# F1b: reconcile-on-read also heals DIVERGENT artifacts back to DB truth.
-# ---------------------------------------------------------------------------
-e2e_case_banner "F1: reconcile-on-read heals the divergent artifact back to DB truth"
-if [ -n "${RES_ID}" ] && [ -f "${ALPHA_ARTIFACT}" ]; then
+    check "F1: compatible stale revision was actually staged" "${ALPHA_ARTIFACT}" \
+        '.revision == 0 and .reason == "stale compatible archive reason"'
     stdio_session "${HEALTHY_DB}" "${ART}/f1b_heal.jsonl" \
         "${INIT_REQ}" \
         "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_KEY}\",\"agent_name\":\"GoldFox\",\"paths\":[\"src/gamma/**\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"br-bvq1x.14.8 F1b heal trigger\"}}}"
 
-    if jq -e '.path_pattern == "src/alpha/**"' "${ALPHA_ARTIFACT}" >/dev/null 2>&1; then
-        e2e_pass "F1: divergent path_pattern healed back to the DB value"
+    if [ "$(is_error_result "${ART}/f1b_heal.jsonl" 30)" = "false" ]; then
+        e2e_pass "F1: compatible-revision read probe succeeded through MCP"
     else
-        e2e_fail "F1: artifact still carries the injected drift after a tool read"
+        e2e_fail "F1: compatible-revision read probe errored"
+    fi
+    if jq -e '.path_pattern == "src/alpha/**"' "${ALPHA_ARTIFACT}" >/dev/null 2>&1; then
+        e2e_pass "F1: compatible repair retains the DB reservation path"
+    else
+        e2e_fail "F1: compatible repair changed the reservation identity"
         printf '      got: %s\n' "$(jq -c . "${ALPHA_ARTIFACT}" 2>/dev/null | head -c 240)"
     fi
+    check "F1: compatible artifact advances to the authoritative intent revision" \
+        "${ALPHA_ARTIFACT}" '.revision >= 1 and .reason == "br-bvq1x.14.8 F1 seed"'
 
     amrun "${ART}/f1b_health.txt" doctor health
     if grep -q "reservation_parity: ok" "${ART}/f1b_health.txt" "${ART}/f1b_health.txt.err" 2>/dev/null; then
@@ -375,7 +350,7 @@ if [ -n "${RES_ID}" ] && [ -f "${ALPHA_ARTIFACT}" ]; then
         printf '      out: %s\n' "$(grep -h reservation_parity "${ART}/f1b_health.txt" "${ART}/f1b_health.txt.err" 2>/dev/null | head -c 240)"
     fi
 else
-    e2e_skip "F1b skipped: no drifted artifact available to heal"
+    e2e_skip "F1b skipped: no compatible artifact available to stage"
 fi
 
 # ---------------------------------------------------------------------------
@@ -462,6 +437,77 @@ if jq -e . "${ART}/f3_robot_cleared.json" >/dev/null 2>&1; then
         '[.queued_intents[]? | select(.kind == "release_file_reservations")] | length == 0'
 else
     e2e_fail "F3: robot status emitted no JSON after the replay"
+fi
+
+# ---------------------------------------------------------------------------
+# F2: report and preserve conflicting identity after positive lifecycle checks.
+# A path conflict is deliberately nonrepairable. Keep it out of the earlier
+# compatible-heal/release fixtures, then retain it as evidence through the end.
+# ---------------------------------------------------------------------------
+e2e_case_banner "F2: parity checker reports per-field drift in doctor surfaces"
+if [ -n "${RES_ID}" ] && [ -f "${ALPHA_ARTIFACT}" ]; then
+    # Corrupt one archive-side field. path_pattern drift is detect-only (never
+    # auto-reconciled by doctor), so it is a stable probe for the reporting path.
+    if ! { jq '.path_pattern = "src/DRIFT-INJECTED/**"' "${ALPHA_ARTIFACT}" >"${ALPHA_ARTIFACT}.tmp" &&
+        mv "${ALPHA_ARTIFACT}.tmp" "${ALPHA_ARTIFACT}" &&
+        cp "${ALPHA_ARTIFACT}" "${ART}/f2_conflicting_artifact.json"; }; then
+        e2e_fail "F2: could not stage and retain the conflicting identity"
+        e2e_summary
+        exit 1
+    fi
+    e2e_log "F2: injected path_pattern drift into ${ALPHA_ARTIFACT}"
+
+    amrun "${ART}/f2_health.txt" doctor health
+    if grep -q "reservation_parity: drift" "${ART}/f2_health.txt" "${ART}/f2_health.txt.err" 2>/dev/null; then
+        e2e_pass "F2: doctor health surfaces reservation_parity drift"
+    else
+        e2e_fail "F2: doctor health did not report reservation_parity drift"
+        printf '      out: %s\n' "$(head -c 240 "${ART}/f2_health.txt" 2>/dev/null | tr '\n' ' ')"
+    fi
+    if grep -q "path_pattern" "${ART}/f2_health.txt" "${ART}/f2_health.txt.err" 2>/dev/null; then
+        e2e_pass "F2: doctor health names the drifted field (path_pattern)"
+    else
+        e2e_fail "F2: doctor health did not name the drifted field"
+    fi
+
+    amrun "${ART}/f2_fm_list.json" doctor fix \
+        --only fm-db-state-files-reservation-db-archive-parity --list
+    if jq -e . "${ART}/f2_fm_list.json" >/dev/null 2>&1; then
+        check "F2: per-FM list is scoped to the parity FM" "${ART}/f2_fm_list.json" \
+            '.fm_id == "fm-db-state-files-reservation-db-archive-parity"'
+        check "F2: per-FM list detects at least one finding" "${ART}/f2_fm_list.json" \
+            '.findings_count >= 1'
+        if jq -c '.findings' "${ART}/f2_fm_list.json" | grep -q "path_pattern"; then
+            e2e_pass "F2: per-FM finding evidence carries the path_pattern drift"
+        else
+            e2e_fail "F2: per-FM finding evidence does not mention path_pattern"
+        fi
+    else
+        e2e_fail "F2: doctor fix --only <parity-fm> --list emitted no JSON"
+    fi
+
+    stdio_session "${HEALTHY_DB}" "${ART}/f2_preserve.jsonl" \
+        "${INIT_REQ}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":65,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_KEY}\",\"agent_name\":\"SilverWolf\",\"paths\":[\"docs/f2-preservation/**\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"br-bvq1x.14.8 F2 preserve conflict\"}}}"
+    if [ "$(is_error_result "${ART}/f2_preserve.jsonl" 65)" = "false" ]; then
+        e2e_pass "F2: conflicting-identity read probe succeeded through MCP"
+    else
+        e2e_fail "F2: conflicting-identity read probe errored"
+    fi
+    if cmp -s "${ART}/f2_conflicting_artifact.json" "${ALPHA_ARTIFACT}"; then
+        e2e_pass "F2: reconcile-on-read preserves conflicting identity byte for byte"
+    else
+        e2e_fail "F2: reconcile-on-read clobbered the conflicting identity"
+    fi
+    amrun "${ART}/f2_preserved_health.txt" doctor health
+    if grep -q "reservation_parity: drift" "${ART}/f2_preserved_health.txt" "${ART}/f2_preserved_health.txt.err" 2>/dev/null &&
+        grep -q "path_pattern" "${ART}/f2_preserved_health.txt" "${ART}/f2_preserved_health.txt.err" 2>/dev/null; then
+        e2e_pass "F2: preserved identity conflict remains visible to doctor health"
+    else
+        e2e_fail "F2: preserved identity conflict disappeared from doctor health"
+    fi
+else
+    e2e_skip "F2 skipped: no released artifact available to drift"
 fi
 
 # ---------------------------------------------------------------------------
