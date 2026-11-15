@@ -115,6 +115,7 @@ pub mod tui_keymap;
 pub mod tui_layout;
 pub mod tui_macro;
 pub mod tui_markdown;
+pub(crate) mod tui_operator_message;
 pub mod tui_panel_helpers;
 pub mod tui_persist;
 pub mod tui_poller;

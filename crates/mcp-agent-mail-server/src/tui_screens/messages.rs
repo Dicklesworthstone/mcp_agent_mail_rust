@@ -41,8 +41,14 @@ use serde::Deserialize;
 
 use crate::tui_action_menu::{ActionEntry, ActionKind, messages_actions, messages_batch_actions};
 use crate::tui_bridge::{KeyboardMoveSnapshot, MessageDragSnapshot, TuiSharedState};
+use crate::tui_compose::OVERSEER_AGENT_NAME as COMPOSE_SENDER_NAME;
 use crate::tui_events::MailEvent;
 use crate::tui_layout::{DockLayout, DockPosition};
+use crate::tui_operator_message::{
+    ComposeAgent, active_compose_agent_names, ensure_compose_sender_on_connection,
+    open_live_mutation_db_connection, open_live_recipient_connection, query_compose_agent_rows,
+    require_active_compose_recipient, verify_form_mailbox_source,
+};
 use crate::tui_persist::{
     ScreenFilterPresetStore, configured_console_persist_path,
     load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
@@ -71,7 +77,6 @@ const SHIMMER_MAX_ROWS: usize = 5;
 const SHIMMER_HIGHLIGHT_WIDTH: usize = 5;
 const COMPOSE_BODY_MIN_ROWS: u16 = 10;
 const QUICK_REPLY_BODY_MIN_ROWS: u16 = 8;
-const COMPOSE_SENDER_NAME: &str = "HumanOverseer";
 const COMPOSE_IMPORTANCE_LEVELS: [&str; 3] = ["normal", "high", "urgent"];
 const MESSAGE_DRAG_HOLD_DELAY: Duration = Duration::from_millis(200);
 const MESSAGE_DOCK_HIDE_HEIGHT_THRESHOLD: u16 = 8;
@@ -888,41 +893,6 @@ struct ComposePayload {
     ack_required: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComposeAgentStatus {
-    Active,
-    Retired,
-    Deregistered,
-}
-
-#[derive(Debug)]
-struct ComposeAgent {
-    id: i64,
-    name: String,
-    status: ComposeAgentStatus,
-}
-
-impl ComposeAgent {
-    fn require_active(&self) -> Result<(), String> {
-        match self.status {
-            ComposeAgentStatus::Active => Ok(()),
-            ComposeAgentStatus::Retired => Err(format!(
-                "Agent '{}' is retired. Unretire this agent before sending new messages.",
-                self.name
-            )),
-            ComposeAgentStatus::Deregistered => Err(format!(
-                "Agent '{}' is deregistered and cannot send or receive new messages. Choose an active agent.",
-                self.name
-            )),
-        }
-    }
-}
-
-/// Resolve names like the backend: the first registered case-insensitive
-/// identity wins, even when a newer spelling is still active. Observe its
-/// lifecycle ledger in the same statement as the profile. Read-only legacy
-/// snapshots may predate the ledger and retirement column, so retain their
-/// task-description tombstones without attempting a migration here.
 fn query_compose_agents(
     query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
     project_slug: &str,
@@ -982,101 +952,6 @@ fn query_quick_reply_recipient(
         })?;
     sender.require_active()?;
     Ok(sender)
-}
-
-fn query_compose_agent_rows(
-    mut query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
-    source_filter: &str,
-    params: &[Value],
-) -> Result<Vec<ComposeAgent>, String> {
-    let query_error = |error| format!("Failed to load agents for compose: {error}");
-    let columns: HashSet<String> = query("PRAGMA table_info(agents)", &[])
-        .map_err(query_error)?
-        .iter()
-        .map(|row| row.get_named::<String>("name"))
-        .collect::<Result<_, _>>()
-        .map_err(query_error)?;
-    let has_ledger = !query(
-        "SELECT 1 AS present FROM sqlite_master \
-         WHERE type = 'table' AND name = 'agent_deregistrations' LIMIT 1",
-        &[],
-    )
-    .map_err(query_error)?
-    .is_empty();
-    let mut source_columns = vec!["id", "name"];
-    let retired = if columns.contains("retired_at") {
-        source_columns.push("retired_at");
-        "a.retired_at"
-    } else {
-        "NULL"
-    };
-    let task = if columns.contains("task_description") {
-        source_columns.push("task_description");
-        "COALESCE(a.task_description, '')"
-    } else {
-        "''"
-    };
-    let (ledger_join, deregistered) = if has_ledger {
-        (
-            "LEFT JOIN agent_deregistrations d ON d.agent_id = a.id",
-            "d.agent_id",
-        )
-    } else {
-        ("", "NULL")
-    };
-    let source_projection = source_columns.join(", ");
-    let sql = format!(
-        "SELECT a.id AS id, a.name AS name, {retired} AS retired_at, \
-         {deregistered} AS deregistered_id, {task} AS task_description \
-         FROM (SELECT {source_projection} FROM agents \
-               WHERE {source_filter}) a \
-         {ledger_join} ORDER BY a.id ASC"
-    );
-    let rows = query(&sql, params).map_err(query_error)?;
-    let mut seen_names = HashSet::new();
-    let mut agents = Vec::with_capacity(rows.len());
-    for row in rows {
-        let name = row.get_named::<String>("name").map_err(query_error)?;
-        if !seen_names.insert(name.to_ascii_lowercase()) {
-            continue;
-        }
-        let task = row
-            .get_named::<String>("task_description")
-            .map_err(query_error)?;
-        let status = if row.get_by_name("deregistered_id") != Some(&Value::Null)
-            || mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(&task)
-        {
-            ComposeAgentStatus::Deregistered
-        } else if row.get_by_name("retired_at") != Some(&Value::Null) {
-            ComposeAgentStatus::Retired
-        } else {
-            ComposeAgentStatus::Active
-        };
-        agents.push(ComposeAgent {
-            id: row.get_named("id").map_err(query_error)?,
-            name,
-            status,
-        });
-    }
-    Ok(agents)
-}
-
-fn active_compose_agent_names(agents: &[ComposeAgent]) -> Vec<String> {
-    let mut names: Vec<_> = agents
-        .iter()
-        .filter(|agent| agent.status == ComposeAgentStatus::Active)
-        .map(|agent| agent.name.clone())
-        .collect();
-    names.sort();
-    names
-}
-
-fn require_active_compose_recipient(agents: &[ComposeAgent], name: &str) -> Result<(), String> {
-    agents
-        .iter()
-        .find(|agent| agent.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| format!("Unknown recipient: {name}"))?
-        .require_active()
 }
 
 #[derive(Debug, Clone)]
@@ -1640,7 +1515,7 @@ impl MessageBrowserScreen {
         name: Option<&str>,
         config: &mcp_agent_mail_core::Config,
     ) -> Result<Vec<ComposeAgent>, String> {
-        let conn = Self::open_live_recipient_connection(config)?;
+        let conn = open_live_recipient_connection(config)?;
         query_compose_agents(
             |sql, params| conn.query_sync(sql, params),
             project_slug,
@@ -1652,25 +1527,12 @@ impl MessageBrowserScreen {
         context: &QuickReplyContext,
         config: &mcp_agent_mail_core::Config,
     ) -> Result<ComposeAgent, String> {
-        let conn = Self::open_live_recipient_connection(config)?;
+        let conn = open_live_recipient_connection(config)?;
         query_quick_reply_recipient(
             |sql, params| conn.query_sync(sql, params),
             &context.project_slug,
             context.message_id,
         )
-    }
-
-    fn open_live_recipient_connection(
-        config: &mcp_agent_mail_core::Config,
-    ) -> Result<mcp_agent_mail_db::GuardedReadOnlyConn, String> {
-        let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
-            .ok_or_else(|| "Database connection unavailable".to_string())?;
-        crate::open_read_only_sync_db_connection_with_busy_timeout(
-            sqlite_path.to_string_lossy().as_ref(),
-            crate::INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS,
-            "message recipient lifecycle",
-        )
-        .map_err(|error| format!("Cannot verify current agent lifecycle: {error}"))
     }
 
     fn open_compose_error_form(
@@ -1772,18 +1634,6 @@ impl MessageBrowserScreen {
         })
     }
 
-    fn open_live_mutation_db_connection(
-        config: &mcp_agent_mail_core::Config,
-    ) -> Result<DbConn, String> {
-        let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
-            .ok_or_else(|| "Database connection unavailable".to_string())?;
-        if !sqlite_path.exists() {
-            return Err("Database connection unavailable".to_string());
-        }
-        crate::open_interactive_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
-            .map_err(|e| format!("Database connection unavailable: {e}"))
-    }
-
     fn fetch_message_entry_by_id(
         &mut self,
         message_id: i64,
@@ -1856,7 +1706,7 @@ impl MessageBrowserScreen {
         // profile. Freeze recovery promotion before opening the raw live fd and
         // retain the lease until both durable representations are complete.
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-        let conn = Self::open_live_mutation_db_connection(config)?;
+        let conn = open_live_mutation_db_connection(config)?;
         let project_id = if let Some(project_id) = synthetic_project_id(project_slug) {
             ensure_synthetic_project_row(&conn, project_id, project_slug)?
         } else {
@@ -1869,75 +1719,7 @@ impl MessageBrowserScreen {
                 .ok_or_else(|| format!("Project not found: {project_slug}"))?
         };
 
-        let existing_sender = query_compose_agents(
-            |sql, params| conn.query_sync(sql, params),
-            project_slug,
-            Some(COMPOSE_SENDER_NAME),
-        )?
-        .into_iter()
-        .next();
-        let now = unix_epoch_micros_now().unwrap_or(0);
-        if let Some(sender) = existing_sender {
-            sender.require_active()?;
-            let changed = conn
-                .execute_sync(
-                    "UPDATE agents SET last_active_ts = ? WHERE id = ? \
-                     AND retired_at IS NULL \
-                     AND id NOT IN (SELECT agent_id FROM agent_deregistrations) \
-                     AND substr(COALESCE(task_description, ''), 1, 14) <> '[DEREGISTERED '",
-                    &[Value::BigInt(now), Value::BigInt(sender.id)],
-                )
-                .map_err(|e| format!("Failed to update compose sender activity: {e}"))?;
-            if changed != 1 {
-                return Err(format!(
-                    "Agent '{}' changed lifecycle while composing. Refresh its status before sending.",
-                    sender.name
-                ));
-            }
-            // A heartbeat owns no profile fields. Replacing an existing
-            // profile here erased lifecycle state, operator settings and
-            // extensions even when the subsequent send was refused.
-            return Ok(());
-        }
-        conn.execute_sync(
-            "INSERT INTO agents \
-             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            &[
-                Value::BigInt(project_id),
-                Value::Text(COMPOSE_SENDER_NAME.to_string()),
-                Value::Text("am-tui".to_string()),
-                Value::Text("human".to_string()),
-                Value::Text("Human operator composing messages in TUI".to_string()),
-                Value::BigInt(now),
-                Value::BigInt(now),
-                Value::Text("auto".to_string()),
-                Value::Text("auto".to_string()),
-            ],
-        )
-        .map_err(|e| format!("Failed to create compose sender: {e}"))?;
-
-        if let Ok(Some(archive)) = mcp_agent_mail_storage::open_archive(config, project_slug) {
-            let agent_json = serde_json::json!({
-                "name": COMPOSE_SENDER_NAME,
-                "program": "am-tui",
-                "model": "human",
-                "task_description": "Human operator composing messages in TUI",
-                "inception_ts": micros_to_iso(now),
-                "last_active_ts": micros_to_iso(now),
-                "attachments_policy": "auto",
-                "contact_policy": "auto",
-                "reaper_exempt": false,
-                "retired_at": null,
-                "deregistered_at": null,
-            });
-            let _ = mcp_agent_mail_storage::write_agent_profile_with_config(
-                &archive,
-                config,
-                &agent_json,
-            );
-        }
-        Ok(())
+        ensure_compose_sender_on_connection(&conn, config, project_id, project_slug)
     }
 
     fn next_form_request_id(&mut self) -> Result<u64, String> {
@@ -1945,31 +1727,6 @@ impl MessageBrowserScreen {
             "Form request limit reached; restart the console before submitting again".to_string()
         })?;
         Ok(self.form_request_id)
-    }
-
-    fn verify_form_mailbox_source(
-        config: &mcp_agent_mail_core::Config,
-        displayed_source: Option<&(String, PathBuf)>,
-    ) -> Result<(), String> {
-        // Send/reply use the cached tool configuration. Re-reading only the
-        // environment here could approve a mailbox the tools have not adopted.
-        let current = mcp_agent_mail_core::Config::get();
-        let captured_path = crate::resolve_server_database_url_sqlite_path(&config.database_url);
-        let current_path = crate::resolve_server_database_url_sqlite_path(&current.database_url);
-        let source_matches = displayed_source.is_none_or(|(url, root)| {
-            crate::resolve_server_database_url_sqlite_path(url) == captured_path
-                && root == &config.storage_root
-        });
-        if captured_path.is_none()
-            || captured_path != current_path
-            || config.storage_root != current.storage_root
-            || !source_matches
-        {
-            return Err(
-                "This draft belongs to a different mailbox than the sending tools; refresh with the same database and storage configuration before sending".to_string(),
-            );
-        }
-        Ok(())
     }
 
     fn submit_compose_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
@@ -2034,7 +1791,7 @@ impl MessageBrowserScreen {
                 for name in payload.to.iter().chain(&payload.cc) {
                     require_active_compose_recipient(&agents, name)?;
                 }
-                Self::verify_form_mailbox_source(&config, displayed_source.as_ref())?;
+                verify_form_mailbox_source(&config, displayed_source.as_ref())?;
                 Self::ensure_compose_sender(&payload.project_slug, &config)?;
                 if payload.thread_id.is_none() {
                     let micros = unix_epoch_micros_now().unwrap_or(0);
@@ -2135,7 +1892,7 @@ impl MessageBrowserScreen {
                 // Resolve every selected delivery before the first write, then
                 // drop the read connection before entering tool write admission.
                 let plans = {
-                    let conn = Self::open_live_recipient_connection(&config)?;
+                    let conn = open_live_recipient_connection(&config)?;
                     with_message_delivery_snapshot(&conn, || {
                         selected
                             .iter()
@@ -2276,7 +2033,7 @@ impl MessageBrowserScreen {
                     "This message has no verified live mailbox source; reload the mailbox before replying".to_string()
                 })?;
                 Self::live_quick_reply_recipient(&context, &config)?;
-                Self::verify_form_mailbox_source(&config, Some(displayed_source))?;
+                verify_form_mailbox_source(&config, Some(displayed_source))?;
                 Self::ensure_compose_sender(&context.project_slug, &config)?;
 
                 let cx = block_on(async {
