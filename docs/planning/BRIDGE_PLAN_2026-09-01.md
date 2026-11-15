@@ -1,5 +1,63 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review38 compact candidate through promotion — EmeraldEagle
+
+- [x] Reread Review37 identity helpers, rollback, committed follow-up and
+  consumers; no new concrete defect found. Check ready Beads against current
+  implementation and original acceptance before choosing new work.
+- [x] Claim unassigned br-talqb; preserve its description and earlier compaction
+  authorship. Confirm archive rebuild and committed salvage both invoke the
+  existing VACUUM/checkpoint finalizer before promotion.
+- [x] Extend the real GH#289 orphan/free-page fixture through the public
+  promotion boundary: untouched candidate on invalid-image refusal, zero
+  unreachable/freelist pages after promotion, preserved logical rows/metadata/
+  message-ID high-water mark, valid durable receipt, source telemetry intact.
+- [x] Run original compaction refusal/archive/salvage controls plus the prior52
+  promotion/lock cases (56 predeclared named cases) on frozen source; retain
+  exact source/dependency/toolchain/worker/executable evidence and any failures.
+- [x] Run mandatory workspace/all-target and production compiler graphs,
+  strict Clippy, formatting, diff and scoped scanner checks; reread all changes.
+- [x] Re-execute the original decisive acceptance probes in a fresh pass;
+  close only on cited current evidence without weakening original requirements.
+- [x] Finalize existing TODO/Bead/audit, verify tracker history and cycles,
+  preserve shared commits/peer files and prepare exact-path publication.
+  Terminal push/ref/lease observations are recorded after execution in the
+  retained `review-audit.md`, rather than pre-certified in this commit.
+
+The first 56-case run failed the expanded fixture because its expected corrupt
+promotion correctly activated target-specific recovery backoff. The negative
+control now uses a separate target; no admission reset, sleep, retry or runtime
+change was added. That failed receipt remains retained. This pass adds real
+post-promotion acceptance coverage for an existing compaction implementation;
+it claims no new runtime compaction capability.
+
+Final frozen-source run: **56/56 passed, 4,040 outside selection** on strict RCH
+hz2 (30.295 s test execution). Workspace/all-target and production lib/bins
+checks passed on ovh-a. Base `dce092fb` plus reconstruct-only overlay
+`3a639e3a86cd5c93117c7c1ca123fbb0be2925d4be292942eb2937e3b37471f1`;
+reconstruct SHA-256 `3eae5375b166412abc370ad8aa67bb09ea9ea7801c0cb83a7bf0857ac2ff59fb`.
+Direct probes on all three workers matched all five frozen
+source/dependency/toolchain inputs. Full-file strict UBS remains red: zero
+critical, 2,192 warnings and 789 informational findings; changed-test findings were manually triaged without
+suppression. No full-workspace test, scanner-clean, release, production-soak or
+non-Linux qualification is claimed.
+
+Fresh solo acceptance reexecution passed **4/4 original probes, 4,092 outside
+selection** (1.208 s), with identical frozen inputs and native ELF SHA-256
+`08e40eff786aa821bed8d4cefbf5b10c9a2f4dc319f7a0b3753b6725fc641f56`.
+This is self-review, not independent certification. Strict all-workspace/all-target
+Clippy with warnings denied passed on vmi1156319; formatting and diff checks
+passed. The first fresh acceptance invocation ended in RCH admission exit103
+without executing tests; the later admitted invocation ran the exact declared
+four cases. No disk budget was lowered or peer job disturbed. Cargo's
+`proc-macro-error2` future-incompatibility notice is retained.
+
+`br-talqb` closed at 14:25:46 UTC on the original populated GH#289 acceptance,
+with exact source hashes, named cases, terminal receipts and the warning/coverage
+limits cited in its transition comment. `br-cxsgx` and all peer records remain
+unchanged. Receipts and the bounded honesty audit are retained under
+`/data/tmp/am-archive-reader-20261110.t7ueMuTt/review38-*` and `review-audit.md`.
+
 ## November 15 Review37 post-commit generation authority — EmeraldEagle
 
 - [x] Reread the prior rollback repair, promotion callers and ATC follow-up;

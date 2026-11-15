@@ -7881,9 +7881,12 @@ mod tests {
         // pages unreachable from both b-trees and the freelist. Merely checking
         // freelist_count would accept the latter without reclaiming anything.
         for orphan_pages in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("candidate.sqlite3");
-            let atc_path = directory.path().join("atc.sqlite3");
+            let directory = tempfile::tempdir().unwrap().keep();
+            let path = directory.join("candidate.sqlite3");
+            let atc_path = directory.join("atc.sqlite3");
+            let promotion_root = directory.join("promoted");
+            std::fs::create_dir_all(&promotion_root).unwrap();
+            let primary = promotion_root.join("storage.sqlite3");
             std::fs::write(&atc_path, b"live telemetry must remain untouched").unwrap();
             let conn = DbConn::open_file(path.to_str().unwrap()).unwrap();
             conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL).unwrap();
@@ -7973,6 +7976,28 @@ mod tests {
                 );
             }
 
+            drop(conn);
+            assert!(crate::pool::sqlite_recovery_candidate_is_standalone(&path));
+            if orphan_pages {
+                // A refused promotion intentionally activates backoff for its
+                // target. Keep that negative control independent of the later
+                // successful promotion without resetting production state.
+                let rejected_primary = promotion_root.join("rejected.sqlite3");
+                let before_refusal = std::fs::read(&path).unwrap();
+                let error = crate::pool::promote_recovery_candidate(
+                    &rejected_primary,
+                    &path,
+                    &promotion_root,
+                )
+                .expect_err("unreachable pages must refuse promotion before compaction");
+                assert!(error.to_string().contains("integrity"), "{error}");
+                assert!(
+                    std::fs::symlink_metadata(&rejected_primary)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), before_refusal);
+            }
+            let conn = DbConn::open_file(path.to_str().unwrap()).unwrap();
             finalize_reconstruction_candidate(conn, &path, "reconstruct test").unwrap();
 
             assert!(std::fs::metadata(&path).unwrap().len() < bytes_before / 2);
@@ -7999,6 +8024,40 @@ mod tests {
                 129,
                 "deleted message IDs must never be reused after compaction"
             );
+            assert_eq!(
+                std::fs::read(&atc_path).unwrap(),
+                b"live telemetry must remain untouched"
+            );
+            let expected_promoted_state = snapshot(&conn);
+            drop(conn);
+            crate::pool::promote_recovery_candidate(&primary, &path, &promotion_root)
+                .expect("compact candidate must survive the real receipt/promotion boundary");
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
+            assert!(std::fs::metadata(&primary).unwrap().len() < bytes_before / 2);
+            let promoted = open_read_only_salvage_db(&primary).unwrap();
+            assert_compact_reconstruction_candidate(&promoted);
+            let promoted_state = snapshot(&promoted);
+            // Receipt preparation legitimately adds its own schema. Preserve
+            // every application row and both SQLite metadata values instead.
+            assert_eq!(promoted_state[1..5], expected_promoted_state[1..5]);
+            assert_eq!(promoted_state[6..], expected_promoted_state[6..]);
+            assert_eq!(
+                promoted
+                    .query_sync(
+                        "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",
+                        &[]
+                    )
+                    .unwrap()[0]
+                    .get_named::<i64>("seq")
+                    .unwrap(),
+                129,
+                "promotion must preserve the post-compaction message-ID high-water mark"
+            );
+            crate::forensics::verify_recovery_receipt_state(&promotion_root, &primary)
+                .expect("the compact live generation must match its durable promotion receipt");
             assert_eq!(
                 std::fs::read(&atc_path).unwrap(),
                 b"live telemetry must remain untouched"
