@@ -264,6 +264,7 @@ fn attempt(
 ) -> Result<bool, PassFailure> {
     let activity = admit_source(pool, config, Some(control.identity))?;
     let mut attempted = false;
+    let mut archive_state = ReservationArchiveState::default();
     // Failed checkout/query operations retain retry debt. Validated malformed
     // identity or missing holder evidence still remains a conflict; neither
     // outcome can authorize publication without a fresh live source read.
@@ -275,6 +276,14 @@ fn attempt(
             {
                 // This ID belonged to a different pass binding. Refuse the
                 // whole pass without consuming its scan position or retry.
+                drop(activity);
+                log_release_decision(
+                    &source,
+                    &archive_state,
+                    &Err(ReleaseFailure::from(
+                        "reservation reconciliation source generation changed; rescan required",
+                    )),
+                );
                 return Err(PassFailure::Source(
                     "reservation reconciliation source generation changed; rescan required".into(),
                 ));
@@ -286,6 +295,7 @@ fn attempt(
                 &source,
                 ReleaseTargets::WithOwnedAliases,
                 &mut attempted,
+                &mut archive_state,
             );
             (Some(source), result)
         }
@@ -298,11 +308,18 @@ fn attempt(
     #[cfg(test)]
     tests::observe_boundary(tests::Boundary::Attempt(id));
     if let Some(source) = source {
-        tracing::info!(target: "maintenance", event = "reservation_release_reconcile",
-            reservation_id = id, project = %source.project_slug,
-            generation = ?source.generation, db_state = "released",
-            action = "verify_terminal_release", outcome = ?result,
-            "reservation archive release reconciliation decision");
+        log_release_decision(&source, &archive_state, &result);
+    } else {
+        super::super::log_reservation_source_decision(
+            id,
+            if result.is_err() {
+                "unavailable"
+            } else {
+                "not_terminal"
+            },
+            "verify_terminal_release",
+            &result,
+        );
     }
     report.attempted += usize::from(attempted);
     if control.stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
@@ -966,6 +983,7 @@ mod tests {
                     &source,
                     ReleaseTargets::WithOwnedAliases,
                     &mut attempted,
+                    &mut ReservationArchiveState::default(),
                 );
                 assert!(
                     !attempted,
@@ -1482,6 +1500,7 @@ mod tests {
                     &source,
                     ReleaseTargets::WithOwnedAliases,
                     &mut false,
+                    &mut ReservationArchiveState::default(),
                 )
                 .unwrap()
             );

@@ -34,6 +34,75 @@ use std::path::Path;
 
 use git2::{ErrorCode, ObjectType, Oid, Repository};
 
+/// Observed canonical artifact state, never publication authority. Keep missing
+/// evidence distinct from a read that failed or was never admitted. Reusable
+/// aliases do not replace these observations of the generation-stamped target.
+/// Lifecycle labels describe the release marker; identity validation is separate.
+#[derive(Debug)]
+struct ReservationArchiveState {
+    working: &'static str,
+    committed: &'static str,
+}
+
+impl Default for ReservationArchiveState {
+    fn default() -> Self {
+        Self {
+            working: "not_observed",
+            committed: "not_observed",
+        }
+    }
+}
+
+fn reservation_artifact_state(value: Option<&serde_json::Value>) -> &'static str {
+    use serde_json::Value;
+
+    let Some(value) = value else {
+        return "missing";
+    };
+    if !value.is_object() {
+        return "malformed";
+    }
+    match value.get("released_ts") {
+        None | Some(Value::Null) => "active",
+        Some(Value::Number(value)) if value.as_f64() == Some(0.0) => "active",
+        Some(Value::Number(value)) if value.as_i64().is_some_and(|value| value > 0) => "released",
+        Some(Value::String(value)) => {
+            let text = value.trim();
+            if matches!(
+                text.to_ascii_lowercase().as_str(),
+                "" | "0" | "null" | "none"
+            ) {
+                "active"
+            } else if text
+                .parse::<i64>()
+                .ok()
+                .or_else(|| mcp_agent_mail_core::iso_to_micros(text))
+                .is_some_and(|value| value > 0)
+            {
+                "released"
+            } else {
+                "invalid_release"
+            }
+        }
+        Some(_) => "invalid_release",
+    }
+}
+
+/// A rejected or ineligible source cannot supply project/generation authority.
+/// Record that absence explicitly without querying again just for diagnostics.
+fn log_reservation_source_decision(
+    reservation_id: i64,
+    db_state: &'static str,
+    action: &'static str,
+    result: &impl std::fmt::Debug,
+) {
+    tracing::debug!(target: "maintenance", event = "reservation_reconcile_source_decision",
+        reservation_id, project = ?Option::<&str>::None,
+        generation = ?Option::<&str>::None, db_state,
+        archive_state = ?ReservationArchiveState::default(), action, outcome = ?result,
+        "reservation source did not authorize an artifact decision");
+}
+
 /// Serialize each progress read/merge/publish without delaying maintenance
 /// behind another owner. The stable sidecar stays named across atomic record
 /// replacements; a lock on the replaced record itself would not serialize them.

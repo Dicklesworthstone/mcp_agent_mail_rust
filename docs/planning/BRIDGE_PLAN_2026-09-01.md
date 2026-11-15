@@ -1,5 +1,94 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review32 reservation decisions — EmeraldEagle
+
+- [x] Reread Review31 code and actual callers; preserve shared history and the
+  unchanged original br-kp1in.19 acceptance and refinements.
+- [x] Trace terminal decisions into retry.rs: existing events already include
+  id/project/generation/DB state/action/outcome. Correct the earlier incomplete
+  search; observed archive state, active decisions and targeted decisions need
+  coverage. Extend existing diagnostics without extra DB queries or new policy.
+- [x] Extend the existing real16-row failed-write/reopen/guard fixture with
+  actual tracing-event capture, unchanged-replay and planted identity-conflict
+  observations. Preserve every original positive guard/parity/count assertion.
+- [x] Execute the strengthened test-only fixture against unchanged9e9 runtime:
+  run81937b97-43b8-4d0c-88e0-41c68d81b785, terminal100/1FAIL/132skipped,
+  9.745s after Cargo24m13s on hz4. It passes the original recovery/guard/parity
+  assertions, then fails the missing targeted event (38 versus39). Seven
+  captured runtime/config hashes match9e9. The final fixture adds a further
+  wrong-generation refusal check; do not call these fixture inputs identical.
+- [x] Preserve combined12-case attempt137/RCH-E330: output growth36838117376
+  exceeds reservation36507222016 bytes; zero tests executed. Exact wrapper
+  5b7917f7 recovered137/terminal acknowledged. Seven captured runtime/config
+  hashes match9e9dbb89; only the test fixture is overlaid. Split verification by
+  crate while retaining all12 names and unchanged resource/test policies.
+  Subsequent hz2 tools submission103 is a disk-admission refusal, not a test.
+- [x] Add observed canonical worktree/HEAD state to existing terminal events;
+  cover active and targeted repair decisions, preserving all admission/budgets.
+- [x] Keep unknown source authority explicitly unknown. Reuse existing reads;
+  do not let optional aliases replace canonical artifact observations. Release
+  targeted write admission before diagnostics; actual event capture checks zero
+  active writers. Add real active-gap repair/no-op and targeted no-op probes to
+  the final16-row fixture without removing its original assertions.
+- [x] Correct four missed internal test callers after workspace check101/E0061;
+  preserve all existing assertions. Give the event collector unique span IDs.
+  Final formatting0 and diff-check0; source scopes remain distinct.
+- [x] Complete strict five-file UBS1/statusok:13critical/2149warning/346info.
+  All13 criticals are unchanged integration-test helper fail-fast panics;
+  inspect each against9e9dbb89 and its test-only callers. Separate full-file
+  runtime scan0/0critical/1958warning/309info; fixture scan1/13/191/41.
+  Retain red results, no suppression, rewritten assertions or scanner-clearance
+  claim. Later caller/collector edits still need a final scan.
+- [x] Reread changes and real callers again. Add observations to known-source
+  targeted and pass-generation refusals; retain their original error and
+  no-clobber behavior. Fix Clippy101 by cloning the captured event snapshot
+  before assertions, rather than holding its mutex or suppressing the lint.
+- [x] Run the final0ad03d18 five-file overlay on base9e9: real16-row tools case
+  runea92ef1b-70f1-4eea-b194-8b6ef8dc5431, terminal0/1PASS/132skipped,
+  12.893s after Cargo2m17s on hz4. Actual captured active/terminal events cover
+  repaired, unchanged and preserved-conflict outcomes, plus targeted refusal.
+  Ten running-worker source/config hashes match; selected test ELF SHA256
+  58ffd5b9b2c4374f7574b846b6d03c63398b2a1a0cfedf4aa3759c925dbc1c6a.
+- [x] Run all seven original CLI/WAL names on earlier35700117 overlay:
+  run1522f323-ad94-4427-bc30-e8e50ba77ec7, terminal0/7PASS/3576skipped,
+  128.843s after Cargo12m20s on ovh. Public release/restart/guard/health
+  passes12.452s; actual shell36PASS/0FAIL/2SKIP. Preserve the two outage skips
+  and manifest-only limits. Three selected ELF hashes retained. These results
+  do not qualify the later refusal-logging/snapshot edits as identical input.
+- [x] Finish all four original server cases on final0ad03d18:
+  run08eef1ed-3c8e-40bf-ae6d-096ce92f5f06, terminal0/4PASS/5673skipped,
+  4.922s after Cargo29m59s on hz2. Exact census includes the bounded worker,
+  transaction/write-lease and both normal-archive compose paths. Ten actual
+  worker hashes match. Stable selected server test ELF SHA256
+  3989f5a3e43f096afe52cc8d9973dbe450fc84a89df3a4d86b744f2bf7d35504.
+- [x] Finish fresh solo public acceptance plus shell-wrapper cases on the
+  same final0ad03d18 source: runfcd66696-a06e-4c48-8f50-6556786990be,
+  terminal0/2PASS/328skipped/36.779s, Cargo14m04s on ovh. Public recovery
+  passes16.680s; shell19.607s/36PASS/0FAIL/2SKIP. Actual10 running-worker
+  hashes match. Retain first ovh103/hard-admission and122103/queue failures.
+  After server completion, fresh hz2/ovh guards0 permit a new allowed-set
+  submission; RCH refuses hz2 disk admission then executes on ovh without
+  policy changes. Earlier manual hz2 source capture addressed the rerouted
+  worker incorrectly and fails; its empty file is not source evidence.
+- [x] Final0ad03d18 workspace/all-target check0/Cargo3m13s; separate production
+  lib+bins check0/2m47s; strict workspace/all-target Clippy0/1m22s, all on ovh.
+  Formatting0 and diff-check0. Retain proc-macro-error2 future notice.
+- [x] Final complete five-file strict UBS1/statusok/no failed modules:
+  13critical/2156warning/350info. Criticals remain the same13 legacy test-helper
+  panics, not production failures. This is a red scanner gate, not clearance;
+  no suppression, excluded tests or assertion rewrites. Exact commands and
+  all failed/positive receipts remain in the existing external review audit.
+- [x] Compare original requirements and refinement with actual source and
+  populated probes; fresh solo re-execution supports scoped closure of owned
+  br-kp1in.19, comment4403. No independent-review, full-workspace-native,
+  installed-host, platform/load/soak or release claim. All2871 IDs and19
+  original comments preserved; only this issue changes, adding4402/4403 and
+  closure metadata. Flush0/cycles0. Parent/related and release Beads stay open.
+- [x] Reread final runtime/test diffs and verify source/lock/toolchain manifest
+  still matches. Prepare one owned publication; retain seven original untracked
+  roots and peer history. Exact commit/push/ref and lease-release results are
+  appended after execution to the existing external review-audit.md.
+
 ## November 14 Review31 public reservation recovery — EmeraldEagle
 
 - [x] Fresh reread of the latest progress helper, both producers and callers:

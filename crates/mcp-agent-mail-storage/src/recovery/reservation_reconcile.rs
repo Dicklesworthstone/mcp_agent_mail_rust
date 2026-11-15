@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use sha1::{Digest as _, Sha1};
 
 use super::agent_reconcile::{Artifact, committed_artifact, head_tree, read_artifact};
+use super::{ReservationArchiveState, reservation_artifact_state};
 use crate::{ProjectArchive, StorageError};
 
 mod repair_lock;
@@ -554,10 +555,17 @@ fn prepare_target(
     source: &ReleaseSource,
     path: PathBuf,
     optional: bool,
+    archive_state: &mut ReservationArchiveState,
 ) -> crate::Result<Option<Target>> {
     let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path)?;
     let working = read_artifact(&path)?;
+    if !optional {
+        archive_state.working = reservation_artifact_state(working.as_ref().map(|a| &a.value));
+    }
     let committed = committed_artifact(repo, tree, &relative)?;
+    if !optional {
+        archive_state.committed = reservation_artifact_state(committed.as_ref().map(|a| &a.value));
+    }
     if optional && working.is_none() && committed.is_none() {
         return Ok(None);
     }
@@ -661,6 +669,7 @@ fn publish_release(
     original: &ReleaseSource,
     targets: ReleaseTargets,
     attempted: &mut bool,
+    archive_state: &mut ReservationArchiveState,
 ) -> Result<bool, ReleaseFailure> {
     // Pool checkout may wait for capacity or connection validation. Never
     // retain the global archive fence while waiting: a current borrower may
@@ -734,9 +743,15 @@ fn publish_release(
         }
         let mut targets = Vec::new();
         for (path, optional) in paths {
-            if let Some(target) =
-                prepare_target(&archive, &repo, tree.as_ref(), original, path, optional)?
-            {
+            if let Some(target) = prepare_target(
+                &archive,
+                &repo,
+                tree.as_ref(),
+                original,
+                path,
+                optional,
+                archive_state,
+            )? {
                 targets.push(target);
             }
         }
@@ -884,7 +899,7 @@ pub fn reconcile_released_reservation(
     {
         return Err("disk pressure defers targeted reservation archive repair".into());
     }
-    let _write_activity =
+    let write_activity =
         mcp_agent_mail_db::write_barrier::try_begin_write_activity().ok_or_else(|| {
             "reservation reconciliation deferred: recovery promotion or admission contention"
                 .to_string()
@@ -917,17 +932,39 @@ pub fn reconcile_released_reservation(
         || (source.artifact["exclusive"].as_bool().map(i64::from) != Some(reservation.exclusive)
             && source_revision <= reservation.revision)
     {
-        return Err("captured release identity or generation changed; archive preserved".into());
+        let result = Err(ReleaseFailure::from(
+            "captured release identity or generation changed; archive preserved",
+        ));
+        drop(write_activity);
+        log_release_decision(&source, &ReservationArchiveState::default(), &result);
+        return result.map_err(|error| error.to_string());
     }
-    publish_release(
+    let mut archive_state = ReservationArchiveState::default();
+    let result = publish_release(
         cx,
         pool,
         config,
         &source,
         ReleaseTargets::StableOnly,
         &mut false,
-    )
-    .map_err(|error| error.to_string())
+        &mut archive_state,
+    );
+    drop(write_activity);
+    log_release_decision(&source, &archive_state, &result);
+    result.map_err(|error| error.to_string())
+}
+
+fn log_release_decision(
+    source: &ReleaseSource,
+    archive_state: &ReservationArchiveState,
+    result: &Result<bool, ReleaseFailure>,
+) {
+    tracing::info!(target: "maintenance", event = "reservation_release_reconcile",
+        reservation_id = source.id, project = %source.project_slug,
+        generation = ?source.generation, db_state = "released",
+        archive_state = ?archive_state,
+        action = "verify_terminal_release", outcome = ?result,
+        "reservation archive release reconciliation decision");
 }
 
 /// Repair terminal releases without client reads or reservation mutations.
@@ -1107,6 +1144,7 @@ mod tests {
                     &source,
                     ReleaseTargets::WithOwnedAliases,
                     &mut false,
+                    &mut ReservationArchiveState::default(),
                 )
             });
             let pending = pending_rx.recv_timeout(std::time::Duration::from_secs(5));
@@ -1756,6 +1794,7 @@ mod tests {
                     &source,
                     ReleaseTargets::WithOwnedAliases,
                     &mut false,
+                    &mut ReservationArchiveState::default(),
                 )
                 .unwrap_err()
                 .to_string()

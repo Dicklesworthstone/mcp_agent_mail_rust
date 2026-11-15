@@ -558,6 +558,56 @@ fn probe_release_guard(root: &Path, blocked: bool) {
     );
 }
 
+#[derive(Clone, Default)]
+struct ReservationDecisionEvents(std::sync::Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>);
+
+impl tracing::Subscriber for ReservationDecisionEvents {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "maintenance"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        static NEXT_SPAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        tracing::span::Id::from_u64(NEXT_SPAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+        let mut fields = Fields(BTreeMap::new());
+        event.record(&mut fields);
+        if fields.0.get("event").is_some_and(|name| {
+            matches!(
+                name.as_str(),
+                "reservation_release_reconcile" | "active_reservation_reconcile"
+            )
+        }) {
+            fields.0.insert(
+                "observed_active_writers".to_string(),
+                mcp_agent_mail_db::write_barrier::active_writer_count().to_string(),
+            );
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn reservation_release_background_repair_survives_reopen_without_client_reads() {
@@ -590,6 +640,10 @@ fn reservation_release_background_repair_survives_reopen_without_client_reads() 
         return;
     }
 
+    // Observe real production events without substituting source, archive or
+    // Git results. The child keeps the subscriber and mailbox private.
+    let decisions = ReservationDecisionEvents::default();
+    let _subscriber = tracing::subscriber::set_default(decisions.clone());
     mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
@@ -634,6 +688,40 @@ fn reservation_release_background_repair_survives_reopen_without_client_reads() 
         let archive = mcp_agent_mail_storage::ensure_archive(&config, "project").unwrap();
         mcp_agent_mail_storage::write_file_reservation_records(&archive, &config, &active).unwrap();
         mcp_agent_mail_storage::flush_async_commits();
+        let active_target = archive
+            .root
+            .join("file_reservations")
+            .join(reservation_artifact_filename(Some("aabb"), 401));
+        std::fs::rename(
+            &active_target,
+            temp.path().join("retained-active-before-repair.json"),
+        )
+        .unwrap();
+        let repaired_active = mcp_agent_mail_storage::recovery::active_reservations::reconcile_active_reservations(
+            &cx,
+            &pool,
+            &config,
+            &mut mcp_agent_mail_storage::recovery::active_reservations::ActiveReservationCursor::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(repaired_active.repaired, 1, "{repaired_active:?}");
+        assert_eq!(repaired_active.deferred, 0, "{repaired_active:?}");
+        let healed_active: Value =
+            serde_json::from_slice(&std::fs::read(&active_target).unwrap()).unwrap();
+        assert_eq!(healed_active["id"], 401);
+        assert_eq!(healed_active["path_pattern"], "src/401.rs");
+        assert!(healed_active["released_ts"].is_null());
+        let healthy_active = mcp_agent_mail_storage::recovery::active_reservations::reconcile_active_reservations(
+            &cx,
+            &pool,
+            &config,
+            &mut mcp_agent_mail_storage::recovery::active_reservations::ActiveReservationCursor::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(healthy_active.repaired, 0, "{healthy_active:?}");
+        assert_eq!(healthy_active.unchanged, 16, "{healthy_active:?}");
         let ids = (401..417).collect::<Vec<_>>();
         let released = block_on(mcp_agent_mail_db::queries::release_reservations_by_ids(
             &cx, &pool, &ids,
@@ -728,6 +816,164 @@ fn reservation_release_background_repair_survives_reopen_without_client_reads() 
             ),
             16
         );
+        drop(conn);
+
+        let unchanged = reconcile_reservation_releases(
+            &cx,
+            &reopened,
+            &config,
+            &mut ReservationReconcileCursor::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(unchanged.repaired, 0, "{unchanged:?}");
+        assert_eq!(unchanged.unchanged, 16, "{unchanged:?}");
+
+        let Outcome::Ok(mut captured) = block_on(
+            mcp_agent_mail_db::queries::get_reservations_by_ids(&cx, &reopened, &[401]),
+        ) else {
+            panic!("read the actual targeted-release source")
+        };
+        assert_eq!(captured.len(), 1);
+        let captured = captured.pop().unwrap();
+        let events_before_targeted = decisions.0.lock().unwrap().len();
+        assert!(
+            !mcp_agent_mail_storage::recovery::reservation_reconcile::reconcile_released_reservation(
+                &cx,
+                &reopened,
+                &config,
+                &captured,
+                "aabb",
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            decisions.0.lock().unwrap().len(),
+            events_before_targeted + 1
+        );
+        let before_refusal = std::fs::read(&stable).unwrap();
+        assert!(
+            mcp_agent_mail_storage::recovery::reservation_reconcile::reconcile_released_reservation(
+                &cx,
+                &reopened,
+                &config,
+                &captured,
+                "ffff",
+            )
+            .unwrap_err()
+            .contains("captured release identity or generation changed")
+        );
+        assert_eq!(std::fs::read(&stable).unwrap(), before_refusal);
+        assert_eq!(
+            decisions.0.lock().unwrap().len(),
+            events_before_targeted + 2
+        );
+
+        // Preserve a real conflicting identity after the positive guard/parity
+        // assertions. No repair may overwrite it or report committed success.
+        let mut conflicting = released_records[0].clone();
+        conflicting["path_pattern"] = serde_json::json!("foreign/keep.rs");
+        let conflicting_bytes = serde_json::to_vec_pretty(&conflicting).unwrap();
+        std::fs::write(&stable, &conflicting_bytes).unwrap();
+        let refused = reconcile_reservation_releases(
+            &cx,
+            &reopened,
+            &config,
+            &mut ReservationReconcileCursor::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(refused.repaired, 0, "{refused:?}");
+        assert_eq!(refused.deferred, 1, "{refused:?}");
+        assert_eq!(std::fs::read(&stable).unwrap(), conflicting_bytes);
+
+        let events = decisions.0.lock().unwrap().clone();
+        assert!(
+            events.iter().all(|event| {
+                event.get("observed_active_writers").map(String::as_str) == Some("0")
+            }),
+            "diagnostics must not prolong database write admission: {events:?}"
+        );
+        let repaired_ids = events
+            .iter()
+            .filter(|event| {
+                event.get("event").map(String::as_str) == Some("reservation_release_reconcile")
+                    && event
+                        .get("outcome")
+                        .is_some_and(|value| value == "Ok(true)")
+            })
+            .map(|event| {
+                assert_eq!(event.get("project").map(String::as_str), Some("project"));
+                assert_eq!(event.get("db_state").map(String::as_str), Some("released"));
+                assert_eq!(
+                    event.get("generation").map(String::as_str),
+                    Some("Some(\"aabb\")")
+                );
+                assert_eq!(
+                    event.get("action").map(String::as_str),
+                    Some("verify_terminal_release")
+                );
+                let state = event.get("archive_state").expect("observed archive state");
+                assert!(state.contains("working: \"active\""), "{event:?}");
+                event["reservation_id"].parse::<i64>().unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(repaired_ids, (401..417).collect());
+        assert!(events.iter().any(|event| {
+            event
+                .get("outcome")
+                .is_some_and(|value| value == "Ok(false)")
+                && event
+                    .get("archive_state")
+                    .is_some_and(|state| state.contains("working: \"released\""))
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("reservation_id").map(String::as_str) == Some("401")
+                && event.get("outcome").is_some_and(|value| {
+                    value.contains("captured release identity or generation changed")
+                })
+                && event
+                    .get("archive_state")
+                    .is_some_and(|state| state.contains("working: \"not_observed\""))
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("reservation_id").is_some_and(|id| id == "401")
+                && event
+                    .get("outcome")
+                    .is_some_and(|value| value.contains("path_pattern conflicts"))
+                && event
+                    .get("archive_state")
+                    .is_some_and(|state| state.contains("working: \"released\""))
+        }));
+        let active_ids = events
+            .iter()
+            .filter(|event| {
+                event.get("event").map(String::as_str) == Some("active_reservation_reconcile")
+                    && event.get("outcome").map(String::as_str) == Some("Ok(false)")
+            })
+            .map(|event| {
+                assert_eq!(event.get("project").map(String::as_str), Some("project"));
+                assert_eq!(event.get("db_state").map(String::as_str), Some("active"));
+                assert_eq!(event.get("generation").map(String::as_str), Some("aabb"));
+                assert_eq!(event.get("outcome").map(String::as_str), Some("Ok(false)"));
+                assert_eq!(
+                    event.get("action").map(String::as_str),
+                    Some("verify_active_reservation")
+                );
+                assert!(event["archive_state"].contains("working: \"active\""));
+                event["reservation_id"].parse::<i64>().unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(active_ids, (401..417).collect());
+        assert!(events.iter().any(|event| {
+            event.get("event").map(String::as_str) == Some("active_reservation_reconcile")
+                && event.get("reservation_id").map(String::as_str) == Some("401")
+                && event.get("outcome").map(String::as_str) == Some("Ok(true)")
+                && event.get("archive_state").is_some_and(|state| {
+                    state.contains("working: \"missing\"")
+                        && state.contains("committed: \"active\"")
+                })
+        }));
     });
     println!("reservation-release-reopen-executed");
 }

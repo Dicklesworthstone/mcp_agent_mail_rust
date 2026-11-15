@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::agent_reconcile::{committed_artifact, head_tree, read_artifact};
+use super::{ReservationArchiveState, reservation_artifact_state};
 use retry::RetryQueue;
 
 const IDS_PER_PASS: i64 = 32;
@@ -526,6 +527,7 @@ fn repair_one(
     original: &Source,
     attempted: &mut bool,
     stop: &AtomicBool,
+    archive_state: &mut ReservationArchiveState,
 ) -> Result<bool, RepairFailure> {
     checkpoint(cx, stop)?;
     // An exhausted pool may be owned by a borrower that needs this archive
@@ -597,7 +599,9 @@ fn repair_one(
             ));
         let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path)?;
         let working = read_artifact(&path)?;
+        archive_state.working = reservation_artifact_state(working.as_ref().map(|a| &a.value));
         let committed = committed_artifact(&repo, tree.as_ref(), &relative)?;
+        archive_state.committed = reservation_artifact_state(committed.as_ref().map(|a| &a.value));
         for artifact in [working.as_ref(), committed.as_ref()].into_iter().flatten() {
             validate_evidence(original, &artifact.value)?;
         }
@@ -951,13 +955,44 @@ pub fn reconcile_active_reservations(
             );
         }
         let mut attempted = false;
-        let result = read_source(cx, pool, id).and_then(|source| {
-            source.map_or(Ok(false), |source| {
-                repair_one(cx, pool, config, &source, &mut attempted, stop)
-            })
-        });
+        let mut archive_state = ReservationArchiveState::default();
+        let (source, result) = match read_source(cx, pool, id) {
+            Ok(Some(source)) => {
+                let result = repair_one(
+                    cx,
+                    pool,
+                    config,
+                    &source,
+                    &mut attempted,
+                    stop,
+                    &mut archive_state,
+                );
+                (Some(source), result)
+            }
+            Ok(None) => (None, Ok(false)),
+            Err(error) => (None, Err(error)),
+        };
         // Do not retain source/promotion authority across outer diagnostics.
         drop(activity);
+        if let Some(source) = source {
+            tracing::info!(target: "maintenance", event = "active_reservation_reconcile",
+                reservation_id = source.id, project = %source.slug,
+                generation = %source.generation, db_state = "active",
+                archive_state = ?archive_state,
+                action = "verify_active_reservation", outcome = ?result,
+                "active reservation archive reconciliation decision");
+        } else {
+            super::log_reservation_source_decision(
+                id,
+                if result.is_err() {
+                    "unavailable"
+                } else {
+                    "not_active"
+                },
+                "verify_active_reservation",
+                &result,
+            );
+        }
         report.attempted += usize::from(attempted);
         if checkpoint(cx, stop).is_err() {
             report.interrupted = true;
@@ -1107,6 +1142,7 @@ mod tests {
                     &source,
                     &mut attempted,
                     &worker_stop,
+                    &mut ReservationArchiveState::default(),
                 );
                 (result, attempted)
             });
@@ -1512,6 +1548,7 @@ mod tests {
                         &source,
                         &mut attempted,
                         &AtomicBool::new(false),
+                        &mut ReservationArchiveState::default(),
                     )
                     .unwrap_err()
                 } else {
@@ -1677,7 +1714,8 @@ mod tests {
                         config,
                         &captured,
                         &mut attempted,
-                        &AtomicBool::new(false)
+                        &AtomicBool::new(false),
+                        &mut ReservationArchiveState::default(),
                     )
                     .is_err()
                 );
@@ -2136,7 +2174,15 @@ mod tests {
                     }));
                 });
                 let mut attempted = false;
-                let result = repair_one(cx, pool, config, &source, &mut attempted, &stop);
+                let result = repair_one(
+                    cx,
+                    pool,
+                    config,
+                    &source,
+                    &mut attempted,
+                    &stop,
+                    &mut ReservationArchiveState::default(),
+                );
                 assert!(
                     result.is_err(),
                     "stale renewal published after {change}: {result:?}"
