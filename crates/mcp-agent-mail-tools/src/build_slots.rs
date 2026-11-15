@@ -173,6 +173,7 @@ fn compute_branch(repo_path: &str) -> Option<String> {
     head.shorthand().ok().map(str::to_string)
 }
 
+#[cfg(test)]
 fn read_active_leases(
     slot_path: &Path,
     now: chrono::DateTime<chrono::Utc>,
@@ -546,8 +547,13 @@ fn acquire_slot_lease(
     let slot_lock = try_lock_slot(slot_path, true)?
         .ok_or_else(|| std::io::Error::other("build slot directory was not created"))?;
     let now = chrono::Utc::now();
-    let active = read_active_leases(slot_path, now)?;
-    let conflicts = collect_slot_conflicts(active, agent_name, branch.as_deref(), is_exclusive);
+    let active = read_active_lease_entries(slot_path, now)?;
+    let conflicts = collect_slot_conflicts(
+        active.iter().map(|entry| entry.lease.clone()).collect(),
+        agent_name,
+        branch.as_deref(),
+        is_exclusive,
+    );
     let lease_path = resolve_holder_lease_path(slot_path, agent_name, branch.as_deref())?;
     let granted = BuildSlotLease {
         slot: slot.to_string(),
@@ -560,6 +566,22 @@ fn acquire_slot_lease(
     };
     slot_lock.validate()?;
     write_lease_json(&lease_path, &granted)?;
+    // Branch-keyed versions could leave several files for one logical holder.
+    // Reacquiring replaces that holder's mode and expiry, so an older exclusive
+    // alias must not continue conflicting after a successful shared acquisition.
+    // Publish the replacement first: an interrupted cleanup keeps conservative
+    // coverage, returns an error, and a retry can finish the remaining aliases.
+    for mut entry in active {
+        if entry.path == lease_path
+            || !lease_matches_holder(&entry.lease, agent_name, granted.branch.as_deref())
+            || entry.lease.released_ts.is_some()
+        {
+            continue;
+        }
+        entry.lease.released_ts = Some(granted.acquired_ts.clone());
+        slot_lock.validate()?;
+        write_lease_json(&entry.path, &entry.lease)?;
+    }
     slot_lock.validate()?;
     Ok(AcquireBuildSlotResponse { granted, conflicts })
 }
@@ -1902,6 +1924,132 @@ mod tests {
 
     fn stored_lease(path: &Path) -> BuildSlotLease {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn reacquisition_replaces_every_active_alias_with_one_current_holder() {
+        for branch in ["one", "new-branch"] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = legacy_lease_path_for_holder(dir.path(), "BlueLake", Some("one"));
+            let second = legacy_lease_path_for_holder(dir.path(), "BlueLake", Some("two"));
+            write_lease_json(&first, &make_lease("BlueLake", Some("one"), true)).unwrap();
+            write_lease_json(&second, &make_lease("BlueLake", Some("two"), true)).unwrap();
+            let expired_path = dir.path().join("expired.json");
+            let mut expired = make_lease("BlueLake", Some("expired"), true);
+            expired.expires_ts =
+                (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+            write_lease_json(&expired_path, &expired).unwrap();
+            let released_path = dir.path().join("released.json");
+            let mut released = make_lease("BlueLake", Some("released"), true);
+            released.released_ts = Some("2000-01-01T00:00:00+00:00".into());
+            write_lease_json(&released_path, &released).unwrap();
+            let peer_path = dir.path().join("peer.json");
+            write_lease_json(&peer_path, &make_lease("RedStone", None, false)).unwrap();
+            let preserved: Vec<_> = [&expired_path, &released_path, &peer_path]
+                .into_iter()
+                .map(|path| (path, std::fs::read(path).unwrap()))
+                .collect();
+
+            let result = acquire_slot_lease(
+                dir.path(),
+                "slot-a",
+                "BlueLake",
+                Some(branch.into()),
+                60,
+                false,
+            )
+            .unwrap();
+
+            assert!(result.conflicts.is_empty());
+            let selected = if branch == "one" {
+                first.clone()
+            } else {
+                lease_path_for_holder(dir.path(), "BlueLake", None)
+            };
+            let current = stored_lease(&selected);
+            assert!(!current.exclusive);
+            assert_eq!(current.branch.as_deref(), Some(branch));
+            assert_eq!(current.expires_ts, result.granted.expires_ts);
+            assert!(current.released_ts.is_none());
+            for path in [&first, &second] {
+                if path != &selected {
+                    let alias = stored_lease(path);
+                    assert!(alias.exclusive, "retain the superseded lease's history");
+                    assert_eq!(alias.released_ts, Some(result.granted.acquired_ts.clone()));
+                }
+            }
+            for (path, bytes) in preserved {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+            let next =
+                acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, false)
+                    .unwrap();
+            assert!(
+                next.conflicts.is_empty(),
+                "superseded exclusive aliases must not block a shared peer"
+            );
+
+            // The new lease remains authoritative if the same holder switches
+            // back to exclusive; only one current conflict may be reported.
+            acquire_slot_lease(
+                dir.path(),
+                "slot-a",
+                "BlueLake",
+                Some("another-branch".into()),
+                3600,
+                true,
+            )
+            .unwrap();
+            let next =
+                acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, false)
+                    .unwrap();
+            assert_eq!(next.conflicts.len(), 1);
+            assert_eq!(next.conflicts[0].agent, "BlueLake");
+            assert_eq!(next.conflicts[0].branch.as_deref(), Some("another-branch"));
+        }
+    }
+
+    #[test]
+    fn reacquisition_preserves_aliases_when_inventory_or_destination_is_invalid() {
+        for invalid in ["inventory", "destination"] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = dir.path().join("one.json");
+            let second = dir.path().join("two.json");
+            write_lease_json(&first, &make_lease("BlueLake", Some("one"), true)).unwrap();
+            write_lease_json(&second, &make_lease("BlueLake", Some("two"), true)).unwrap();
+            let destination = lease_path_for_holder(dir.path(), "BlueLake", None);
+            let obstacle = if invalid == "inventory" {
+                let path = dir.path().join("invalid.json");
+                std::fs::write(&path, "{ interrupted lease").unwrap();
+                path
+            } else {
+                write_lease_json(&destination, &make_lease("GreenPeak", None, true)).unwrap();
+                destination.clone()
+            };
+            let preserved: Vec<_> = [&first, &second, &obstacle]
+                .into_iter()
+                .map(|path| (path, std::fs::read(path).unwrap()))
+                .collect();
+
+            let error = acquire_slot_lease(
+                dir.path(),
+                "slot-a",
+                "BlueLake",
+                Some("new-branch".into()),
+                3600,
+                false,
+            )
+            .unwrap_err();
+
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            for (path, bytes) in preserved {
+                assert_eq!(std::fs::read(path).unwrap(), bytes, "case {invalid}");
+            }
+            if invalid == "inventory" {
+                assert!(!destination.exists());
+            }
+            let _lock = try_lock_slot(dir.path(), false).unwrap().unwrap();
+        }
     }
 
     #[test]
