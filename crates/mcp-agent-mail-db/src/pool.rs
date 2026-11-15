@@ -18824,12 +18824,20 @@ fn verify_recovery_candidate_identity_at(
         // would erase this process's classic POSIX locks on that generation.
         // The retained candidate descriptor prevents inode recycling.
         let expected = fstat(candidate_identity.as_file()).map_err(|error| {
-            SqlError::Custom(format!("{context}: cannot inspect retained candidate identity: {error}"))
+            SqlError::Custom(format!(
+                "{context}: cannot inspect retained candidate identity: {error}"
+            ))
         })?;
-        let observed = statat(&anchor.parent_dir, &anchor.file_name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|error| {
-                SqlError::Custom(format!("{context}: cannot inspect live candidate identity: {error}"))
-            })?;
+        let observed = statat(
+            &anchor.parent_dir,
+            &anchor.file_name,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: cannot inspect live candidate identity: {error}"
+            ))
+        })?;
         if FileType::from_raw_mode(observed.st_mode) != FileType::RegularFile
             || observed.st_nlink != 1
             || !AnchoredRecoveryParent::same_inode(&expected, &observed)
@@ -18843,10 +18851,17 @@ fn verify_recovery_candidate_identity_at(
     #[cfg(not(unix))]
     {
         let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&anchor.target_path)
-            .map_err(|error| SqlError::Custom(format!("{context}: cannot inspect live candidate identity: {error}")))?;
-        let observed = same_file::Handle::from_file(file)
-            .map_err(|error| SqlError::Custom(format!("{context}: cannot identify live candidate: {error}")))?;
-        if &observed != candidate_identity {
+            .map_err(|error| {
+                SqlError::Custom(format!(
+                    "{context}: cannot inspect live candidate identity: {error}"
+                ))
+            })?;
+        let observed = same_file::Handle::from_file(file).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: cannot identify live candidate: {error}"
+            ))
+        })?;
+        if &observed != candidate_identity || recovery_file_link_count(observed.as_file())? != 1 {
             return Err(SqlError::Custom(format!(
                 "{context}: {} no longer matches the retained recovery candidate identity",
                 anchor.target_path.display()
@@ -18932,8 +18947,9 @@ fn rollback_recovery_candidate_promotion(
         rename(&activated_anchor, candidate_anchor, context)?;
         // NOREPLACE does not pin the source leaf. Verify the actual moved
         // generation before touching the original family or aborting intent.
-        let verified = verify_recovery_candidate_identity_at(candidate_anchor, candidate_identity, context)
-            .and_then(|()| primary_anchor.verify_parent_only(context));
+        let verified =
+            verify_recovery_candidate_identity_at(candidate_anchor, candidate_identity, context)
+                .and_then(|()| primary_anchor.verify_parent_only(context));
         if let Err(error) = verified {
             let restored = rename(
                 candidate_anchor,
@@ -19525,13 +19541,16 @@ where
     };
     let receipt_committed = match &finalization {
         Ok(()) => true,
-        Err(error) => error.publication_stage()
-            != crate::forensics::RecoveryReceiptPublicationStage::BeforeMarkerMove,
+        Err(error) => {
+            error.publication_stage()
+                != crate::forensics::RecoveryReceiptPublicationStage::BeforeMarkerMove
+        }
     };
     if receipt_committed && let Err(mut failure) = verify_committed_identity() {
         if let Err(error) = &finalization {
             failure.error = SqlError::Custom(format!(
-                "{}; receipt finalization also failed: {error}", failure.error
+                "{}; receipt finalization also failed: {error}",
+                failure.error
             ));
         }
         return Err(failure);
