@@ -2,6 +2,9 @@
 
 ## Current operational reliability improvements
 
+- [x] Make glob reservation discovery lazy and bounded without hashing tracked
+  file contents; honor Git ignore rules and preserve unknown activity for partial
+  scans, nested repositories, and submodules before force-release decisions.
 - [x] Keep descriptor-floor monitoring safe during declining counts, sampler
   restarts, and missed windows; use observed minima timestamps for growth and
   expose a conditional soft-limit exhaustion estimate in health and logs.

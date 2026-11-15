@@ -15,7 +15,7 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{DbError, iso_to_micros, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
@@ -5471,22 +5471,25 @@ fn reservation_literal_fs_activity(
     (true, fs_latest, incomplete || !keep_going())
 }
 
-/// Upper bound on untracked/modified status entries collected once per
-/// listing request (tracked entries come from the index and are not capped).
-const RESERVATION_STATUS_LISTING_MAX: usize = 100_000;
+/// Bound work while discovering untracked paths, including directories and
+/// ignored entries. Limiting an already-built Git status list is too late.
+const RESERVATION_WORKTREE_ENTRY_BUDGET: usize = 100_000;
 
 /// Repository paths (relative to the repo root) that a glob reservation can
-/// match: every index entry plus untracked/modified, non-ignored files.
+/// match: every index entry plus untracked, non-ignored files.
 ///
 /// GH #337: built once per `file_reservations` read and shared by every glob
-/// pattern, instead of one index scan and one full `statuses()` walk of the
-/// working tree per pattern.
+/// pattern. GH #385: discover worktree paths lazily, checking the request
+/// budget before each entry instead of building an eager `statuses()` list.
+/// Status also hashes tracked files with stale stat information; neither
+/// contents nor a diff are needed to inspect their modification times.
 fn reservation_repo_candidate_paths(
     repo: &git2::Repository,
     keep_going: &mut dyn FnMut() -> bool,
 ) -> (Vec<String>, bool) {
     let mut paths = Vec::new();
     let mut incomplete = false;
+    let mut tracked = HashSet::new();
     if !keep_going() {
         return (paths, true);
     }
@@ -5497,6 +5500,10 @@ fn reservation_repo_candidate_paths(
             }
             if let Ok(rel) = std::str::from_utf8(&entry.path) {
                 paths.push(rel.to_string());
+                tracked.insert(rel.to_string());
+                // A gitlink represents an opaque worktree. Its root mtime
+                // does not reveal edits to files inside the submodule.
+                incomplete |= entry.mode == 0o160_000;
             } else {
                 incomplete = true;
             }
@@ -5507,29 +5514,117 @@ fn reservation_repo_candidate_paths(
     if !keep_going() {
         return (paths, true);
     }
-    let mut status_opts = git2::StatusOptions::new();
-    status_opts
-        .include_untracked(true)
-        .include_ignored(false)
-        .recurse_untracked_dirs(true)
-        .include_unmodified(false);
-    if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
-        incomplete |= statuses.len() > RESERVATION_STATUS_LISTING_MAX;
-        for entry in statuses.iter().take(RESERVATION_STATUS_LISTING_MAX) {
-            if !keep_going() {
+    incomplete |= reservation_untracked_candidate_paths(
+        repo,
+        &tracked,
+        &mut paths,
+        RESERVATION_WORKTREE_ENTRY_BUDGET,
+        keep_going,
+    );
+    (paths, incomplete)
+}
+
+/// Discover paths without hashing tracked file contents. The index supplies
+/// every tracked path, including ignored tracked files and submodules. Native
+/// Git ignore checks preserve repository, per-directory, and global excludes.
+/// Any refused or unfinished inspection remains unknown to force-release.
+fn reservation_untracked_candidate_paths(
+    repo: &git2::Repository,
+    tracked: &HashSet<String>,
+    paths: &mut Vec<String>,
+    entry_budget: usize,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> bool {
+    if !keep_going() {
+        return true;
+    }
+    let Some(root) = repo.workdir() else {
+        return true;
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return true;
+    };
+    let mut stack = vec![entries];
+    let mut visited = 0usize;
+    let mut incomplete = false;
+    while let Some(entries) = stack.last_mut() {
+        // Check before advancing ReadDir: reaching a cap cannot trigger a
+        // subsequent entry read or descend into another directory.
+        if visited >= entry_budget || !keep_going() {
+            return true;
+        }
+        let Some(entry) = entries.next() else {
+            stack.pop();
+            continue;
+        };
+        visited += 1;
+        let Ok(entry) = entry else {
+            incomplete = true;
+            continue;
+        };
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(root) else {
+            incomplete = true;
+            continue;
+        };
+        let Some(relative) = relative.to_str() else {
+            incomplete = true;
+            continue;
+        };
+        #[cfg(windows)]
+        let relative = relative.replace('\\', "/");
+        #[cfg(not(windows))]
+        let relative = relative.to_string();
+        if tracked.contains(&relative) {
+            continue;
+        }
+        match repo.status_should_ignore(Path::new(&relative)) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => {
                 incomplete = true;
-                break;
-            }
-            if let Ok(rel) = entry.path() {
-                paths.push(rel.to_string());
-            } else {
-                incomplete = true;
+                continue;
             }
         }
-    } else {
-        incomplete = true;
+        if !keep_going() {
+            return true;
+        }
+        let Ok(kind) = entry.file_type() else {
+            incomplete = true;
+            continue;
+        };
+        if kind.is_dir() {
+            // Git reports untracked nested repositories as one directory.
+            // Do not inspect another repository's metadata or silently use
+            // just its directory mtime as proof that its contents are quiet.
+            match std::fs::symlink_metadata(path.join(".git")) {
+                Ok(_) => {
+                    paths.push(format!("{relative}/"));
+                    incomplete = true;
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    incomplete = true;
+                    continue;
+                }
+            }
+            match std::fs::read_dir(&path) {
+                Ok(entries) => stack.push(entries),
+                Err(_) => incomplete = true,
+            }
+        } else if kind.is_file() || kind.is_symlink() {
+            // Retain symlink names for the existing no-follow metadata probe,
+            // which marks their activity unknown without following the link.
+            paths.push(relative);
+        } else {
+            incomplete = true;
+        }
     }
-    (paths, incomplete)
+    incomplete
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -6011,6 +6106,242 @@ mod reservation_activity_tests {
             assert!(ctx.ensure_live().is_ok());
             assert!(!ctx.cx().is_cancel_requested());
         });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reservation_candidate_inventory_does_not_read_tracked_file_contents() {
+        fn thread_read_chars() -> u64 {
+            std::fs::read_to_string("/proc/thread-self/io")
+                .expect("read current thread I/O counters")
+                .lines()
+                .find_map(|line| line.strip_prefix("rchar: "))
+                .expect("rchar counter")
+                .parse()
+                .expect("numeric rchar counter")
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = reservation_scan_repo(root);
+        let file = std::fs::File::create(root.join("large.bin")).expect("create sparse file");
+        file.set_len(16 * 1024 * 1024).expect("size sparse file");
+        run_git(root, &["add", "large.bin"]);
+        // Identical bytes with different stat information force a Git status
+        // diff to read/hash the entire file. Reservation activity only needs
+        // the path and mtime, even when the file is much larger than its budget.
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+        )
+        .expect("invalidate index stat information");
+
+        let before = thread_read_chars();
+        let (paths, incomplete) = reservation_repo_candidate_paths(&repo, &mut || true);
+        let read_chars = thread_read_chars().saturating_sub(before);
+
+        assert!(!incomplete);
+        assert!(paths.iter().any(|path| path == "large.bin"));
+        assert!(
+            read_chars < 1024 * 1024,
+            "metadata inventory must not read the 16 MiB tracked payload: read {read_chars} bytes"
+        );
+    }
+
+    #[test]
+    fn reservation_candidate_inventory_preserves_git_ignore_and_tracked_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root).expect("create workspace");
+        let repo = reservation_scan_repo(&root);
+        for directory in ["ignored", "src", "untracked/deep"] {
+            std::fs::create_dir_all(root.join(directory)).expect("create directory");
+        }
+        for path in [
+            "tracked.rs",
+            "ignored/tracked.rs",
+            "ignored/untracked.rs",
+            "src/kept.rs",
+            "src/local.log",
+            "from-info.txt",
+            "from-global.txt",
+            "untracked/deep/new.rs",
+        ] {
+            std::fs::write(root.join(path), path).expect("write fixture");
+        }
+        std::fs::write(root.join(".gitignore"), "ignored/\n").expect("repository ignores");
+        std::fs::write(root.join("src/.gitignore"), "*.log\n").expect("nested ignores");
+        std::fs::write(repo.path().join("info/exclude"), "from-info.txt\n").expect("local excludes");
+        let global = tmp.path().join("global-excludes");
+        std::fs::write(&global, "from-global.txt\n").expect("global excludes");
+        repo.config()
+            .expect("repository config")
+            .set_str("core.excludesFile", global.to_str().expect("fixture path"))
+            .expect("configure global excludes");
+        run_git(&root, &["add", "tracked.rs"]);
+        run_git(&root, &["add", "-f", "ignored/tracked.rs"]);
+        // Tracked paths stay candidates independently of their current Git
+        // status or ignore rules. Contents are irrelevant to the inventory.
+        std::fs::write(root.join("tracked.rs"), "modified\n").expect("modify tracked file");
+
+        let (paths, incomplete) = reservation_repo_candidate_paths(&repo, &mut || true);
+        let actual: std::collections::BTreeSet<_> = paths.into_iter().collect();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["ls-files", "-c", "-o", "--exclude-standard"])
+            .output()
+            .expect("query real Git path inventory");
+        assert!(output.status.success());
+        let expected: std::collections::BTreeSet<_> = String::from_utf8(output.stdout)
+            .expect("UTF-8 fixture paths")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(!incomplete);
+        assert_eq!(actual, expected);
+        assert!(actual.contains("ignored/tracked.rs"));
+        assert!(actual.contains("untracked/deep/new.rs"));
+        assert!(!actual.contains("ignored/untracked.rs"));
+        assert!(!actual.contains("src/local.log"));
+        assert!(!actual.contains("from-info.txt"));
+        assert!(!actual.contains("from-global.txt"));
+        assert!(actual.iter().all(|path| !path.starts_with(".git/")));
+    }
+
+    #[test]
+    fn reservation_untracked_inventory_stops_on_entry_budget_and_cancellation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        for index in 0..32 {
+            std::fs::write(tmp.path().join(format!("untracked-{index}.rs")), "x\n")
+                .expect("write untracked file");
+        }
+        let tracked = HashSet::new();
+        let mut paths = Vec::new();
+        assert!(reservation_untracked_candidate_paths(
+            &repo,
+            &tracked,
+            &mut paths,
+            4,
+            &mut || true,
+        ));
+        assert!(paths.len() <= 4, "entry budget must bound discovery itself");
+
+        paths.clear();
+        let mut checkpoints = 0;
+        assert!(reservation_untracked_candidate_paths(
+            &repo,
+            &tracked,
+            &mut paths,
+            usize::MAX,
+            &mut || {
+                checkpoints += 1;
+                checkpoints < 5
+            },
+        ));
+        assert_eq!(checkpoints, 5, "no work starts after cancellation");
+        assert!(paths.len() < 32);
+
+        paths.clear();
+        assert!(!reservation_untracked_candidate_paths(
+            &repo,
+            &tracked,
+            &mut paths,
+            64,
+            &mut || true,
+        ));
+        assert_eq!(paths.len(), 32, "a later read can finish the inventory");
+    }
+
+    #[test]
+    fn reservation_untracked_nested_repository_cannot_prove_inactivity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).expect("create nested workspace");
+        let _nested_repo = reservation_scan_repo(&nested);
+        std::fs::write(nested.join("active.rs"), "new work\n").expect("nested work");
+
+        let (paths, incomplete) = reservation_repo_candidate_paths(&repo, &mut || true);
+
+        assert_eq!(paths, vec!["nested/".to_string()]);
+        assert!(
+            incomplete,
+            "a nested repository's root mtime cannot prove its contents are quiet"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reservation_glob_activity_preserves_literal_backslashes_in_unix_filenames() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = reservation_scan_repo(root);
+        let old = std::fs::File::create(root.join("old.rs")).expect("create stale tracked file");
+        old.set_times(
+            std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+        )
+        .expect("old tracked mtime");
+        run_git(root, &["add", "old.rs"]);
+        let recent = std::fs::File::create(root.join("recent\\edit.rs"))
+            .expect("create literal backslash filename");
+        recent
+            .set_times(
+                std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_100)),
+            )
+            .expect("more recent untracked mtime");
+
+        let (paths, incomplete) = reservation_repo_candidate_paths(&repo, &mut || true);
+        assert!(!incomplete);
+        assert!(paths.iter().any(|path| path == "recent\\edit.rs"));
+        assert!(!paths.iter().any(|path| path == "recent/edit.rs"));
+        let patterns = ["*.rs".to_string()];
+        let activity = reservation_compute_patterns_activity(
+            Some(root),
+            Some(root),
+            Some(Path::new("")),
+            &patterns,
+            i64::MIN,
+            &mut || true,
+        );
+        assert!(activity[&patterns[0]].matches);
+        assert!(!activity[&patterns[0]].fs_activity_incomplete);
+        assert_eq!(
+            activity[&patterns[0]].fs_activity_micros,
+            Some(1_700_000_100_000_000),
+            "a stale tracked match must not hide a more recent literal-backslash path"
+        );
+    }
+
+    #[test]
+    fn reservation_tracked_submodule_cannot_prove_inactivity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).expect("create submodule workspace");
+        let nested_repo = reservation_scan_repo(&nested);
+        std::fs::write(nested.join("active.rs"), "nested work\n").expect("nested work");
+        let mut nested_index = nested_repo.index().expect("submodule index");
+        nested_index
+            .add_path(Path::new("active.rs"))
+            .expect("stage nested work");
+        let tree_id = nested_index.write_tree().expect("nested tree");
+        let tree = nested_repo.find_tree(tree_id).expect("nested tree object");
+        let signature = git2::Signature::now("Test", "test@example.com").expect("signature");
+        nested_repo
+            .commit(Some("HEAD"), &signature, &signature, "nested", &tree, &[])
+            .expect("commit nested work");
+        run_git(tmp.path(), &["add", "nested"]);
+        let index = repo.index().expect("outer index");
+        assert_eq!(
+            index.get_path(Path::new("nested"), 0).expect("gitlink").mode,
+            0o160_000
+        );
+
+        let (paths, incomplete) = reservation_repo_candidate_paths(&repo, &mut || true);
+
+        assert!(paths.iter().any(|path| path == "nested"));
+        assert!(incomplete, "opaque tracked submodule activity is unknown");
     }
 
     #[test]
