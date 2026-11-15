@@ -1098,7 +1098,7 @@ fn open_windows_directory(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(windows)]
-fn pin_windows_parents(path: &Path) -> io::Result<Vec<(PathBuf, File)>> {
+pub(crate) fn pin_windows_parents(path: &Path) -> io::Result<Vec<(PathBuf, File)>> {
     if !path.is_absolute() {
         return Err(invalid("snapshot authority requires an absolute parent"));
     }

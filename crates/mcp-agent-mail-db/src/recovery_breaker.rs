@@ -11,10 +11,9 @@
 //!
 //! This module adds the durable layer: a tiny JSON sidecar next to the
 //! database records consecutive automatic-recovery failures **for the same
-//! database generation** (on Unix, a stable full-content family fingerprint;
-//! other platforms retain the bounded single-file fingerprint). Once the failure
-//! count reaches the threshold the breaker trips, and automatic recovery
-//! refuses fast — BEFORE any forensic capture — until either
+//! database generation** (a stable full-content SQLite family fingerprint).
+//! Once the failure count reaches the threshold the breaker trips, and
+//! automatic recovery refuses fast — BEFORE any forensic capture — until either
 //!
 //! * the cooldown elapses (one half-open attempt is then admitted),
 //! * the database content changes with no unfinished automatic attempt, or
@@ -833,13 +832,13 @@ fn fingerprint_db_with_observer(db_path: &Path, observed: impl FnMut(&Path, u64)
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), test))]
 struct NonUnixFingerprintMember {
     member_path: PathBuf,
     source: Option<(std::fs::File, std::fs::Metadata, same_file::Handle)>,
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), test))]
 fn fingerprint_non_unix_family(
     path: &Path,
     mut observed: impl FnMut(&Path, u64),
@@ -867,6 +866,16 @@ fn fingerprint_non_unix_family(
                 "fingerprint parent is not a directory",
             ));
         }
+    }
+    // Windows pathname opens need every ancestor pinned before selecting
+    // any member. Reuse snapshot publication's no-reparse, deny-delete policy.
+    #[cfg(windows)]
+    let _parents = crate::snapshot::pin_windows_parents(parent_path)?;
+    let parent_identity = same_file::Handle::from_path(parent_path)?;
+    if !parent_identity.as_file().metadata()?.is_dir() {
+        return Err(std::io::Error::other(
+            "fingerprint parent is not a directory",
+        ));
     }
     let mut members = Vec::with_capacity(SUFFIXES.len());
     for suffix in SUFFIXES {
@@ -971,6 +980,13 @@ fn fingerprint_non_unix_family(
                 ));
             }
         }
+    }
+    // Matching member handles alone does not preserve directory authority:
+    // a replacement parent can contain hard links to those exact inodes.
+    if !std::fs::symlink_metadata(parent_path)?.is_dir()
+        || same_file::Handle::from_path(parent_path)? != parent_identity
+    {
+        return Err(std::io::Error::other("fingerprint parent was displaced"));
     }
     if present {
         Ok(format!("family1:{main}:{}", hex::encode(family.finalize())))
@@ -3349,6 +3365,108 @@ mod tests {
             assert_eq!(std::fs::read(breaker_sidecar_path(&db)).unwrap(), before);
         }
         assert_eq!(load(&db).unwrap(), Some(valid));
+    }
+
+    #[test]
+    fn portable_family_fingerprint_preserves_stable_and_missing_controls() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("db");
+        assert_eq!(
+            fingerprint_non_unix_family(&db, |_, _| {}).unwrap(),
+            "missing"
+        );
+        assert_eq!(
+            fingerprint_non_unix_family(&td.path().join("absent").join("db"), |_, _| {}).unwrap(),
+            "missing"
+        );
+
+        let wal = crate::pool::sqlite_path_with_suffix(&db, "-wal");
+        std::fs::write(&wal, b"sidecar evidence").unwrap();
+        let sidecar_only = fingerprint_non_unix_family(&db, |_, _| {}).unwrap();
+        assert!(sidecar_only.starts_with("family1:missing:"));
+        assert_eq!(
+            fingerprint_non_unix_family(&db, |_, _| {}).unwrap(),
+            sidecar_only
+        );
+
+        std::fs::write(&db, b"primary evidence").unwrap();
+        let complete = fingerprint_non_unix_family(&db, |_, _| {}).unwrap();
+        assert_ne!(complete, sidecar_only);
+        assert_eq!(
+            fingerprint_non_unix_family(&db, |_, _| {}).unwrap(),
+            complete
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), b"primary evidence");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"sidecar evidence");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn portable_family_fingerprint_keeps_parent_authority_with_identical_members() {
+        let td = tempfile::tempdir().unwrap();
+        let parent = td.path().join("mailbox");
+        let mirror = td.path().join("replacement");
+        let parked = td.path().join("retained-mailbox");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&mirror).unwrap();
+        let db = parent.join("db");
+        let wal = parent.join("db-wal");
+        std::fs::write(&db, b"primary evidence").unwrap();
+        std::fs::write(&wal, b"sidecar evidence").unwrap();
+        // Plant both links before observation: member identity, link count,
+        // content and timestamps stay unchanged when the directories move.
+        std::fs::hard_link(&db, mirror.join("db")).unwrap();
+        std::fs::hard_link(&wal, mirror.join("db-wal")).unwrap();
+        {
+            // An invalid rename fixture must not masquerade as Windows
+            // authority enforcement. Ordinary member handles allow the move.
+            let _primary = mcp_agent_mail_core::disk::open_regular_file_no_follow(&db).unwrap();
+            let _wal = mcp_agent_mail_core::disk::open_regular_file_no_follow(&wal).unwrap();
+            std::fs::rename(&parent, &parked).expect("rename control with member handles");
+            std::fs::rename(&parked, &parent).expect("restore control parent");
+        }
+        let stable = fingerprint_non_unix_family(&db, |_, _| {}).unwrap();
+
+        let mut attempted = false;
+        let result = fingerprint_non_unix_family(&db, |_, count| {
+            if count != 0 || attempted {
+                return;
+            }
+            attempted = true;
+            let moved = std::fs::rename(&parent, &parked);
+            #[cfg(windows)]
+            assert!(
+                moved.is_err(),
+                "retained Windows parent allowed displacement"
+            );
+            #[cfg(not(windows))]
+            {
+                moved.expect("move observed parent");
+                std::fs::rename(&mirror, &parent).unwrap();
+            }
+        });
+        assert!(attempted);
+        #[cfg(windows)]
+        {
+            assert_eq!(result.unwrap(), stable);
+            assert!(!parked.exists());
+            assert!(mirror.is_dir());
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(result.is_err(), "accepted a displaced parent: {result:?}");
+            assert_eq!(
+                std::fs::read(parked.join("db")).unwrap(),
+                b"primary evidence"
+            );
+            assert_eq!(
+                std::fs::read(parked.join("db-wal")).unwrap(),
+                b"sidecar evidence"
+            );
+        }
+        assert_eq!(std::fs::read(&db).unwrap(), b"primary evidence");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"sidecar evidence");
+        assert_eq!(fingerprint_non_unix_family(&db, |_, _| {}).unwrap(), stable);
     }
 
     #[cfg(unix)]

@@ -1,5 +1,59 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review42 recovery fingerprint parent authority — EmeraldEagle
+
+- [x] Inspect ready Beads and landed implementations; preserve the contact
+  statistics fix's outstanding Mac production check and other original gates.
+- [x] Trace the actual DSR publisher, not disabled Actions. Record the missing
+  strict profile and explicit unavailable RCH-native backend on `br-54v1u`;
+  leave it open without adding an unusable configuration or changing policy.
+- [x] Claim `br-oyget`; reread both family fingerprint paths and their callers.
+  Identify that the non-Unix path never revalidates the parent directory.
+- [x] Add real-filesystem stable controls and a parent-replacement regression
+  that keeps member inodes unchanged through pre-created hard links.
+- [x] Execute the regression against the old algorithm, retaining its positive
+  control and exact source identity; do not treat the fixture as native Windows.
+- [x] Retain/revalidate the portable parent and reuse the existing Windows
+  ancestor-pinning helper; preserve no-follow reads, member checks and bounds.
+- [x] Execute the whole breaker module and lock-neutral/live-WAL controls on
+  frozen source. Retain all failures and classify unavailable native lanes.
+- [x] Run both compiler graphs, strict Clippy, formatting and default UBS;
+  review changed findings without scanner exclusions or new lint allowances.
+- [x] Fresh solo reread/reexecution against original acceptance. Keep any
+  unmet native-platform requirement on the original Bead; do not split it away.
+- [ ] Execute native Windows qualification when its worker is available;
+  original `br-oyget` acceptance remains on that in-progress Bead.
+- [x] Prepare the coherent source/tests and tracker export for publication;
+  record actual commit/ref verification and reservation release in the existing
+  audit after execution.
+
+This block targets recovery authority, not a performance claim. The installed
+read-only health probe still reports an orphaned page and stale proactive
+backup; no live repair, restart, release or Actions dispatch is performed.
+The old-algorithm run from private immutable commit `5467a728` reproduces the
+bug: it returns a valid family hash after parent displacement. Its stable and
+missing controls pass: one pass/one expected failure, no ignores, 4,104 filtered
+cases. Seven actual worker inputs match. Final candidate v2 changes only three Rust
+files over `d146c589`, with eight frozen inputs and unchanged dependencies.
+The portable algorithm is exercised on real Linux files; the Windows ancestor
+pinning and sharing-denial branch still need native execution. The Windows RCH
+worker is disabled, so `br-oyget` remains in progress pending qualification.
+Both required workspace compiler graphs and strict Clippy pass on final
+overlay `9f73ae76`; formatting also passes. The default full three-file UBS
+scan returns zero: no critical findings, 1,504 warnings and 889 informational.
+All 64 findings in changed hunks (including context) were reviewed: deliberate
+test assertions/fixture operations and blocking-filesystem/API notes. No lint
+allowance, scanner exclusion, assertion or bound was relaxed. The complete
+Linux breaker module (52 cases) plus the three predeclared lock-neutral/live-WAL
+controls pass all 55 registered cases with no failures or ignores. The fresh
+solo run repeats all 55 passes with an identical executable SHA-256
+`644f82d79dd0fcf35eccf42f7f490912d49cb6ea77fe0484cde7964adcadb3db`.
+Child harness output is not additional coverage; 4,051 unrelated tests remain
+filtered. Eight actual native worker inputs match the final manifest. Fresh
+diff/caller review finds no further defect in this scoped change. This closes
+the observed parent-check gap on the shared algorithm, not the original Bead's
+complete native-platform acceptance. No independent or release proof is claimed.
+
 ## November 15 Review41 synchronous pool retirement — EmeraldEagle
 
 - [x] Inspect ready/owned Beads and current source; preserve already-landed

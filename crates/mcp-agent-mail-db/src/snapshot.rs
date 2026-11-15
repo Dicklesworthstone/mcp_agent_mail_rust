@@ -18,6 +18,8 @@
 #[path = "snapshot_authority.rs"]
 mod authority;
 use authority::SnapshotAuthority;
+#[cfg(windows)]
+pub(crate) use authority::pin_windows_parents;
 #[cfg(unix)]
 pub use authority::{SnapshotRetentionDeferred, SnapshotRetentionGuard};
 
