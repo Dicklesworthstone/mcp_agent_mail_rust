@@ -15,17 +15,63 @@
   window and real shared-receipt TUI case. Freeze8de2a7cf plus the same five
   overlay paths; retain source manifest. Direct fmt2=0, initial wrap fmt1 kept.
 - [x] Release metadata2070/2071 before long qualification; keep source leases.
-- [ ] Execute the22-case merged-input native cohort and verify exact census.
-- [ ] Check merged-input workspace/all-targets.
-- [ ] Check separate merged-input production workspace/lib+bins.
-- [ ] Run merged-input strict workspace/all-target Clippy.
+- [x] Execute the22-case merged-input native cohort: run2154e70a-92af-4d97-
+  86a2-e66f23310e0b, terminal0/22PASS/6946skipped/70.348s, Cargo55m00s.
+  Exact first-report census matches all22 predeclared names; worker122,
+  base8de/five-file overlayf34822d5. Retain tools/server executable hashes.
+  Correct the census parser's padded-counter handling; no native failure
+  or missing test was hidden. This selected cohort is not a full-suite pass.
+- [x] Preserve merged Clippy2 terminal101: doc paragraph in db/error, two
+  single-pattern matches in reconstruct, ASCII string pattern in a verdict
+  assertion. Add a doc break, use equivalent if-let success/error branches
+  with identical counters, keep the same ASCII expectation as a character.
+  No suppression or expected-value change; direct formatting0.
+- [x] Predeclare six existing DB inventory/verdict regressions before execution.
+  Keep the running22-case/f348 source unchanged remotely. Final static input
+  adds the three DB lint files to the five overlays, source13-file manifest.
+- [x] Execute six DB regressions: run9e5fc90b-ed68-43d7-96b0-6f0e47b6cda4,
+  terminal0/6PASS/4074skipped/0.559s after Cargo23m26s on122. Exact six-name
+  census matches; base8de/eight-file043. DB executable SHA256
+  1f6a2c26265c0de761ca36c57f388cecfb8862f6d151bab1d3ecb37ee7b01c17.
+- [x] Eight-file workspace/all-targets check0/Cargo1m37s and separate production
+  check0/Cargo1m15s; retain proc-macro-error2 future-compatibility notice.
+  Clippy3 refused before Cargo120; Clippy4 reaches Cargo101 with five TUI
+  diagnostics. Preserve both outcomes rather than crediting a pending gate.
+- [x] Correct only those five diagnostics: equivalent cursor map_or preserving
+  parameter order; move four test paths at their last use. Same path values,
+  assertions and bounds; final formatting0. Freeze nine overlay files on8de,
+  fingerprintb2b59df2 and source14-file manifest. DB6 remains on eight-file043;
+  native22 remains on five-filef348. Do not relabel earlier executions.
+- [x] Check final nine-file workspace/all-targets: terminal0/Cargo53.88s on hz2.
+- [x] Check separate final nine-file production workspace/lib+bins:
+  terminal0/Cargo38.29s on hz2. Both use final overlayb2b59df2; retain Cargo's
+  proc-macro-error2 future-compatibility notice.
+- [x] Run final nine-file strict workspace/all-target Clippy:
+  terminal0/Cargo51.86s on hz3, same overlayb2b59df2. No lint suppression.
 - [x] Scan both merged Rust files: terminal0/statusok/no failed modules;
   archive_read critical0/warning314/info80, messages0/916/264. Reread the
   resolution against incoming8de: only explicit drop, equivalent receipt
   assertions and independent mutation-window coverage are added to its code.
-- [ ] Record final scoped Bead evidence with original acceptance still open;
-  finish normal merge, flush/import/cycles, publish and verify both refs,
-  release only owned leases. Earlier8e results remain bound to their inputs.
+- [x] Scan the three DB lint files completely: terminal0/statusok/no failed
+  modules; error critical0/warning304/info39, reconstruct0/2174/780,
+  mailbox_verdict0/285/115. Guidance value, error counts and expectation remain
+  unchanged; preserve all warnings and merged Clippy101 without suppression.
+- [x] Scan final poller/messages files: terminal0/statusok/no failed modules;
+  critical0/warning779/info115 and0/916/260 respectively. Source14-file
+  manifest still matches; reread committed-release serialization, both
+  independent archive contention cases, cursor paging and changed fixtures.
+- [x] Refresh installed health: exit1, one orphan page/all rows readable and
+  backup168h35m old. No live repair, installation or restart. Original Bead
+  acceptance remains open; no full-suite or independent-verifier claim.
+- [x] Finish normal merge6848a8aa, preserving both source histories. Final
+  checks remain scoped to frozen8de plus the explicitly selected overlays.
+- [x] Record final scoped Bead evidence in comment4397; original acceptance
+  and in_progress status unchanged. Preserve all2871 IDs and14 prior comments
+  in both exports; only own new comment/updated_at change. Flush0/cycles0.
+- [x] Prepare the five owned lint files, existing plan and two exports for
+  publication. Actual commit/push/ref verification and13 owned-lease release
+  receipts are finalized after execution in retained review-audit.md. Earlier
+  8e results remain bound to their inputs; no status-only commit loop.
 
 ## November 14 Review29 integration continuation — EmeraldEagle, 20:22 UTC
 

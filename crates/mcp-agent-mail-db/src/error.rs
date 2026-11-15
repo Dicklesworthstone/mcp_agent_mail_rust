@@ -169,6 +169,7 @@ impl DbErrorClass {
 }
 
 /// Operator guidance for an unreadable commit-certificate family (GH#387).
+///
 /// Listing backups is diagnostic only; it neither opens the mailbox nor
 /// authorizes restoring an older generation over uncheckpointed commits.
 pub const WAL_CERTIFICATE_RECOVERY_GUIDANCE: &str = "Keep the database and its -wal, -shm, -wal-cert, and -wal-cert-head files intact \

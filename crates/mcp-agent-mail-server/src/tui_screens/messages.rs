@@ -7990,7 +7990,7 @@ first body
             let state = TuiSharedState::new(&config);
             let mut screen = MessageBrowserScreen::new();
             let mut form = valid_compose_draft(&slug, "Complete\noperator message");
-            form.mailbox_source = Some((config.database_url.clone(), config.storage_root.clone()));
+            form.mailbox_source = Some((config.database_url.clone(), config.storage_root));
             form.cc_input.set_value("RedFox");
             form.thread_id_input.set_value("operator-thread");
             form.importance_idx = 2;
@@ -8198,7 +8198,7 @@ first body
             let live_source = Some((config.database_url.clone(), config.storage_root.clone()));
             let other_source = Some((
                 "sqlite:///different-mailbox.sqlite3".to_string(),
-                config.storage_root.clone(),
+                config.storage_root,
             ));
             let mut screen = MessageBrowserScreen::new();
             let entry = screen.fetch_message_entry_by_id(id, Some(&state)).unwrap();
@@ -9540,7 +9540,7 @@ first body
         let history = compose_history_values(&conn);
         let mut screen = MessageBrowserScreen::new();
         screen.db_conn = Some(conn);
-        screen.mailbox_source = Some((config.database_url.clone(), config.storage_root.clone()));
+        screen.mailbox_source = Some((config.database_url.clone(), config.storage_root));
         let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
         screen.open_quick_reply_modal_for_entry(&entry).unwrap();
         screen
@@ -9717,7 +9717,7 @@ first body
         let state = TuiSharedState::new(&config);
         let mut screen = MessageBrowserScreen::new();
         screen.db_conn = Some(conn);
-        screen.mailbox_source = Some((config.database_url.clone(), config.storage_root.clone()));
+        screen.mailbox_source = Some((config.database_url.clone(), config.storage_root));
         let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
         screen.open_quick_reply_modal_for_entry(&entry).unwrap();
         screen

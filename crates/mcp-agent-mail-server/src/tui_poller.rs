@@ -1942,12 +1942,10 @@ fn visit_shared_ack_message_pages(
     let mut after = None;
     loop {
         let mut params = selection_params.to_vec();
-        let continuation = if let Some(id) = after {
+        let continuation = after.map_or("", |id| {
             params.push(Value::BigInt(id));
             " AND d.message_id > ?"
-        } else {
-            ""
-        };
+        });
         let rows = conn
             .query_sync(
                 &format!(

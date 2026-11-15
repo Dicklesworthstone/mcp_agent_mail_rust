@@ -220,12 +220,11 @@ fn inventory_directory_entries(
             return None;
         }
     }
-    match std::fs::read_dir(path) {
-        Ok(entries) => Some(entries),
-        Err(_) => {
-            *errors += 1;
-            None
-        }
+    if let Ok(entries) = std::fs::read_dir(path) {
+        Some(entries)
+    } else {
+        *errors += 1;
+        None
     }
 }
 
@@ -234,12 +233,11 @@ fn inventory_entry(
     errors: &mut usize,
 ) -> Option<(PathBuf, std::fs::FileType)> {
     let result = entry.and_then(|entry| entry.file_type().map(|kind| (entry.path(), kind)));
-    match result {
-        Ok(entry) => Some(entry),
-        Err(_) => {
-            *errors += 1;
-            None
-        }
+    if let Ok(entry) = result {
+        Some(entry)
+    } else {
+        *errors += 1;
+        None
     }
 }
 

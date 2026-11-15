@@ -2425,7 +2425,7 @@ mod tests {
         assert_eq!(incomplete.archive_messages, 1);
         assert_eq!(incomplete.db_projects, 1);
         assert!(incomplete.detail.contains("incomplete"));
-        assert!(incomplete.detail.contains("1"));
+        assert!(incomplete.detail.contains('1'));
 
         let missing = dir.path().join("missing.sqlite3");
         let unavailable = inspect_mailbox_archive_drift(&missing, &storage_root);
