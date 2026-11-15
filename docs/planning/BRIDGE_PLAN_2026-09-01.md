@@ -1,5 +1,64 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 14 Review30 reconciliation progress — EmeraldEagle
+
+- [x] Reread recent source diffs and callers; inventory accounting, cursor
+  bindings, test path moves and committed force-release serialization retain
+  their intended behavior. No new defect established in those corrections.
+- [x] Read current Beads triage and original br-kp1in.19 acceptance. Continue
+  the owned reservation convergence path; do not close unrelated peer work.
+- [x] Trace both progress producers through the maintenance worker to doctor
+  health. Find predictable staging symlink writes and unlocked repair merges.
+- [x] Add real filesystem regressions for both active and released writers:
+  preserve a planted foreign sentinel and old staging symlink; respect a real
+  competing file lock; retry successfully and retain the latest repair.
+- [x] Execute unchanged runtime plus test-only overlayc227d19c on base820a:
+  runebf22729-8105-427c-9c53-7a0792154a4f, terminal100,3PASS/4FAIL/1145skipped,
+  0.221s after Cargo23m26s on hz2. Both foreign sentinels actually contain
+  progress JSON instead of their planted bytes; both lock probes return Ok
+  despite a competing owner. Three existing controls pass; exact seven-name
+  census matches. Preserve this expected failed receipt and executable hash.
+- [x] Serialize read/merge/publish with bounded nonblocking file admission;
+  create private unique staging files and atomically publish valid progress.
+- [x] Reuse the existing bounded no-follow reader; preserve timestamps,
+  clock-skew rules, JSON schema and all health classification thresholds.
+- [x] Reread both producers, shared I/O helper and caller error handling:
+  both workers retain repair times and retry best-effort progress after errors;
+  neither a busy sidecar nor a publication error stops actual reconciliation.
+  Keep progress publication outside the global archive mutation fence so a
+  health-only record cannot invalidate mailbox archive-read epochs.
+- [x] Execute the same seven predeclared cases on the repaired source:
+  run4ce9da9c-ce7a-465e-b131-34f10452d809, terminal0/7PASS/1145skipped,
+  0.177s after Cargo1m17s on hz2. Exact seven-name census matches, no missing
+  or extra names; base820a/three-file8729868b, same source as all final gates.
+  Old ELFbc9fab37c5661dadfe079fd08c61420bec21757316a774243f9b4ab43d7c3cdb;
+  fixed ELF7c0ff5fd91020af9181cf18fdeb84685609c7df79f57b345f394fbd06286e11b.
+- [x] Check workspace/all-targets: terminal0/Cargo7m53s on hz3,
+  base820a90bf/three-file overlay8729868b; retain proc-macro-error2 notice.
+- [x] Check separate production lib+bins: terminal0/Cargo4m01s on hz3,
+  same base820a90bf/three-file overlay8729868b. Future-compatibility notice
+  remains visible; no dependency/profile or lint suppression change.
+- [x] Run strict workspace/all-target Clippy: terminal0/Cargo1m51s on hz3, same frozen
+  overlay8729868b. Direct formatting0. Full-file UBS scans all terminal0,
+  statusok/no failed modules: recovery critical0/warning292/info120, released
+  progress0/645/91, active0/660/73. Preserve warnings and the initial fmt1;
+  no suppression, test exclusion, profile, tolerance or deadline change.
+- [x] Final fresh-eyes reread finds no further concrete defect in the changed
+  paths. Source/lock/toolchain manifest matches; pinned rustc908501772 and
+  Cargo e8cb624d5 verified. These are Linux filesystem component regressions,
+  not public HTTP/restart/background or independent-review qualification.
+- [x] Refresh installed health: exit1, orphan1/all rows readable and backup
+  169h17m old. No installation, live repair or restart; preserve these findings.
+- [x] Record start4398 and final4399 on the owned Bead. Preserve all2871 IDs
+  and15 prior comments in each export; both add only the two owned comments
+  and updated_at after the final flush. Original
+  acceptance/status/assignee intact; flush0 and dependency cycles0.
+- [x] Prepare one source/test/qualification publication with only the three
+  owned Rust files, existing TODO and two changed tracker exports. Actual normal
+  pull/import/push/ref verification and six owned-lease release receipts are
+  finalized after execution in retained review-audit.md, without another
+  status-only commit. The full public restart acceptance stays open.
+
 ## November 14 Review29 overlapping integration — EmeraldEagle, 22:45 UTC
 
 - [x] Commit reviewed fixture/lint work in5d6cb92f. Normal pull discovers

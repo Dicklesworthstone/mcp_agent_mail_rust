@@ -128,40 +128,27 @@ pub fn record_progress(
     storage_root: &Path,
     progress: &ReservationReconcileProgress,
 ) -> std::io::Result<()> {
-    let dir = storage_root.join("doctor");
-    match fs::symlink_metadata(&dir) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => {
-            return Err(std::io::Error::other(format!(
-                "{} is not a plain directory",
-                dir.display()
-            )));
+    super::record_reconcile_progress(storage_root, PROGRESS_FILE, || {
+        let mut merged = progress.clone();
+        if let Some(previous) = read_progress(storage_root) {
+            let previous_repair = previous
+                .last_repair_us
+                .filter(|ts_us| *ts_us <= progress.pass_us.saturating_add(PROGRESS_CLOCK_SKEW_US));
+            merged.last_repair_us = merged.last_repair_us.max(previous_repair);
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&dir)?,
-        Err(error) => return Err(error),
-    }
-    let mut merged = progress.clone();
-    if let Some(previous) = read_progress(storage_root) {
-        let previous_repair = previous
-            .last_repair_us
-            .filter(|ts_us| *ts_us <= progress.pass_us.saturating_add(PROGRESS_CLOCK_SKEW_US));
-        merged.last_repair_us = merged.last_repair_us.max(previous_repair);
-    }
-    let body = serde_json::to_vec(&merged).map_err(std::io::Error::other)?;
-    let tmp = dir.join(format!(".{PROGRESS_FILE}.{}.tmp", std::process::id()));
-    fs::write(&tmp, body)?;
-    fs::rename(&tmp, progress_path(storage_root))
+        serde_json::to_vec(&merged).map_err(std::io::Error::other)
+    })
 }
 
 /// The last recorded progress; `None` when absent, oversized, or unreadable.
 #[must_use]
 pub fn read_progress(storage_root: &Path) -> Option<ReservationReconcileProgress> {
-    let path = progress_path(storage_root);
-    let metadata = fs::symlink_metadata(&path).ok()?;
-    if !metadata.file_type().is_file() || metadata.len() > MAX_PROGRESS_BYTES {
-        return None;
-    }
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &progress_path(storage_root),
+        MAX_PROGRESS_BYTES,
+    )
+    .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 #[derive(Debug, PartialEq)]
@@ -1224,6 +1211,78 @@ mod tests {
         // Garbage reads as absent rather than as progress.
         fs::write(progress_path(root.path()), b"not json").unwrap();
         assert_eq!(read_progress(root.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progress_preserves_legacy_staging_symlink_and_foreign_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let sentinel = elsewhere.path().join("operator-data");
+        fs::write(&sentinel, b"keep operator data intact").unwrap();
+        let doctor = root.path().join("doctor");
+        fs::create_dir(&doctor).unwrap();
+        let legacy_stage = doctor.join(format!(".{PROGRESS_FILE}.{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&sentinel, &legacy_stage).unwrap();
+        let progress = ReservationReconcileProgress {
+            pid: 1,
+            pass_us: 100,
+            last_repair_us: Some(90),
+        };
+
+        record_progress(root.path(), &progress).unwrap();
+
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep operator data intact");
+        assert_eq!(fs::read_link(&legacy_stage).unwrap(), sentinel);
+        assert!(
+            fs::symlink_metadata(progress_path(root.path()))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(read_progress(root.path()), Some(progress));
+    }
+
+    #[test]
+    fn progress_defers_locked_merge_and_preserves_other_owner_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let repaired = ReservationReconcileProgress {
+            pid: 1,
+            pass_us: 100,
+            last_repair_us: Some(90),
+        };
+        record_progress(root.path(), &repaired).unwrap();
+        let before = fs::read(progress_path(root.path())).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(progress_path(root.path()).with_extension("json.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        let idle = ReservationReconcileProgress {
+            pid: 2,
+            pass_us: 200,
+            last_repair_us: None,
+        };
+
+        let error = record_progress(root.path(), &idle).expect_err("another owner holds the merge");
+        assert_eq!(
+            error.raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
+        assert_eq!(fs::read(progress_path(root.path())).unwrap(), before);
+        assert_eq!(read_progress(root.path()), Some(repaired));
+        drop(lock);
+
+        record_progress(root.path(), &idle).unwrap();
+        assert_eq!(
+            read_progress(root.path()),
+            Some(ReservationReconcileProgress {
+                last_repair_us: Some(90),
+                ..idle
+            })
+        );
     }
 
     #[cfg(unix)]

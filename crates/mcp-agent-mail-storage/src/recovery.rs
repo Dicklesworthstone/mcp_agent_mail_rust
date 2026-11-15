@@ -34,6 +34,52 @@ use std::path::Path;
 
 use git2::{ErrorCode, ObjectType, Oid, Repository};
 
+/// Serialize each progress read/merge/publish without delaying maintenance
+/// behind another owner. The stable sidecar stays named across atomic record
+/// replacements; a lock on the replaced record itself would not serialize them.
+fn record_reconcile_progress(
+    storage_root: &Path,
+    filename: &str,
+    encode: impl FnOnce() -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<()> {
+    use std::fs;
+    use std::io::{ErrorKind, Write as _};
+
+    use mcp_agent_mail_core::disk::{
+        create_new_private_file_no_follow, open_regular_file_read_write_no_follow,
+    };
+
+    let dir = storage_root.join("doctor");
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    if !fs::symlink_metadata(&dir)?.file_type().is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a plain directory",
+            dir.display()
+        )));
+    }
+    let path = dir.join(filename);
+    let lock_path = path.with_extension("json.lock");
+    let lock = match create_new_private_file_no_follow(&lock_path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            open_regular_file_read_write_no_follow(&lock_path)?
+        }
+        Err(error) => return Err(error),
+    };
+    fs2::FileExt::try_lock_exclusive(&lock)?;
+    let body = encode()?;
+    // Never open a predictable staging name: a leftover link must not redirect
+    // this write or become the published progress record.
+    let mut staged = tempfile::NamedTempFile::new_in(&dir)?;
+    staged.write_all(&body)?;
+    staged.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{context}")]
 struct RecoveryIoContext {
