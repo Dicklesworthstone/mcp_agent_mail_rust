@@ -18813,26 +18813,9 @@ fn sync_recovery_parent(path: &Path) -> Result<(), SqlError> {
 fn rollback_recovery_candidate_promotion(
     primary_path: &Path,
     candidate_path: &Path,
-    quarantined_source: Option<&Path>,
+    quarantined_moves: &[(PathBuf, PathBuf)],
     timestamp: &str,
 ) -> Result<(), SqlError> {
-    if let Some(quarantined_source) = quarantined_source {
-        // If the candidate was already activated onto the primary path, return
-        // it to its staging path first — exactly like the no-quarantined-source
-        // branch below — so restoring the old generation cannot clobber it and
-        // the caller can still quarantine it for forensics (br-uflow).
-        if path_is_occupied(primary_path) && !path_is_occupied(candidate_path) {
-            rename_noreplace_preserving_source(primary_path, candidate_path).map_err(|error| {
-                SqlError::Custom(format!(
-                    "failed to return promoted candidate {} to staging path {}: {error}",
-                    primary_path.display(),
-                    candidate_path.display()
-                ))
-            })?;
-        }
-        return restore_quarantined_primary(primary_path, quarantined_source, timestamp);
-    }
-
     if path_is_occupied(primary_path) {
         if path_is_occupied(candidate_path) {
             return Err(SqlError::Custom(format!(
@@ -18841,21 +18824,23 @@ fn rollback_recovery_candidate_promotion(
                 candidate_path.display()
             )));
         }
-        rename_noreplace_preserving_source(primary_path, candidate_path).map_err(|error| {
-            SqlError::Custom(format!(
-                "failed to return promoted candidate {} to staging path {}: {error}",
-                primary_path.display(),
-                candidate_path.display()
-            ))
-        })?;
+        // Undo activation durably before restoring any old family members.
+        // A failed candidate retreat must leave that family quarantined.
+        rollback_quarantined_candidate_moves(&[(
+            candidate_path.to_path_buf(),
+            primary_path.to_path_buf(),
+        )])?;
     }
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+    let quarantined_primary = quarantined_moves
         .iter()
-        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
-    {
-        restore_quarantined_sidecar(primary_path, suffix, "corrupt", timestamp)?;
-    }
-    sync_recovery_parent(primary_path)
+        .find(|(source, _)| source == primary_path)
+        .map(|(_, target)| target.as_path());
+    restore_quarantined_primary(
+        primary_path,
+        quarantined_primary,
+        timestamp,
+        quarantined_moves,
+    )
 }
 
 fn abort_prepared_recovery_after_safe_rollback(
@@ -18916,7 +18901,7 @@ fn rollback_and_abort_recovery_promotion(
     primary_path: &Path,
     primary_anchor: &AnchoredRecoveryParent,
     candidate_path: &Path,
-    quarantined_source: Option<&Path>,
+    quarantined_moves: &[(PathBuf, PathBuf)],
     timestamp: &str,
     prepared: &crate::forensics::PreparedRecoveryReceipt,
     error: SqlError,
@@ -18924,7 +18909,7 @@ fn rollback_and_abort_recovery_promotion(
     match rollback_recovery_candidate_promotion(
         primary_path,
         candidate_path,
-        quarantined_source,
+        quarantined_moves,
         timestamp,
     ) {
         Ok(()) => abort_prepared_recovery_after_safe_rollback(primary_anchor, prepared, error),
@@ -19361,21 +19346,28 @@ where
             )),
         ));
     }
-    let quarantine_path = quarantined_source
-        .clone()
-        .unwrap_or_else(|| unique_recovery_quarantine_path(primary_path, timestamp));
-    if let Err(error) = quarantine_corrupt_sidecars_or_restore_primary(
+    let quarantined_moves = match quarantine_corrupt_sidecars_or_restore_primary(
         primary_path,
-        &quarantine_path,
+        quarantined_source.as_deref(),
         timestamp,
         "recovery candidate promotion",
     ) {
-        return Err(abort_prepared_recovery_after_safe_rollback(
-            &primary_anchor,
-            &prepared,
-            error,
-        ));
-    }
+        Ok(moved) => moved,
+        Err(RecoverySidecarQuarantineFailure::RolledBack(error)) => {
+            return Err(abort_prepared_recovery_after_safe_rollback(
+                &primary_anchor,
+                &prepared,
+                error,
+            ));
+        }
+        Err(RecoverySidecarQuarantineFailure::IncompleteRollback(error)) => {
+            return Err(ReconstructionCandidateFailure::before_receipt_commit(
+                SqlError::Custom(format!(
+                    "{error}; leaving the pending receipt in place so readiness fails closed"
+                )),
+            ));
+        }
+    };
 
     if let Err(error) =
         candidate_anchor.activate_into(&primary_anchor, candidate_path, primary_path)
@@ -19384,7 +19376,7 @@ where
             primary_path,
             &primary_anchor,
             candidate_path,
-            quarantined_source.as_deref(),
+            &quarantined_moves,
             timestamp,
             &prepared,
             error,
@@ -19398,7 +19390,7 @@ where
                     primary_path,
                     &primary_anchor,
                     candidate_path,
-                    quarantined_source.as_deref(),
+                    &quarantined_moves,
                     timestamp,
                     &prepared,
                     SqlError::Custom(error.to_string()),
@@ -19620,24 +19612,41 @@ fn quarantine_sidecar_with_label(
     suffix: &str,
     label: &str,
     timestamp: &str,
-) -> Result<(), SqlError> {
+) -> Result<bool, SqlError> {
     let mut source_os = primary_path.as_os_str().to_os_string();
     source_os.push(suffix);
     let source = PathBuf::from(source_os);
     if !path_is_occupied(&source) {
-        return Ok(());
+        return Ok(false);
     }
     let target = quarantined_sidecar_path(primary_path, suffix, label, timestamp);
-    rename_noreplace_preserving_source(&source, &target).map_err(|e| {
-        SqlError::Custom(format!(
-            "failed to quarantine sidecar {}: {e}",
+    #[cfg(all(test, unix))]
+    if let Some(error) = run_anchored_recovery_rename_hook(
+        "quarantine recovery sidecar",
+        source.file_name().unwrap_or(source.as_os_str()),
+        target.file_name().unwrap_or(target.as_os_str()),
+    ) {
+        return Err(SqlError::Custom(format!(
+            "failed to quarantine sidecar {}: {error}",
             source.display()
-        ))
-    })
+        )));
+    }
+    rename_noreplace_preserving_source(&source, &target)
+        .map(|()| true)
+        .map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to quarantine sidecar {}: {e}",
+                source.display()
+            ))
+        })
 }
 
 #[allow(clippy::result_large_err)]
-fn quarantine_sidecar(primary_path: &Path, suffix: &str, timestamp: &str) -> Result<(), SqlError> {
+fn quarantine_sidecar(
+    primary_path: &Path,
+    suffix: &str,
+    timestamp: &str,
+) -> Result<bool, SqlError> {
     quarantine_sidecar_with_label(primary_path, suffix, "corrupt", timestamp)
 }
 
@@ -19675,9 +19684,10 @@ fn quarantine_non_regular_sidecar_objects(
 #[allow(clippy::result_large_err)]
 fn restore_quarantined_primary_with_sidecar_label(
     primary_path: &Path,
-    quarantined_path: &Path,
+    quarantined_path: Option<&Path>,
     sidecar_label: &str,
     timestamp: &str,
+    owned_moves: &[(PathBuf, PathBuf)],
 ) -> Result<(), SqlError> {
     let restore_timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     restore_quarantined_primary_with_sidecar_label_at(
@@ -19686,17 +19696,33 @@ fn restore_quarantined_primary_with_sidecar_label(
         sidecar_label,
         timestamp,
         &restore_timestamp,
+        owned_moves,
     )
 }
 
 #[allow(clippy::result_large_err)]
 fn restore_quarantined_primary_with_sidecar_label_at(
     primary_path: &Path,
-    quarantined_path: &Path,
+    quarantined_path: Option<&Path>,
     sidecar_label: &str,
     timestamp: &str,
     restore_timestamp: &str,
+    owned_moves: &[(PathBuf, PathBuf)],
 ) -> Result<(), SqlError> {
+    // A matching quarantine name is not an ownership witness: a failed
+    // no-replace move may have collided with somebody else's artifact.
+    let owned_suffixes: Vec<_> = SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+        .filter(|suffix| {
+            owned_moves.iter().any(|(source, target)| {
+                *source == sqlite_sidecar_path(primary_path, suffix)
+                    && *target
+                        == quarantined_sidecar_path(primary_path, suffix, sidecar_label, timestamp)
+            })
+        })
+        .copied()
+        .collect();
     for suffix in FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES {
         if path_is_occupied(&quarantined_sidecar_path(
             primary_path,
@@ -19711,7 +19737,7 @@ fn restore_quarantined_primary_with_sidecar_label_at(
             )));
         }
     }
-    if path_is_occupied(primary_path) {
+    if quarantined_path.is_some() && path_is_occupied(primary_path) {
         quarantine_reconstructed_candidate(
             primary_path,
             restore_timestamp,
@@ -19725,7 +19751,7 @@ fn restore_quarantined_primary_with_sidecar_label_at(
         })?;
     }
 
-    if path_is_occupied(quarantined_path) {
+    if let Some(quarantined_path) = quarantined_path {
         rename_noreplace_preserving_source(quarantined_path, primary_path).map_err(|e| {
             SqlError::Custom(format!(
                 "failed to restore original database {} from {}: {e}",
@@ -19735,16 +19761,12 @@ fn restore_quarantined_primary_with_sidecar_label_at(
         })?;
     }
 
-    // Restore the same complete family that promotion quarantined. Leaving
-    // namespace records behind would strand an otherwise-live old owner after
-    // a pre-commit activation/receipt failure.
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
-        .iter()
-        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
-    {
+    // Restore exactly the successfully quarantined family, including owned
+    // namespace records, without adopting unowned collision artifacts.
+    for suffix in owned_suffixes {
         restore_quarantined_sidecar(primary_path, suffix, sidecar_label, timestamp)?;
     }
-    if path_is_occupied(primary_path) {
+    if quarantined_path.is_some() {
         crate::forensics::sync_activated_recovery_database(primary_path).map_err(|error| {
             SqlError::Custom(format!(
                 "restored original database {} but could not make its file/directory activation durable: {error}",
@@ -19765,13 +19787,31 @@ fn restore_quarantined_primary_with_sidecar_label_at(
     }
 }
 
+#[derive(Debug)]
+enum RecoverySidecarQuarantineFailure {
+    RolledBack(SqlError),
+    IncompleteRollback(SqlError),
+}
+
+impl std::fmt::Display for RecoverySidecarQuarantineFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RolledBack(error) | Self::IncompleteRollback(error) => error.fmt(f),
+        }
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn quarantine_corrupt_sidecars_or_restore_primary(
     primary_path: &Path,
-    quarantined_path: &Path,
+    quarantined_path: Option<&Path>,
     timestamp: &str,
     context: &str,
-) -> Result<(), SqlError> {
+) -> Result<Vec<(PathBuf, PathBuf)>, RecoverySidecarQuarantineFailure> {
+    let mut moved = Vec::new();
+    if let Some(quarantined_path) = quarantined_path {
+        moved.push((primary_path.to_path_buf(), quarantined_path.to_path_buf()));
+    }
     // The FrankenSQLite namespace records describe the generation that was
     // just quarantined: they bind its file identity, and the engine's strict
     // read-only admission refuses a promoted generation whose records "name a
@@ -19784,24 +19824,35 @@ fn quarantine_corrupt_sidecars_or_restore_primary(
         .iter()
         .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
     {
-        if let Err(e) = quarantine_sidecar(primary_path, suffix, timestamp) {
-            let sidecar_label = sqlite_recovery_sidecar_label(suffix);
-            if let Err(restore_err) =
-                restore_quarantined_primary(primary_path, quarantined_path, timestamp)
-            {
-                return Err(SqlError::Custom(format!(
-                    "failed to quarantine {sidecar_label} sidecar for {context} at {}: {e}; rollback of quarantined database also failed: {restore_err}",
-                    primary_path.display()
-                )));
+        match quarantine_sidecar(primary_path, suffix, timestamp) {
+            Ok(true) => moved.push((
+                sqlite_sidecar_path(primary_path, suffix),
+                quarantined_sidecar_path(primary_path, suffix, "corrupt", timestamp),
+            )),
+            Ok(false) => {}
+            Err(e) => {
+                let sidecar_label = sqlite_recovery_sidecar_label(suffix);
+                let rollback =
+                    restore_quarantined_primary(primary_path, quarantined_path, timestamp, &moved);
+                if let Err(restore_err) = rollback {
+                    return Err(RecoverySidecarQuarantineFailure::IncompleteRollback(
+                        SqlError::Custom(format!(
+                            "failed to quarantine {sidecar_label} sidecar for {context} at {}: {e}; rollback of quarantined database also failed: {restore_err}",
+                            primary_path.display()
+                        )),
+                    ));
+                }
+                return Err(RecoverySidecarQuarantineFailure::RolledBack(
+                    SqlError::Custom(format!(
+                        "failed to quarantine {sidecar_label} sidecar for {context} at {}: {e}",
+                        primary_path.display()
+                    )),
+                ));
             }
-            return Err(SqlError::Custom(format!(
-                "failed to quarantine {sidecar_label} sidecar for {context} at {}: {e}",
-                primary_path.display()
-            )));
         }
     }
 
-    Ok(())
+    Ok(moved)
 }
 
 #[allow(clippy::result_large_err)]
@@ -19837,31 +19888,40 @@ fn quarantine_reconstructed_candidate(
             ))
         })?;
 
+    let mut owned_moves = vec![(primary_path.to_path_buf(), quarantined.clone())];
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         parent_anchor.verify_parent_only(context)?;
-        if let Err(e) = quarantine_sidecar_with_label(primary_path, suffix, reason, timestamp) {
-            let sidecar_label = sqlite_recovery_sidecar_label(suffix);
-            parent_anchor.verify_parent_only(context).map_err(|parent_error| {
+        match quarantine_sidecar_with_label(primary_path, suffix, reason, timestamp) {
+            Ok(true) => owned_moves.push((
+                sqlite_sidecar_path(primary_path, suffix),
+                quarantined_sidecar_path(primary_path, suffix, reason, timestamp),
+            )),
+            Ok(false) => {}
+            Err(e) => {
+                let sidecar_label = sqlite_recovery_sidecar_label(suffix);
+                parent_anchor.verify_parent_only(context).map_err(|parent_error| {
                 SqlError::Custom(format!(
                     "failed to quarantine {sidecar_label} sidecar for reconstructed candidate {}: {e}; rollback was not attempted through a changed parent directory: {parent_error}",
                     primary_path.display()
                 ))
             })?;
-            if let Err(restore_err) = restore_quarantined_primary_with_sidecar_label(
-                primary_path,
-                &quarantined,
-                reason,
-                timestamp,
-            ) {
+                if let Err(restore_err) = restore_quarantined_primary_with_sidecar_label(
+                    primary_path,
+                    Some(&quarantined),
+                    reason,
+                    timestamp,
+                    &owned_moves,
+                ) {
+                    return Err(SqlError::Custom(format!(
+                        "failed to quarantine {sidecar_label} sidecar for reconstructed candidate {}: {e}; rollback also failed: {restore_err}",
+                        primary_path.display()
+                    )));
+                }
                 return Err(SqlError::Custom(format!(
-                    "failed to quarantine {sidecar_label} sidecar for reconstructed candidate {}: {e}; rollback also failed: {restore_err}",
+                    "failed to quarantine {sidecar_label} sidecar for reconstructed candidate {}: {e}",
                     primary_path.display()
                 )));
             }
-            return Err(SqlError::Custom(format!(
-                "failed to quarantine {sidecar_label} sidecar for reconstructed candidate {}: {e}",
-                primary_path.display()
-            )));
         }
     }
 
@@ -19889,7 +19949,6 @@ fn restore_quarantined_sidecar(
     let quarantined = quarantined_sidecar_path(primary_path, suffix, label, timestamp);
     let metadata = match std::fs::symlink_metadata(&quarantined) {
         Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
             return Err(SqlError::Custom(format!(
                 "failed to inspect quarantined sidecar {}: {e}",
@@ -19899,11 +19958,10 @@ fn restore_quarantined_sidecar(
     };
 
     if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-        tracing::warn!(
-            path = %quarantined.display(),
-            "skipping non-file sqlite sidecar quarantine artifact during restore"
-        );
-        return Ok(());
+        return Err(SqlError::Custom(format!(
+            "owned sidecar quarantine artifact {} is no longer a file or symlink; refusing an incomplete restore",
+            quarantined.display()
+        )));
     }
 
     let mut live_os = primary_path.as_os_str().to_os_string();
@@ -19975,14 +20033,16 @@ fn restore_quarantined_sidecar(
 #[allow(clippy::result_large_err)]
 fn restore_quarantined_primary(
     primary_path: &Path,
-    quarantined_path: &Path,
+    quarantined_path: Option<&Path>,
     timestamp: &str,
+    owned_moves: &[(PathBuf, PathBuf)],
 ) -> Result<(), SqlError> {
     restore_quarantined_primary_with_sidecar_label(
         primary_path,
         quarantined_path,
         "corrupt",
         timestamp,
+        owned_moves,
     )
 }
 
@@ -28396,6 +28456,211 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn recovery_promotion_rollback_preserves_late_unowned_sidecars() {
+        use std::rc::Rc;
+
+        for fail_finalization in [false, true] {
+            let directory = tempfile::tempdir().expect("late sidecar fixture").keep();
+            let primary = directory.join("storage.sqlite3");
+            let candidate = directory.join("storage.sqlite3.candidate");
+            let timestamp = "20261115_111000_000";
+            write_marker_db(&primary, "original-generation");
+            write_marker_db(&candidate, "candidate-generation");
+            let primary_bytes = std::fs::read(&primary).unwrap();
+            let primary_inode = primary_identity(&primary);
+            let candidate_inode = primary_identity(&candidate);
+            let cert = sqlite_sidecar_path(&primary, "-wal-cert");
+            let head = sqlite_sidecar_path(&primary, "-wal-cert-head");
+            std::fs::write(&cert, b"original certificate").unwrap();
+            let cert_inode = primary_identity(&cert);
+            let foreign =
+                quarantined_sidecar_path(&primary, "-wal-cert-head", "corrupt", timestamp);
+            let witness = Rc::new(RefCell::new(None));
+            let foreign_identity = Rc::new(RefCell::new(None));
+            let hook_witness = Rc::clone(&witness);
+            let hook_foreign_identity = Rc::clone(&foreign_identity);
+            let hook_foreign = foreign.clone();
+            let hook_directory = directory.clone();
+            let hook_candidate = candidate.clone();
+            with_anchored_recovery_rename_hook(
+                move |context, _from_name, _to_name| {
+                    if context == "quarantine live database" {
+                        *hook_witness.borrow_mut() = Some(capture_recovery_promotion_rename_witness(
+                            &hook_directory,
+                            &hook_candidate,
+                        ));
+                    } else if !fail_finalization && context == "activate reconstructed candidate" {
+                        std::fs::write(&hook_foreign, b"late foreign evidence").unwrap();
+                        *hook_foreign_identity.borrow_mut() = Some(primary_identity(&hook_foreign));
+                        return Some(rustix::io::Errno::INVAL);
+                    }
+                    None
+                },
+                || {
+                    promote_recovery_candidate_with_finalizer(
+                        &primary,
+                        &candidate,
+                        &directory,
+                        timestamp,
+                        |prepared| {
+                            if fail_finalization {
+                                std::fs::write(&foreign, b"late foreign evidence").unwrap();
+                                *foreign_identity.borrow_mut() = Some(primary_identity(&foreign));
+                                crate::forensics::finalize_recovery_receipt_with_injected_pre_rename_failure(prepared)
+                            } else {
+                                crate::forensics::finalize_recovery_receipt(prepared)
+                            }
+                        },
+                    )
+                },
+            )
+            .expect_err("injected activation or pre-commit receipt failure");
+            assert_eq!(std::fs::read(&primary).unwrap(), primary_bytes);
+            assert_eq!(primary_identity(&primary), primary_inode);
+            assert_eq!(primary_identity(&candidate), candidate_inode);
+            assert_eq!(std::fs::read(&cert).unwrap(), b"original certificate");
+            assert_eq!(primary_identity(&cert), cert_inode);
+            assert_eq!(std::fs::read(&foreign).unwrap(), b"late foreign evidence");
+            assert_eq!(
+                primary_identity(&foreign),
+                foreign_identity.borrow_mut().take().unwrap()
+            );
+            assert!(
+                std::fs::symlink_metadata(&head)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
+            let witness = witness
+                .borrow_mut()
+                .take()
+                .expect("prepared intent reached");
+            assert_recovery_promotion_aborted(&directory, &primary, &candidate, &witness);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_preserves_unowned_sidecar_quarantine_collisions() {
+        for blocked_suffix in ["-wal-cert", "-wal-cert-head"] {
+            check_recovery_sidecar_quarantine_collision(blocked_suffix, false);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_promotion_keeps_pending_intent_after_incomplete_sidecar_rollback() {
+        check_recovery_sidecar_quarantine_collision("-wal-cert-head", true);
+    }
+
+    #[cfg(unix)]
+    fn check_recovery_sidecar_quarantine_collision(blocked_suffix: &str, rollback_collision: bool) {
+        use std::rc::Rc;
+
+        let directory = tempfile::tempdir()
+            .expect("sidecar promotion fixture")
+            .keep();
+        let primary = directory.join("storage.sqlite3");
+        let candidate = directory.join("storage.sqlite3.candidate");
+        let timestamp = "20261115_110000_000";
+        write_marker_db(&primary, "original-generation");
+        write_marker_db(&candidate, "candidate-generation");
+        let primary_bytes = std::fs::read(&primary).unwrap();
+        let primary_inode = primary_identity(&primary);
+        let candidate_inode = primary_identity(&candidate);
+        let cert = sqlite_sidecar_path(&primary, "-wal-cert");
+        let head = sqlite_sidecar_path(&primary, "-wal-cert-head");
+        std::fs::write(&cert, b"original certificate").unwrap();
+        std::fs::write(&head, b"original certificate head").unwrap();
+        let cert_inode = primary_identity(&cert);
+        let head_inode = primary_identity(&head);
+        let collision = quarantined_sidecar_path(&primary, blocked_suffix, "corrupt", timestamp);
+        std::fs::write(&collision, b"foreign quarantine evidence").unwrap();
+        let collision_inode = primary_identity(&collision);
+        let witness = Rc::new(RefCell::new(None));
+        let hook_witness = Rc::clone(&witness);
+        let hook_directory = directory.clone();
+        let hook_candidate = candidate.clone();
+        let hook_cert = cert.clone();
+        let error = with_anchored_recovery_rename_hook(
+            move |context, from_name, _to_name| {
+                if context == "quarantine live database" {
+                    *hook_witness.borrow_mut() = Some(capture_recovery_promotion_rename_witness(
+                        &hook_directory,
+                        &hook_candidate,
+                    ));
+                } else if rollback_collision
+                    && context == "quarantine recovery sidecar"
+                    && from_name == OsStr::new("storage.sqlite3-wal-cert-head")
+                {
+                    assert!(
+                        std::fs::symlink_metadata(&hook_cert)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    );
+                    std::fs::create_dir(&hook_cert).unwrap();
+                    std::fs::write(hook_cert.join("sentinel"), b"new rollback collision").unwrap();
+                }
+                None
+            },
+            || {
+                promote_recovery_candidate_with_finalizer(
+                    &primary,
+                    &candidate,
+                    &directory,
+                    timestamp,
+                    crate::forensics::finalize_recovery_receipt,
+                )
+            },
+        )
+        .expect_err("occupied sidecar quarantine must refuse promotion");
+        assert!(
+            error.to_string().contains("failed to quarantine"),
+            "{error}"
+        );
+        let witness = witness
+            .borrow_mut()
+            .take()
+            .expect("prepared intent reached");
+        assert_eq!(std::fs::read(&primary).unwrap(), primary_bytes);
+        assert_eq!(primary_identity(&primary), primary_inode);
+        assert_eq!(std::fs::read(&candidate).unwrap(), witness.candidate_bytes);
+        assert_eq!(primary_identity(&candidate), candidate_inode);
+        assert_eq!(
+            std::fs::read(&collision).unwrap(),
+            b"foreign quarantine evidence"
+        );
+        assert_eq!(primary_identity(&collision), collision_inode);
+        if rollback_collision {
+            let receipts = recovery_promotion_receipt_artifacts(&directory);
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(
+                receipts[0].extension(),
+                Some(OsStr::new("pending")),
+                "restoring only the primary cannot justify aborting an incomplete family rollback"
+            );
+            assert_eq!(std::fs::read(&receipts[0]).unwrap(), witness.intent_bytes);
+            crate::forensics::verify_recovery_receipt_state(&directory, &primary)
+                .expect_err("an incomplete family rollback must retain the readiness barrier");
+            assert_eq!(
+                std::fs::read(cert.join("sentinel")).unwrap(),
+                b"new rollback collision"
+            );
+            let retained = quarantined_sidecar_path(&primary, "-wal-cert", "corrupt", timestamp);
+            assert_eq!(std::fs::read(&retained).unwrap(), b"original certificate");
+            assert_eq!(primary_identity(&retained), cert_inode);
+        } else {
+            assert_eq!(std::fs::read(&cert).unwrap(), b"original certificate");
+            assert_eq!(primary_identity(&cert), cert_inode);
+            assert_recovery_promotion_aborted(&directory, &primary, &candidate, &witness);
+        }
+        assert_eq!(std::fs::read(&head).unwrap(), b"original certificate head");
+        assert_eq!(primary_identity(&head), head_inode);
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("original-generation")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn recovery_promotion_keeps_pending_intent_when_quarantine_restores_another_generation() {
         use std::rc::Rc;
 
@@ -33939,7 +34204,7 @@ mod tests {
         std::fs::write(&primary, b"db").expect("write primary");
         std::fs::write(&wal, b"wal-content").expect("write wal");
 
-        quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine");
+        assert!(quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine"));
 
         assert!(!wal.exists(), "original WAL should be gone");
         let quarantined = dir.path().join("test.db-wal.corrupt-20260218_120000_000");
@@ -33954,7 +34219,9 @@ mod tests {
         std::fs::write(&primary, b"db").expect("write primary");
 
         // Should not error when WAL doesn't exist.
-        quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine noop");
+        assert!(
+            !quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine noop")
+        );
     }
 
     #[test]
@@ -34010,8 +34277,23 @@ mod tests {
         quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine wal");
         quarantine_sidecar(&primary, "-shm", "20260218_120000_000").expect("quarantine shm");
 
-        restore_quarantined_primary(&primary, &quarantined, "20260218_120000_000")
-            .expect("restore");
+        let mut owned_moves = vec![(primary.clone(), quarantined.clone())];
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+            .iter()
+            .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+        {
+            owned_moves.push((
+                sqlite_sidecar_path(&primary, suffix),
+                quarantined_sidecar_path(&primary, suffix, "corrupt", "20260218_120000_000"),
+            ));
+        }
+        restore_quarantined_primary(
+            &primary,
+            Some(&quarantined),
+            "20260218_120000_000",
+            &owned_moves,
+        )
+        .expect("restore");
 
         assert!(primary.exists(), "primary should be restored");
         assert_eq!(std::fs::read(&journal).unwrap(), b"journal");
@@ -34083,10 +34365,11 @@ mod tests {
 
         let err = restore_quarantined_primary_with_sidecar_label_at(
             &primary,
-            &original,
+            Some(&original),
             "archive-reconcile",
             "20260218_120000_000",
             restore_timestamp,
+            &[(primary.clone(), original.clone())],
         )
         .expect_err("live candidate quarantine failure should stop restore");
 
@@ -34125,17 +34408,56 @@ mod tests {
         )
         .expect("write quarantined shm");
 
-        restore_quarantined_primary(
-            &primary,
-            &dir.path().join("missing.db"),
-            "20260218_120000_000",
-        )
-        .expect("restore sidecars without primary");
+        let owned_moves: Vec<_> = ["-journal", "-wal", "-shm"]
+            .iter()
+            .map(|suffix| {
+                (
+                    sqlite_sidecar_path(&primary, suffix),
+                    quarantined_sidecar_path(&primary, suffix, "corrupt", "20260218_120000_000"),
+                )
+            })
+            .collect();
+        restore_quarantined_primary(&primary, None, "20260218_120000_000", &owned_moves)
+            .expect("restore sidecars without primary");
 
         assert!(!primary.exists(), "missing primary should stay absent");
         assert_eq!(std::fs::read(&journal).unwrap(), b"journal");
         assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
         assert_eq!(std::fs::read(&shm).unwrap(), b"shm");
+    }
+
+    #[test]
+    fn restore_quarantined_primary_refuses_a_displaced_owned_sidecar() {
+        let directory = tempfile::tempdir().expect("owned sidecar fixture").keep();
+        let primary = directory.join("test.db");
+        let original = directory.join("original.db");
+        let sidecar = sqlite_sidecar_path(&primary, "-wal-cert");
+        let timestamp = "20261115_112000_000";
+        let retained = quarantined_sidecar_path(&primary, "-wal-cert", "corrupt", timestamp);
+        let displaced = directory.join("displaced-certificate");
+        std::fs::write(&original, b"original database").unwrap();
+        std::fs::write(&retained, b"original certificate").unwrap();
+        let certificate_inode = primary_identity(&retained);
+        let owned = vec![
+            (primary.clone(), original.clone()),
+            (sidecar.clone(), retained.clone()),
+        ];
+        std::fs::rename(&retained, &displaced).unwrap();
+        let error = restore_quarantined_primary(&primary, Some(&original), timestamp, &owned)
+            .expect_err("a missing owned artifact cannot be treated as a successful restore");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to inspect quarantined sidecar"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"original database");
+        assert!(
+            std::fs::symlink_metadata(&sidecar)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"original certificate");
+        assert_eq!(primary_identity(&displaced), certificate_inode);
     }
 
     #[test]
@@ -34200,35 +34522,47 @@ mod tests {
 
     #[test]
     fn quarantine_reconstructed_candidate_rolls_back_on_sidecar_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let primary = dir.path().join("test.db");
-        let wal = dir.path().join("test.db-wal");
-        let quarantine_target = dir
-            .path()
-            .join("test.db-wal.reconstruct-failed-20260218_120000_000");
-        std::fs::write(&primary, b"db").expect("write primary");
-        std::fs::write(&wal, b"wal").expect("write wal");
-        std::fs::create_dir(&quarantine_target).expect("create blocking target directory");
+        for regular_collision in [false, true] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let dir = directory.as_path();
+            let primary = dir.join("test.db");
+            let wal = dir.join("test.db-wal");
+            let quarantine_target = dir.join("test.db-wal.reconstruct-failed-20260218_120000_000");
+            std::fs::write(&primary, b"db").expect("write primary");
+            std::fs::write(&wal, b"wal").expect("write wal");
+            if regular_collision {
+                std::fs::write(&quarantine_target, b"foreign quarantine evidence").unwrap();
+            } else {
+                std::fs::create_dir(&quarantine_target).expect("create blocking target directory");
+            }
 
-        let err = quarantine_reconstructed_candidate(
-            &primary,
-            "20260218_120000_000",
-            "reconstruct-failed",
-        )
-        .expect_err("sidecar quarantine failure should roll back");
-        let err_text = err.to_string();
-        assert!(
-            err_text.contains("failed to quarantine WAL sidecar"),
-            "unexpected error: {err_text}"
-        );
-        assert_eq!(std::fs::read(&primary).unwrap(), b"db");
-        assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
-        assert!(
-            !dir.path()
-                .join("test.db.reconstruct-failed-20260218_120000_000")
-                .exists(),
-            "quarantined primary should be rolled back on failure"
-        );
+            let err = quarantine_reconstructed_candidate(
+                &primary,
+                "20260218_120000_000",
+                "reconstruct-failed",
+            )
+            .expect_err("sidecar quarantine failure should roll back");
+            let err_text = err.to_string();
+            assert!(
+                err_text.contains("failed to quarantine WAL sidecar"),
+                "unexpected error: {err_text}"
+            );
+            assert_eq!(std::fs::read(&primary).unwrap(), b"db");
+            assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
+            assert!(
+                !dir.join("test.db.reconstruct-failed-20260218_120000_000")
+                    .exists(),
+                "quarantined primary should be rolled back on failure"
+            );
+            if regular_collision {
+                assert_eq!(
+                    std::fs::read(&quarantine_target).unwrap(),
+                    b"foreign quarantine evidence"
+                );
+            } else {
+                assert!(quarantine_target.is_dir());
+            }
+        }
     }
 
     #[test]
@@ -34711,11 +35045,15 @@ mod tests {
 
         let err = quarantine_corrupt_sidecars_or_restore_primary(
             &primary,
-            &quarantined,
+            Some(&quarantined),
             "20260218_120000_000",
             "unit test",
         )
         .expect_err("sidecar quarantine failure should roll back");
+        assert!(matches!(
+            &err,
+            RecoverySidecarQuarantineFailure::RolledBack(_)
+        ));
         let err_text = err.to_string();
         assert!(
             err_text.contains("failed to quarantine WAL sidecar"),
@@ -34742,11 +35080,15 @@ mod tests {
 
         let err = quarantine_corrupt_sidecars_or_restore_primary(
             &primary,
-            &dir.path().join("missing.db"),
+            None,
             "20260218_120000_000",
             "unit test without primary",
         )
         .expect_err("sidecar quarantine failure should roll back sidecars");
+        assert!(matches!(
+            &err,
+            RecoverySidecarQuarantineFailure::RolledBack(_)
+        ));
         let err_text = err.to_string();
         assert!(
             err_text.contains("failed to quarantine SHM sidecar"),

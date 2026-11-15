@@ -1,5 +1,73 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review35 sidecar rollback ownership — EmeraldEagle
+
+- [x] Reread Review34 abort guards and every family rollback caller. Find
+  name-based rollback consuming unowned sidecar quarantine artifacts, and
+  primary-only verification clearing intent after incomplete family rollback.
+- [x] Keep owned br-cxsgx in progress with its original acceptance unchanged;
+  reserve existing implementation, TODO and tracker files; preserve peer work.
+- [x] Add real promotion regressions for unowned regular sidecar collisions,
+  earlier completed moves, and a blocked sidecar restoration with the original
+  primary restored. Reuse the existing rename hook at the sidecar syscall.
+- [x] Execute unchanged-production baseline: require both new cases to fail
+  their independent byte/intent assertions while safe-refusal control passes.
+- [x] Record successful moves explicitly; rollback only owned artifacts using
+  existing no-replace/durability helpers, preserving ordinary safe-abort behavior.
+- [x] Carry actual family rollback success/failure to the promotion caller;
+  retain exact pending intent after incomplete restoration or durability failure.
+- [x] Reread all modified helpers/callers; prove moved versus missing sidecars
+  are distinguished and primary-absent rollback owns no unrelated primary file.
+- [x] Carry the same owned-move list through later activation/receipt failure;
+  prove late unowned artifacts survive both pre-activation and post-activation
+  rollback. Candidate retreat must complete before old-family restoration.
+- [x] Reuse ownership filtering in rejected-candidate quarantine; retain
+  namespace-owner refusal and ordinary sidecar conflict preservation. Extend
+  its existing control to regular-file and directory quarantine collisions.
+- [x] Reject missing or non-file owned quarantine artifacts as incomplete
+  restoration. Add a displaced-owned-sidecar regression; explicit absence of
+  an original primary carries no authority to restore an unrelated main file.
+- [x] Execute final44-case cohort (prior37, three new promotion regressions,
+  one displaced-artifact regression, three existing sidecar operation controls)
+  with exact-name census. Final scope is declared before final execution;
+  baseline remains its original3 and no timing ratio is claimed.
+- [x] Complete workspace/all-target and production checks, strict Clippy,
+  formatting, full changed-file UBS and diff checks on the frozen final source.
+- [x] Baseline run118e148e-2175-425c-8809-896929c6e039 exits100:3run,
+  1PASS/2FAIL/4084skipped/6.426s, Cargo23m18s. Independent failures are
+  consumed foreign-quarantine evidence and `.aborted` versus `.pending` after
+  incomplete rollback; safe-refusal control passes. Four actual inputs match.
+  Stable baseline ELF5375a0f03a9ceda8b71af4088e41666546d363cf213ce9ae84c6bd9f3d709160.
+- [x] Final frozen sourcefe27b59b/strict-RCH overlay0b1aa201 passes native
+  run9401f083-79f2-4b51-98d7-6c155f5e7e46:44PASS/4045skipped/23.398s,
+  Cargo5m05s. Exact44-name census matches; new collision/incomplete/late/
+  displaced cases pass1.953s/0.773s/1.582s/0.014s respectively. Stable ELF
+  512b91447288b144a39281832f30be1689fbbb7923da33edde25a991b9026b4c.
+- [x] Workspace/all-target check0/Cargo3m00s on ovh; strict Clippy0/9m59s
+  on hz2; exact production lib+bins command0/50.52s on ovh. Preserve the
+  first129 production101/E0463 missing-crate metadata failure: identical source
+  and command passed elsewhere without source/config changes; worker/artifact
+  cause remains an inference. No cache deletion, namespace or policy override.
+- [x] Actual native, Clippy and successful production four-input hashes match.
+  Short all-target/failed-production checkouts retired before late direct
+  probes; retain their RCH overlay receipts and failed probes without inventing
+  worker-byte verification. Formatting0/diff-check0; full pool UBS0/statusok/
+  critical0/warning5290/info2544/no failed modules; retain future notice.
+- [x] Reread the complete final runtime/test changes and caller wiring again.
+  No further concrete defect found. Solo review/selected Linux controls are
+  bounded evidence, not every legacy/platform path, full-family fingerprinting,
+  physical crash/IO-fault behavior, installed-host repair or release clearance.
+- [x] Record scoped evidence in comments4408/4409; preserve all2871 IDs and
+  all18 prior comments (18to20), with only owned issue comments/updated_at
+  changed. Original status, assignee and acceptance are unchanged; cycles0.
+- [x] Normal pull remains current at104881db; immediate import and final
+  flush complete0. Exact qualified four-input hashes and diff checks remain0.
+  Limit publication to existing runtime/tests, TODO and two tracker exports;
+  preserve all seven original nonempty untracked roots and peer history.
+- Publication commit/ref verification and reservation releases are appended
+  after execution to the existing session audit at
+  `/data/tmp/am-archive-reader-20261110.t7ueMuTt/review-audit.md`.
+
 ## November 15 Review34 promotion receipt authority — EmeraldEagle
 
 - [x] Trace Review33 quarantine errors through promotion and the receipt abort
