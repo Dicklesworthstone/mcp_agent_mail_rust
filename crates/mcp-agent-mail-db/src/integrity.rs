@@ -363,7 +363,7 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
     }
 }
 
-/// GH#247: how many unused-page rows (`Page N: never used` / `... unused`)
+/// GH#247: how many unused-page rows (`Page N: never used` / `Page N is never used`)
 /// an integrity check may report before the "benign freelist/accounting
 /// slack" classification stops applying.
 ///
@@ -402,7 +402,7 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
         {
             continue;
         }
-        if lower.contains("never used") || lower.contains("unused") {
+        if crate::never_written_pages::never_used_page_number(trimmed).is_some() {
             unused_page_rows += 1;
             continue;
         }
@@ -437,19 +437,14 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
 /// every distinct owner table, which rebuilds all of that table's indexes.
 #[must_use]
 pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<String>> {
-    fn detail_is_unused_page_row(detail: &str) -> bool {
-        let lower = detail.trim().to_ascii_lowercase();
-        lower.contains("never used") || lower.contains("unused")
-    }
-
     fn detail_is_ignorable(detail: &str) -> bool {
         let trimmed = detail.trim();
         let lower = trimmed.to_ascii_lowercase();
-        // Section headers like "*** in database main ***" carry no verdict.
+        // Match complete orphan-page diagnostics. A constraint failure in a
+        // table or column named "unused" is structural damage, not slack.
         (trimmed.starts_with("***") && trimmed.ends_with("***"))
             || lower == "ok"
-            || lower.contains("never used")
-            || lower.contains("unused")
+            || crate::never_written_pages::never_used_page_number(trimmed).is_some()
             || lower.contains("wal without shm")
     }
 
@@ -467,7 +462,7 @@ pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<Strin
             // GH#247: unused-page rows are only ignorable as small freelist
             // slack. Mass page loss alongside index damage must escalate to
             // repair/reconstruct, never the REINDEX fast path.
-            if detail_is_unused_page_row(detail) {
+            if crate::never_written_pages::never_used_page_number(detail).is_some() {
                 unused_page_rows += 1;
                 if unused_page_rows > BENIGN_UNUSED_PAGE_ROW_LIMIT {
                     return None;
@@ -724,8 +719,7 @@ pub fn summarize_check_details(details: &[String]) -> String {
     let mut unused_page_rows = 0_usize;
     let mut distinctive_rows = 0_usize;
     for detail in details {
-        let lower = detail.to_ascii_lowercase();
-        if lower.contains("never used") || lower.contains("unused") {
+        if crate::never_written_pages::never_used_page_number(detail).is_some() {
             unused_page_rows += 1;
             if unused_page_rows <= SHOWN_UNUSED {
                 shown.push(detail);
@@ -883,7 +877,7 @@ impl IntegrityClass {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrityClassification {
     pub class: IntegrityClass,
-    /// `Page N: never used` (and `... unused`) rows.
+    /// Complete `Page N: never used` (or `Page N is never used`) rows.
     pub leaked_pages: usize,
     /// Rows that are neither benign nor index-only damage.
     pub structural_errors: usize,
@@ -916,7 +910,7 @@ pub fn classify_check_details(details: &[String]) -> IntegrityClassification {
         {
             continue;
         }
-        if lower.contains("never used") || lower.contains("unused") {
+        if crate::never_written_pages::never_used_page_number(trimmed).is_some() {
             leaked_pages += 1;
             continue;
         }
@@ -1493,6 +1487,70 @@ mod tests {
         assert_eq!(c.structural_errors, 0);
         assert_eq!(c.index_errors, 0);
         assert!(c.first_structural_error.is_none());
+    }
+
+    #[test]
+    fn unused_words_in_corruption_details_never_authorize_slack_or_reindex() {
+        for detail in [
+            "NULL value in agents.unused",
+            "CHECK constraint failed in unused_values",
+            "NULL value in agents.never used",
+            "Page 9: never used; b-tree page is malformed",
+            "Tree 12 page 9: never used",
+            "Page 0: never used",
+            "Page 4294967296: never used",
+        ] {
+            let details = vec![detail.to_string()];
+            let classification = classify_check_details(&details);
+            assert_eq!(classification.class, IntegrityClass::Structural, "{detail}");
+            assert_eq!(classification.leaked_pages, 0, "{detail}");
+            assert_eq!(classification.structural_errors, 1, "{detail}");
+            assert!(!integrity_details_are_suspect(&details), "{detail}");
+
+            let mut with_index_damage = details;
+            with_index_damage.push("wrong # of entries in index idx_agents_name".to_string());
+            assert!(
+                index_only_corruption_index_names(&with_index_damage).is_none(),
+                "{detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_classifiers_share_the_exact_canonical_and_runtime_grammar() {
+        for detail in [
+            "Page 9: never used",
+            "  Page 9 is never used  ",
+            "page 9 is never used",
+            "database disk image is malformed: page 9 is never used",
+        ] {
+            let details = vec![detail.to_string()];
+            let classification = classify_check_details(&details);
+            assert_eq!(classification.class, IntegrityClass::LeakedPagesOnly, "{detail}");
+            assert_eq!(classification.leaked_pages, 1, "{detail}");
+            assert_eq!(classification.structural_errors, 0, "{detail}");
+            assert!(integrity_details_are_suspect(&details), "{detail}");
+
+            let mut with_index_damage = details;
+            with_index_damage.push("wrong # of entries in index idx_agents_name".to_string());
+            assert_eq!(
+                index_only_corruption_index_names(&with_index_damage),
+                Some(vec!["idx_agents_name".to_string()]),
+                "{detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn constraint_failures_with_unused_names_survive_orphan_log_compaction() {
+        let mut details: Vec<String> =
+            (2..=201).map(|page| format!("Page {page}: never used")).collect();
+        details.push("NULL value in agents.unused".to_string());
+        details.push("CHECK constraint failed in unused_values".to_string());
+        let summary = summarize_check_details(&details);
+        assert!(summary.contains("NULL value in agents.unused"));
+        assert!(summary.contains("CHECK constraint failed in unused_values"));
+        assert!(summary.contains("200 unused-page row(s) of 202 total"));
     }
 
     #[test]
