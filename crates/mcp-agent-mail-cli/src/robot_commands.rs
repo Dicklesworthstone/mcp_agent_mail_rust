@@ -9512,11 +9512,20 @@ fn live_server_health_payload_proves_mailbox_healthy(
         && crate::doctor_truncated_wal_sidecar_detail(db_path).is_none()
 }
 
-pub(crate) fn live_server_proves_mailbox_healthy(
+/// The daemon's overall verdict and its narrower database attestation are
+/// independent: a readable mailbox cannot clear a serving-process stall.
+#[derive(Debug)]
+pub(crate) struct LiveMailboxHealth {
+    pub(crate) mailbox_healthy: bool,
+    pub(crate) server_level: mcp_agent_mail_core::HealthLevel,
+    pub(crate) server_detail: String,
+}
+
+pub(crate) fn probe_live_server_mailbox_health(
     config: &mcp_agent_mail_core::Config,
     target_database_url: &str,
     target_storage_root: &Path,
-) -> Result<bool, CliError> {
+) -> Result<Option<LiveMailboxHealth>, CliError> {
     // Doctor may already have selected the daemon's advertised mailbox instead
     // of the CLI's XDG default. Pin the health read to that selected pair while
     // retaining the configured endpoint and credential.
@@ -9526,15 +9535,19 @@ pub(crate) fn live_server_proves_mailbox_healthy(
     let Some((server_health, latency_ms)) =
         crate::probe_local_jsonrpc_health_with_latency(&target_config)?
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    assess_live_server_health(&target_config, &server_health, latency_ms)?
+    let assessment = assess_live_server_health(&target_config, &server_health, latency_ms)?
         .ok_or_else(|| CliError::Other("server health mailbox identity changed".into()))?;
-    Ok(live_server_health_payload_proves_mailbox_healthy(
-        target_database_url,
-        target_storage_root,
-        &server_health,
-    ))
+    Ok(Some(LiveMailboxHealth {
+        mailbox_healthy: live_server_health_payload_proves_mailbox_healthy(
+            target_database_url,
+            target_storage_root,
+            &server_health,
+        ),
+        server_level: assessment.level,
+        server_detail: assessment.probe.detail,
+    }))
 }
 
 // ── Reservations command implementation ─────────────────────────────────────

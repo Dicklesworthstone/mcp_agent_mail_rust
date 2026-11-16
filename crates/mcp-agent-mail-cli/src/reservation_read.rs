@@ -137,6 +137,7 @@ impl ServerResourceSession {
             &request,
             MAILBOX_PROBE_TIMEOUT_SECONDS,
             &session.client,
+            crate::JsonRpcHttpResponsePolicy::RequireHttpSuccess,
         )
         .await
         {
@@ -219,6 +220,7 @@ impl ServerResourceSession {
             &request,
             timeout_seconds,
             &self.client,
+            crate::JsonRpcHttpResponsePolicy::RequireHttpSuccess,
         )
         .await
         .map_err(sanitize_transport_error)?;
@@ -615,6 +617,7 @@ async fn read_resource_json(
         &request,
         timeout_seconds,
         client,
+        crate::JsonRpcHttpResponsePolicy::RequireHttpSuccess,
     )
     .await
     .map_err(sanitize_transport_error)?;
@@ -1535,7 +1538,7 @@ pub(crate) mod tests {
                 let mut cli_config = config.clone();
                 cli_config.database_url = "sqlite:////different/xdg/default.db".into();
                 cli_config.storage_root = "/different/xdg/archive".into();
-                crate::robot::live_server_proves_mailbox_healthy(
+                crate::robot::probe_live_server_mailbox_health(
                     &cli_config,
                     &config.database_url,
                     &config.storage_root,
@@ -1672,7 +1675,7 @@ pub(crate) mod tests {
                     vec![TestReply::Raw(
                         status,
                         serde_json::json!({
-                            "jsonrpc":"2.0", "error":{"code":-32001,"message":"private-token"}
+                            "jsonrpc":"2.0", "error":{"code":-32001,"message":"read-test-token"}
                         }),
                     )]
                 },
@@ -1682,7 +1685,7 @@ pub(crate) mod tests {
                 },
             );
             let error = result.unwrap_err().to_string();
-            assert!(!error.contains("private-token"));
+            assert!(!error.contains("read-test-token"), "HTTP {status}: {error}");
         }
         let (result, _) = with_test_server(
             |config| {
@@ -1961,7 +1964,10 @@ pub(crate) mod tests {
                 assert!(error.contains("maintenance window"));
                 assert!(!error.contains("authentication"));
             } else {
-                assert!(error.contains("authentication failed"));
+                assert!(
+                    error.contains("authentication failed"),
+                    "HTTP {status}: {error}"
+                );
             }
         }
         let (result, requests) = with_test_server(
@@ -2048,7 +2054,10 @@ pub(crate) mod tests {
             if status == 200 {
                 assert!(error.contains("snapshot expired"));
             } else {
-                assert!(error.contains("authentication failed"));
+                assert!(
+                    error.contains("authentication failed"),
+                    "HTTP {status}: {error}"
+                );
             }
         }
     }

@@ -1,5 +1,138 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 16 Review47 finish validated runtime repairs — EmeraldEagle
+
+- [x] Confirm the five reviewed Rust files still match the source that passed
+  both compiler graphs, strict Clippy, formatting and both 64-case native runs.
+- [x] Recheck ready Beads and their actual callers before choosing new work;
+  the contact-statistics optimization is already implemented and wired.
+- [x] Trace the scanner cutoff to its automatic per-file-count estimate;
+  retain the original incomplete scans and their nonzero statuses.
+- [x] Complete all five changed files with the same verified scanner and all
+  rules enabled, using its documented bounded 900-second review allowance.
+- [x] Read every critical and all 65 changed-line findings; no additional
+  production defect found. Six unchanged protocol comparisons are false
+  positives. The completed scan exits 1; the user's following go-ahead accepts
+  the requested scoped exception for publishing this reviewed repair.
+- [x] Confirm no additional Rust change is needed; the original qualified
+  source hashes remain unchanged, with no suppressions or exclusions added.
+- [x] Prepare the tested doctor/authentication repair for normal publication
+  under that scoped exception; keep original acceptance and ownership unchanged.
+- [x] Verify the exact staged source, both tracker exports, empty dependency
+  cycles, peer preservation and unchanged public refs; prepare the reviewed patch.
+- [x] Claim ready `br-bdo5g`; its optimized query is implemented and wired,
+  with real-engine parity and realistic before/after measurement to finish.
+- [ ] Run its three existing contact-policy regressions on a source-retaining
+  strict RCH route; the first request refuses 103 before Cargo on a namespace
+  skeleton mismatch, so zero tests have executed for this task.
+- [ ] Complete the original measured query comparison and preserve the
+  distinction between query maintenance and a whole-daemon performance win.
+- [x] Identify an existing publisher integration gap for ready `br-54v1u`:
+  DSR's strict contract machinery exists, but this dispatcher's MCP config
+  does not opt in. Record the actual source/config locations on the Bead;
+  preserve all required artifacts and native/publication acceptance.
+
+The longer scanner allowance changes review-tool scheduling only. It does not
+change test deadlines, performance acceptance, analyzer rules or the required
+completion status. A completed scan with findings remains non-green until
+those findings are assessed. All temporary scanner evidence is retained.
+Actual commit, push and public-ref receipts are appended to the existing audit
+after execution; no status-only follow-up commit certifies those operations.
+
+## November 16 Review46 doctor daemon verdict — EmeraldEagle
+
+- [x] Recheck ready Beads and actual callers; choose the discarded live-server
+  assessment in the existing owned liveness task `br-kp1in.29`.
+- [x] Reread doctor, robot, mailbox identity validation and real-daemon tests.
+- [x] Define the behavior: a verified red daemon verdict fails doctor health;
+  yellow remains advisory so ordinary archive reconciliation can succeed.
+- [x] Strengthen the existing real RSS-pressure regression and add a healthy
+  real-daemon control, retaining original assertions and startup deadline.
+- [x] Execute the initial immutable old-production control: zero passes/two
+  failures, including the intended pressure failure and an uninitialized
+  healthy fixture. Retain both original failures in the existing audit.
+- [x] Initialize the healthy fixture through real project/agent/message/search
+  tools, retaining its original healthy assertions and 45-second deadline.
+- [x] Execute the corrected healthy fixture against immutable old production:
+  one healthy pass and the intended real-pressure failure, zero ignored.
+- [x] Preserve the validated overall daemon verdict alongside mailbox proof
+  in the existing single health request; update both direct callers.
+- [x] Make doctor report a red daemon verdict without calling it corruption.
+- [x] Exercise real pressure, healthy daemon, reservation reconciliation,
+  malformed replies, mailbox pinning and existing assessment controls.
+- [x] Reread the complete final diff and direct callers with fresh eyes.
+- [x] Repeat the same native cohort in a fresh solo run: both runs pass all
+  59 unit/caller and five real integration cases, zero failures or ignores.
+- [x] Run the first 58-case native caller cohort; retain its 55 passes and
+  three failures without shrinking the declared selection.
+- [x] Trace the three failures: correct the fixture to reflect its actual
+  configured credential, and identify lost HTTP authentication status.
+- [x] Freeze corrected fixtures with old auth behavior as an immutable control.
+- [x] Execute the full control and publish its gate-admission split; no real
+  credential leak was established by the original mismatched marker.
+- [x] Require HTTP success for pinned resource reads while preserving ordinary
+  tools' structured RPC errors; add cross-policy status controls.
+- [x] Strengthen the existing authenticated real-server read regression.
+- [x] Pass the final-source all-targets workspace compiler graph and formatting.
+- [x] Pass the final-source production compiler graph and strict Clippy.
+- [x] Run final default UBS and review all 53 changed-span findings plus six
+  unchanged critical public-protocol comparisons across four changed files.
+- [x] Obtain full CLI-root scanner coverage in Review47. Original default-budget
+  partial scans remain failures; the completed 900-second-allowance review
+  retains six unchanged false-positive findings and exit 1.
+- [x] Update the original owned Bead with actual evidence; retain its original
+  slope, 1,000-flat-run, smoke/soak and measured release-overhead acceptance.
+- [x] Verify exported tracker, empty cycles and preservation of all 2,873
+  issue IDs; only the two intended progress-comment rows change, with original
+  descriptions, acceptance, ownership, status and dependencies intact.
+- [x] Complete the scoped repair's review and publication preparation in
+  Review47, including the user's scoped UBS exception; preserve adverse results.
+
+This operator-requested TODO retires as active tracking at scoped handoff.
+The counterexample is `robot_health_preserves_real_daemon_memory_pressure`:
+the actual daemon reports red memory pressure while the old doctor can exit
+zero. `robot_and_doctor_health_accept_real_healthy_daemon` guards ordinary
+success. No new graph structure, full-task closure, live mailbox mutation,
+benchmark or release claim is implied.
+
+The first source passes both workspace compiler graphs, strict Clippy and fmt.
+Its default four-file UBS completes with exit 1: six unchanged critical findings
+compare public JSON-RPC version/request identifiers or payload structure,
+not secrets. All 30 changed-span findings were read; they concern assertions,
+unwraps and loopback HTTP in the actual daemon test. No suppression, excluded
+category, timeout or lint policy was changed. The first native run executes
+all 58 declared cases: 55 pass and three fail. Two failures expose lost HTTP
+authentication classification; the third fixture echoed a marker different
+from its configured credential. The corrected fixture now reflects the real
+bearer. After an RCH pre-admission refusal, the immutable old-auth control
+executes all 58 cases: 56 pass and two actual HTTP-authentication failures
+remain. Exactly one invalid fixture veto is removed; it earns no runtime win.
+No real credential leak is claimed. Final source additionally repairs the
+transport policy, so the first compiler/scanner results are historical.
+The final declared cohort retains all 58 original cases, adds one transport
+policy test and the strengthened authenticated real-server read case: 59 unit
+and five integration tests. Original .29 and `br-gh368` acceptance/ownership
+remain unchanged; neither broad task is closed.
+Final all-targets checking and formatting pass. Final four-file UBS completes
+with six critical, 5,586 warning and 1,764 informational findings. The six
+criticals compare public protocol fields rather than secrets. Full-file CLI
+root UBS times out at its unchanged default budget; manual review of that
+delta does not replace missing scanner coverage. No scanner suppression,
+category exclusion, gate relaxation or timeout increase is applied.
+Both final native executions pass the exact declared 64-case census. The
+first uses strict remote Cargo; the fresh solo repeat directly executes the
+same observed ELF files on that worker, with checksums verified before and
+after, a private working directory and unchanged in-test assertions/bounds.
+This is native Cargo/binary verification, not Nextest watchdog qualification
+or independent review. The unit ELF is `f0a71edd`, integration ELF `55bc007b`,
+and actual `am` ELF `f57b9682`. The final-source production graph and strict
+Clippy also pass after their initial timed-out jobs are recovered as failures.
+Full-root UBS on spare capacity, using identical scanner files and limits,
+also times out. No full scanner, broad task, performance or release clearance
+is claimed. Source/executable/census evidence, failed controls and tool
+incidents remain in the existing scratch audit. Explicit literal native
+commands passed the guard. Review47 records the completed scanner result.
+
 ## November 16 Review45 canonical collation acceptance — EmeraldEagle
 
 - [x] Recheck ready Beads and current callers; preserve existing platform,

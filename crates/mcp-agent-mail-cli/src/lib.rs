@@ -99003,12 +99003,20 @@ mod blocking_http_chunk_tests {
     }
 }
 
+#[derive(Clone, Copy)]
+enum JsonRpcHttpResponsePolicy {
+    PreserveRpcErrors,
+    RequireHttpSuccess,
+}
+
 fn decode_jsonrpc_http_response(
     server_url: &str,
     status: u16,
     body: &[u8],
+    policy: JsonRpcHttpResponsePolicy,
 ) -> CliResult<serde_json::Value> {
-    if matches!(status, 401 | 403 | 429)
+    if matches!(policy, JsonRpcHttpResponsePolicy::PreserveRpcErrors)
+        && matches!(status, 401 | 403 | 429)
         && let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body)
         && payload.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0")
         && payload.get("error").is_some()
@@ -99034,6 +99042,60 @@ fn decode_jsonrpc_http_response(
     })
 }
 
+#[cfg(test)]
+#[test]
+fn jsonrpc_http_resource_status_and_tool_error_contracts_remain_distinct() {
+    let endpoint = "http://127.0.0.1:1/mcp/";
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0", "id": "status-contract",
+        "error": {"code": -32000, "message": "private-peer-body"}
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    for policy in [
+        JsonRpcHttpResponsePolicy::PreserveRpcErrors,
+        JsonRpcHttpResponsePolicy::RequireHttpSuccess,
+    ] {
+        assert_eq!(
+            decode_jsonrpc_http_response(endpoint, 200, &body, policy).unwrap(),
+            payload
+        );
+    }
+    for status in [401, 403, 429] {
+        assert_eq!(
+            decode_jsonrpc_http_response(
+                endpoint,
+                status,
+                &body,
+                JsonRpcHttpResponsePolicy::PreserveRpcErrors,
+            )
+            .unwrap(),
+            payload,
+            "ordinary tool errors retain their structured diagnosis on HTTP {status}"
+        );
+        let error = decode_jsonrpc_http_response(
+            endpoint,
+            status,
+            &body,
+            JsonRpcHttpResponsePolicy::RequireHttpSuccess,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&status.to_string()), "{error}");
+        assert!(!error.contains("private-peer-body"), "{error}");
+        if status != 429 {
+            assert!(error.starts_with("authentication failed"), "{error}");
+        }
+    }
+    for status in [307, 500] {
+        for policy in [
+            JsonRpcHttpResponsePolicy::PreserveRpcErrors,
+            JsonRpcHttpResponsePolicy::RequireHttpSuccess,
+        ] {
+            assert!(decode_jsonrpc_http_response(endpoint, status, &body, policy).is_err());
+        }
+    }
+}
+
 async fn post_jsonrpc_request(
     server_url: &str,
     bearer: Option<&str>,
@@ -99046,6 +99108,7 @@ async fn post_jsonrpc_request(
         payload,
         timeout_seconds,
         products_http_client(),
+        JsonRpcHttpResponsePolicy::PreserveRpcErrors,
     )
     .await
 }
@@ -99058,6 +99121,7 @@ async fn post_jsonrpc_request_with_client(
     payload: &serde_json::Value,
     timeout_seconds: u64,
     client: &asupersync::http::h1::HttpClient,
+    response_policy: JsonRpcHttpResponsePolicy,
 ) -> CliResult<serde_json::Value> {
     use asupersync::http::h1::Method;
     use asupersync::time::{timeout, wall_now};
@@ -99066,7 +99130,12 @@ async fn post_jsonrpc_request_with_client(
     if let Some(response) =
         post_jsonrpc_request_blocking_http(server_url, bearer, payload, timeout_seconds)?
     {
-        return decode_jsonrpc_http_response(server_url, response.status, &response.body);
+        return decode_jsonrpc_http_response(
+            server_url,
+            response.status,
+            &response.body,
+            response_policy,
+        );
     }
 
     let body = serde_json::to_vec(payload)
@@ -99101,7 +99170,7 @@ async fn post_jsonrpc_request_with_client(
         }
     };
 
-    decode_jsonrpc_http_response(server_url, response.status, &response.body)
+    decode_jsonrpc_http_response(server_url, response.status, &response.body, response_policy)
 }
 
 fn normalize_fetch_inbox_rows(result_payload: serde_json::Value) -> Option<Vec<serde_json::Value>> {

@@ -3526,12 +3526,27 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
             "database_target: local_config_unattested (live server config unavailable)"
         );
     }
-    let mut live_mailbox_degraded = false;
-    let fix_strategy = if crate::robot::live_server_proves_mailbox_healthy(
+    let live_health = crate::robot::probe_live_server_mailbox_health(
         &config,
         &probe_target.database_url,
         &probe_target.storage_root,
-    )? {
+    )?;
+    if let Some(health) = &live_health {
+        match health.server_level {
+            mcp_agent_mail_core::HealthLevel::Red => {
+                ftui_runtime::ftui_println!("fail: {}", health.server_detail);
+                return Err(CliError::ExitCode(1));
+            }
+            mcp_agent_mail_core::HealthLevel::Yellow => {
+                // Temporary archive reconciliation remains advisory here;
+                // the mailbox checks below still decide whether it is safe.
+                ftui_runtime::ftui_println!("warn: {}", health.server_detail);
+            }
+            mcp_agent_mail_core::HealthLevel::Green => {}
+        }
+    }
+    let mut live_mailbox_degraded = false;
+    let fix_strategy = if live_health.is_some_and(|health| health.mailbox_healthy) {
         Ok(crate::DoctorDatabaseFixStrategy::None(
             "Database passed live server health_check probes".to_string(),
         ))

@@ -6345,6 +6345,11 @@ fn reservation_reads_direct_and_real_server_preserve_output_without_local_admiss
             ],
         );
         reservation_read_failed_closed(&unauthorized);
+        assert!(
+            String::from_utf8_lossy(&unauthorized.stderr).contains("authentication failed"),
+            "HTTP authentication rejection lost its classification: {}",
+            String::from_utf8_lossy(&unauthorized.stderr)
+        );
     }
     let unknown = run_am_hermetic(
         &server_env,
@@ -9739,6 +9744,17 @@ fn serve_http_updates_client_configs_only_with_explicit_setup() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn robot_health_preserves_real_daemon_memory_pressure() {
+    check_robot_and_doctor_live_daemon_health(true);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn robot_and_doctor_health_accept_real_healthy_daemon() {
+    check_robot_and_doctor_live_daemon_health(false);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_robot_and_doctor_live_daemon_health(memory_pressure: bool) {
     struct OwnedServer(std::process::Child);
     impl Drop for OwnedServer {
         fn drop(&mut self) {
@@ -9760,9 +9776,16 @@ fn robot_health_preserves_real_daemon_memory_pressure() {
             .env("HTTP_PORT", port.to_string())
             // Exercise the real serving process's RSS sampler without putting
             // the host under pressure. The CLI keeps its ordinary thresholds.
-            .env("MEMORY_WARNING_MB", "1")
-            .env("MEMORY_CRITICAL_MB", "2")
-            .env("MEMORY_FATAL_MB", "0")
+            .envs(
+                memory_pressure
+                    .then_some([
+                        ("MEMORY_WARNING_MB", "1"),
+                        ("MEMORY_CRITICAL_MB", "2"),
+                        ("MEMORY_FATAL_MB", "0"),
+                    ])
+                    .into_iter()
+                    .flatten(),
+            )
             .current_dir(env.hostile_repo())
             .args([
                 "serve-http",
@@ -9789,68 +9812,155 @@ fn robot_health_preserves_real_daemon_memory_pressure() {
         );
         thread::sleep(Duration::from_millis(50));
     }
+    if !memory_pressure {
+        // A blank daemon has no archive inventory or initialized lexical
+        // index. Establish both through the real MCP tools before expecting
+        // the CLI's broader health assessment to be completely green.
+        let project_key = env.hostile_repo().display().to_string();
+        for (id, tool, arguments) in [
+            (41, "ensure_project", json!({"human_key": &project_key})),
+            (
+                42,
+                "register_agent",
+                json!({"project_key": &project_key, "program": "codex", "model": "test", "name": "BlueLake"}),
+            ),
+            (
+                43,
+                "send_message",
+                json!({"project_key": &project_key, "sender_name": "BlueLake", "to": ["BlueLake"],
+                    "subject": "Healthy daemon control", "body_md": "healthydaemoncontrolfixture"}),
+            ),
+            (
+                44,
+                "search_messages",
+                json!({"project_key": &project_key, "query": "healthydaemoncontrolfixture"}),
+            ),
+        ] {
+            let (status, response) =
+                reservation_read_http_rpc(port, None, &tool_call(id, tool, arguments));
+            assert_eq!(status, 200, "{tool}: {response}");
+            assert!(response.get("error").is_none(), "{tool}: {response}");
+            assert_ne!(response["result"]["isError"], true, "{tool}: {response}");
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            let _: Value = serde_json::from_str(text).expect("real tool JSON payload");
+            assert!(
+                Instant::now() < deadline,
+                "healthy fixture startup exceeded its deadline"
+            );
+        }
+    }
+    let health = loop {
+        let output = Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("HTTP_PORT", port.to_string())
+            .env("AGENT_MAIL_URL", format!("http://127.0.0.1:{port}/mcp/"))
+            .current_dir(env.hostile_repo())
+            .args(["robot", "health", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\nserver:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        let health: Value = serde_json::from_slice(&output.stdout).expect("robot health JSON");
+        assert!(
+            Instant::now() < deadline && server.0.try_wait().unwrap().is_none(),
+            "healthy fixture did not converge within its original startup deadline: {health}"
+        );
+        if memory_pressure || health["overall"] == "healthy" {
+            break health;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if !memory_pressure {
+        assert_eq!(health["overall"], "healthy", "{health}");
+        assert_eq!(health["health_level"], "green", "{health}");
+        assert!(
+            health["probes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|probe| { probe["name"] == "server_health" && probe["status"] == "ok" }),
+            "{health}"
+        );
+    } else {
+        assert_eq!(health["overall"], "unhealthy", "{health}");
+        assert_eq!(health["health_level"], "red", "{health}");
+        assert_eq!(health["capacity_health_level"], "red", "{health}");
+        let probes = health["probes"].as_array().unwrap();
+        let server_probe = probes
+            .iter()
+            .find(|probe| probe["name"] == "server_health")
+            .unwrap();
+        assert_eq!(server_probe["status"], "fail", "{server_probe}");
+        assert!(
+            server_probe["detail"]
+                .as_str()
+                .unwrap()
+                .contains("pressure=red")
+        );
+        let pressure = probes
+            .iter()
+            .find(|probe| probe["name"] == "backpressure")
+            .unwrap();
+        assert_eq!(pressure["status"], "red", "{pressure}");
+        assert!(
+            pressure["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("live server:")
+        );
+        assert!(pressure["detail"].as_str().unwrap().contains("memory"));
+        let circuits = probes
+            .iter()
+            .find(|probe| probe["name"] == "circuit_breakers")
+            .unwrap();
+        assert!(
+            circuits["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("live server:")
+        );
+        assert!(
+            health["_alerts"].as_array().unwrap().iter().any(|alert| {
+                alert["severity"] == "error"
+                    && alert["summary"]
+                        .as_str()
+                        .is_some_and(|summary| summary.contains("pressure=red"))
+            }),
+            "{health}"
+        );
+    }
     let output = Command::new(am_bin())
         .env_clear()
         .envs(env.isolated_env())
         .env("HTTP_PORT", port.to_string())
         .env("AGENT_MAIL_URL", format!("http://127.0.0.1:{port}/mcp/"))
         .current_dir(env.hostile_repo())
-        .args(["robot", "health", "--json"])
+        .args(["doctor", "health"])
         .output()
         .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "{}\nserver:\n{}",
-        String::from_utf8_lossy(&output.stderr),
-        std::fs::read_to_string(&log_path).unwrap()
+        stdout.contains("database_target: live_server"),
+        "{stdout}\n{stderr}"
     );
-    let health: Value = serde_json::from_slice(&output.stdout).expect("robot health JSON");
-    assert_eq!(health["overall"], "unhealthy", "{health}");
-    assert_eq!(health["health_level"], "red", "{health}");
-    assert_eq!(health["capacity_health_level"], "red", "{health}");
-    let probes = health["probes"].as_array().unwrap();
-    let server_probe = probes
-        .iter()
-        .find(|probe| probe["name"] == "server_health")
-        .unwrap();
-    assert_eq!(server_probe["status"], "fail", "{server_probe}");
-    assert!(
-        server_probe["detail"]
-            .as_str()
-            .unwrap()
-            .contains("pressure=red")
-    );
-    let pressure = probes
-        .iter()
-        .find(|probe| probe["name"] == "backpressure")
-        .unwrap();
-    assert_eq!(pressure["status"], "red", "{pressure}");
-    assert!(
-        pressure["detail"]
-            .as_str()
-            .unwrap()
-            .starts_with("live server:")
-    );
-    assert!(pressure["detail"].as_str().unwrap().contains("memory"));
-    let circuits = probes
-        .iter()
-        .find(|probe| probe["name"] == "circuit_breakers")
-        .unwrap();
-    assert!(
-        circuits["detail"]
-            .as_str()
-            .unwrap()
-            .starts_with("live server:")
-    );
-    assert!(
-        health["_alerts"].as_array().unwrap().iter().any(|alert| {
-            alert["severity"] == "error"
-                && alert["summary"]
-                    .as_str()
-                    .is_some_and(|summary| summary.contains("pressure=red"))
-        }),
-        "{health}"
-    );
+    if memory_pressure {
+        assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(stdout.contains("fail: live server"), "{stdout}\n{stderr}");
+        assert!(stdout.contains("pressure=red"), "{stdout}\n{stderr}");
+        assert!(!stdout.contains("live mailbox needs"), "{stdout}\n{stderr}");
+    } else {
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("ok: live mailbox healthy"),
+            "{stdout}\n{stderr}"
+        );
+    }
 }
 
 fn check_serve_http_client_config_setup(setup: bool) {
