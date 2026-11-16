@@ -1,5 +1,31 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 15 Review43 malformed HTTP request-head responses — EmeraldEagle
+
+- [x] Review ready Beads, current callers and the upstream HTTP repair;
+  claim `br-wyfa9` without changing its original acceptance or peer work.
+- [x] Adopt immutable Asupersync 0.5 revision `2946438a` (HTTP repair
+  `cc504db5` plus its required upstream resume-factory Send fix) through Cargo's
+  shared patch graph; check the full lock delta and keep one runtime identity.
+- [ ] Extend existing real-listener tests with malformed-head refusals,
+  a successful follow-up request, connection closure and oversized-head status.
+- [ ] Run unchanged old-runtime controls and the repaired native tests on
+  frozen sources, preserving terminal failures and executable identities.
+- [ ] Run the existing 22-case GH332 raw-wire probe against disposable
+  candidate and old servers; keep fixtures separate from server evidence.
+- [ ] Run both workspace compiler graphs, strict Clippy, formatting and UBS;
+  inspect changed findings without relaxing tests, gates or lint policy.
+- [ ] Fresh solo reread and reexecution against original acceptance; record
+  any remaining registry-release or platform requirement on the original Bead.
+- [ ] Flush and verify tracker history/cycles; publish the coherent source,
+  tests and bounded TODO, verify remote refs and release owned reservations.
+
+The operator explicitly requested this granular TODO. It gates this scoped
+implementation report and retires as active work when the original Bead's
+acceptance is met. Test receipts in the existing scratch root preserve the
+observed silent-close defect and exact source identity; they create no new
+runtime status machinery. This is a protocol repair, not a performance claim.
+
 ## November 15 Review42 recovery fingerprint parent authority — EmeraldEagle
 
 - [x] Inspect ready Beads and landed implementations; preserve the contact

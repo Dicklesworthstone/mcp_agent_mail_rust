@@ -101,7 +101,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 | Crate | Purpose |
 |-------|---------|
-| `asupersync` (`=0.5.0`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
+| `asupersync` (`=0.5.0`, Git revision `2946438a5d2bd164c9aee73a5ea079afe0c13907`) | Structured async runtime (channels, sync, regions, HTTP, testing); immutable 0.5 repair returns HTTP errors for malformed request heads and includes the resume-factory Send fix, without splitting the shared runtime type graph |
 | `fastmcp-rust` (`0.13.0`, crates.io; imported as `fastmcp`) | MCP protocol implementation; `Cargo.lock` selects the 0.13.0 registry family on Asupersync 0.5 |
 | `sqlmodel` (`=0.5.1`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; core/pool/FrankenSQLite driver use immutable revision `ca959f89` for cancellation-safe acquisition, bounded teardown and synchronous driver retirement. Runtime `DbConn` uses FrankenSQLite `=0.4.13` with only `fsqlite-core` patched to immutable Git revision `e7ffeff4` (package version 0.4.14) for transaction-bound archive headers and bounded zero-filled WAL certificate recovery with validated enclosing records; its other 19 engine packages remain registry 0.4.13 |
 | `sqlmodel-sqlite` (`=0.5.1`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |

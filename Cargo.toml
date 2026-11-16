@@ -201,6 +201,11 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
+# br-wyfa9: return HTTP errors before closing malformed request heads. Keep
+# all consumers on one Asupersync 0.5 identity; the registry 0.5.0 predates
+# this upstream repair, while 0.6 changes the shared Cx type graph.
+# Include the upstream resume-factory Send repair required by our toolchain.
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "2946438a5d2bd164c9aee73a5ea079afe0c13907" }
 # br-kp1in.52: bind VACUUM's headers to its schema/row hydration transaction.
 # GH#387 / FrankenSQLite#537: recover bounded zero-filled WAL certificate tails.
 # Validate enclosing records before rejecting false EOF boundaries in those tails.
@@ -217,7 +222,7 @@ sqlmodel-frankensqlite = { git = "https://github.com/Dicklesworthstone/sqlmodel_
 # Beads directory discovery and queries use the installed br CLI. Do not embed
 # a separate storage engine for filesystem discovery: its old Git source
 # carried a submodule that prevented strict clean-source releases (br-kp1in.45).
-# The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.1
+# The mailbox runtime uses pinned Asupersync 0.5.0, SQLModel 0.5.1
 # (core/pool/FrankenSQLite driver pinned above for lifecycle cleanup),
 # registry FrankenSQLite 0.4.13 and registry FastMCP 0.13.0.
 # 0.4.9 carries the AM SQL-compatibility, NOCASE, INSERT SELECT UPSERT and

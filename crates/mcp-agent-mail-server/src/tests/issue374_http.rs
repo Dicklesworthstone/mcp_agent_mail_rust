@@ -1,6 +1,7 @@
 //! GH#374: native TCP -> HTTP -> ordinary inbox resource -> live query-only DB.
 //! The storage qualification owns the full archive convergence/integrity sweep;
 //! this module adds real dispatch and cancellation evidence on that read path.
+//! GH#332 also uses this native listener for raw request-head regressions.
 
 use super::*;
 use mcp_agent_mail_core::Config;
@@ -52,6 +53,106 @@ impl Drop for NativeServer {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+#[test]
+fn gh332_http_raw_header_probe_initializes_and_rejects_all_22_cases() {
+    const TEST: &str =
+        "tests::issue374_http::gh332_http_raw_header_probe_initializes_and_rejects_all_22_cases";
+    if run_prepared_http_test_in_child(TEST) {
+        return;
+    }
+    let mut config = prepared_http_test_config();
+    config.http_path = "/mcp/".into();
+    config.http_rate_limit_enabled = false;
+    let mut server = NativeServer::start(config);
+    let probe =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/repro_http_empty_headers.py");
+    let output = Command::new("python3")
+        .arg(probe)
+        .args(["--url", &format!("http://127.0.0.1:{}/mcp/", server.port)])
+        .output()
+        .expect("execute the existing stdlib-only raw HTTP regression probe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    print!("{stdout}");
+    eprint!("{stderr}");
+    server.stop().expect("graceful HTTP shutdown after probe");
+    assert!(
+        output.status.success() && stdout.contains("22/22 cases passed"),
+        "real listener must pass the complete unmodified GH332 probe: {stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn gh332_http_head_errors_close_before_pipelined_request_and_preserve_listener() {
+    const TEST: &str = "tests::issue374_http::gh332_http_head_errors_close_before_pipelined_request_and_preserve_listener";
+    if run_prepared_http_test_in_child(TEST) {
+        return;
+    }
+    let mut config = prepared_http_test_config();
+    config.http_path = "/mcp/".into();
+    config.http_rate_limit_enabled = false;
+    let mut server = NativeServer::start(config);
+    let oversized = format!("X-Pad: {}", "x".repeat(33 * 1024));
+    let mut cases = vec![
+        ("Content-Length:", 400),
+        ("Content-Length: \t ", 400),
+        ("Transfer-Encoding:", 400),
+        ("Transfer-Encoding: \t ", 400),
+        ("Bad Header: value", 400),
+        ("X-Optional: a\0b", 400),
+        ("X-Optional: a\u{7f}b", 400),
+        ("X-Optional: a\rb", 400),
+        (oversized.as_str(), 431),
+    ];
+    // A valid request remains valid, including an empty extension header.
+    cases.push(("X-Optional:", 200));
+    for (field, expected) in cases {
+        let request = format!(
+            "GET /health/liveness HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{field}\r\n\r\n\
+             GET /health/liveness HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            server.port, server.port,
+        );
+        let mut stream = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], server.port)),
+            WAIT_BOUND,
+        )
+        .expect("connect raw pipeline");
+        stream.set_write_timeout(Some(WAIT_BOUND)).unwrap();
+        stream.set_read_timeout(Some(WAIT_BOUND)).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut wire = Vec::new();
+        // EOF must arrive: a timeout or a still-open rejected connection fails.
+        stream
+            .take(128 * 1024)
+            .read_to_end(&mut wire)
+            .expect("bounded response followed by connection closure");
+        assert!(wire.len() < 128 * 1024, "response exceeded the wire bound");
+        let wire = std::str::from_utf8(&wire).expect("HTTP response text");
+        let status = wire
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1)?.parse::<u16>().ok());
+        assert_eq!(status, Some(expected), "{field:?}: {wire:?}");
+        if expected == 200 {
+            assert_eq!(wire.matches("HTTP/1.1 200 ").count(), 2, "{wire}");
+        } else {
+            assert!(
+                wire.to_ascii_lowercase()
+                    .contains("\r\nconnection: close\r\n"),
+                "{wire}"
+            );
+            assert_eq!(wire.matches("HTTP/1.1 ").count(), 1, "{wire}");
+            assert!(
+                !wire.contains("200 OK"),
+                "pipeline ran after rejection: {wire}"
+            );
+        }
+    }
+    server
+        .stop()
+        .expect("listener remains drainable after refusals");
 }
 
 fn message_body(id: i64) -> String {
