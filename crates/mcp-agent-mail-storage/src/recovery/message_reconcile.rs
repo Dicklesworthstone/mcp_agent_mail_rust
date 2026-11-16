@@ -29,9 +29,13 @@ pub const MAX_MESSAGE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 /// Bound fan-out as well as the size of an individual message.
 const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECIPIENTS: usize = 1024;
-/// Recovery must finish an identity scan before publishing. These limits bound
-/// enumeration and actual reads, not elapsed filesystem time. Exhaustion is
-/// unavailable evidence, never an empty index or permission to repair.
+/// Recovery must finish each identity scan before publishing. These limits
+/// independently bound enumeration and actual reads for HEAD, the staged index
+/// and the working tree, not elapsed filesystem time. A complete repair admits
+/// at most three such scans. Sharing one counter across these distinct sources
+/// would make the usable project size depend on how many copies are missing
+/// (GH#390). Exhaustion is unavailable evidence, never an empty index or
+/// permission to repair; no individual scan replenishes its allowance.
 const MAX_CANONICAL_SCAN_ENTRIES: usize = 100_000;
 const MAX_CANONICAL_SCAN_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -220,7 +224,7 @@ fn reconcile_message_bundle_inner(
     }
     let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
     let expected = Oid::hash_object(ObjectType::Blob, full.as_bytes())?;
-    let mut identity_budget = CanonicalScanBudget {
+    let mut committed_budget = CanonicalScanBudget {
         control,
         ..Default::default()
     };
@@ -231,7 +235,7 @@ fn reconcile_message_bundle_inner(
         &canonical,
         expected,
         initial_message_files_missing,
-        &mut identity_budget,
+        &mut committed_budget,
     )?;
     // Missing-file publication creates parent directories inside the project
     // lock. Enter their mutation fence first, matching ordinary bundle writes
@@ -276,21 +280,30 @@ fn reconcile_message_bundle_inner(
             .any(|missing| *missing);
         // Disk loss does not erase a canonical ID recorded under another Git
         // path. Consume the immutable proof only if that exact namespace is
-        // still current; mutable index and disk checks share its remaining
-        // budget. Drift defers instead of rescanning while holding the fence.
+        // still current. Index and disk observations each need a complete,
+        // independently bounded scan; earlier HEAD work cannot consume their
+        // allowance. Drift defers instead of rescanning while holding the fence.
+        let mut staged_budget = CanonicalScanBudget {
+            control,
+            ..Default::default()
+        };
         let canonical_committed = identity::revalidate_prepared(
             &repo,
             archive,
             &committed_identity,
             message_files_missing,
-            &mut identity_budget,
+            &mut staged_budget,
         )?;
         if message_files_missing || !canonical_committed {
+            let mut working_tree_budget = CanonicalScanBudget {
+                control,
+                ..Default::default()
+            };
             reject_recovery_canonical_id_collision(
                 archive,
                 id,
                 &paths.canonical,
-                &mut identity_budget,
+                &mut working_tree_budget,
             )?;
         }
         let mut created = 0;
@@ -1012,6 +1025,78 @@ mod tests {
         for (path, expected) in copies.iter().zip(saved) {
             assert_eq!(std::fs::read(path).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn repair_large_project_keeps_each_identity_source_within_its_own_budget() {
+        // GH#390: each of HEAD, the index and the working tree fits the
+        // 100,000-entry limit, but charging all three against one counter
+        // refuses every missing-message repair in this ordinary project.
+        const OTHER_MESSAGES: usize = 36_000;
+        let (_dir, config, archive, message, recipients) = fixture();
+        reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let mut index = repo.index().unwrap();
+        index.read_tree(&parent.tree().unwrap()).unwrap();
+        let shard = archive.root.join("messages/2025/01");
+        std::fs::create_dir_all(&shard).unwrap();
+        let mut retained = message.clone();
+        retained["created"] = json!("2025-01-02T03:04:05Z");
+        retained["subject"] = json!("retained");
+        for ordinal in 0..OTHER_MESSAGES {
+            let id = i64::try_from(ordinal).unwrap() + 1000;
+            retained["id"] = json!(id);
+            let source = shard.join(format!("2025-01-02T03-04-05Z__retained__{id}.md"));
+            let bytes = crate::render_message_bundle_content(&retained, "retained body").unwrap();
+            std::fs::write(&source, bytes).unwrap();
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, &source).unwrap();
+            index.add_path(Path::new(&relative)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = git2::Signature::now("recovery", "recovery@example.invalid").unwrap();
+        let before = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "fixture: large canonical namespace",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        let index_before = std::fs::read(repo.path().join("index")).unwrap();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let mut copies = vec![paths.canonical, paths.outbox];
+        copies.extend(paths.inbox);
+        let mut saved = Vec::new();
+        for (ordinal, path) in copies.iter().enumerate() {
+            saved.push(std::fs::read(path).unwrap());
+            std::fs::rename(
+                path,
+                config
+                    .storage_root
+                    .join(format!("large-project-evidence-{ordinal}.md")),
+            )
+            .unwrap();
+        }
+
+        let result =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        assert_eq!(result.files_created, copies.len());
+        assert!(!result.git_commit_needed);
+        assert_eq!(repo.head().unwrap().target().unwrap(), before);
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            index_before
+        );
+        for (path, expected) in copies.iter().zip(saved) {
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+        }
+        assert_eq!(std::fs::read_dir(shard).unwrap().count(), OTHER_MESSAGES);
     }
 
     #[test]
