@@ -7,7 +7,7 @@
 - [x] Adopt immutable Asupersync 0.5 revision `2946438a` (HTTP repair
   `cc504db5` plus its required upstream resume-factory Send fix) through Cargo's
   shared patch graph; check the full lock delta and keep one runtime identity.
-- [ ] Extend existing real-listener tests with malformed-head refusals,
+- [x] Extend existing real-listener tests with malformed-head refusals,
   a successful follow-up request, connection closure and oversized-head status.
 - [ ] Run unchanged old-runtime controls and the repaired native tests on
   frozen sources, preserving terminal failures and executable identities.
