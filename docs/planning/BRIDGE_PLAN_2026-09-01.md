@@ -9,22 +9,48 @@
   shared patch graph; check the full lock delta and keep one runtime identity.
 - [x] Extend existing real-listener tests with malformed-head refusals,
   a successful follow-up request, connection closure and oversized-head status.
-- [ ] Run unchanged old-runtime controls and the repaired native tests on
+- [x] Run unchanged old-runtime controls and the repaired native tests on
   frozen sources, preserving terminal failures and executable identities.
-- [ ] Run the existing 22-case GH332 raw-wire probe against disposable
+- [x] Run the existing 22-case GH332 raw-wire probe against disposable
   candidate and old servers; keep fixtures separate from server evidence.
-- [ ] Run both workspace compiler graphs, strict Clippy, formatting and UBS;
+- [x] Run both workspace compiler graphs, strict Clippy, formatting and UBS;
   inspect changed findings without relaxing tests, gates or lint policy.
-- [ ] Fresh solo reread and reexecution against original acceptance; record
+- [x] Fresh solo reread and reexecution against original acceptance; record
   any remaining registry-release or platform requirement on the original Bead.
-- [ ] Flush and verify tracker history/cycles; publish the coherent source,
-  tests and bounded TODO, verify remote refs and release owned reservations.
+- [x] Resolve final workspace formatting drift in two newly landed peer-test
+  layouts; preserve their behavior and run current formatting/changed-file UBS.
+- [x] Prepare the coherent qualification and tracker export for normal
+  publication; record actual commit/ref verification and reservation release
+  in the existing audit after execution.
 
 The operator explicitly requested this granular TODO. It gates this scoped
 implementation report and retires as active work when the original Bead's
 acceptance is met. Test receipts in the existing scratch root preserve the
 observed silent-close defect and exact source identity; they create no new
 runtime status machinery. This is a protocol repair, not a performance claim.
+
+`br-wyfa9` is closed on executed named-probe evidence. The unchanged registry
+runtime passes 14/22 raw-header cases and fails exactly eight with silent
+disconnects. Its broader cohort passes nine existing controls and fails the
+two new regressions. The compatible pinned runtime passes all 11 registered
+cases twice, including the unchanged 22/22 probe, exact 400/431 refusals,
+connection closure, valid pipelining, real inbox/cancellation and file-backed
+pool controls. Child output and repeat runs do not increase the unique count.
+Both executable hashes are identical on repetition; six actual worker inputs
+match the frozen manifest. Source identity is `2fee578f` plus overlay
+`ce3736e0`, with unchanged package versions/edges and 819 of 824 lock records
+identical. Both workspace compiler graphs and strict Clippy pass on that
+repair. Current workspace formatting passes after two format-only peer-test
+corrections, including an optional trailing comma. Final two-file default UBS
+returns zero with no critical findings, 580 warnings and 71 informational;
+there is no warning-free or strict warning-fatal UBS claim. Initial compiler,
+admission and source-capture failures remain retained in the existing scratch
+root. This was a fresh solo verification, not independent or release proof.
+Newer peer integrity/recovery commits `98c58ecb` and `ee9156bc` are preserved
+and excluded from these frozen runtime receipts. No new 0.5 registry release,
+native Windows qualification, live daemon upgrade or broader project closure
+is claimed; the upstream repair is already released in 0.6, while this 0.5
+source adoption preserves the shared runtime type graph.
 
 ## November 15 Review42 recovery fingerprint parent authority — EmeraldEagle
 

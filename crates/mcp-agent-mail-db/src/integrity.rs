@@ -1526,7 +1526,11 @@ mod tests {
         ] {
             let details = vec![detail.to_string()];
             let classification = classify_check_details(&details);
-            assert_eq!(classification.class, IntegrityClass::LeakedPagesOnly, "{detail}");
+            assert_eq!(
+                classification.class,
+                IntegrityClass::LeakedPagesOnly,
+                "{detail}"
+            );
             assert_eq!(classification.leaked_pages, 1, "{detail}");
             assert_eq!(classification.structural_errors, 0, "{detail}");
             assert!(integrity_details_are_suspect(&details), "{detail}");
@@ -1543,8 +1547,9 @@ mod tests {
 
     #[test]
     fn constraint_failures_with_unused_names_survive_orphan_log_compaction() {
-        let mut details: Vec<String> =
-            (2..=201).map(|page| format!("Page {page}: never used")).collect();
+        let mut details: Vec<String> = (2..=201)
+            .map(|page| format!("Page {page}: never used"))
+            .collect();
         details.push("NULL value in agents.unused".to_string());
         details.push("CHECK constraint failed in unused_values".to_string());
         let summary = summarize_check_details(&details);
