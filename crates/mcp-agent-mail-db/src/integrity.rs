@@ -523,6 +523,8 @@ fn index_damage_index_name(detail: &str) -> Option<&str> {
 /// treating the verdict as a collation disagreement rather than damage. A
 /// genuinely torn index also loses entries, which surfaces as
 /// `wrong # of entries in index …` and disqualifies this class.
+/// Each row must match a complete checker diagnostic; words embedded in a
+/// constraint error or another diagnostic are not index-order evidence.
 #[must_use]
 pub fn collated_index_disagreement_index_names(details: &[String]) -> Option<Vec<String>> {
     fn detail_is_ignorable(detail: &str) -> bool {
@@ -538,7 +540,7 @@ pub fn collated_index_disagreement_index_names(details: &[String]) -> Option<Vec
         if detail_is_ignorable(detail) {
             continue;
         }
-        let name = index_order_complaint_index_name(detail)?;
+        let name = collated_index_detail_name(detail)?.to_string();
         if !names.contains(&name) {
             names.push(name);
         }
@@ -546,12 +548,48 @@ pub fn collated_index_disagreement_index_names(details: &[String]) -> Option<Vec
     if names.is_empty() { None } else { Some(names) }
 }
 
-/// The index an ordering/lookup complaint names.
+/// Extract a name only from a complete individual checker row.
+fn collated_index_detail_name(detail: &str) -> Option<&str> {
+    fn quoted_name_is_valid(name: &str) -> bool {
+        !name.is_empty() && !name.contains('`') && !name.chars().any(char::is_control)
+    }
+
+    let trimmed = detail.trim();
+    let diagnostic = trimmed
+        .strip_prefix("database disk image is malformed: ")
+        .unwrap_or(trimmed);
+    // Reuse the bounded canonical lookup and primary key-order grammar,
+    // excluding entry-count damage from the collation-disagreement class.
+    if diagnostic.starts_with("row ") || diagnostic.starts_with("index `") {
+        return index_damage_index_name(diagnostic)
+            .filter(|name| !name.is_empty() && !name.chars().any(char::is_control));
+    }
+
+    let (owner, quoted_index) = diagnostic.split_once(" is missing from index `")?;
+    let index = quoted_index.strip_suffix('`')?;
+    if !quoted_name_is_valid(index) {
+        return None;
+    }
+    let table = if let Some(rest) = owner.strip_prefix("table `") {
+        let (table, rowid) = rest.split_once("` rowid ")?;
+        rowid.parse::<i64>().ok()?;
+        table
+    } else {
+        owner
+            .strip_prefix("a row of WITHOUT ROWID table `")?
+            .strip_suffix('`')?
+    };
+    quoted_name_is_valid(table).then_some(index)
+}
+
+/// The index a rendered primary ordering/lookup complaint names.
 ///
 /// Understands every spelling the two engines use: ``index `NAME` entries are out of order …`` and
 /// ``table `t` rowid N is missing from index `NAME` `` (primary engine),
 /// `row N missing from index NAME` (canonical SQLite), and the older
-/// `… for index NAME` form. `None` for every other row, including
+/// `… for index NAME` form, including existing rendered wrappers. Individual
+/// checker rows use the complete grammar in
+/// [`collated_index_disagreement_index_names`]. Returns `None` for
 /// `wrong # of entries in index NAME`, which is a real count mismatch.
 #[must_use]
 pub fn index_order_complaint_index_name(detail: &str) -> Option<String> {
@@ -1621,6 +1659,261 @@ mod tests {
         let mut order_damage = details;
         order_damage.push("row 1 missing from index idx_probe".to_string());
         assert!(collated_index_disagreement_index_names(&order_damage).is_none());
+    }
+
+    #[test]
+    fn canonical_constraint_with_index_complaint_name_is_not_collation_disagreement() {
+        for table in [
+            "row 1 missing from index idx_probe",
+            "index `idx_probe` entries are out of order for their declared key directions",
+            "entries are out of order for index idx_probe under NOCASE",
+            "integrity_check reported: row 1 missing from index idx_probe",
+        ] {
+            let conn = crate::CanonicalDbConn::open_memory().expect("canonical collation fixture");
+            conn.execute_raw(
+                "CREATE TABLE collated_data (name TEXT COLLATE NOCASE); \
+                 CREATE INDEX idx_probe ON collated_data(name); \
+                 INSERT INTO collated_data VALUES ('a'), ('B');",
+            )
+            .expect("create a real healthy NOCASE index");
+            let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
+            conn.execute_raw(&format!(
+                "CREATE TABLE {quoted_table} (value INTEGER CHECK(value > 0)); \
+                 INSERT INTO {quoted_table} VALUES (1);"
+            ))
+            .expect("create a valid table whose name resembles an index complaint");
+            let probe = || {
+                let rows = probe_check_rows(
+                    |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
+                    CheckKind::Full,
+                )
+                .expect("execute the real canonical checker");
+                extract_check_details(&rows, CheckKind::Full)
+            };
+            assert_eq!(probe(), vec!["ok".to_string()]);
+            // A complete lookup complaint remains eligible on this actual
+            // NOCASE schema; the structural diagnostic below must not be.
+            assert!(
+                crate::pool::canonical_details_are_collated_index_disagreement(
+                    &conn,
+                    &["row 1 missing from index idx_probe".to_string()]
+                )
+            );
+            conn.execute_raw(&format!(
+                "PRAGMA ignore_check_constraints=ON; \
+                 INSERT INTO {quoted_table} VALUES (-1); \
+                 PRAGMA ignore_check_constraints=OFF;"
+            ))
+            .expect("plant a real CHECK violation");
+            let details = probe();
+            assert_eq!(details, vec![format!("CHECK constraint failed in {table}")]);
+            assert_eq!(
+                classify_check_details(&details).class,
+                IntegrityClass::Structural
+            );
+            assert!(!integrity_details_are_suspect(&details));
+            assert!(
+                !crate::pool::canonical_details_are_collated_index_disagreement(&conn, &details),
+                "a real CHECK failure must not be waived as collation disagreement: {details:?}"
+            );
+            assert!(collated_index_disagreement_index_names(&details).is_none());
+        }
+    }
+
+    #[test]
+    fn canonical_binary_index_damage_is_not_waived_by_unrelated_nocase_column() {
+        let conn = crate::CanonicalDbConn::open_memory().expect("canonical index damage fixture");
+        conn.execute_raw(
+            "CREATE TABLE collated_data (name TEXT COLLATE BINARY, unrelated TEXT COLLATE NOCASE); \
+             CREATE INDEX idx_probe ON collated_data(name COLLATE NOCASE); \
+             INSERT INTO collated_data VALUES ('a', 'x'), ('B', 'y');",
+        )
+        .expect("create a real healthy NOCASE index");
+        let probe = || {
+            let rows = probe_check_rows(
+                |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
+                CheckKind::Full,
+            )
+            .expect("execute the real canonical checker");
+            extract_check_details(&rows, CheckKind::Full)
+        };
+        assert_eq!(probe(), vec!["ok".to_string()]);
+        assert!(
+            crate::pool::canonical_details_are_collated_index_disagreement(
+                &conn,
+                &["row 2 missing from index idx_probe".to_string()]
+            )
+        );
+        let schema_version = conn
+            .query_sync("PRAGMA schema_version", &[])
+            .expect("read the fixture schema version")[0]
+            .get_named::<i64>("schema_version")
+            .expect("integer schema version")
+            .checked_add(1)
+            .expect("fixture schema version has room to advance");
+        // Deliberately mismatch this private index's physical order and
+        // declared collation, then make SQLite reload that real schema.
+        conn.execute_raw(&format!(
+            "PRAGMA writable_schema=ON; \
+             UPDATE sqlite_master SET sql='CREATE INDEX idx_probe ON collated_data(name COLLATE BINARY)' \
+             WHERE type='index' AND name='idx_probe'; \
+             PRAGMA writable_schema=OFF; PRAGMA schema_version={schema_version};"
+        ))
+        .expect("plant real BINARY index-order damage");
+        let metadata = conn
+            .query_sync("PRAGMA index_xinfo('idx_probe')", &[])
+            .expect("independently inspect actual index collations");
+        assert_eq!(metadata.len(), 2);
+        for column in metadata {
+            assert_eq!(column.get_named::<String>("coll").unwrap(), "BINARY");
+        }
+        let details = probe();
+        assert_eq!(
+            details,
+            vec!["row 2 missing from index idx_probe".to_string()]
+        );
+        assert!(
+            !crate::pool::canonical_details_are_collated_index_disagreement(&conn, &details),
+            "an unrelated NOCASE column cannot excuse real BINARY index damage: {details:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_collation_exception_tracks_index_fields_in_real_schemas() {
+        for (schema, index, expected) in [
+            (
+                "CREATE TABLE t(name TEXT, unrelated TEXT COLLATE NOCASE); CREATE INDEX idx_probe ON t(name);",
+                "idx_probe",
+                false,
+            ),
+            (
+                "CREATE TABLE t(name TEXT COLLATE NOCASE); CREATE INDEX idx_probe ON t(name COLLATE BINARY);",
+                "idx_probe",
+                false,
+            ),
+            (
+                "CREATE TABLE t(name TEXT, unrelated TEXT COLLATE NOCASE); CREATE INDEX idx_probe ON t(lower(name) COLLATE BINARY);",
+                "idx_probe",
+                false,
+            ),
+            (
+                "CREATE TABLE t(name TEXT COLLATE NOCASE); CREATE INDEX idx_probe ON t(name);",
+                "idx_probe",
+                true,
+            ),
+            (
+                "CREATE TABLE t(name TEXT); CREATE INDEX idx_probe ON t(name COLLATE NOCASE);",
+                "idx_probe",
+                true,
+            ),
+            (
+                "CREATE TABLE t(name TEXT COLLATE NOCASE UNIQUE);",
+                "sqlite_autoindex_t_1",
+                true,
+            ),
+            (
+                "CREATE TABLE t(id TEXT COLLATE NOCASE PRIMARY KEY, name TEXT) WITHOUT ROWID; CREATE INDEX idx_probe ON t(name);",
+                "idx_probe",
+                true,
+            ),
+            (
+                "CREATE TABLE idx_probe(id TEXT COLLATE NOCASE PRIMARY KEY) WITHOUT ROWID;",
+                "idx_probe",
+                false,
+            ),
+            (
+                "CREATE TABLE t(name TEXT COLLATE NOCASE);",
+                "missing_index",
+                false,
+            ),
+            (
+                "CREATE TABLE t(name TEXT COLLATE NOCASE); CREATE INDEX \"idx ' Δ\" ON t(name);",
+                "idx ' Δ",
+                true,
+            ),
+        ] {
+            let conn = crate::CanonicalDbConn::open_memory().expect("canonical metadata fixture");
+            conn.execute_raw(schema)
+                .expect("create the real index schema");
+            // Diagnostic parsing is independently covered; this unit control
+            // asks the public consumer to consult each actual index schema.
+            assert_eq!(
+                crate::pool::canonical_details_are_collated_index_disagreement(
+                    &conn,
+                    &[format!("row 1 missing from index {index}")]
+                ),
+                expected,
+                "{schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn collated_index_rows_require_complete_supported_grammar() {
+        for detail in [
+            "row 7 missing from index idx_probe",
+            "index `idx_probe` entries are out of order for their declared key directions",
+            "database disk image is malformed: index `idx_probe` entries are out of order for their declared key directions",
+            "table `t` rowid -7 is missing from index `idx_probe`",
+            "a row of WITHOUT ROWID table `t` is missing from index `idx_probe`",
+        ] {
+            assert_eq!(
+                collated_index_disagreement_index_names(&[detail.to_string()]),
+                Some(vec!["idx_probe".to_string()]),
+                "{detail}"
+            );
+        }
+        for detail in [
+            "row X missing from index idx_probe",
+            "CHECK constraint failed in row 1 missing from index idx_probe",
+            "NOT NULL constraint failed: index idx_probe entries are out of order",
+            "page 7 malformed: index `idx_probe` entries are out of order for their declared key directions",
+            "table `t` rowid X is missing from index `idx_probe`",
+            "table `t` rowid 7 is missing from index `idx_probe`; page 3 is corrupt",
+            "a row of WITHOUT ROWID table `t` is missing from index `idx_probe` with missing cells",
+            "index `idx_probe` entries are out of order on a malformed page",
+            "index `idx_probe` entries are out of order for their declared key directions; page 3 is corrupt",
+            "wrong # of entries in index idx_probe",
+            "row 7 missing from index ",
+            "table `` rowid 7 is missing from index `idx_probe`",
+            "table `t` rowid 7 is missing from index ``",
+            "table `t` rowid 7 is missing from index `idx\nprobe`",
+        ] {
+            assert!(
+                collated_index_disagreement_index_names(&[detail.to_string()]).is_none(),
+                "{detail}"
+            );
+            assert!(
+                collated_index_disagreement_index_names(&[
+                    "row 1 missing from index idx_probe".to_string(),
+                    detail.to_string(),
+                ])
+                .is_none(),
+                "a valid lookup row cannot hide another diagnostic: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn collated_index_rows_preserve_complete_identifiers() {
+        for detail in [
+            "row 7 missing from index idx with spaces",
+            "index `idx with spaces` entries are out of order for their declared key directions",
+            "table `odd table` rowid -7 is missing from index `idx with spaces`",
+            "a row of WITHOUT ROWID table `odd table` is missing from index `idx with spaces`",
+        ] {
+            assert_eq!(
+                collated_index_disagreement_index_names(&[detail.to_string()]),
+                Some(vec!["idx with spaces".to_string()]),
+                "{detail}"
+            );
+        }
+        assert_eq!(
+            collated_index_disagreement_index_names(&[
+                "row 7 missing from index idx_Δ with spaces".to_string()
+            ]),
+            Some(vec!["idx_Δ with spaces".to_string()])
+        );
     }
 
     #[test]

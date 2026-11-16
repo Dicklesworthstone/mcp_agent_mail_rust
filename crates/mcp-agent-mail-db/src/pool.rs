@@ -10967,10 +10967,12 @@ pub fn canonical_details_are_collated_index_disagreement(
     all_collated
 }
 
-/// Whether `index_name` (or a column of its table) declares a non-BINARY
-/// collation.
+/// Whether an actual field of `index_name` uses a non-BINARY collation.
 ///
-/// Read from `sqlite_master` on an open canonical connection. `None` when the schema cannot be read or the index does not exist.
+/// Include auxiliary fields, such as a WITHOUT ROWID table's primary key.
+/// Table-wide DDL is insufficient: unrelated columns and explicit BINARY
+/// overrides do not determine this index's ordering. `None` when metadata
+/// cannot be read or the index does not exist.
 #[must_use]
 fn canonical_conn_index_declares_collation(
     conn: &crate::CanonicalDbConn,
@@ -10980,35 +10982,26 @@ fn canonical_conn_index_declares_collation(
     let rows = conn
         .query_sync(
             &format!(
-                "SELECT COALESCE(sql, '') AS sql, tbl_name FROM sqlite_master \
+                "SELECT name FROM sqlite_master \
                  WHERE type = 'index' AND name = '{quoted}' LIMIT 1"
             ),
             &[],
         )
         .ok()?;
-    let row = rows.first()?;
-    let index_sql = row.get_named::<String>("sql").unwrap_or_default();
-    if sql_declares_non_binary_collation(&index_sql) {
-        return Some(true);
-    }
-    let table = row
-        .get_named::<String>("tbl_name")
-        .unwrap_or_default()
-        .replace('\'', "''");
-    let table_rows = conn
-        .query_sync(
-            &format!(
-                "SELECT COALESCE(sql, '') AS sql FROM sqlite_master \
-                 WHERE type = 'table' AND name = '{table}' LIMIT 1"
-            ),
-            &[],
-        )
+    // index_xinfo also accepts WITHOUT ROWID table names. Confirm the
+    // diagnostic actually names an index before consulting its metadata.
+    rows.first()?;
+    let columns = conn
+        .query_sync(&format!("PRAGMA index_xinfo('{quoted}')"), &[])
         .ok()?;
-    let table_sql = table_rows
-        .first()
-        .and_then(|row| row.get_named::<String>("sql").ok())
-        .unwrap_or_default();
-    Some(sql_declares_non_binary_collation(&table_sql))
+    columns.first()?;
+    columns.iter().try_fold(false, |has_collation, column| {
+        let collation = column.get_named::<String>("coll").ok()?;
+        if collation.is_empty() {
+            return None;
+        }
+        Some(has_collation || !collation.eq_ignore_ascii_case("BINARY"))
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -11386,6 +11379,10 @@ fn is_known_collated_index_false_positive(
 
 /// Whether a `CREATE TABLE` / `CREATE INDEX` statement declares any collation
 /// other than `BINARY`.
+///
+/// Retained for the existing SQL-tokenizer controls only. Runtime verdicts
+/// inspect actual index fields through `canonical_conn_index_declares_collation`.
+#[cfg(test)]
 #[must_use]
 fn sql_declares_non_binary_collation(sql: &str) -> bool {
     let upper = sql.to_ascii_uppercase();

@@ -1,5 +1,77 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 16 Review45 canonical collation acceptance — EmeraldEagle
+
+- [x] Recheck ready Beads and current callers; preserve existing platform,
+  release, upstream-engine and peer-owned requirements.
+- [x] Claim new observed bug `br-kp1in.100` with its original populated probe,
+  explicit positive controls and unchanged no-claim boundaries.
+- [x] Add real canonical healthy/CHECK and actual public-consumer coverage;
+  add complete-row grammar and complete-identifier controls.
+- [x] Execute the immutable old-production/test-only control; preserve the
+  actual failure after real healthy/schema/diagnostic preconditions pass.
+- [x] Wire individual collation rows to complete diagnostic grammar while
+  preserving the separate rendered-primary-error extractor and its callers.
+- [x] Trace the canonical schema witness; identify unrelated NOCASE columns
+  incorrectly waiving real BINARY-index corruption and claim `br-kp1in.101`.
+- [x] Add a real healthy/damaged canonical index fixture with independent
+  BINARY metadata and exact checker diagnostics, plus real-schema controls.
+- [x] Run the second immutable counterexample with the first fix present.
+- [x] Replace table-wide DDL inference with actual index-column metadata;
+  restrict the now test-only tokenizer to test builds, preserving its assertions.
+- [x] Execute the full integrity module and all ten predeclared pool controls,
+  including both real NOCASE writing directions and malformed-btree rejection.
+- [x] Pass the final-source all-targets workspace compiler graph.
+- [x] Pass the final-source production library/binary workspace graph.
+- [x] Pass final-source strict Clippy with all targets and warnings denied.
+- [x] Pass formatting and full two-file UBS; review all 56 changed-span
+  findings without exclusions, suppressions or relaxed policy.
+- [x] Re-read the final diff/callers and repeat the full named native cohort
+  in a fresh solo pass; compare exact case sets and actual binary identities.
+- [x] Reconcile original acceptance, update only these two owned bugs, export the
+  tracker and verify graph cycles and preservation of peer records.
+- [x] Prepare the exact source/tests and existing TODO for normal publication.
+
+Record actual pushes, ref verification and lease release in the existing audit
+after execution; do not create a status-only follow-up commit to certify them.
+
+The operator requested the granular TODO. It gates these two health-path fixes
+and retires as active tracking at its scoped handoff. The named probe is
+`canonical_constraint_with_index_complaint_name_is_not_collation_disagreement`.
+The old and final controls retain all existing assertions and bounds. A
+complete real lookup complaint must still be accepted on a real NOCASE schema;
+a CHECK failure whose table name embeds those words must not be accepted.
+No benchmark, storage-engine repair, native-platform or release claim follows.
+The second named probe is
+`canonical_binary_index_damage_is_not_waived_by_unrelated_nocase_column`.
+It must reject actual BINARY-index damage even when the table has an unrelated
+NOCASE column. Real inherited/explicit collations, BINARY overrides, expression
+and implicit indexes, auxiliary WITHOUT ROWID fields and missing indexes are
+checked against actual schema metadata. Initial one-file compiler jobs remain
+evidence for that initial source only; the final two-file source needs its own
+required checks and the full expanded native cohort.
+
+Both final native runs pass all 98 declared cases: 88 integrity tests and ten
+pool controls, zero failures/ignores. They execute the same ELF SHA-256
+`bad28fe36ed60ebe4ae0c34a59e7fcf56e92f637379a0142a7ed61dcc4e7745f`.
+Source is frozen to `79fcf814` plus overlay `e22d7ee2`; the all-targets graph
+also passes there. These are native Cargo runs and solo re-verification.
+Strict Clippy also passes on the final source. Both immutable old controls
+reproduce their expected failures: the first is 2 passes/3 failures, the
+second 3 passes/2 failures. The second reaches its intended rejection
+assertion after real healthy/schema/BINARY-metadata/exact-diagnostic checks.
+The final production compiler graph also passes. `br-kp1in.100` and
+`br-kp1in.101` close against their original acceptance after the full checks
+and fresh solo repeat. Full-file default UBS returns zero with no critical
+findings, 6,027 warnings and 2,703 informational; all 56 changed-span findings
+were reviewed. No test, lint, timeout, dependency or scanner policy was relaxed.
+Earlier queue, source-change, admission, retrieval, cancellation and timeout
+attempts are retained and earn no final pass credit. Source/toolchain/binary
+evidence, original-acceptance comparison and actual publication receipts live
+in the existing scratch audit. The requested TODO retires as active tracking
+at this scoped handoff; broader benchmark, engine, platform and release Beads
+retain their original requirements and remain open.
+
 ## November 16 Review44 pool acceptance and integrity diagnostics — EmeraldEagle
 
 - [x] Recheck ready/owned Beads, code and the recent source-bound results.
