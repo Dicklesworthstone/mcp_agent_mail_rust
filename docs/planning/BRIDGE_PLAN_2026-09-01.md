@@ -1,5 +1,65 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 16 Review49 coherent contact health — EmeraldEagle
+
+- [x] Recheck ready Beads and actual callers; continue owned `br-bdo5g`.
+- [x] Compare installed RCH commit with its checkout before choosing the
+  source-retaining ordinary Cargo receipt route; retain original refusals.
+- [x] Reconcile the exact interrupted vmi wrapper without replay, after
+  verifying its populated retained-root/no-replace branch. Source survives;
+  execution never started and no test pass is inferred from recovery.
+- [x] Preserve the original three contact-policy regressions and add two
+  real two-connection controls for one consistent database observation.
+- [x] Execute the five-case old-query control through strict RCH: three
+  original cases pass; both FrankenSQLite and canonical controls fail with
+  the same invented respected delivery. Bind the exact source to its receipt.
+- [x] Connect the existing savepoint guard to both contact queries; retain
+  the subquery-free aggregation and all original policy/count assertions.
+- [x] Check actual commit success in the fixture; add query-only and caller
+  transaction checks without weakening its original failing assertion.
+- [x] Prepare a private file-backed comparison with 8,192 in-window deliveries,
+  512 outside-window negatives and independently expected policy counts.
+  Three warmup pairs and ten timed pairs compare the actual incumbent SQL
+  and current function in alternating order; retain every raw timing.
+- [x] Execute the final seven-case cohort, including existing acknowledgement
+  error-cleanup and outer-transaction callers of the shared snapshot guard.
+- [x] Explicitly run the new manual comparison, including on final V3 source;
+  all independently expected counts and ten alternating timing pairs pass.
+- [x] Run every poller test plus the manual comparison on V2: 114 pass, but
+  preserve RCH's failed post-source barrier, not a green source-qualified run.
+- [x] Trace that failure to the existing resolver fixture's leftover ancestor
+  directories. Isolate its original corrupt-shadow/healthy-absolute assertion
+  in a private child cwd; require the actual cwd and one executed passing case.
+- [x] Run the full final V3 module: 114 pass, zero ignored/failed. Its complete
+  RCH post-source receipt matches all 12 pinned runtime/build input hashes.
+- [x] Pass final workspace all-targets and production compiler graphs, strict
+  Clippy and formatting. Retain the existing dependency future-compat warning.
+- [x] Complete final full-file UBS: zero critical, 836 warnings, 116 info;
+  review all 70 changed-line findings without suppressions or exclusions.
+- [x] Reread the full final diff and callers with fresh eyes; find no further
+  defect and retain query-only and caller-transaction behavior.
+- [x] Reverify original acceptance and all 2,873 issue IDs, prior comments and
+  dependencies; export tracker and confirm no cycles or new/closed Beads.
+- [x] Prepare the reviewed source for normal publication; append actual commit,
+  push and public-ref observations to the existing audit after execution.
+- [x] Attempt the outstanding Mac observation read-only; retain the Tailscale
+  authentication timeout as zero remote process/CPU evidence.
+- [ ] Complete the original production Mac TUI CPU observation after an
+  appropriate upgrade/restart; keep `br-bdo5g` in progress for that probe.
+
+Final V3 source `0a4a54ffb4a9` passes strict RCH native build
+`30097323753215999`, all-targets `30097323753216009`, production
+`30097323753216014` and Clippy `30097323753215995`. The private real
+FrankenSQLite comparison uses 8,192 in-window deliveries plus 512 negatives,
+three warmup pairs and ten timed pairs. Current/legacy query medians are
+56.781276/149.803725 ms; raw samples and original refusals remain retained.
+This measures the existing optimization, with no new speedup credit for
+the snapshot correctness repair. Bead comments 4463/4464 retain the evidence.
+
+This is contact-health correctness and query qualification. It does not prove
+whole-daemon/GH#354 performance, native macOS/Windows behavior or release health.
+The original task stays in progress for its original production Mac probe.
+
 ## November 16 Review48 publish repairs and connect strict DSR — EmeraldEagle
 
 - [x] Apply the user's contextual go-ahead only to the six reviewed UBS
@@ -63,11 +123,11 @@ key access, service restart or live mailbox repair is part of this change.
   cycles, peer preservation and unchanged public refs; prepare the reviewed patch.
 - [x] Claim ready `br-bdo5g`; its optimized query is implemented and wired,
   with real-engine parity and realistic before/after measurement to finish.
-- [ ] Run its three existing contact-policy regressions on a source-retaining
-  strict RCH route; the first request refuses 103 before Cargo on a namespace
-  skeleton mismatch, so zero tests have executed for this task.
-- [ ] Complete the original measured query comparison and preserve the
-  distinction between query maintenance and a whole-daemon performance win.
+- [x] Run its three existing contact-policy regressions through Review49's
+  source-retaining strict RCH route. The initial namespace refusal executed
+  zero cases; later populated control/repair and final 114-case runs pass them.
+- [x] Complete the original measured query comparison in Review49; preserve
+  the distinction between query maintenance and whole-daemon performance.
 - [x] Identify an existing publisher integration gap for ready `br-54v1u`:
   DSR's strict contract machinery exists, but this dispatcher's MCP config
   does not opt in. Record the actual source/config locations on the Bead;

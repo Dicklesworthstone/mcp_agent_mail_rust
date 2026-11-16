@@ -324,7 +324,7 @@ impl<'a> DbStatQueryBatcher<'a> {
         // This counter has always counted recipient obligations, not distinct
         // messages. A shared delivery contributes one obligation per eligible
         // unacknowledged viewer; its direct recipients retain precedence.
-        with_ack_read_snapshot(self.conn, || {
+        with_poller_read_snapshot(self.conn, || {
             let shared = ExplorerQuery::shared_mailbox_schema_available(self.conn)
                 .map_err(|error| error.to_string())?;
             let direct = self
@@ -1901,30 +1901,32 @@ fn agent_health_source_availability(conn: &DbConn) -> AgentHealthSourceAvailabil
     }
 }
 
-struct AckReadSnapshot<'a, C: SyncQuery> {
+struct PollerReadSnapshot<'a, C: SyncQuery> {
     conn: &'a C,
     active: bool,
 }
 
-impl<C: SyncQuery> Drop for AckReadSnapshot<'_, C> {
+impl<C: SyncQuery> Drop for PollerReadSnapshot<'_, C> {
     fn drop(&mut self) {
         if self.active
-            && let Err(error) = self.conn.execute_raw("RELEASE SAVEPOINT am_tui_ack_stats")
+            && let Err(error) = self
+                .conn
+                .execute_raw("RELEASE SAVEPOINT am_tui_health_stats")
         {
-            tracing::warn!(%error, "tui acknowledgement snapshot cleanup failed");
+            tracing::warn!(%error, "tui poller read snapshot cleanup failed");
         }
     }
 }
 
-fn with_ack_read_snapshot<C: SyncQuery, T>(
+fn with_poller_read_snapshot<C: SyncQuery, T>(
     conn: &C,
     read: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    conn.execute_raw("SAVEPOINT am_tui_ack_stats")
+    conn.execute_raw("SAVEPOINT am_tui_health_stats")
         .map_err(|error| error.to_string())?;
-    let mut snapshot = AckReadSnapshot { conn, active: true };
+    let mut snapshot = PollerReadSnapshot { conn, active: true };
     let result = read();
-    conn.execute_raw("RELEASE SAVEPOINT am_tui_ack_stats")
+    conn.execute_raw("RELEASE SAVEPOINT am_tui_health_stats")
         .map_err(|error| error.to_string())?;
     snapshot.active = false;
     result
@@ -2222,7 +2224,7 @@ fn fetch_agent_ack_stats(
            AND m.ack_required != 0 \
            AND {created_expr} >= {window_start}"
     );
-    with_ack_read_snapshot(conn, || {
+    with_poller_read_snapshot(conn, || {
         let shared = ExplorerQuery::shared_mailbox_schema_available(conn)
             .map_err(|error| error.to_string())?;
         let rows = conn
@@ -2345,8 +2347,11 @@ fn fetch_agent_reservation_stats(
 /// `EXISTS` over a CTE made the engine re-run the CTE for every recipient row
 /// in the 30-day window, which pegged the poller thread at a full core once
 /// the window held enough mail (br-bdo5g).
+///
+/// Links and grouped deliveries share one read snapshot. Otherwise a commit
+/// between the queries can classify a new delivery using a revoked old link.
 fn fetch_agent_contact_stats(
-    conn: &DbConn,
+    conn: &impl SyncQuery,
     agent_ids_sql: &str,
     window_start: i64,
     now: i64,
@@ -2354,43 +2359,45 @@ fn fetch_agent_contact_stats(
     if agent_ids_sql.is_empty() {
         return HashMap::new();
     }
-    let Some(approved_links) = fetch_approved_contact_links(conn, now) else {
-        return HashMap::new();
-    };
-    conn.query_sync(&contact_policy_rows_sql(agent_ids_sql, window_start), &[])
-        .ok()
-        .map(|rows| {
-            let mut stats: HashMap<i64, AgentContactStats> = HashMap::new();
-            for row in rows {
-                let Some(recipient_id) = parse_raw_i64(&row, "agent_id") else {
-                    continue;
-                };
-                let sender_id = parse_raw_i64(&row, "sender_id");
-                let policy = row.get_named::<String>("contact_policy").ok();
-                let row_count =
-                    nonnegative_i64_to_u64(parse_raw_i64(&row, "row_count").unwrap_or(0));
-                let (respected, violation) = classify_contact_policy_rows(
-                    policy.as_deref(),
-                    sender_id,
-                    recipient_id,
-                    &approved_links,
-                );
-                let entry = stats.entry(recipient_id).or_default();
-                if respected {
-                    entry.respected_count += row_count;
+    with_poller_read_snapshot(conn, || {
+        let Some(approved_links) = fetch_approved_contact_links(conn, now) else {
+            return Ok(HashMap::new());
+        };
+        conn.query_sync(&contact_policy_rows_sql(agent_ids_sql, window_start), &[])
+            .map(|rows| {
+                let mut stats: HashMap<i64, AgentContactStats> = HashMap::new();
+                for row in rows {
+                    let Some(recipient_id) = parse_raw_i64(&row, "agent_id") else {
+                        continue;
+                    };
+                    let sender_id = parse_raw_i64(&row, "sender_id");
+                    let policy = row.get_named::<String>("contact_policy").ok();
+                    let row_count =
+                        nonnegative_i64_to_u64(parse_raw_i64(&row, "row_count").unwrap_or(0));
+                    let (respected, violation) = classify_contact_policy_rows(
+                        policy.as_deref(),
+                        sender_id,
+                        recipient_id,
+                        &approved_links,
+                    );
+                    let entry = stats.entry(recipient_id).or_default();
+                    if respected {
+                        entry.respected_count += row_count;
+                    }
+                    if violation {
+                        entry.violation_count += row_count;
+                    }
                 }
-                if violation {
-                    entry.violation_count += row_count;
-                }
-            }
-            stats
-        })
-        .unwrap_or_default()
+                stats
+            })
+            .map_err(|error| error.to_string())
+    })
+    .unwrap_or_default()
 }
 
 /// Directed (sender, recipient) pairs allowed by an approved, unexpired link.
 /// A link permits messages in both directions. `None` when the query fails.
-fn fetch_approved_contact_links(conn: &DbConn, now: i64) -> Option<HashSet<(i64, i64)>> {
+fn fetch_approved_contact_links(conn: &impl SyncQuery, now: i64) -> Option<HashSet<(i64, i64)>> {
     let link_expires_expr = timestamp_sort_expr("al.expires_ts");
     let rows = conn
         .query_sync(
@@ -4286,6 +4293,46 @@ mod tests {
 
     #[test]
     fn open_sync_connection_with_path_uses_shared_server_resolver() {
+        const CHILD_CWD: &str = "AM_TUI_POLLER_RESOLVER_TEST_CWD";
+        if let Some(expected_cwd) = std::env::var_os(CHILD_CWD) {
+            assert_eq!(
+                std::env::current_dir()
+                    .expect("child cwd")
+                    .canonicalize()
+                    .unwrap(),
+                std::path::PathBuf::from(expected_cwd)
+                    .canonicalize()
+                    .unwrap(),
+                "the resolver child must run in its private working directory"
+            );
+        } else {
+            // The malformed relative candidate needs a cwd-relative shadow.
+            // Keep its entire ancestor tree out of the checkout, and avoid
+            // changing the cwd shared by other tests in this process.
+            let working = tempfile::tempdir().expect("private resolver cwd");
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "tui_poller::tests::open_sync_connection_with_path_uses_shared_server_resolver",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_CWD, working.path())
+                .current_dir(working.path())
+                .output()
+                .expect("run isolated resolver test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "isolated resolver test failed\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed; 0 failed"),
+                "the isolated resolver case must actually execute: {stdout}"
+            );
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         // The resolver reports canonical paths; macOS temp dirs sit behind the
         // /var -> /private/var symlink.
@@ -4302,23 +4349,20 @@ mod tests {
             .to_string_lossy()
             .trim_start_matches('/')
             .to_string();
-        let relative_parent = std::path::Path::new(&relative_path)
-            .parent()
-            .expect("relative db parent");
-        let shadow_root = std::env::current_dir().expect("cwd").join(relative_parent);
-        struct ShadowRootCleanup(std::path::PathBuf);
-        impl Drop for ShadowRootCleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
+        // A drive-prefixed spelling is already absolute; its "shadow" would
+        // overwrite the healthy candidate instead of creating a second file.
+        if std::path::Path::new(&relative_path).is_relative() {
+            let relative_parent = std::path::Path::new(&relative_path)
+                .parent()
+                .expect("relative db parent");
+            let shadow_root = std::env::current_dir().expect("cwd").join(relative_parent);
+            std::fs::create_dir_all(&shadow_root).expect("create relative shadow root");
+            std::fs::write(
+                shadow_root.join("poller_fallback.sqlite3"),
+                b"not a sqlite database",
+            )
+            .expect("write corrupt shadow");
         }
-        let _cleanup = ShadowRootCleanup(shadow_root.clone());
-        std::fs::create_dir_all(&shadow_root).expect("create relative shadow root");
-        std::fs::write(
-            shadow_root.join("poller_fallback.sqlite3"),
-            b"not a sqlite database",
-        )
-        .expect("write corrupt shadow");
 
         let db_url = format!("sqlite:///{relative_path}");
         let (_conn, sqlite_path) =
@@ -7465,9 +7509,7 @@ first body
         }
     }
 
-    #[test]
-    fn fetch_agent_contact_stats_matches_legacy_correlated_query() {
-        let conn = DbConn::open_memory().expect("open in-memory db");
+    fn seed_contact_stats_fixture(conn: &DbConn) -> (i64, i64) {
         conn.execute_sync(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, contact_policy TEXT)",
             &[],
@@ -7571,6 +7613,13 @@ first body
         )
         .expect("insert recipients");
 
+        (window_start, now)
+    }
+
+    #[test]
+    fn fetch_agent_contact_stats_matches_legacy_correlated_query() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        let (window_start, now) = seed_contact_stats_fixture(&conn);
         let ids = "1,2,3,4,5,6,7,8";
         let current = fetch_agent_contact_stats(&conn, ids, window_start, now);
         let legacy = legacy_contact_stats(&conn, ids, window_start, now);
@@ -7592,6 +7641,262 @@ first body
         .into_iter()
         .collect();
         assert_eq!(current, expected);
+    }
+
+    #[test]
+    #[ignore = "manual paired real-engine comparison for br-bdo5g; run explicitly"]
+    fn contact_stats_realistic_query_comparison() {
+        let directory = tempfile::tempdir().expect("private comparison directory");
+        let path = directory.path().join("contact-comparison.sqlite3");
+        let conn = DbConn::open_file(path.to_str().expect("UTF-8 comparison path"))
+            .expect("open real file-backed FrankenSQLite");
+        conn.execute_raw("PRAGMA journal_mode=WAL").unwrap();
+        let (window_start, now) = seed_contact_stats_fixture(&conn);
+        conn.execute_raw(
+            "CREATE INDEX idx_message_recipients_agent ON message_recipients(agent_id); \
+             CREATE INDEX idx_message_recipients_agent_message ON message_recipients(agent_id, message_id); \
+             CREATE INDEX idx_messages_created_ts ON messages(created_ts); \
+             BEGIN;",
+        )
+        .unwrap();
+        // Nine doublings retain the original policy mix: 3,584 messages and
+        // 8,704 stored deliveries, including 512 outside the health window.
+        for generation in 0..9 {
+            let offset = 7_i64 << generation;
+            let params = [Value::BigInt(offset), Value::BigInt(offset)];
+            conn.execute_sync(
+                "INSERT INTO messages (id, sender_id, created_ts) \
+                 SELECT id + ?, sender_id, created_ts FROM messages WHERE id <= ?",
+                &params,
+            )
+            .expect("duplicate bounded message generation");
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id) \
+                 SELECT message_id + ?, agent_id FROM message_recipients WHERE message_id <= ?",
+                &params,
+            )
+            .expect("duplicate bounded delivery generation");
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        let count = |sql: &str| {
+            conn.query_sync(sql, &[])
+                .unwrap()
+                .first()
+                .unwrap()
+                .get_named::<i64>("c")
+                .unwrap()
+        };
+        assert_eq!(count("SELECT COUNT(*) AS c FROM messages"), 3_584);
+        assert_eq!(count("SELECT COUNT(*) AS c FROM message_recipients"), 8_704);
+        let in_window = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM message_recipients mr \
+                 JOIN messages m ON m.id=mr.message_id WHERE m.created_ts >= ?",
+                &[Value::BigInt(window_start)],
+            )
+            .unwrap();
+        assert_eq!(in_window[0].get_named::<i64>("c").unwrap(), 8_192);
+        let expected: HashMap<i64, AgentContactStats> = [
+            (1, contact_stats(1_024, 0)),
+            (2, contact_stats(512, 0)),
+            (3, contact_stats(1_024, 512)),
+            (4, contact_stats(512, 1_024)),
+            (5, contact_stats(512, 512)),
+            (6, contact_stats(512, 1_024)),
+            (7, contact_stats(0, 512)),
+            (8, contact_stats(0, 0)),
+        ]
+        .into_iter()
+        .collect();
+        let ids = "1,2,3,4,5,6,7,8";
+        let current = || {
+            let started = Instant::now();
+            let result =
+                std::hint::black_box(fetch_agent_contact_stats(&conn, ids, window_start, now));
+            let elapsed = started.elapsed().as_nanos();
+            assert_eq!(result, expected, "current real-engine counts");
+            elapsed
+        };
+        let legacy = || {
+            let started = Instant::now();
+            let result = std::hint::black_box(legacy_contact_stats(&conn, ids, window_start, now));
+            let elapsed = started.elapsed().as_nanos();
+            assert_eq!(result, expected, "incumbent real-engine counts");
+            elapsed
+        };
+        for _ in 0..3 {
+            let _ = legacy();
+            let _ = current();
+        }
+        let mut current_ns = [0_u128; 10];
+        let mut legacy_ns = [0_u128; 10];
+        for index in 0..10 {
+            if index % 2 == 0 {
+                legacy_ns[index] = legacy();
+                current_ns[index] = current();
+            } else {
+                current_ns[index] = current();
+                legacy_ns[index] = legacy();
+            }
+        }
+        let summary = |samples: [u128; 10]| {
+            let mut sorted = samples;
+            sorted.sort_unstable();
+            serde_json::json!({
+                "raw_ns": samples,
+                "p50_ns": u128::midpoint(sorted[4], sorted[5]),
+                "p95_ns": sorted[9],
+                "p99_ns": sorted[9],
+            })
+        };
+        eprintln!(
+            "CONTACT_STATS_COMPARISON {}",
+            serde_json::json!({
+                "engine": "FrankenSQLite",
+                "storage": "private file-backed WAL",
+                "in_window_deliveries": 8192,
+                "stored_deliveries": 8704,
+                "messages": 3584,
+                "warmup_pairs": 3,
+                "timed_pairs": 10,
+                "order": "alternating legacy/current and current/legacy",
+                "current": summary(current_ns),
+                "legacy": summary(legacy_ns),
+                "no_claim": "query comparison only; no whole-daemon, GH354, native macOS or release claim",
+            })
+        );
+    }
+
+    fn assert_contact_stats_keep_one_read_snapshot(
+        reader: &impl SyncQuery,
+        writer: &impl SyncQuery,
+    ) {
+        struct PublishBetweenQueries<'a> {
+            reader: &'a dyn SyncQuery,
+            writer: &'a dyn SyncQuery,
+            published: std::cell::Cell<bool>,
+        }
+
+        impl SyncQuery for PublishBetweenQueries<'_> {
+            fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
+                let rows = self
+                    .reader
+                    .query_sync(sql, params)
+                    .expect("real contact reader query must succeed");
+                if sql.contains("FROM agent_links al") && !self.published.get() {
+                    // The real writer revokes the link and publishes a delivery
+                    // in one commit after the real reader selected its links.
+                    self.writer
+                        .execute_raw("BEGIN")
+                        .expect("begin real interleaved writer");
+                    self.writer
+                        .execute_raw("DELETE FROM agent_links")
+                        .expect("revoke the real contact link");
+                    self.writer
+                        .execute_raw(
+                            "INSERT INTO messages (id, sender_id, created_ts) VALUES (1, 2, 100)",
+                        )
+                        .expect("publish real interleaved message");
+                    self.writer
+                        .execute_raw(
+                            "INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 1)",
+                        )
+                        .expect("publish real interleaved delivery");
+                    self.writer
+                        .execute_raw("COMMIT")
+                        .expect("commit real interleaved publication");
+                    self.published.set(true);
+                }
+                Ok(rows)
+            }
+
+            fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+                self.reader.execute_raw(sql)
+            }
+        }
+
+        reader
+            .execute_raw(
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, contact_policy TEXT); \
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER, created_ts INTEGER NOT NULL); \
+                 CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL); \
+                 CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_agent_id INTEGER, b_agent_id INTEGER, status TEXT, expires_ts INTEGER); \
+                 INSERT INTO agents VALUES (1, 'contacts_only'), (2, 'auto'); \
+                 INSERT INTO agent_links VALUES (1, 2, 1, 'approved', 0);",
+            )
+            .expect("seed real contact snapshot fixture");
+        let interleaved = PublishBetweenQueries {
+            reader,
+            writer,
+            published: std::cell::Cell::new(false),
+        };
+        let before = fetch_agent_contact_stats(&interleaved, "1", 0, 1_000);
+        assert!(interleaved.published.get(), "the real writer must commit");
+        assert!(
+            before.is_empty(),
+            "the earlier snapshot has no delivery; mixing old links with the new delivery invents a respected message: {before:?}"
+        );
+        assert_eq!(
+            fetch_agent_contact_stats(&interleaved, "1", 0, 1_000),
+            std::iter::once((1, contact_stats(0, 1))).collect(),
+            "after releasing the read snapshot, the revoked-link delivery must be a violation"
+        );
+        reader.execute_raw("PRAGMA query_only=ON").unwrap();
+        assert_eq!(
+            fetch_agent_contact_stats(reader, "1", 0, 1_000),
+            std::iter::once((1, contact_stats(0, 1))).collect(),
+            "query-only callers must still receive the real contact counts"
+        );
+        reader.execute_raw("PRAGMA query_only=OFF").unwrap();
+        reader.execute_raw("BEGIN").unwrap();
+        reader
+            .execute_raw(
+                "INSERT INTO messages VALUES (2, 1, 100); \
+                 INSERT INTO message_recipients VALUES (2, 1);",
+            )
+            .unwrap();
+        assert_eq!(
+            fetch_agent_contact_stats(reader, "1", 0, 1_000),
+            std::iter::once((1, contact_stats(1, 1))).collect(),
+            "the caller's own uncommitted delivery stays visible"
+        );
+        let published_rows = writer
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .unwrap();
+        assert_eq!(
+            published_rows[0].get_named::<i64>("c").unwrap(),
+            1,
+            "contact reads must not commit their caller's transaction"
+        );
+        reader.execute_raw("ROLLBACK").unwrap();
+        assert_eq!(
+            fetch_agent_contact_stats(reader, "1", 0, 1_000),
+            std::iter::once((1, contact_stats(0, 1))).collect()
+        );
+    }
+
+    #[test]
+    fn contact_stats_keep_one_read_snapshot_during_real_franken_commit() {
+        let directory = tempfile::tempdir().expect("private database directory");
+        let path = directory.path().join("contact-snapshot.sqlite3");
+        let path = path.to_str().expect("UTF-8 database path");
+        let reader = DbConn::open_file(path).expect("open real Franken reader");
+        reader.execute_raw("PRAGMA journal_mode=WAL").unwrap();
+        let writer = DbConn::open_file(path).expect("open real Franken writer");
+        assert_contact_stats_keep_one_read_snapshot(&reader, &writer);
+    }
+
+    #[test]
+    fn contact_stats_keep_one_read_snapshot_during_real_canonical_commit() {
+        let directory = tempfile::tempdir().expect("private database directory");
+        let path = directory.path().join("contact-snapshot.sqlite3");
+        let path = path.to_str().expect("UTF-8 database path");
+        let reader = mcp_agent_mail_db::CanonicalDbConn::open_file(path)
+            .expect("open real canonical reader");
+        reader.execute_raw("PRAGMA journal_mode=WAL").unwrap();
+        let writer = mcp_agent_mail_db::CanonicalDbConn::open_file(path)
+            .expect("open real canonical writer");
+        assert_contact_stats_keep_one_read_snapshot(&reader, &writer);
     }
 
     #[test]
