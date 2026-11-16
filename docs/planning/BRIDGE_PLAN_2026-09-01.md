@@ -1,5 +1,46 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 16 Review48 publish repairs and connect strict DSR — EmeraldEagle
+
+- [x] Apply the user's contextual go-ahead only to the six reviewed UBS
+  protocol-comparison findings on the unchanged qualified Rust repair.
+- [x] Commit that repair as `7dee25a0` and push normally; verify both public
+  branches resolve to its exact full SHA. Preserve the nonzero UBS result.
+- [x] Claim ready P0 `br-54v1u`; trace the installed publisher and its actual
+  config, naming, quality and native-environment consumers before editing.
+- [x] Preserve the original dispatcher profile and registry in existing
+  review scratch; use a candidate copy before changing active configuration.
+- [x] Enable the existing strict contract with six exact archive identities,
+  both packaged binaries, signed aggregate checksums and a public manifest.
+- [x] Include GNU and musl as distinct Linux x86 variants; correct the tool
+  identity and align the registry's supported platform inventory.
+- [x] Put the six original checks in the actual required-check registry,
+  fixing consolidated integration-test selectors; add the production graph
+  and full workspace Nextest without replacing the original checks.
+- [x] Require strict RCH and locked dependencies. Remove obsolete copied
+  sibling declarations only after checking the active Cargo workspace.
+- [x] Add the standalone public key required by DSR's existing consumer;
+  confirm it equals the installer key and verifies published v0.3.40 sums.
+- [x] Validate the candidate through real DSR functions: 43 checks pass,
+  including malformed-contract refusals and six exact naming/env bindings.
+- [x] Apply the reviewed profile and registry without changing other tools.
+- [x] Repeat all 43 checks against the active dispatcher files.
+- [x] Reread final diffs and confirm original non-MCP registry entries;
+  finish formatting, tracker export, cycle and unchanged-Rust-source checks.
+- [x] Scan the extracted executable build/check Bash with UBS: two files,
+  zero findings, exit 0. Retain unsupported key/Markdown scan's exit 3 as
+  zero coverage, not a pass; verify the key through actual signature checks.
+- [x] Prepare the reviewed public-key integration for normal publication;
+  record actual commit/push/public-ref receipts in the existing audit.
+- [ ] Obtain real strict-RCH native admission and execute both packaged
+  binaries on all required platforms. Current backend refuses before builds.
+- [ ] Execute exact-tag positive/adversarial publisher transitions and retain
+  public artifact identity evidence; original P0 acceptance stays open.
+
+The 43 checks establish configuration/signature behavior, not native build or
+publisher-transition proof. No Actions dispatch, release publication, private
+key access, service restart or live mailbox repair is part of this change.
+
 ## November 16 Review47 finish validated runtime repairs — EmeraldEagle
 
 - [x] Confirm the five reviewed Rust files still match the source that passed

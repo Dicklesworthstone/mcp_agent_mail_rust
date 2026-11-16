@@ -14,6 +14,18 @@ rollout checkboxes below are historical implementation notes, not evidence that
 the current candidate passes. Start a fresh candidate record with its source
 commit, dependency revisions, exact commands, binary hashes, and terminal results.
 
+The dispatcher's `repos.d/mcp_agent_mail_rust.yaml` must opt into DSR's
+`release_contract`, cover all six archives below (GNU and musl are separate
+`linux/amd64` target-triple variants), and pin `minisign_public_key_file` to
+the tracked `minisign.pub`. That key must match the installer trust root;
+verify it against a published `SHA256SUMS.minisig` before changing the profile.
+DSR quality reads `required_checks` from `repos.yaml`, so checks stored only
+in the build profile do not enforce a gate. Keep both registry and profile
+identities consistent. Configuration validation alone does not prove a release:
+the installed native backend currently refuses `RCH_REQUIRE_REMOTE=1` with
+`RCH_REQUIRED_NATIVE_UNAVAILABLE`; retain that refusal until real admission
+and all native/publication evidence exist.
+
 - [ ] Resolve release-blocking bugs and run workspace check, strict Clippy,
   formatting, full nextest, and the real transport/recovery/installer gates.
   A build refusal, skipped dependency, or interrupted run is not a pass. The
