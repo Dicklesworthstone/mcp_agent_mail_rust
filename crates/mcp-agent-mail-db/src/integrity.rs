@@ -396,8 +396,10 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
         let trimmed = detail.trim();
         let lower = trimmed.to_ascii_lowercase();
         // Section headers like "*** in database main ***" carry no verdict.
+        // Only the complete sidecar advisory is harmless: the same words
+        // inside a constraint diagnostic can be a table or column name.
         if lower == "ok"
-            || lower.contains("wal without shm")
+            || lower == "wal without shm"
             || (trimmed.starts_with("***") && trimmed.ends_with("***"))
         {
             continue;
@@ -445,7 +447,7 @@ pub fn index_only_corruption_index_names(details: &[String]) -> Option<Vec<Strin
         (trimmed.starts_with("***") && trimmed.ends_with("***"))
             || lower == "ok"
             || crate::never_written_pages::never_used_page_number(trimmed).is_some()
-            || lower.contains("wal without shm")
+            || lower == "wal without shm"
     }
 
     let mut names: Vec<String> = Vec::new();
@@ -528,7 +530,7 @@ pub fn collated_index_disagreement_index_names(details: &[String]) -> Option<Vec
         let lower = trimmed.to_ascii_lowercase();
         (trimmed.starts_with("***") && trimmed.ends_with("***"))
             || lower == "ok"
-            || lower.contains("wal without shm")
+            || lower == "wal without shm"
     }
 
     let mut names: Vec<String> = Vec::new();
@@ -905,7 +907,7 @@ pub fn classify_check_details(details: &[String]) -> IntegrityClassification {
         let trimmed = detail.trim();
         let lower = trimmed.to_ascii_lowercase();
         if lower == "ok"
-            || lower.contains("wal without shm")
+            || lower == "wal without shm"
             || (trimmed.starts_with("***") && trimmed.ends_with("***"))
         {
             continue;
@@ -1543,6 +1545,82 @@ mod tests {
                 "{detail}"
             );
         }
+    }
+
+    #[test]
+    fn standalone_wal_sidecar_advisory_preserves_repair_classification() {
+        for advisory in ["wal without shm", "  WAL without SHM  "] {
+            let details = vec![advisory.to_string()];
+            assert_eq!(
+                classify_check_details(&details).class,
+                IntegrityClass::Clean
+            );
+            assert!(integrity_details_are_suspect(&details));
+
+            let mut index_damage = details.clone();
+            index_damage.push("wrong # of entries in index idx_probe".to_string());
+            assert_eq!(
+                index_only_corruption_index_names(&index_damage),
+                Some(vec!["idx_probe".to_string()])
+            );
+
+            let mut order_damage = details;
+            order_damage.push("row 1 missing from index idx_probe".to_string());
+            assert_eq!(
+                collated_index_disagreement_index_names(&order_damage),
+                Some(vec!["idx_probe".to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_constraint_with_wal_advisory_name_remains_structural() {
+        let conn = crate::CanonicalDbConn::open_memory().expect("canonical constraint fixture");
+        conn.execute_raw(
+            "CREATE TABLE \"wal without shm\" (value INTEGER CHECK(value > 0)); \
+             INSERT INTO \"wal without shm\" VALUES (1);",
+        )
+        .expect("create valid table whose name resembles a sidecar advisory");
+        let probe = || {
+            probe_check_rows(
+                |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
+                CheckKind::Full,
+            )
+            .expect("execute real canonical integrity probe")
+        };
+        let healthy = extract_check_details(&probe(), CheckKind::Full);
+        assert_eq!(healthy, vec!["ok".to_string()]);
+        assert_eq!(
+            classify_check_details(&healthy).class,
+            IntegrityClass::Clean
+        );
+
+        // SQLite permits this explicit corruption fixture without editing
+        // database bytes or substituting a fabricated integrity result.
+        conn.execute_raw(
+            "PRAGMA ignore_check_constraints=ON; \
+             INSERT INTO \"wal without shm\" VALUES (-1); \
+             PRAGMA ignore_check_constraints=OFF;",
+        )
+        .expect("plant a real CHECK violation");
+        let details = extract_check_details(&probe(), CheckKind::Full);
+        let expected = "CHECK constraint failed in wal without shm";
+        assert_eq!(details, vec![expected.to_string()]);
+        let classification = classify_check_details(&details);
+        assert_eq!(classification.class, IntegrityClass::Structural);
+        assert_eq!(classification.structural_errors, 1);
+        assert_eq!(
+            classification.first_structural_error.as_deref(),
+            Some(expected)
+        );
+        assert!(!integrity_details_are_suspect(&details));
+
+        let mut index_damage = details.clone();
+        index_damage.push("wrong # of entries in index idx_probe".to_string());
+        assert!(index_only_corruption_index_names(&index_damage).is_none());
+        let mut order_damage = details;
+        order_damage.push("row 1 missing from index idx_probe".to_string());
+        assert!(collated_index_disagreement_index_names(&order_damage).is_none());
     }
 
     #[test]

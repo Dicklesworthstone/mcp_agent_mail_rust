@@ -1,5 +1,73 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 16 Review44 pool acceptance and integrity diagnostics — EmeraldEagle
+
+- [x] Recheck ready/owned Beads, code and the recent source-bound results.
+  Avoid duplicating landed memory attribution and OMP plugin discovery.
+- [x] Retain `br-kp1in.87` as the original task authority; reread its failed
+  initializer/warmup history and preserve its acceptance and other open gates.
+- [x] Reread the real initializer, warmup, retirement and HTTP callers/tests;
+  verify the selected immutable SQLModel/runtime graph and source identities.
+- [x] Execute all ten existing DB pool controls and four real HTTP controls
+  on the previously frozen repair, with original assertions and deadlines.
+- [x] Repeat the same fourteen registered cases in a fresh solo pass;
+  compare actual source/toolchain and both executable identities.
+- [x] Reconcile those results with the existing upstream and compiler gates;
+  close only the original task if all its acceptance is actually met.
+- [x] Reproduce a real canonical SQLite CHECK violation whose table name is
+  `wal without shm`; identify four substring-based advisory misclassifiers.
+- [x] Add real-engine healthy/damaged controls and preserve the standalone
+  sidecar advisory's behavior; execute the old classifier counterexample.
+- [x] Restrict all four advisory matches to the complete diagnostic;
+  preserve every existing assertion, bound and dependency.
+- [x] Execute all 83 registered integrity-module tests, including the real
+  canonical healthy/damaged and advisory/repair-selection controls.
+- [x] Repeat the full integrity module in a fresh solo native process;
+  compare its exact case census and actual executed binary identity.
+- [x] Run both workspace compiler graphs, strict Clippy, formatting and
+  default UBS; review changed findings and retain every failed attempt.
+- [x] Record this supporting integrity-health repair on owned `br-kp1in.5`;
+  preserve that task's benchmark acceptance and the upstream storage gates.
+- [x] Reread the final diff and callers; prepare the exact source/tests,
+  owned tracker exports and existing TODO for normal publication. Record
+  actual push/ref verification and reservation release in the existing
+  audit after execution.
+
+The operator requested this detailed TODO. It gates the two scoped handoffs
+and retires as active work after their disposition. Pool closure qualifies a
+landed integration; the integrity work adds a production diagnostic fix.
+Neither is a performance win. Native Windows, stdio latency, full-application
+soak, release publication and peer work retain their original open tasks.
+
+`br-kp1in.87` is closed after all fourteen original registered controls pass
+twice: ten real DB pool controls and four HTTP controls, with original
+assertions/deadlines and identical actual DB/server executable hashes. Its
+qualification remains frozen to `2fee578f` plus overlay `ce3736e0`, with
+seven actual inputs and the pinned compiler verified. Historical initializer,
+warmup and load failures remain retained; there is no broader source, latency,
+full-convergence or release claim.
+
+The integrity repair qualifies `72926c9b` plus overlay `4ed0599e`. The old
+production/test-only control `80f7b932` passes three controls and fails the
+real canonical CHECK regression by returning `Clean` instead of `Structural`.
+Healthy-table and exact diagnostic assertions pass before that intended
+failure. All 83 registered integrity tests then pass twice on the repair,
+with no failures/ignores and 4,028 unrelated cases filtered. Both actual
+native executions use the identical ELF SHA-256 `18bab8951c69a76ebdf8a4c82f87fb64df20b14f02997dae97cb5126b516670f`.
+Six actual worker inputs and the running compiler are verified. These are
+native Cargo runs; Nextest is refused before testing by
+disk admission, so no Nextest isolation/leak-watchdog proof is claimed.
+
+Both compiler graphs, strict Clippy and formatting pass on the repair.
+Default full-file UBS returns zero with no critical findings, 444 warnings
+and 42 informational; all 24 changed-span findings were reviewed. Existing
+dependency future-incompatibility warnings remain. Failed queue, SSH,
+disk-probe and admission attempts are retained in the existing scratch root
+`/data/tmp/am-archive-reader-20261110.t7ueMuTt`; none earns a test pass. This is
+solo verification, not independent certification. The supporting health
+repair leaves `br-kp1in.5`'s original benchmark acceptance open. No dependency,
+gate, test assertion, timeout, ignore, live mailbox or release was changed.
+
 ## November 15 Review43 malformed HTTP request-head responses — EmeraldEagle
 
 - [x] Review ready Beads, current callers and the upstream HTTP repair;
