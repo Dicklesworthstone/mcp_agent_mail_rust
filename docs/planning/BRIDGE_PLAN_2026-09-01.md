@@ -1,5 +1,29 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 17 Review52 release container wiring — EmeraldEagle
+
+- [x] Inspect ready/owned Beads and the actual DSR/container callers; preserve
+  prior ACFS/native release holds and all shared checkout artifacts.
+- [x] Confirm the SSH-warning source fix already exists; select and claim the
+  original ready `br-p9zor` without changing its acceptance or dependencies.
+- [x] Reserve the existing container implementation/tests and integration paths.
+- [ ] Wire verified published release assets into DSR's existing container path:
+  exact tag/source, installer-pinned Minisign key, complete signed inventory,
+  safe GNU archive extraction and automatic version/source build arguments.
+- [ ] Keep source-build and release tags separate and require both Linux
+  architectures before stable-tag mutation. Preserve strict RCH requirements.
+- [ ] Exercise real signatures/archives and actual command dispatch with a valid
+  candidate plus wrong tag/source/signer, incomplete/tampered evidence, wrong
+  version and missing-platform controls; label transport/tool substitutes.
+- [ ] Attempt a real read-only public release preparation and a nonpublishing
+  image build through strict RCH when the required worker capability is present.
+- [ ] Reread final code/callers, run affected existing suites, syntax/ShellCheck
+  and full changed-file UBS; keep every failed receipt and original release hold.
+- [ ] Update only the claimed Bead and existing requested TODO; verify issue
+  history/cycles, publish only owned source/integration and release reservations.
+- [ ] Original actual image publication, two-platform/native packaged execution
+  and public digest proof remain required before this P0 can close.
+
 ## November 16 Review50 enforce the raw-installer checksum — EmeraldEagle
 
 - [x] Recheck ready/owned Beads, graph triage and actual production callers.
