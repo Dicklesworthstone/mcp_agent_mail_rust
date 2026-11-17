@@ -22,9 +22,11 @@
   Review UBS findings and preserve the broad ShellCheck timeout.
 - [x] Route the maintainer's Dockerfile example through DSR and document the
   explicit aliases used for stable releases.
-- [ ] Read the terminal broad helper report and preserve failures and skips.
-- [ ] Record the terminal results on the original Bead and verify the tracker
-  export, publish the qualified source, and release the scoped reservations.
+- [x] Read the terminal broad helper report and separately run all BATS files
+  that were skipped because the executable was missing from PATH.
+- [x] Publish the DSR source on both refs and append evidence to `br-p9zor`
+  without changing acceptance. Verify the tracker export and public refs and
+  release the scoped reservations at handoff.
 - [ ] Run the original production strict-RCH build, native packaged execution
   and public image verification when authenticated inputs and workers exist.
 
@@ -41,7 +43,20 @@ byte-identical build manifest aliases under the signed aggregate.
 These tests use real Git, Minisign, archives and subprocesses. GitHub transport,
 RCH/Docker delivery and image signing use explicit fixtures here. Current public
 `v0.3.40` still has no build manifest. Read-only strict Docker admission selects
-no worker (`disk_headroom=2`). The original production acceptance stays open.
+no worker (`disk_headroom=2`). The actual preparation exits 7 on the missing
+manifest before building. The original production acceptance stays open.
+
+DSR `f3c0c7e0511ae5ebdc6e1eaa4257510c2cc0c76b` is on both public refs. Syntax
+and changed-file ShellCheck pass. Monolithic ShellCheck times out (124), and
+the individual module scan finds the same three warnings in unchanged
+`act_runner.sh`. UBS exits 1 on the unchanged trap restoration finding, with
+zero changed-line findings and no failed modules. The broad helper run records
+123 passed, 41 failed and 23 skipped across 187 files in 1586 seconds. The
+separate BATS run covers all 14 BATS files, with 13 passing and the prior
+`test_commands.bats` timeout. Every failed file already appeared in the
+previous run's failure list. `test_generated_installer_source.sh` is skipped
+by its existing libc fixture prerequisite and earns no pass. Evidence is in
+`br-p9zor` comment 4470 and the retained `review54-*` logs.
 
 ## November 17 Review53 authenticated container publication — EmeraldEagle
 
