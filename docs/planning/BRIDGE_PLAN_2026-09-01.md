@@ -33,8 +33,17 @@
   checkout's RCH admission and namespace refusals. The first all-targets
   build caught an optional subcommand pattern in the new test. Correct
   the pattern and retain that compiler failure.
-- [ ] Run the focused doctor tests, workspace all-targets and production
-  checks, and strict Clippy on the candidate.
+- [x] Verify workspace all-targets and production builds on the corrected
+  source. RCH jobs `30097323753216269` and `30097323753216272` completed
+  on `ovh-a` and matched the changed file, lockfile and toolchain hashes.
+- [x] Run formatting, diff checks and strict UBS. Formatting and diff
+  checks pass. UBS reports zero critical findings and 77 warnings,
+  including assertions and unwraps in the test module.
+- [ ] Run strict Clippy on the corrected source. The initial request was
+  refused before Cargo after the worker's disk-capacity sample expired.
+- [ ] Run the focused doctor tests with the two original native release-gate
+  test bodies in one Cargo invocation. Check individual test names and
+  actual execution evidence before counting any pass.
 - [ ] Finish the release-gate work on `br-qpacg`. Its original native test
   bodies, complete gate report and allowed deployment target remain required.
 
