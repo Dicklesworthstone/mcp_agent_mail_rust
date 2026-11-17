@@ -369,15 +369,28 @@ RES_SHARED_ID="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['gra
 
 digest_excl="$(sha1_str "${PAT_EXCL}")"
 digest_shared="$(sha1_str "${PAT_SHARED}")"
+db_generation="$(python3 - "${DB_PATH}" <<'PY'
+import pathlib, sqlite3, sys
+
+db_uri = pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro"
+with sqlite3.connect(db_uri, uri=True) as conn:
+    generation = conn.execute("SELECT generation_id FROM db_identity WHERE singleton = 0").fetchone()
+print(generation[0] if generation else "")
+PY
+)" || e2e_fatal "could not read the reservation database generation"
+[[ "${db_generation}" =~ ^[0-9a-f]+$ ]] \
+    || e2e_fatal "missing or invalid reservation database generation"
 EXCL_SHA_PATH="${STORAGE_ROOT}/projects/${PROJECT_SLUG}/file_reservations/${digest_excl}.json"
-EXCL_ID_PATH="${STORAGE_ROOT}/projects/${PROJECT_SLUG}/file_reservations/id-${RES_EXCL_ID}.json"
+EXCL_ID_PATH="${STORAGE_ROOT}/projects/${PROJECT_SLUG}/file_reservations/id-${RES_EXCL_ID}-g${db_generation}.json"
 SHARED_SHA_PATH="${STORAGE_ROOT}/projects/${PROJECT_SLUG}/file_reservations/${digest_shared}.json"
-SHARED_ID_PATH="${STORAGE_ROOT}/projects/${PROJECT_SLUG}/file_reservations/id-${RES_SHARED_ID}.json"
+SHARED_ID_PATH="${STORAGE_ROOT}/projects/${PROJECT_SLUG}/file_reservations/id-${RES_SHARED_ID}-g${db_generation}.json"
 
 wait_for_path "$EXCL_SHA_PATH" 10 || e2e_fatal "missing reservation sha artifact (exclusive)"
 wait_for_path "$EXCL_ID_PATH" 10 || e2e_fatal "missing reservation id artifact (exclusive)"
 wait_for_path "$SHARED_SHA_PATH" 10 || e2e_fatal "missing reservation sha artifact (shared)"
 wait_for_path "$SHARED_ID_PATH" 10 || e2e_fatal "missing reservation id artifact (shared)"
+cmp -s "${EXCL_SHA_PATH}" "${EXCL_ID_PATH}" || e2e_fatal "exclusive reservation artifacts differ"
+cmp -s "${SHARED_SHA_PATH}" "${SHARED_ID_PATH}" || e2e_fatal "shared reservation artifacts differ"
 e2e_pass "reservation artifacts exist"
 
 if ! wait_for_git_contains "${STORAGE_ROOT}" "file_reservation: RedFox" 10; then

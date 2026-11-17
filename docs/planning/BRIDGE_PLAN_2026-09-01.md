@@ -1,5 +1,48 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 17 Review55 share release gate
+
+- [x] Recheck ready and owned Beads. Continue `br-qpacg` and verify that
+  encrypted export already requires real `age` and the benchmark runs its
+  help subprocess without an installed `am`.
+- [x] Make the native gate require a successful delegate and a summary with
+  passing assertions. Give every invocation its own wrapper and suite artifacts.
+- [x] Confirm that the summary counts cases separately from assertions. Add a
+  regression for missing, wrong-suite, all-skipped, failed and zero-case summaries.
+- [x] Require Python and either SQLite or the prepared `test_db` for full
+  share. Run missing Python, SQLite and `age` controls through the real wrapper.
+- [x] Isolate Chromium profiles and correct the positional `deploy tooling`
+  call in the verify-live fixture.
+- [x] Run the full share wrapper with signed release binaries and real `age`,
+  SQLite, Python and Chromium. All 19 cases finished with 78 passing assertions
+  and zero failures or skips. This run used the published v0.3.40 binaries.
+- [x] Run the archive wrapper with and without `curl`. The missing-tool control
+  exits zero with zero cases and one skip. The published binary run reports ten
+  passes and one failure on a missing exclusive reservation ID artifact.
+- [x] Read the actual SQLite generation and compare the ID-stamped archive
+  artifacts byte for byte with their SHA-1 aliases. The repaired reservation
+  case passes. The suite now reaches 15 passes and one failure when Git sees
+  two untracked reconciliation files under `doctor/`.
+- [x] Run the verify-live wrapper against those binaries. It finds the generated
+  tooling in the test Git root and delegates to the pinned `am`. The matrix
+  reports 35 passing and 12 failed assertions. Its database fixture lacks the
+  exported schema and digest, and the release binary refuses loopback probes.
+- [x] Run strict remote workspace all-targets check and confirm the changed
+  Rust and dependency hashes in RCH job `30097323753216178`.
+- [x] Recover the original production feature-check and strict Clippy jobs
+  `30097323753216186` and `30097323753216179`. Cargo exited zero on both
+  workers. The initial wrappers refused later changes to shell and docs files,
+  and recovery acknowledged both exact commands.
+- [ ] Execute the summary regression and native share transport test once a
+  worker completes the candidate build. The Nextest request timed out in
+  admission. Cargo retry `30097323753216189` was admitted and is compiling.
+- [ ] Qualify the archive Git-cleanliness check and the verify-live fixture
+  with candidate binaries. A successful live fixture needs a real exported
+  bundle and a deployment endpoint admitted by the existing address policy.
+- [ ] Run the full candidate release gate and retain both original test bodies,
+  strict transport and TUI evidence, and the early-return count for each step.
+  Keep `br-qpacg` open until that run satisfies its acceptance.
+
 ## November 17 Review54 binary-to-container publication handoff
 
 - [x] Recheck the Beads queue, current mailbox health, and existing release holds.
