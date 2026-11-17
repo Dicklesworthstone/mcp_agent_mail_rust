@@ -742,11 +742,8 @@ e2e_fatal() {
     exit 1
 }
 
-for cmd in sqlite3 python3; do
-    if ! command -v "${cmd}" >/dev/null 2>&1; then
-        e2e_fatal "${cmd} required for the full share suite"
-    fi
-done
+command -v python3 >/dev/null 2>&1 || e2e_fatal "python3 required for the full share suite"
+e2e_has_sqlite_compat || e2e_fatal "sqlite3 or a prepared test_db required for the full share suite"
 
 # ---------------------------------------------------------------------------
 # Build binaries
