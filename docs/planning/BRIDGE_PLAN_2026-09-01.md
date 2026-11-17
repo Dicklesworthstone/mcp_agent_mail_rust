@@ -1,5 +1,30 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 17 Review53 authenticated container publication — EmeraldEagle
+
+- [x] Recheck the ready/owned task graph and actual container callers; continue
+  original `br-p9zor`, preserving its complete acceptance and prior evidence.
+- [x] Reserve the existing publisher, tests, CLI/docs and tracker paths.
+- [ ] Verify the real OCI registry transport contract before implementation.
+- [ ] Connect `docker release --published-release` to the completed remote OCI
+  export, preserving strict RCH and the existing signature/SBOM policy.
+- [ ] Validate the exported OCI index, every referenced blob and both platform
+  configs against its authenticated release source/version before uploading.
+- [ ] Upload by immutable digest, verify remote platform/evidence inventory,
+  then promote only the validated digest to selected stable tags.
+- [ ] Re-observe public tag and release inventory before publication and each
+  tag transition; retain partial effects and refuse drift or failed operations.
+- [ ] Exercise positive actual publisher dispatch plus corrupt/missing index,
+  blob/platform/config/source, failed upload/evidence/promotion and drift cases.
+- [ ] Use real transport where available and label substitutes explicitly;
+  attempt current strict remote admission without weakening capability policy.
+- [ ] Review final code/callers; run scoped assertions, syntax/ShellCheck, UBS
+  and required helper runner, retaining non-green gates and exact source IDs.
+- [ ] Append evidence only to the original Bead, preserve tracker history and
+  empty cycles, publish only owned source and release scoped reservations.
+- [ ] Original native packaged execution, production canonical transition and
+  public image digest/platform proof remain required before closing the P0.
+
 ## November 17 Review52 release container wiring — EmeraldEagle
 
 - [x] Inspect ready/owned Beads and the actual DSR/container callers; preserve
