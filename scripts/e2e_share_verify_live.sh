@@ -26,7 +26,7 @@ e2e_init_artifacts
 e2e_banner "Share Deploy Verify-Live E2E Matrix"
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
 
-for cmd in python3 sqlite3; do
+for cmd in python3 git; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
         e2e_log "${cmd} not found; skipping suite"
         e2e_skip "${cmd} required"
@@ -51,7 +51,6 @@ WORK="$(e2e_mktemp "e2e_share_verify_live")"
 DB_PATH="${WORK}/storage.sqlite3"
 STORAGE_ROOT="${WORK}/storage_root"
 mkdir -p "${STORAGE_ROOT}"
-sqlite3 "${DB_PATH}" "PRAGMA journal_mode=WAL;" >/dev/null 2>&1 || true
 
 e2e_log "Workspace: ${WORK}"
 e2e_log "DB: ${DB_PATH}"
@@ -78,71 +77,6 @@ s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()
 PY
-}
-
-write_bundle_fixture() {
-    local bundle_dir="$1"
-    local root_label="$2"
-    mkdir -p "${bundle_dir}/viewer/vendor" "${bundle_dir}/viewer/data" "${bundle_dir}/viewer/pages"
-
-    cat > "${bundle_dir}/manifest.json" <<JSON
-{
-  "schema_version": "1.0.0",
-  "generated_at": "2026-02-12T00:00:00Z",
-  "database": {"path": "mailbox.sqlite3"},
-  "export_config": {"scrub_preset": "archive"},
-  "label": "${root_label}"
-}
-JSON
-
-    cat > "${bundle_dir}/index.html" <<HTML
-<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>${root_label}</title></head>
-  <body><main>${root_label}</main></body>
-</html>
-HTML
-
-    cat > "${bundle_dir}/viewer/index.html" <<HTML
-<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>Viewer ${root_label}</title><link rel="stylesheet" href="/viewer/styles.css"></head>
-  <body><h1>Viewer ${root_label}</h1></body>
-</html>
-HTML
-
-    cat > "${bundle_dir}/viewer/styles.css" <<'CSS'
-body { font-family: monospace; background: #fafafa; color: #222; }
-CSS
-
-    cat > "${bundle_dir}/viewer/vendor/runtime.js" <<'JS'
-console.log("verify-live fixture");
-JS
-
-    cat > "${bundle_dir}/viewer/data/messages.json" <<'JSON'
-[]
-JSON
-
-    cat > "${bundle_dir}/viewer/data/meta.json" <<JSON
-{"suite":"share_verify_live","label":"${root_label}"}
-JSON
-
-    cat > "${bundle_dir}/viewer/pages/index.html" <<HTML
-<!doctype html><html><body><article>Page ${root_label}</article></body></html>
-HTML
-
-    cat > "${bundle_dir}/_headers" <<'HDR'
-/*
-  Cross-Origin-Opener-Policy: same-origin
-  Cross-Origin-Embedder-Policy: require-corp
-  Cross-Origin-Resource-Policy: same-origin
-  Strict-Transport-Security: max-age=31536000
-  X-Content-Type-Options: nosniff
-  X-Frame-Options: DENY
-HDR
-
-    touch "${bundle_dir}/.nojekyll"
-    sqlite3 "${bundle_dir}/mailbox.sqlite3" "VACUUM;" >/dev/null 2>&1
 }
 
 parse_verify_report() {
@@ -469,7 +403,21 @@ stop_fixture_server() {
 # ---------------------------------------------------------------------------
 
 BUNDLE_BASE="${WORK}/bundle_base"
-write_bundle_fixture "${BUNDLE_BASE}" "bundle-root-v1"
+FIXTURE_PROJECT="${WORK}/fixture_project"
+mkdir -p "${FIXTURE_PROJECT}"
+e2e_case_banner "Export and validate the fixture mailbox"
+if am_env "${AM_BIN}" macros start-session --project "${FIXTURE_PROJECT}" \
+    --program e2e --model fixture --agent-name RedFox > /dev/null \
+    && am_env "${AM_BIN}" share export --no-zip --scrub-preset archive --output "${BUNDLE_BASE}" \
+        > "${E2E_ARTIFACT_DIR}/fixture_export.txt" \
+    && am_env "${AM_BIN}" share deploy validate "${BUNDLE_BASE}" --json \
+        > "${E2E_ARTIFACT_DIR}/fixture_validation.json"; then
+    e2e_pass "exported fixture passes local deploy validation"
+else
+    e2e_fail "could not seed, export, or validate the fixture mailbox"
+    e2e_summary
+    exit 1
+fi
 
 DEPLOY_PASS="${WORK}/deploy_pass"
 cp -R "${BUNDLE_BASE}" "${DEPLOY_PASS}"

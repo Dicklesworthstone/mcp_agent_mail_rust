@@ -12,11 +12,25 @@
 - [x] Add a regression covering an existing archive, its custom ignore rule,
   both real progress writers and readers, and overload publication with
   unrelated files that must remain visible.
-- [ ] Verify the Git rule against the retained failing archive and run the
-  storage regression against the candidate. Record the results separately.
-- [ ] Run workspace compiler, production feature, lint, and formatting checks.
+- [x] Check Git visibility on the retained archive. Both progress records,
+  both locks and the temporary file stay on disk. The unrelated doctor note
+  and the same-named nested project file remain visible and stageable.
+- [x] Run the unchanged archive wrapper with signed v0.3.40. Ordinary Git
+  configuration reproduces 15 assertions passing and one cleanliness failure.
+  Injecting the four exact ignore rules into the isolated Git configuration
+  passes 16 assertions across seven cases.
+- [x] Run the focused storage regression against the candidate. RCH job
+  `30097323753216212` executed the real writers, readers and overload commit
+  and passed its one selected test.
+- [x] Run the workspace all-targets and production feature checks, strict
+  Clippy, formatting, and UBS. All exited zero on the changed Rust bytes.
+- [x] Build verify-live's local fixture through the real mailbox seed and share
+  exporter. Keep the seed output out of the artifacts. Local validation on
+  signed v0.3.40 reports ready with zero errors, and the matrix preserves all
+  12 remote assertion failures under the shipping address policy.
 - [ ] Run the unchanged archive E2E against candidate binaries and confirm that
-  its final Git-cleanliness check passes before closing `br-2t0z`.
+  its final Git-cleanliness check passes before closing `br-2t0z`. The first
+  portable build hit RCH's 1,800-second transport timeout while compiling.
 - [ ] Preserve the separate full release gate and verify-live requirements on
   `br-qpacg`.
 
