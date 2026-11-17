@@ -39,16 +39,18 @@
 - [x] Run formatting, diff checks and strict UBS. Formatting and diff
   checks pass. UBS reports zero critical findings and 77 warnings,
   including assertions and unwraps in the test module.
-- [ ] Run strict Clippy on the corrected source. The initial request was
-  refused before Cargo after the worker's disk-capacity sample expired.
-  The next requests hit queue timeout and a disk-headroom refusal.
+- [x] Run strict Clippy on the corrected source. RCH job
+  `30097323753216281` passed on `vmi1227854` and matched the edited file,
+  lockfile and toolchain hashes. The earlier disk-sample, queue-timeout
+  and disk-headroom refusals are retained.
 - [ ] Run the focused doctor tests with the two original native release-gate
   test bodies in one Cargo invocation. Check individual test names and
   actual execution evidence before counting any pass. The combined request
   timed out in admission, and the Cargo shim refused local execution under
   the configured remote requirement. The scoped retry on `hz4` timed out
   during SSH source admission. Recovery of job `30097323753216276`
-  acknowledged the terminal failure before Cargo ran.
+  acknowledged the terminal failure before Cargo ran. The warm retry
+  required 55 GiB and the worker reported 42 GiB free.
 - [x] Recover the earlier native summary regression, job
   `30097323753216189`. The selected test ran and passed. The wrapper's
   post-run comparison refused six intervening source changes. Recovery
