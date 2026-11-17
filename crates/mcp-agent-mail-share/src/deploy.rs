@@ -1435,8 +1435,13 @@ if command -v am >/dev/null 2>&1; then
     exec am share deploy validate "$BUNDLE_DIR"
 fi
 
-echo "WARNING: 'am' command not found; running compatibility fallback checks."
-echo "Install/build the 'am' CLI for full verify-live behavior."
+if [ -n "$DEPLOYED_URL" ]; then
+    echo "Live deployment verification requires 'am' on PATH." >&2
+    echo "Run am share deploy verify-live <deployed_url> --bundle <bundle_dir>." >&2
+    exit 1
+fi
+
+echo "WARNING: 'am' command not found; checking local bundle structure."
 echo ""
 
 ERRORS=0
@@ -1483,28 +1488,10 @@ check_file warning "_headers" "$BUNDLE_DIR/_headers" "Present" "Missing (needed 
 check_dir warning "viewer" "$BUNDLE_DIR/viewer" "Present" "Missing"
 echo ""
 
-if [ -n "$DEPLOYED_URL" ]; then
-    echo "--- Compatibility HTTP Checks ($DEPLOYED_URL) ---"
-    check_url() {
-        local path="$1" expected="$2"
-        local status
-        status=$(curl -s -o /dev/null -w "%{http_code}" "$DEPLOYED_URL/$path" 2>/dev/null || echo "000")
-        if [ "$status" = "$expected" ]; then
-            echo "  ✅ GET /$path → $status"
-        else
-            echo "  ❌ GET /$path → $status (expected $expected)"
-            ERRORS=$((ERRORS + 1))
-        fi
-    }
-    check_url "" "200"
-    check_url "viewer/" "200"
-    check_url "manifest.json" "200"
-fi
-
 echo ""
 echo "--- Migration Mapping ---"
 echo "  Preferred: am share deploy verify-live <deployed_url> --bundle <bundle_dir>"
-echo "  Fallback : ./validate_deploy.sh <bundle_dir> [deployed_url]"
+echo "  Local fallback: ./validate_deploy.sh <bundle_dir>"
 echo "  Wrapper  : set AM_VERIFY_LIVE_STRICT=1 to add --strict while delegating"
 echo ""
 
@@ -3677,8 +3664,51 @@ mod tests {
         assert!(script.starts_with("#!/usr/bin/env bash"));
         assert!(script.contains("am share deploy verify-live"));
         assert!(script.contains("compatibility-only"));
-        assert!(script.contains("check_url"));
         assert!(!script.contains("eval "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_script_requires_native_am_for_live_verification() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+        let script = dir.path().join("validate_deploy.sh");
+        std::fs::write(&script, generate_validation_script()).unwrap();
+        let curl = dir.path().join("curl");
+        let curl_marker = dir.path().join("curl-called");
+        // A 200 from every request must never stand in for native verification.
+        std::fs::write(
+            &curl,
+            "#!/bin/sh\nprintf invoked > \"$CURL_MARKER\"\nprintf 200\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let run = |args: &[&str]| {
+            Command::new("/bin/bash")
+                .arg(&script)
+                .arg(&bundle)
+                .args(args)
+                .env("PATH", dir.path())
+                .env("CURL_MARKER", &curl_marker)
+                .env_remove("BASH_ENV")
+                .output()
+                .expect("run generated Bash validation wrapper")
+        };
+        let local = run(&[]);
+        assert!(local.status.success(), "{local:?}");
+        assert!(String::from_utf8_lossy(&local.stdout).contains("Compatibility Structure Checks"));
+        let remote = run(&["https://example.test/bundle"]);
+        assert_eq!(remote.status.code(), Some(1), "{remote:?}");
+        assert!(
+            String::from_utf8_lossy(&remote.stderr)
+                .contains("Live deployment verification requires 'am' on PATH")
+        );
+        assert!(!curl_marker.exists());
     }
 
     // ── write_deploy_tooling ────────────────────────────────────────

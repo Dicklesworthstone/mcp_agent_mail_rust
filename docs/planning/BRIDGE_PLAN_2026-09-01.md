@@ -1,5 +1,57 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 17 live verification compatibility wrapper
+
+- [x] Recheck the ready release and storage Beads. Continue `br-qpacg`
+  and dispatch the earlier doctor regressions and the two release test bodies
+  against the frozen candidate with the portable feature set.
+- [x] Preserve the first native batch, job `30097323753216298`. The 16
+  doctor tests and benchmark pass. The encrypted-export test fails at the
+  missing `age` prerequisite.
+- [x] Check the official age v1.3.2 archive digest and each member. Stage
+  only `age` and `age-keygen` in the private source root and pass that
+  directory on the test command's PATH.
+- [x] Execute all 18 selected native bodies again. RCH job
+  `30097323753216314` passes all 18, including encrypted export using the
+  verified tools and the original quick benchmark. Its source receipt
+  matches both executable hashes.
+- [x] Refresh the DSR quality registry on `br-nq2kb`. The installed
+  command's dry run now resolves eight required commands, with zero
+  executions. The exact publication gate remains open.
+- [x] Generate the old wrapper with signed v0.3.40. With `am` absent,
+  a network-free curl sentinel returning HTTP 200 was called three times
+  and the wrapper reported PASS.
+- [x] Make the wrapper require `am` for a supplied URL. Keep local structure
+  checks available with only Bash, and preserve native argument and exit
+  status delegation, including `AM_VERIFY_LIVE_STRICT`.
+- [x] Update the operator runbook and verify-live contract. Existing
+  generated files remain subject to the tooling writer's no-overwrite rule.
+- [x] Exercise the emitted wrapper with a complete local fixture, a missing
+  manifest, and a URL with no `am`. The complete fixture passes; the latter
+  two cases fail, and the URL path never calls the curl sentinel.
+- [x] Export a real fixture mailbox with signed v0.3.40. Its native local
+  report is ready with all 19 checks passing. Run the new wrapper with the
+  actual CLI to verify local delegation and that `--strict` and the native
+  refusal reach the caller.
+- [x] Add a native regression that executes the generated shell script with
+  and without a URL and monitors the curl sentinel. Invoke Bash directly
+  with separate arguments and an isolated PATH.
+- [x] Run both native wrapper tests on the exact candidate. RCH job
+  `30097323753216325` passes both on `hz3` and matches the changed file,
+  lockfile and toolchain hashes. Keep the earlier disk-budget, queue and
+  SSH source-admission refusals separate.
+- [x] Compile the production generator and run all five shell scenarios on
+  its emitted script. Bash syntax, ShellCheck, formatting and diff checks
+  pass. Strict UBS reports zero critical findings and 491 warnings.
+- [x] Finish the workspace all-targets, production and strict Clippy
+  checks. Jobs `30097323753216317`, `30097323753216329` and
+  `30097323753216327` match the same source, lockfile and toolchain
+  hashes. The earlier production command returned zero and its source
+  witness timed out. Recovery acknowledged the original compiler result.
+- [ ] Run the full release gate with per-step early-return counts, the
+  required strict transport and TUI suites, and an eligible live deployment
+  for verify-live. Keep `br-qpacg` in progress.
+
 ## November 17 deployment diagnostics and source receipts
 
 - [x] Recheck ready and owned Beads. Claim `br-o5qg0` and preserve the

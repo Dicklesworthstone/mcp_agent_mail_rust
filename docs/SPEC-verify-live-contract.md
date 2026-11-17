@@ -241,7 +241,7 @@ The generated `scripts/validate_deploy.sh` is compatibility-only and follows thi
 1. If `am` is available, it delegates to native commands:
    - With URL: `am share deploy verify-live <url> --bundle <bundle_dir>`
    - Without URL: `am share deploy validate <bundle_dir>`
-2. If `am` is unavailable, it runs a minimal fallback checker (structure + basic HTTP probes) and clearly labels the run as compatibility mode.
+2. If `am` is unavailable and no URL is supplied, it checks local bundle structure. A URL requires `am`. The wrapper exits 1 with setup guidance before issuing any request.
 3. The wrapper prints explicit before/after command mapping and migration guidance.
 
 This keeps legacy automation functioning while preventing script-first ambiguity.

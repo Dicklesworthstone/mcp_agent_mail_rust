@@ -704,8 +704,8 @@ Interpretation:
 - Stage-level details and per-check messages are in the JSON report.
 
 Compatibility-only wrapper behavior:
-- Generated `scripts/validate_deploy.sh` should be treated as compatibility fallback.
-- Prefer native command path in docs/CI/runbooks: `am share deploy verify-live`.
+- Generated `scripts/validate_deploy.sh <bundle_dir>` can check local bundle structure when `am` is unavailable.
+- Supply a deployment URL only when `am` is on `PATH`. For CI and existing exported tooling, use `am share deploy verify-live` directly.
 
 ### Troubleshooting Suite Map (Use Before Escalation)
 
