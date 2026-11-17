@@ -735,21 +735,18 @@ fi
 
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
 
-for cmd in sqlite3 python3; do
-    if ! command -v "${cmd}" >/dev/null 2>&1; then
-        e2e_log "${cmd} not found; skipping suite"
-        e2e_skip "${cmd} required"
-        e2e_summary
-        exit 0
-    fi
-done
-
 e2e_fatal() {
     local msg="$1"
     e2e_fail "${msg}"
     e2e_summary || true
     exit 1
 }
+
+for cmd in sqlite3 python3; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        e2e_fatal "${cmd} required for the full share suite"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Build binaries

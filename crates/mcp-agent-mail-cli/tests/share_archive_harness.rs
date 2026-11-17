@@ -3,7 +3,7 @@
 //! Current phase: managed adapter.
 //! - Native runner entrypoint is Rust (`cargo test -p mcp-agent-mail-cli --test it share_archive_harness::`).
 //! - Scenario execution delegates to shell suites (`share`, `share_verify_live`, `archive`).
-//! - Harness captures deterministic metadata and copies legacy artifacts.
+//! - Each adapter writes evidence into its own directory for this run.
 
 #![forbid(unsafe_code)]
 
@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlmodel_core::Value as SqlValue;
 
@@ -44,9 +44,7 @@ struct HarnessSummary {
     adapter_duration_ms: u64,
     adapter_stdout_path: String,
     adapter_stderr_path: String,
-    legacy_artifacts_root: String,
-    new_legacy_run_paths: Vec<String>,
-    copied_legacy_run_path: Option<String>,
+    adapter_artifacts_dir: String,
     notes: Vec<String>,
 }
 
@@ -56,11 +54,6 @@ const DEFAULT_HARNESS_SUITE: &str = "share";
 struct HarnessSuiteSpec {
     suite_name: &'static str,
     adapter_script: &'static str,
-    legacy_artifacts_subdir: &'static str,
-}
-
-fn bool_env(var_name: &str) -> bool {
-    std::env::var(var_name).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 fn selected_suite_name() -> String {
@@ -73,17 +66,14 @@ fn suite_spec_for(name: &str) -> HarnessSuiteSpec {
         "share" => HarnessSuiteSpec {
             suite_name: "share",
             adapter_script: "tests/e2e/test_share.sh",
-            legacy_artifacts_subdir: "share",
         },
         "share_verify_live" => HarnessSuiteSpec {
             suite_name: "share_verify_live",
             adapter_script: "tests/e2e/test_share_verify_live.sh",
-            legacy_artifacts_subdir: "share_verify_live",
         },
         "archive" => HarnessSuiteSpec {
             suite_name: "archive",
             adapter_script: "tests/e2e/test_archive.sh",
-            legacy_artifacts_subdir: "archive",
         },
         _ => panic!(
             "unsupported AM_SHARE_ARCHIVE_HARNESS_SUITE={name}; expected one of: share, share_verify_live, archive"
@@ -106,39 +96,29 @@ fn harness_artifacts_root(suite_name: &str) -> PathBuf {
     repo_root().join("tests/artifacts/cli").join(suite_name)
 }
 
-fn legacy_artifacts_root(subdir: &str) -> PathBuf {
-    repo_root().join("tests/artifacts").join(subdir)
+#[derive(Debug, Deserialize)]
+struct AdapterSummary {
+    schema_version: u32,
+    suite: String,
+    total: u64,
+    pass: u64,
+    fail: u64,
+    skip: u64,
 }
 
-fn list_run_directories(root: &Path) -> BTreeSet<String> {
-    let mut runs = BTreeSet::new();
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(_) => return runs,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir()
-            && let Some(name) = path.file_name().and_then(|n| n.to_str())
-        {
-            runs.insert(name.to_string());
-        }
-    }
-    runs
-}
-
-fn copy_directory_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_directory_recursive(&src_path, &dst_path)?;
-        } else if file_type.is_file() {
-            fs::copy(src_path, dst_path)?;
-        }
+fn validate_adapter_summary(path: &Path, suite: &str) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let summary: AdapterSummary =
+        serde_json::from_slice(&bytes).map_err(|err| format!("parse {}: {err}", path.display()))?;
+    if summary.schema_version != 1
+        || summary.suite != suite
+        || summary.pass == 0
+        || summary.fail != 0
+        || summary.pass.checked_add(summary.skip) != Some(summary.total)
+    {
+        return Err(format!(
+            "{suite} adapter summary must record a completed suite with passing cases and no failures: {summary:?}"
+        ));
     }
     Ok(())
 }
@@ -206,28 +186,29 @@ fn native_share_archive_transport_gate() {
     let suite_name = selected_suite_name();
     let suite_spec = suite_spec_for(&suite_name);
     let start_instant = Instant::now();
-    let run_root = harness_artifacts_root(suite_spec.suite_name).join(format!(
+    let artifacts_root = harness_artifacts_root(suite_spec.suite_name);
+    fs::create_dir_all(&artifacts_root).expect("create harness artifacts root");
+    let run_root = artifacts_root.join(format!(
         "{}_{}",
         Utc::now().format("%Y%m%d_%H%M%S%.3fZ"),
         std::process::id()
     ));
-    fs::create_dir_all(&run_root).expect("create run root");
+    fs::create_dir(&run_root).expect("create fresh run root");
+    let run_root = run_root.canonicalize().expect("resolve absolute run root");
+    let adapter_artifacts = run_root.join("subsuite");
     eprintln!(
         "share/archive harness artifact root (suite={}): {}",
         suite_spec.suite_name,
         run_root.display()
     );
 
-    let strict_mode = bool_env("AM_E2E_SHARE_ARCHIVE_REQUIRE_PASS");
-    let legacy_root = legacy_artifacts_root(suite_spec.legacy_artifacts_subdir);
-    fs::create_dir_all(&legacy_root).expect("create legacy artifact root");
-    let before_runs = list_run_directories(&legacy_root);
-
     let repo = repo_root();
     let mut cmd = Command::new("bash");
     cmd.current_dir(&repo)
         .arg(suite_spec.adapter_script)
         .env("E2E_PROJECT_ROOT", &repo)
+        .env("E2E_SUITE", suite_spec.suite_name)
+        .env("AM_E2E_ARTIFACT_DIR", &adapter_artifacts)
         .env(
             "E2E_SERVER_START_TIMEOUT_SECONDS",
             std::env::var("E2E_SERVER_START_TIMEOUT_SECONDS").unwrap_or_else(|_| "60".to_string()),
@@ -248,26 +229,14 @@ fn native_share_archive_transport_gate() {
     fs::write(&stdout_path, &outcome.stdout).expect("write adapter stdout");
     fs::write(&stderr_path, &outcome.stderr).expect("write adapter stderr");
 
-    let after_runs = list_run_directories(&legacy_root);
-    let new_runs = after_runs
-        .difference(&before_runs)
-        .cloned()
-        .collect::<Vec<String>>();
-
-    let copied_legacy_run_path = new_runs.last().and_then(|run_name| {
-        let src = legacy_root.join(run_name);
-        let dst = run_root
-            .join("subsuite")
-            .join(suite_spec.suite_name)
-            .join(run_name);
-        copy_directory_recursive(&src, &dst).ok()?;
-        Some(dst.display().to_string())
-    });
-
-    let passed = outcome.exit_code == Some(0) && !outcome.timed_out;
+    let evidence = validate_adapter_summary(
+        &adapter_artifacts.join("summary.json"),
+        suite_spec.suite_name,
+    );
+    let passed = outcome.exit_code == Some(0) && !outcome.timed_out && evidence.is_ok();
     let mut notes = Vec::new();
-    if new_runs.is_empty() {
-        notes.push("No new legacy artifact run was detected.".to_string());
+    if let Err(err) = evidence {
+        notes.push(err);
     }
     if outcome.timed_out {
         notes.push("Adapter execution timed out.".to_string());
@@ -283,7 +252,7 @@ fn native_share_archive_transport_gate() {
         suite: suite_spec.suite_name.to_string(),
         runner: "native".to_string(),
         adapter_mode: "shell_managed".to_string(),
-        strict_mode,
+        strict_mode: true,
         generated_at: Utc::now().to_rfc3339(),
         duration_ms: start_instant.elapsed().as_millis() as u64,
         passed,
@@ -293,9 +262,7 @@ fn native_share_archive_transport_gate() {
         adapter_duration_ms: outcome.duration_ms,
         adapter_stdout_path: stdout_path.display().to_string(),
         adapter_stderr_path: stderr_path.display().to_string(),
-        legacy_artifacts_root: legacy_root.display().to_string(),
-        new_legacy_run_paths: new_runs,
-        copied_legacy_run_path,
+        adapter_artifacts_dir: adapter_artifacts.display().to_string(),
         notes,
     };
     let summary_path = run_root.join("run_summary.json");
@@ -305,27 +272,51 @@ fn native_share_archive_transport_gate() {
     )
     .expect("write summary");
 
-    if strict_mode {
-        assert!(
-            passed,
-            "{} adapter failed (exit={:?}, timed_out={})\nstdout:\n{}\nstderr:\n{}",
-            suite_spec.suite_name,
-            outcome.exit_code,
-            outcome.timed_out,
-            outcome.stdout,
-            outcome.stderr
-        );
-        assert!(
-            summary.copied_legacy_run_path.is_some(),
-            "{} adapter succeeded but did not produce a new legacy artifact run under {}",
-            suite_spec.suite_name,
-            legacy_root.display()
-        );
-    } else if !passed {
-        eprintln!(
-            "SKIP(non-strict): {} adapter failed but strict mode is disabled; see {}",
-            suite_spec.suite_name,
-            summary_path.display()
+    assert!(
+        passed,
+        "{} adapter failed (exit={:?}, timed_out={}): {}\nartifacts: {}\nstdout:\n{}\nstderr:\n{}",
+        suite_spec.suite_name,
+        outcome.exit_code,
+        outcome.timed_out,
+        summary.notes.join(". "),
+        run_root.display(),
+        outcome.stdout,
+        outcome.stderr
+    );
+}
+
+#[test]
+fn adapter_summary_requires_positive_suite_evidence() {
+    let run = tempfile::tempdir().expect("private run directory");
+    let path = run.path().join("summary.json");
+    assert!(validate_adapter_summary(&path, "share").is_err());
+    for (file, valid) in [
+        (
+            r#"{"schema_version":1,"suite":"share","total":1,"pass":0,"fail":0,"skip":1}"#,
+            false,
+        ),
+        (
+            r#"{"schema_version":1,"suite":"share","total":2,"pass":1,"fail":1,"skip":0}"#,
+            false,
+        ),
+        (
+            r#"{"schema_version":1,"suite":"archive","total":1,"pass":1,"fail":0,"skip":0}"#,
+            false,
+        ),
+        (
+            r#"{"schema_version":1,"suite":"share","total":3,"pass":1,"fail":0,"skip":1}"#,
+            false,
+        ),
+        (
+            r#"{"schema_version":1,"suite":"share","total":2,"pass":1,"fail":0,"skip":1}"#,
+            true,
+        ),
+    ] {
+        fs::write(&path, file).expect("write adapter summary fixture");
+        assert_eq!(
+            validate_adapter_summary(&path, "share").is_ok(),
+            valid,
+            "{file}"
         );
     }
 }

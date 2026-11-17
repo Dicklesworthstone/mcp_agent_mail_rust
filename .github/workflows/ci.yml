@@ -191,7 +191,6 @@ jobs:
         env:
           AM_E2E_HTTP_REQUIRE_PASS: "1"
           AM_E2E_HTTP_INCLUDE_FOCUSED_SUBSUITES: "1"
-          AM_E2E_SHARE_ARCHIVE_REQUIRE_PASS: "1"
           AM_E2E_TUI_REQUIRE_PASS: "1"
           DATABASE_URL: "sqlite:///tmp/ci_test.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"

@@ -38,7 +38,7 @@ WRAPPER_SUITE="${WRAPPER_SUITE:-${E2E_SUITE:-unknown}}"
 # Reuse e2e_lib.sh timestamp logic for consistent artifact paths
 _WRAPPER_TIMESTAMP="${E2E_TIMESTAMP:-$(date -u '+%Y%m%d_%H%M%S')}"
 _WRAPPER_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-_WRAPPER_ARTIFACT_DIR="${_WRAPPER_PROJECT_ROOT}/tests/artifacts/${WRAPPER_SUITE}/${_WRAPPER_TIMESTAMP}"
+_WRAPPER_ARTIFACT_DIR="${AM_E2E_ARTIFACT_DIR:-${_WRAPPER_PROJECT_ROOT}/tests/artifacts/${WRAPPER_SUITE}/${_WRAPPER_TIMESTAMP}}"
 
 # Safety: default to keeping temp dirs
 : "${AM_E2E_KEEP_TMP:=1}"

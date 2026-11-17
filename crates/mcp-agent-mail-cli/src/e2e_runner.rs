@@ -1065,7 +1065,6 @@ impl Runner {
             cmd.env(key, value);
         }
         cmd.env("AM_SHARE_ARCHIVE_HARNESS_SUITE", &suite.name);
-        cmd.env("AM_E2E_SHARE_ARCHIVE_REQUIRE_PASS", "1");
         if let Some(artifact_root) = &self.config.artifact_dir {
             cmd.env("AM_SHARE_ARCHIVE_ARTIFACT_DIR", artifact_root);
         }
