@@ -57,9 +57,22 @@ This requires the complete signed public inventory and source-bound build
 manifest, then uses strict RCH for both GNU Linux architectures. A refused
 admission, incomplete collection or local-success response is non-green.
 Source builds use `source-*` tags; the retired Docker Actions path is disabled
-in code. Artifact mode currently exports OCI only. The actual stable-tag
-publisher must consume that verified output before `br-p9zor` can close;
-native packaged execution and public image digest/platform proof remain open.
+in code. The build command exports OCI. Publish that path through:
+
+```bash
+dsr docker release mcp_agent_mail_rust "$RELEASE_TAG" --published-release \
+  --certificate-identity "$IMAGE_SIGNER_IDENTITY" \
+  --certificate-oidc-issuer "$IMAGE_SIGNER_ISSUER"
+```
+
+The release command requires Skopeo, Cosign and Syft. It validates all OCI
+blobs, platform configs, source/version labels, layer hashes and packaged
+binary bytes, uploads by digest, verifies image signatures and both platform
+SBOMs, then promotes the selected tags. Public Git/release identity is checked
+before upload and each tag transition. It retains each attempt and partial
+tag effects; failures remain failures. `--skip-sign` is refused in this mode.
+Native packaged execution, the actual production canonical transition and
+public image digest/platform proof remain open on `br-p9zor`.
 
 - [ ] Resolve release-blocking bugs and run workspace check, strict Clippy,
   formatting, full nextest, and the real transport/recovery/installer gates.

@@ -5,25 +5,64 @@
 - [x] Recheck the ready/owned task graph and actual container callers; continue
   original `br-p9zor`, preserving its complete acceptance and prior evidence.
 - [x] Reserve the existing publisher, tests, CLI/docs and tracker paths.
-- [ ] Verify the real OCI registry transport contract before implementation.
-- [ ] Connect `docker release --published-release` to the completed remote OCI
+- [x] Verify the real OCI registry transport contract before implementation.
+- [x] Connect `docker release --published-release` to the completed remote OCI
   export, preserving strict RCH and the existing signature/SBOM policy.
-- [ ] Validate the exported OCI index, every referenced blob and both platform
+- [x] Validate the exported OCI index, every referenced blob and both platform
   configs against its authenticated release source/version before uploading.
-- [ ] Upload by immutable digest, verify remote platform/evidence inventory,
+- [x] Upload by immutable digest, verify remote platform/evidence inventory,
   then promote only the validated digest to selected stable tags.
-- [ ] Re-observe public tag and release inventory before publication and each
+- [x] Re-observe public tag and release inventory before publication and each
   tag transition; retain partial effects and refuse drift or failed operations.
-- [ ] Exercise positive actual publisher dispatch plus corrupt/missing index,
+- [x] Exercise positive actual publisher dispatch plus corrupt/missing index,
   blob/platform/config/source, failed upload/evidence/promotion and drift cases.
-- [ ] Use real transport where available and label substitutes explicitly;
+- [x] Fix the actual public JSON adapter to report `pushed: true` after verified
+  OCI publication; retain the failing old-adapter control.
+- [x] Use real transport where available and label substitutes explicitly;
   attempt current strict remote admission without weakening capability policy.
-- [ ] Review final code/callers; run scoped assertions, syntax/ShellCheck, UBS
+- [x] Review final code/callers; run scoped assertions, syntax/ShellCheck, UBS
   and required helper runner, retaining non-green gates and exact source IDs.
-- [ ] Append evidence only to the original Bead, preserve tracker history and
-  empty cycles, publish only owned source and release scoped reservations.
+- [x] Append evidence only to the original Bead, preserve tracker history and
+  empty cycles, and prepare only owned source for publication. Verify public
+  refs and release scoped reservations at final handoff.
 - [ ] Original native packaged execution, production canonical transition and
   public image digest/platform proof remain required before closing the P0.
+
+The final frozen cohort passes 620 assertions at the unchanged 120-second
+bound (397 original, 113 export, 110 publication), including the repaired
+public JSON adapter. The prior adapter fails the actual publication-report
+assertion; the pre-feature publisher source also fails its positive transition.
+Real Git, Minisign, archives and processes execute. GitHub/RCH/build and image
+signing/SBOM tools use explicit R2 fixtures in this cohort.
+
+The complete helper runner, before the narrow final JSON-reporting repair,
+exits 1: 187 files, 136 passed, 43 failed, 8 skipped, 1693 seconds. All 618
+then-current container assertions pass inside it. The additional failure
+relative to Review52 is `test_generated_installer_source.sh` timing out;
+it was previously skipped, so no baseline-failure attribution is claimed.
+The whole runner was not repeated after the reporting repair; the final 620
+affected assertions and changed-file checks were repeated. Syntax and final
+changed-file ShellCheck pass. Full changed-file UBS exits 1: one unchanged
+trap-eval critical, zero warnings, 51 info, zero changed-line findings, no failed
+scanner modules. Monolithic ShellCheck times out at 120 seconds (exit 124);
+per-file coverage finds 62 of 63 files passing, with three warnings in unchanged
+`src/act_runner.sh`. This compensating scan does not turn the timed-out run green.
+
+The actual publisher function also completes against an isolated local TLS
+registry using real Skopeo and Docker manifest/tag inspection. Both selected
+tags resolve to `sha256:cf96a7b4984528709f7747f318b3daea74a72ceeb7a4d8e0e6cbf617c7412c05`,
+with both executable platforms and both preserved BuildKit attestations. Build
+production, GitHub and image-signing evidence are explicit R2 boundaries;
+this is neither native packaged execution nor public-image proof. All fixture
+registry containers are stopped, with data and evidence retained. Current
+read-only strict Docker admission finds no worker (`disk_headroom=3`); it does
+not execute a build. No native/local build fallback is used. All source/probe
+failures, including a timed-out intermediate cohort, remain retained under
+`/data/tmp/am-archive-reader-20261110.t7ueMuTt/review53-*`.
+
+DSR implementation `7d329c59f1403add9ee10abd7d01432d053c150d` is published
+on both public refs. Original `br-p9zor` comment 4469 records the exact evidence
+and remaining native/public acceptance; its status stays `in_progress`.
 
 ## November 17 Review52 release container wiring — EmeraldEagle
 
