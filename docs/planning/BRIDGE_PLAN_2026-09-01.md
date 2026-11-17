@@ -1,5 +1,25 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 17 archive reconciliation progress
+
+- [x] Recover the exact archive suite failure from the v0.3.40 receipt and
+  identify the two files left visible to Git.
+- [x] Reopen and claim `br-2t0z` for the recurring Git-cleanliness failure.
+- [x] Trace reconciliation progress, lock, and staging paths and the real
+  archive initialization and overload commit paths.
+- [x] Apply exact root-anchored ignores for the two records and their lock
+  files. Use the archive's existing temporary-file prefix for staging.
+- [x] Add a regression covering an existing archive, its custom ignore rule,
+  both real progress writers and readers, and overload publication with
+  unrelated files that must remain visible.
+- [ ] Verify the Git rule against the retained failing archive and run the
+  storage regression against the candidate. Record the results separately.
+- [ ] Run workspace compiler, production feature, lint, and formatting checks.
+- [ ] Run the unchanged archive E2E against candidate binaries and confirm that
+  its final Git-cleanliness check passes before closing `br-2t0z`.
+- [ ] Preserve the separate full release gate and verify-live requirements on
+  `br-qpacg`.
+
 ## November 17 Review55 share release gate
 
 - [x] Recheck ready and owned Beads. Continue `br-qpacg` and verify that

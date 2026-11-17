@@ -143,7 +143,8 @@ fn record_reconcile_progress(
     let body = encode()?;
     // Never open a predictable staging name: a leftover link must not redirect
     // this write or become the published progress record.
-    let mut staged = tempfile::NamedTempFile::new_in(&dir)?;
+    // Match the archive's staging ignore rule while this file is in flight.
+    let mut staged = tempfile::Builder::new().prefix(".tmp-").tempfile_in(&dir)?;
     staged.write_all(&body)?;
     staged.persist(path).map_err(|error| error.error)?;
     Ok(())

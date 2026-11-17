@@ -9917,6 +9917,12 @@ const ARCHIVE_GITIGNORE_ENTRIES: &[&str] = &[
     ".mailbox.activity.lock",
     "diagnostics/",
     "search_index/",
+    // Reconciliation records and their writer locks live beside the archive
+    // data so doctor can read them across mailbox owner restarts.
+    "/doctor/active-reservation-reconcile.json",
+    "/doctor/active-reservation-reconcile.json.lock",
+    "/doctor/reservation-reconcile.json",
+    "/doctor/reservation-reconcile.json.lock",
     ".tmp-*",
 ];
 
@@ -20508,6 +20514,73 @@ mod tests {
         assert_eq!(committed, ["id-2.json"]);
         drop(staged);
         assert!(staged_temp_files(&reservation_dir).is_empty());
+    }
+
+    #[test]
+    fn archive_reconcile_progress_stays_out_of_git() {
+        use crate::recovery::{active_reservations, reservation_reconcile};
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let config = test_config(root);
+        let repo = Repository::init(root).unwrap();
+        let operator_rule = "# Operator rule\n*.operator\n";
+        fs::write(root.join(".gitignore"), operator_rule).unwrap();
+        assert!(!ensure_repo(root, &config).unwrap());
+        assert!(
+            fs::read_to_string(root.join(".gitignore"))
+                .unwrap()
+                .starts_with(operator_rule)
+        );
+
+        active_reservations::record_progress(
+            root,
+            &active_reservations::ActiveReservationProgress {
+                pid: std::process::id(),
+                pass_us: 123,
+                last_repair_us: None,
+            },
+        )
+        .unwrap();
+        reservation_reconcile::record_progress(
+            root,
+            &reservation_reconcile::ReservationReconcileProgress {
+                pid: std::process::id(),
+                pass_us: 456,
+                last_repair_us: Some(321),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            active_reservations::read_progress(root).unwrap().pass_us,
+            123
+        );
+        assert_eq!(
+            reservation_reconcile::read_progress(root).unwrap().pass_us,
+            456
+        );
+
+        let operator_note = Path::new("doctor/operator-note.md");
+        fs::write(root.join(operator_note), "retain this archive file").unwrap();
+        let project_note = Path::new("projects/doctor/reservation-reconcile.json");
+        ensure_dir(&root.join("projects/doctor")).unwrap();
+        fs::write(root.join(project_note), "{}").unwrap();
+
+        commit_all(&repo, &config, "overload snapshot").unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        assert!(tree.get_path(operator_note).is_ok());
+        assert!(tree.get_path(project_note).is_ok());
+        for progress in [
+            active_reservations::progress_path(root),
+            reservation_reconcile::progress_path(root),
+        ] {
+            for path in [progress.with_extension("json.lock"), progress] {
+                let relative = path.strip_prefix(root).unwrap();
+                assert!(path.is_file(), "{} was not written", relative.display());
+                assert!(repo.status_should_ignore(relative).unwrap());
+                assert!(tree.get_path(relative).is_err());
+            }
+        }
     }
 
     /// A failed publication stops at the failing rename and removes every
