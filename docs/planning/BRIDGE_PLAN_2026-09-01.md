@@ -7,22 +7,58 @@
 - [x] Confirm the SSH-warning source fix already exists; select and claim the
   original ready `br-p9zor` without changing its acceptance or dependencies.
 - [x] Reserve the existing container implementation/tests and integration paths.
-- [ ] Wire verified published release assets into DSR's existing container path:
+- [x] Wire verified published release assets into DSR's existing container path:
   exact tag/source, installer-pinned Minisign key, complete signed inventory,
   safe GNU archive extraction and automatic version/source build arguments.
-- [ ] Keep source-build and release tags separate and require both Linux
-  architectures before stable-tag mutation. Preserve strict RCH requirements.
-- [ ] Exercise real signatures/archives and actual command dispatch with a valid
+- [x] Namespace source tags and disable the retired Actions path in code.
+  Require both Linux architectures and strict RCH for artifact OCI exports;
+  refuse registry mutation until a publisher consumes the verified OCI output.
+- [x] Exercise real signatures/archives and actual command dispatch with a valid
   candidate plus wrong tag/source/signer, incomplete/tampered evidence, wrong
   version and missing-platform controls; label transport/tool substitutes.
-- [ ] Attempt a real read-only public release preparation and a nonpublishing
-  image build through strict RCH when the required worker capability is present.
-- [ ] Reread final code/callers, run affected existing suites, syntax/ShellCheck
+- [x] Attempt actual public preparation: `v0.3.40` lacks `build-manifest.json`
+  and refuses before payload download or Docker. Real RCH Docker probe refuses
+  admission103 (`disk_headroom=2`), with no native/local execution.
+- [x] Track the private input bundle so RCH preserves `context/dist/` as inputs.
+  Real Git/rsync control reproduces zero of four binaries without this and
+  four exact files with the tracked-input carveout; preserve credential filters.
+- [x] Reproduce and fix inherited Git selectors modifying a foreign index.
+  Clear repository-local variables inside the private helper subshells;
+  both inherited-index and foreign-repository cases preserve exact index bytes.
+- [x] Probe the actual RCH CLI, fix its incompatible job/receipt flags and
+  scope the canonical root to the private bundle. Verify all private input
+  hashes on the worker before Docker and compare the returned manifest/source.
+- [x] Run all 510 focused assertions, including transferred-input corruption
+  and a changed manifest/source receipt. Concurrent isolated cases retain the
+  existing 120-second bound; GitHub/RCH/Docker delivery remains explicit R2.
+- [ ] Execute a real native image build once authenticated inputs and remote
+  admission are available; R2 substitutes do not meet that requirement.
+- [x] Reread final code/callers, run affected existing suites, syntax/ShellCheck
   and full changed-file UBS; keep every failed receipt and original release hold.
-- [ ] Update only the claimed Bead and existing requested TODO; verify issue
-  history/cycles, publish only owned source/integration and release reservations.
+- [x] Update only the claimed Bead and existing requested TODO; verify issue
+  history/cycles and prepare only owned source/integration for publication.
+  Verify public refs and release scoped reservations at the final handoff.
 - [ ] Original actual image publication, two-platform/native packaged execution
   and public digest proof remain required before this P0 can close.
+
+The final complete helper run reports 136 passed, 42 failed and 9 skipped,
+with the same failed selection as both earlier runs. The default 120-second
+bounds and all 187 files remain; no pristine identical-bound baseline is
+claimed. All 510 scoped container assertions pass, including inside that full
+runner. Real Git, Minisign, archives and rsync run; GitHub/RCH/Docker delivery
+uses explicit R2 substitutes. Syntax and changed-file ShellCheck pass. Full
+changed-file UBS exits 1: one unchanged trap-eval critical, zero warnings,
+51 info findings, zero changed-line findings. The monolithic ShellCheck run
+was stopped with exit 143 at about 15 GiB; per-file scanning is compensating
+coverage, not a pass for that invocation. All failed controls remain retained,
+including the actual CLI argument conflict and off-root refusal. The corrected
+read-only job gets past both and refuses admission 103 for `disk_headroom=2`;
+no native Docker build or release was executed.
+
+DSR source is `8e9c358163240758cd1191b21da81e98432993ec`. The active profile
+contains only the two intended new container fields; prior six-archive, signing
+and ACFS requirements remain. This is a partial container enabler. The actual
+stable-tag publisher and original native/public evidence remain on `br-p9zor`.
 
 ## November 16 Review50 enforce the raw-installer checksum — EmeraldEagle
 

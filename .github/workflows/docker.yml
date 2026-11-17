@@ -1,8 +1,10 @@
-# Publish a multi-arch container image to ghcr.io.
+# Retained historical multi-arch container workflow. DSR/manual is authoritative;
+# prepare is deliberately disabled in code, so re-enabling this workflow at
+# GitHub cannot overwrite the canonical publisher's stable image tags.
 #
 # Triggers
 # --------
-#   push tag v*          — canonical release path. Waits for dist.yml to
+#   push tag v*          — historical release path. Waited for dist.yml to
 #                          publish the matching GitHub Release, verifies its
 #                          Linux binaries, and packages them with
 #                          Dockerfile.release. Publishes :<tag>, :latest, and
@@ -52,6 +54,9 @@ env:
 
 jobs:
   prepare:
+    # DSR/manual is the canonical publisher. Even re-enabling Actions must not
+    # let this retired path overwrite its stable image tags (br-p9zor).
+    if: ${{ false }}
     name: Bind release inputs and image metadata
     runs-on: ubuntu-latest
     timeout-minutes: 110

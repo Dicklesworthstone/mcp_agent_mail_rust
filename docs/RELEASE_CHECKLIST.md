@@ -44,6 +44,23 @@ that downstream refresh/push automatically. Its Git/Minisign transition tests
 use isolated HTTP delivery and do not replace native or public release proof;
 `br-quq4r` remains open for its complete original acceptance.
 
+The active container profile sets `container_release_from_published_assets: true`
+and `container_binaries: [mcp-agent-mail, am]`. Prepare a qualified public release
+as an OCI archive with:
+
+```bash
+dsr docker build mcp_agent_mail_rust "$RELEASE_TAG" --published-release \
+  --repo-path /data/projects/mcp_agent_mail_rust --output /private/results/am.oci.tar
+```
+
+This requires the complete signed public inventory and source-bound build
+manifest, then uses strict RCH for both GNU Linux architectures. A refused
+admission, incomplete collection or local-success response is non-green.
+Source builds use `source-*` tags; the retired Docker Actions path is disabled
+in code. Artifact mode currently exports OCI only. The actual stable-tag
+publisher must consume that verified output before `br-p9zor` can close;
+native packaged execution and public image digest/platform proof remain open.
+
 - [ ] Resolve release-blocking bugs and run workspace check, strict Clippy,
   formatting, full nextest, and the real transport/recovery/installer gates.
   A build refusal, skipped dependency, or interrupted run is not a pass. The
