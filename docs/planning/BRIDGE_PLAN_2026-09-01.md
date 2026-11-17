@@ -41,9 +41,19 @@
   including assertions and unwraps in the test module.
 - [ ] Run strict Clippy on the corrected source. The initial request was
   refused before Cargo after the worker's disk-capacity sample expired.
+  The next requests hit queue timeout and a disk-headroom refusal.
 - [ ] Run the focused doctor tests with the two original native release-gate
   test bodies in one Cargo invocation. Check individual test names and
-  actual execution evidence before counting any pass.
+  actual execution evidence before counting any pass. The combined request
+  timed out in admission, and the Cargo shim refused local execution under
+  the configured remote requirement. The scoped retry on `hz4` timed out
+  during SSH source admission. Recovery of job `30097323753216276`
+  acknowledged the terminal failure before Cargo ran.
+- [x] Recover the earlier native summary regression, job
+  `30097323753216189`. The selected test ran and passed. The wrapper's
+  post-run comparison refused six intervening source changes. Recovery
+  acknowledged Cargo exit 0 on the original job, which bounds this result
+  to the earlier selected test.
 - [ ] Finish the release-gate work on `br-qpacg`. Its original native test
   bodies, complete gate report and allowed deployment target remain required.
 
