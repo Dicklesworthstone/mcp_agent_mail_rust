@@ -16,13 +16,32 @@
   checkout advances. Keep trust rooted in the tracked installer key.
 - [x] Feed real binary-publisher output through the existing GitHub/RCH/registry
   fixture boundary to the actual container publisher, using real Minisign.
-- [ ] Finish the scoped suite and old-source controls for the missing checksum,
-  incompatible signature and checkout recipe drift. Check final source hashes,
-  shell syntax, ShellCheck, UBS and the required broad helper runner.
+- [x] Compare both old-source controls and pass all 631 container assertions.
+  Exercise signed draft creation and finalization with two public manifest names.
+- [x] Verify final source hashes, shell syntax and changed-file ShellCheck.
+  Review UBS findings and preserve the broad ShellCheck timeout.
+- [x] Route the maintainer's Dockerfile example through DSR and document the
+  explicit aliases used for stable releases.
+- [ ] Read the terminal broad helper report and preserve failures and skips.
 - [ ] Record the terminal results on the original Bead and verify the tracker
   export, publish the qualified source, and release the scoped reservations.
 - [ ] Run the original production strict-RCH build, native packaged execution
   and public image verification when authenticated inputs and workers exist.
+
+The earlier binary publisher produced a valid signature with an incompatible
+comment and left `build-manifest.json` outside the signed inventory. Its output
+fails the actual container consumer on the comment. Correcting only the comment
+still fails on the missing checksum. The earlier container module also fails
+the tagged-recipe assertion with an advanced checkout. The repaired pair passes
+397 original, 113 export and 121 publisher assertions at the existing 120-second
+bound, both directly and inside the broad runner. The actual draft dispatcher
+and finalizer also pass nine checks in a separate fixture that publishes two
+byte-identical build manifest aliases under the signed aggregate.
+
+These tests use real Git, Minisign, archives and subprocesses. GitHub transport,
+RCH/Docker delivery and image signing use explicit fixtures here. Current public
+`v0.3.40` still has no build manifest. Read-only strict Docker admission selects
+no worker (`disk_headroom=2`). The original production acceptance stays open.
 
 ## November 17 Review53 authenticated container publication — EmeraldEagle
 

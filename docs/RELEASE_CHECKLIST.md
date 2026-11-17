@@ -74,6 +74,11 @@ tag effects; failures remain failures. `--skip-sign` is refused in this mode.
 Native packaged execution, the actual production canonical transition and
 public image digest/platform proof remain open on `br-p9zor`.
 
+DSR always publishes the exact version tag on success. For a stable release
+that should also advance the published aliases, pass them explicitly. With
+`RELEASE_TAG=v0.3.40`, the additional arguments are `--tag 0.3.40 --tag 0.3
+--tag latest`. For prereleases, omit those stable aliases.
+
 - [ ] Resolve release-blocking bugs and run workspace check, strict Clippy,
   formatting, full nextest, and the real transport/recovery/installer gates.
   A build refusal, skipped dependency, or interrupted run is not a pass. The

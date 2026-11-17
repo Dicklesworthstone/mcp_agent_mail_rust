@@ -4,12 +4,9 @@
 #
 # Why this exists (GH#256)
 # ------------------------
-# The sibling-clone builder in ./Dockerfile compiles the whole workspace from
-# source inside the image. That is the reproducible-from-git path, but it is
-# also the path that kept the GHCR image pinned at v0.3.13: a source build must
-# reconstruct every out-of-tree `path` dependency, and any drift in that list
-# fails the build for both architectures at once. Building linux/arm64 that way
-# additionally means a full Rust workspace compile under QEMU, which is hours.
+# The source builder in ./Dockerfile compiles Agent Mail inside the image.
+# Using the release binaries avoids a second compilation and keeps the
+# container and installer artifacts on the same binary bytes.
 #
 # This file packages the exact DSR/fleet-built binaries published in the
 # GitHub release into the same runtime image. GitHub Actions are not used
@@ -30,13 +27,10 @@
 #
 # Usage
 # -----
-#   docker buildx build -f Dockerfile.release \
-#       --platform linux/amd64,linux/arm64 \
-#       --build-arg AM_VERSION=0.3.35 \
-#       --build-arg AM_REVISION=<full-tag-commit-sha> \
-#       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:0.3.35 \
-#       -t ghcr.io/dicklesworthstone/mcp_agent_mail_rust:latest \
-#       --push .
+#   Use `dsr docker release --published-release` as documented in
+#   docs/RELEASE_CHECKLIST.md. DSR authenticates the binaries and recipe,
+#   builds both platforms using strict RCH, then verifies the collected image
+#   before promoting registry tags.
 #
 # Runtime
 # -------
