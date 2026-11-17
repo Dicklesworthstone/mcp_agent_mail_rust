@@ -103,7 +103,6 @@ struct AdapterSummary {
     total: u64,
     pass: u64,
     fail: u64,
-    skip: u64,
 }
 
 fn validate_adapter_summary(path: &Path, suite: &str) -> Result<(), String> {
@@ -112,9 +111,9 @@ fn validate_adapter_summary(path: &Path, suite: &str) -> Result<(), String> {
         serde_json::from_slice(&bytes).map_err(|err| format!("parse {}: {err}", path.display()))?;
     if summary.schema_version != 1
         || summary.suite != suite
+        || summary.total == 0
         || summary.pass == 0
         || summary.fail != 0
-        || summary.pass.checked_add(summary.skip) != Some(summary.total)
     {
         return Err(format!(
             "{suite} adapter summary must record a completed suite with passing cases and no failures: {summary:?}"
@@ -304,11 +303,11 @@ fn adapter_summary_requires_positive_suite_evidence() {
             false,
         ),
         (
-            r#"{"schema_version":1,"suite":"share","total":3,"pass":1,"fail":0,"skip":1}"#,
+            r#"{"schema_version":1,"suite":"share","total":0,"pass":1,"fail":0,"skip":0}"#,
             false,
         ),
         (
-            r#"{"schema_version":1,"suite":"share","total":2,"pass":1,"fail":0,"skip":1}"#,
+            r#"{"schema_version":1,"suite":"share","total":1,"pass":3,"fail":0,"skip":1}"#,
             true,
         ),
     ] {

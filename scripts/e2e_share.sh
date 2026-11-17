@@ -1681,9 +1681,9 @@ if [ -z "${CHROMIUM_BIN}" ] || [ "${NODE_MAJOR}" -lt 22 ]; then
     e2e_skip "viewer browser render needs Chromium and Node >= 22 (chromium='${CHROMIUM_BIN}' node=${NODE_MAJOR})"
 else
     # Snap-packaged Chromium can only write a profile inside its own snap dir.
-    if [ -d "${HOME}/snap/chromium" ]; then
-        VIEWER_PROFILE="${HOME}/snap/chromium/common/am-e2e-share-viewer-profile"
-        mkdir -p "${VIEWER_PROFILE}"
+    if [ -n "${HOME:-}" ] && [ -d "${HOME}/snap/chromium" ]; then
+        mkdir -p "${HOME}/snap/chromium/common"
+        VIEWER_PROFILE="$(mktemp -d "${HOME}/snap/chromium/common/am-e2e-share-viewer-profile.XXXXXXXX")"
     else
         VIEWER_PROFILE="$(e2e_mktemp "e2e_share_viewer_profile")"
     fi

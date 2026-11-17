@@ -44,6 +44,8 @@ if ! "${AM_BIN}" share deploy verify-live --help >/dev/null 2>&1; then
     e2e_summary
     exit 0
 fi
+PATH="$(dirname "${AM_BIN}"):${PATH}"
+export PATH
 
 WORK="$(e2e_mktemp "e2e_share_verify_live")"
 DB_PATH="${WORK}/storage.sqlite3"
@@ -486,9 +488,12 @@ BUNDLE_FAILFAST="${WORK}/bundle_failfast"
 cp -R "${BUNDLE_BASE}" "${BUNDLE_FAILFAST}"
 rm -f "${BUNDLE_FAILFAST}/manifest.json"
 
-TOOLING_OUT="$(am_env "${AM_BIN}" share deploy tooling --bundle "${BUNDLE_BASE}" 2>&1)" || true
+# Tooling is generated at the bundle's repository root, including when TMPDIR
+# is nested under the source checkout.
+git -C "${WORK}" init --quiet
+TOOLING_OUT="$(am_env "${AM_BIN}" share deploy tooling "${BUNDLE_BASE}" 2>&1)" || true
 e2e_save_artifact "tooling_stdout.txt" "${TOOLING_OUT}"
-VALIDATE_SCRIPT="${BUNDLE_BASE}/scripts/validate_deploy.sh"
+VALIDATE_SCRIPT="${WORK}/scripts/validate_deploy.sh"
 e2e_assert_file_exists "validate_deploy.sh generated" "${VALIDATE_SCRIPT}"
 
 CASE_IDS=()

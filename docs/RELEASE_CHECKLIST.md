@@ -85,6 +85,12 @@ that should also advance the published aliases, pass them explicitly. With
   default-feature `cargo nextest run --locked --workspace` fits one 64-core host
   (one integration-test binary per crate, br-kp1in.28: ~26 GB of target, ~35 min),
   so an unavailable build fleet is not a reason to substitute selected suites.
+- [ ] On the nextest execution host, verify real `age`, `age-keygen`, `python3`,
+  and `sqlite3` (or the prepared `test_db` substitute). Build both candidate
+  executables and put their target directory first on that host's `PATH`.
+  Set `AM_E2E_HTTP_REQUIRE_PASS=1` and `AM_E2E_TUI_REQUIRE_PASS=1` on the
+  execution host. The native share test always checks the shell suite's exit
+  status and requires passing assertions in its own run directory.
 - [ ] Build both `am` and `mcp-agent-mail` for Linux x86_64 GNU, Linux aarch64
   GNU, Linux x86_64 musl, macOS aarch64, macOS x86_64, and Windows x86_64 MSVC.
   Retain native execution receipts; cross-compilation alone is not native proof.
