@@ -1,5 +1,29 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 17 Review54 binary-to-container publication handoff
+
+- [x] Recheck the Beads queue, current mailbox health, and existing release holds.
+- [x] Compare the strict binary publisher's output with the installer and
+  container publisher's authenticated inputs; continue owned `br-p9zor`.
+- [x] Reserve the two publishers, existing container regression and tracker paths.
+- [x] Add the frozen build manifest under every contracted public name to the
+  aggregate checksums without inserting a self-referential manifest row.
+- [x] Generate the installer-compatible exact-tag trusted comment for the
+  signed public manifest and verify retained signatures against it.
+- [x] Admit the exact fully qualified tag representation emitted by build bundles
+  under the same local and remote commit identity checks.
+- [x] Read the Docker recipe from the authenticated tag even after the local
+  checkout advances. Keep trust rooted in the tracked installer key.
+- [x] Feed real binary-publisher output through the existing GitHub/RCH/registry
+  fixture boundary to the actual container publisher, using real Minisign.
+- [ ] Finish the scoped suite and old-source controls for the missing checksum,
+  incompatible signature and checkout recipe drift. Check final source hashes,
+  shell syntax, ShellCheck, UBS and the required broad helper runner.
+- [ ] Record the terminal results on the original Bead and verify the tracker
+  export, publish the qualified source, and release the scoped reservations.
+- [ ] Run the original production strict-RCH build, native packaged execution
+  and public image verification when authenticated inputs and workers exist.
+
 ## November 17 Review53 authenticated container publication — EmeraldEagle
 
 - [x] Recheck the ready/owned task graph and actual container callers; continue
