@@ -4,7 +4,7 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 
 **Primary Beads:** br-3vwi.12.1, br-3vwi.12.2
 **Track:** br-3vwi.12 (Rollout governance, release gates, feedback loop)
-**Last Updated:** 2026-09-15
+**Last Updated:** 2026-11-16
 
 ## Current Release Procedure
 
@@ -25,6 +25,24 @@ identities consistent. Configuration validation alone does not prove a release:
 the installed native backend currently refuses `RCH_REQUIRE_REMOTE=1` with
 `RCH_REQUIRED_NATIVE_UNAVAILABLE`; retain that refusal until real admission
 and all native/publication evidence exist.
+
+The active profile also requires `release_contract.raw_installer_checksum`
+with `checker: acfs`, downstream repository `Dicklesworthstone/agentic_coding_flywheel_setup`,
+`checksum_path: checksums.yaml`, `installer_key: mcp_agent_mail` and
+`installer_path: install.sh`. The strict DSR publisher and retained-draft
+finalizer verify the release-source installer blob against the canonical raw
+`refs/heads/main` URL and the downstream committed public main entry before
+promotion and before reporting completion. This is separate from archive
+`SHA256SUMS`; a local refresh or successful push response alone is insufficient.
+DSR executes ACFS's existing single-URL checker from the immutable downstream
+revision, in a clean child environment with private retained downloads/output.
+The checker and its logging dependency have verified Git blob identities;
+failure or a different digest blocks publication without a fallback.
+Use ACFS's existing refresh mechanism, review only the intended pin,
+commit/push it, and let DSR re-observe public state. The gate does not perform
+that downstream refresh/push automatically. Its Git/Minisign transition tests
+use isolated HTTP delivery and do not replace native or public release proof;
+`br-quq4r` remains open for its complete original acceptance.
 
 - [ ] Resolve release-blocking bugs and run workspace check, strict Clippy,
   formatting, full nextest, and the real transport/recovery/installer gates.

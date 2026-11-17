@@ -1,5 +1,112 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 16 Review50 enforce the raw-installer checksum — EmeraldEagle
+
+- [x] Recheck ready/owned Beads, graph triage and actual production callers.
+- [x] Preserve the Mac CPU acceptance and the existing live-health findings.
+- [x] Trace container, signing and ACFS paths; choose ready P0 `br-quq4r`.
+- [x] Claim the original Bead; retain every acceptance criterion and comment.
+- [x] Locate the existing disabled-workflow checksum policy and the actual
+  DSR strict publication/finalization transitions. Reserve the edit surfaces.
+- [x] Add a strict opt-in raw-installer policy to the existing release contract.
+- [x] Bind the expected installer digest to its immutable release-source blob.
+- [x] Verify public source/main bytes and the exact downstream checksum entry
+  at a committed public revision; reject ambiguous metadata and moving refs.
+- [x] Enforce the check on direct publication and retained-draft finalization,
+  including immediately before mutation and before reporting completion.
+- [x] Exercise both positive transitions plus stale/wrong URL or digest,
+  cached raw bytes, changed refs, malformed/duplicate metadata, failed push,
+  uncommitted refresh and auth refusals: final 98 checks pass. Deliberately skipping
+  the pin check fails the actual stale-pin publication assertion.
+- [x] Compare record boundaries against ACFS's actual reader. Preserve LF,
+  CRLF and ASCII blank records; reject bare-CR, Unicode separators and
+  nonbreaking-space records in both publication paths. Retain rejected-push
+  diagnostics and require the actual pre-receive-hook failure.
+- [x] Execute ACFS's existing single-URL checksum checker as a required
+  publication step, with checker-error controls and the original real failed
+  downstream-push controls. Downstream refresh/commit/push remains manual.
+- [x] Preserve real Git/Minisign coverage and distinguish HTTP fixtures from
+  real public proof. Keep the original native/publication acceptance open.
+- [x] Run affected config/strict-release suites, syntax, ShellCheck, UBS and
+  all 187 helper files; inspect and retain their actual failed/skipped results.
+- [x] Preserve the hot-edit wrapper failure despite 497 internal assertions;
+  repeat from immutable input to terminal 0 before the final parser alignment.
+- [x] Reread the final implementation/callers with fresh eyes and repeat the
+  decisive transition cases against the original acceptance.
+- [x] Enable the reviewed policy in the actual MCP DSR profile; validate it
+  with the implemented consumer and attempt read-only public verification.
+- [x] Update the existing release checklist, original Bead and tracker exports;
+  verify issue-ID/comment preservation, empty cycles and final source identities.
+- [x] Prepare the reviewed staged changes and request the specific source
+  publication exception required by the unchanged red UBS/ShellCheck gates.
+- [x] Apply the user's contextual go-ahead to the reviewed source exception.
+  Publish the five reviewed DSR paths normally as `e6f45be7`; both public refs
+  match. Preserve all red gates and the original incomplete acceptance.
+- [x] Prepare the coupled Agent Mail integration and tracker update for normal
+  publication, with original acceptance and all adverse results retained.
+- [x] Release the scoped file leases after completing this validation pass.
+- [ ] Complete the original canonical release/native/public post-release probes
+  before closing `br-quq4r`; no test release is authorized by this work item.
+
+The final consumer observes public MCP main `87b4523a` and ACFS main
+`95248c15`; immutable source/main blobs, canonical raw URL and committed pin
+agree on SHA-256 `df93f14492621de7663244e89fd6f38343d6b4eb9f32f950ec466075fe438c0e`.
+This is current public pin parity. It does not certify a version-changing
+release, native execution or automatic downstream refresh/push. Final config
+tests pass 180/180; final changed production ShellCheck and syntax pass.
+The complete immutable strict cohort passes 497 assertions on source
+`249782fb` before the final reader-alignment repair; all 98 affected cases
+pass on final source `f9cc991d`. No full-497 rerun of that last narrow repair
+is claimed. Six format controls agree with the actual ACFS reader.
+
+The broad helper run is red: 141 passed, 37 failed and 9 skipped. Unchanged
+source reproduces the two selected act-runner failures, the GNU parser failure
+and the full release-verification result (63 passed, 28 failed). Other failures
+remain unqualified. Final full-file UBS exits 1: three unchanged critical,
+15 warning, 146 info, zero HEAD-relative changed-line findings. Complete
+ShellCheck covers 63 files: 62 pass, one unchanged file has three warnings.
+No suppression, native fallback, gate relaxation or Bead closure is applied.
+
+Review51 continuation on the original Bead:
+- [x] Publish the reviewed public-pin consumer without a release/tag mutation.
+- [x] Inspect ACFS's actual single-URL checker and its dependency path.
+- [x] Require that checker for Agent Mail's active DSR profile, bound to the
+  same immutable downstream revision as the public pin. Preserve private
+  checker/download output and refuse errors without a fallback.
+- [x] Exercise real committed checker snapshots, both actual publishers,
+  failure/invalid-output/stale-digest controls, and clean child environment.
+- [x] Run the actual public ACFS checker through the final consumer, read-only;
+  distinguish this result from isolated HTTP/script-delivery controls.
+- [x] Review the final diff and run affected configuration/transition checks,
+  production ShellCheck, syntax and UBS; retain the broader known gate failures.
+- [x] Prepare exact results on `br-quq4r`, preserve tracker history and cycles,
+  and prepare only owned paths for normal publication. Actual push identities
+  and lease release are verified at handoff.
+- [ ] Original downstream refresh/update and canonical native/version-changing
+  release plus public post-release proof remain required before closure.
+
+The ACFS checker implementation is DSR `d2b9f19`, following the published pin
+consumer `e6f45be7`. Final production source SHA-256 is
+`ea090d067ab279596cec8f8aa17949e029f640243979d2d8f3029d82db81d229`.
+Configuration passes 181/181; the original 98 pin checks and all 64 checker
+checks pass on that production source. The latter use real committed/pushed
+Git objects and processes with R2 HTTP/script delivery; real public ACFS code
+and its actual network downloader separately pass the read-only final consumer.
+No native/version-changing release or public post-release proof is inferred.
+Final syntax and production ShellCheck pass. Full four-file UBS still exits 1
+with 3 unchanged critical, 15 warning and 146 info findings, zero changed-line
+findings. The earlier full 187-file runner remains red; no rerun of that whole
+suite on the final checker source is claimed.
+
+The first live probe exposed an exclusive-write option leaking into GitHub's
+temporary response-file writer. The scope is repaired; the copied old-bug
+control fails the valid preflight with the original cannot-overwrite error.
+The superseded test run was stopped at exit 143, never counted as passing.
+A strengthened request-count assertion initially compared setup snapshots with
+transition-only requests; it now observes the same interval on both sides and
+all 64 assertions pass. Every failed receipt remains in the existing private
+scratch directory. `br-quq4r` remains in progress with its original acceptance.
+
 ## November 16 Review49 coherent contact health — EmeraldEagle
 
 - [x] Recheck ready Beads and actual callers; continue owned `br-bdo5g`.
