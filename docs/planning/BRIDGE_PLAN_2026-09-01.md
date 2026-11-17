@@ -28,9 +28,14 @@
   exporter. Keep the seed output out of the artifacts. Local validation on
   signed v0.3.40 reports ready with zero errors, and the matrix preserves all
   12 remote assertion failures under the shipping address policy.
-- [ ] Run the unchanged archive E2E against candidate binaries and confirm that
-  its final Git-cleanliness check passes before closing `br-2t0z`. The first
-  portable build hit RCH's 1,800-second transport timeout while compiling.
+- [x] Build the portable server remotely and match its artifact SHA-256 after
+  retrieval. The first build hit RCH's 1,800-second transport timeout. Warm
+  retry `30097323753216231` produced the candidate on `vmi1156319`.
+- [x] Run the unchanged archive E2E twice with that candidate and ordinary Git
+  configuration. Both runs passed 16 assertions across seven cases. Both
+  archives contained all four runtime files and had a clean Git worktree.
+- [x] Close `br-2t0z` on the focused Rust regression and both full candidate
+  archive runs.
 - [ ] Preserve the separate full release gate and verify-live requirements on
   `br-qpacg`.
 
