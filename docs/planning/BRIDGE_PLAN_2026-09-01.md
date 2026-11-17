@@ -1,5 +1,43 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 17 deployment diagnostics and source receipts
+
+- [x] Recheck ready and owned Beads. Claim `br-o5qg0` and preserve the
+  full release acceptance on `br-qpacg`.
+- [x] Locate the RCH logging option in both production source-proof steps
+  and confirm the installed RCH revision contains it.
+- [x] Reproduce first-connect enrollment noise with real OpenSSH and rsync.
+  Keep both unmodified fixture attempts, which refused an intermittent
+  server-side `mm_reap` message on the shared diagnostic stream.
+- [x] Repeat the private fixture twice with sshd writing its daemon log
+  separately. Each run passes all 48 transport cases and all nine Rust
+  policy tests. The 33 refusal cases include changed host keys, invalid
+  authentication, file deltas and stderr emitted by the remote command.
+- [x] Run two complete strict source receipts on enrolled worker
+  `vmi1293453`. Jobs `30097323753216243` and `30097323753216244` both
+  execute Cargo successfully and match independent hashes for Cargo.toml,
+  Cargo.lock and the Rust source.
+- [ ] Run the complete receipt twice through a newly enrolled worker.
+  All configured workers already have known-host entries. The isolated
+  SSH tests and enrolled-worker receipts cover different portions of the
+  acceptance on `br-o5qg0`.
+- [x] Reproduce the broken doctor remediation with signed v0.3.40.
+  Its prescribed command exits 2. The valid command emits a failed
+  manifest check, which the doctor reports with a null cause.
+- [x] Make the doctor read native reports and use the verifier's exit-code
+  policy. Surface the first decisive check, preserve old report summaries
+  and give operators the current command and report path.
+- [x] Add coverage for a real local-bundle failure, strict versus advisory
+  warnings, a succeeding report and parsing the printed command through Clap.
+- [x] Retry the Rust checks from a private source snapshot after the shared
+  checkout's RCH admission and namespace refusals. The first all-targets
+  build caught an optional subcommand pattern in the new test. Correct
+  the pattern and retain that compiler failure.
+- [ ] Run the focused doctor tests, workspace all-targets and production
+  checks, and strict Clippy on the candidate.
+- [ ] Finish the release-gate work on `br-qpacg`. Its original native test
+  bodies, complete gate report and allowed deployment target remain required.
+
 ## November 17 archive reconciliation progress
 
 - [x] Recover the exact archive suite failure from the v0.3.40 receipt and
