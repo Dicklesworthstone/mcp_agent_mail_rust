@@ -18,6 +18,24 @@
   counts of 3, 1 and 0, then 1, 1 and 0 after two decisions aged out.
 - [ ] Measure CPU on the original production Mac for `br-bdo5g`.
 
+### Installer recovery on Windows
+
+- [x] Verify the signed v0.3.40 checksum manifest and its exact release tag.
+  Compare both Windows executables to the authenticated archive after transfer.
+  Both reported version 0.3.40 on the x86-64 Windows host.
+- [x] Run the original PowerShell suite with PowerShell and Minisign required.
+  The pair-transaction tests passed. A separate assertion joined arguments
+  with CRLF and rejected the exact Cosign flag.
+- [x] Check the individual argument tokens, including the values following
+  the certificate identity and issuer flags. Five malformed controls failed.
+- [x] Repeat all seven Windows cases, including diagnostic export, with
+  PowerShell 7.6.4, Minisign 0.12 and the installed Python 3.13 interpreter.
+  Seven passed with zero skips. The Unix installer passed scenarios A–L.
+- [ ] Exercise a Windows console Ctrl+C during binary replacement for
+  `br-r1say`. The Windows fixture uses terminating function faults.
+- [ ] Complete a full Windows installer invocation and the publisher
+  acceptance in `br-8tszv`. The Windows version probes used a private directory.
+
 ## November 18 robot and TUI decision attribution
 
 - [x] Trace `am robot agents --health` from the selected project roster to
