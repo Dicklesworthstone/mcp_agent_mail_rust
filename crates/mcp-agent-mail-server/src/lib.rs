@@ -3755,6 +3755,7 @@ impl Drop for SnapshotDirGuard {
 pub(crate) struct ObservabilitySyncDb {
     conn: Option<DbConn>,
     sqlite_path: String,
+    archive_primary_path: Option<String>,
     #[cfg(test)]
     kind: ObservabilitySyncDbKind,
     _snapshot_dir: Option<SnapshotDirGuard>,
@@ -3803,6 +3804,7 @@ impl ObservabilitySyncDb {
         Self {
             conn: Some(conn),
             sqlite_path,
+            archive_primary_path: None,
             #[cfg(test)]
             kind: ObservabilitySyncDbKind::LiveSqlite,
             _snapshot_dir: None,
@@ -3811,6 +3813,7 @@ impl ObservabilitySyncDb {
 
     fn archive_snapshot(
         storage_root: &Path,
+        primary_sqlite_path: &str,
         live_salvage_db_path: Option<&Path>,
         context: &str,
     ) -> Result<Self, String> {
@@ -3858,6 +3861,7 @@ impl ObservabilitySyncDb {
         Ok(Self {
             conn: Some(conn),
             sqlite_path: sqlite_path_str,
+            archive_primary_path: Some(primary_sqlite_path.to_owned()),
             #[cfg(test)]
             kind: ObservabilitySyncDbKind::ArchiveSnapshot,
             _snapshot_dir: Some(snapshot_dir),
@@ -3868,6 +3872,14 @@ impl ObservabilitySyncDb {
         self.conn
             .as_ref()
             .expect("ObservabilitySyncDb::conn called after into_parts consumed the connection")
+    }
+
+    /// Path used by services whose state belongs to the observed mailbox.
+    /// For archive-backed reads this still identifies the original mailbox.
+    pub(crate) fn primary_sqlite_path(&self) -> &str {
+        self.archive_primary_path
+            .as_deref()
+            .unwrap_or(&self.sqlite_path)
     }
 
     pub(crate) fn into_parts(mut self) -> (DbConn, String, Option<SnapshotDirGuard>) {
@@ -3959,7 +3971,8 @@ pub(crate) fn open_observability_sync_db_connection(
     // snapshot from it; otherwise report that no read source is available.
     if !resolved_path.exists() {
         return if archive_has_state() {
-            ObservabilitySyncDb::archive_snapshot(storage_root, None, context).map(Some)
+            ObservabilitySyncDb::archive_snapshot(storage_root, &sqlite_path, None, context)
+                .map(Some)
         } else {
             Ok(None)
         };
@@ -3994,6 +4007,7 @@ pub(crate) fn open_observability_sync_db_connection(
                 );
                 ObservabilitySyncDb::archive_snapshot(
                     storage_root,
+                    &sqlite_path,
                     resolved_path.exists().then_some(resolved_path.as_path()),
                     context,
                 )
@@ -4028,6 +4042,7 @@ pub(crate) fn open_observability_sync_db_connection(
                 );
                 ObservabilitySyncDb::archive_snapshot(
                     storage_root,
+                    &sqlite_path,
                     resolved_path.exists().then_some(resolved_path.as_path()),
                     context,
                 )
@@ -4054,6 +4069,7 @@ pub(crate) fn open_observability_sync_db_connection(
             );
             ObservabilitySyncDb::archive_snapshot(
                 storage_root,
+                &sqlite_path,
                 resolved_path.exists().then_some(resolved_path.as_path()),
                 context,
             )

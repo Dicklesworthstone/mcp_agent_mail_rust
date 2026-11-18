@@ -1,5 +1,24 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 18 TUI telemetry mailbox identity
+
+- [x] Trace the agent health projection from the selected poller database
+  to the ATC sidecar lookup. The lookup previously consulted the ambient
+  database setting.
+- [x] Reproduce cross-mailbox counts on Apple Silicon with real SQLite
+  files. The same-named agent in the selected mailbox has two decisions.
+  The old poller reports all five from the ambient mailbox.
+- [x] Retain the selected primary path when the poller switches to a
+  private archive snapshot. Use that path for agent health telemetry,
+  including the detail-list refill.
+- [ ] Verify the selected, ambient, and missing-sidecar cases and the
+  archive fallback on the patched poller.
+- [ ] Run the poller cohort, production and all-target workspace checks,
+  strict Clippy, formatting, and scoped bug scans. Record the result on
+  `br-bdo5g` and check dependency cycles.
+- [ ] Qualify the production Mac TUI CPU probe for the original
+  `br-bdo5g` acceptance.
+
 ## November 18 recovery quarantine reporting
 
 - [x] Claim `br-3p187` and trace the active manual and post-heal reclaim

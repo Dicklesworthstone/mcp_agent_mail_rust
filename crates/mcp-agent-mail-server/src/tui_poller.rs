@@ -172,6 +172,7 @@ impl Ord for SnapshotHeapEntry {
 struct DbStatQueryBatcher<'a> {
     conn: &'a DbConn,
     sqlite_path: Option<&'a str>,
+    primary_sqlite_path: Option<&'a str>,
 }
 
 impl<'a> DbStatQueryBatcher<'a> {
@@ -180,13 +181,19 @@ impl<'a> DbStatQueryBatcher<'a> {
         Self {
             conn,
             sqlite_path: None,
+            primary_sqlite_path: None,
         }
     }
 
-    const fn new_with_path(conn: &'a DbConn, sqlite_path: &'a str) -> Self {
+    const fn new_with_paths(
+        conn: &'a DbConn,
+        sqlite_path: &'a str,
+        primary_sqlite_path: &'a str,
+    ) -> Self {
         Self {
             conn,
             sqlite_path: Some(sqlite_path),
+            primary_sqlite_path: Some(primary_sqlite_path),
         }
     }
 
@@ -217,7 +224,7 @@ impl<'a> DbStatQueryBatcher<'a> {
             file_reservations: counts.file_reservations,
             contact_links: counts.contact_links,
             ack_pending: counts.ack_pending,
-            agents_list: fetch_agents_list(self.conn),
+            agents_list: fetch_agents_list(self.conn, self.primary_sqlite_path),
             projects_list: fetch_projects_list_with_reservation_counts(
                 self.conn,
                 Some(&reservation_bundle.active_counts_by_project),
@@ -230,6 +237,7 @@ impl<'a> DbStatQueryBatcher<'a> {
         refill_missing_detail_lists_from_sqlite(
             &mut snapshot,
             self.sqlite_path,
+            self.primary_sqlite_path,
             &reservation_bundle.active_counts_by_project,
         );
         restore_missing_project_rollup_counts_from_previous(
@@ -424,6 +432,7 @@ pub struct DbPoller {
 struct PollerConnectionState {
     conn: DbConn,
     sqlite_path: String,
+    primary_sqlite_path: String,
     _snapshot_dir: Option<crate::SnapshotDirGuard>,
     last_data_version: Option<i64>,
     last_reservation_snapshot_gap_refresh_micros: i64,
@@ -792,18 +801,35 @@ where
 #[cfg(test)]
 fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
     let (conn, sqlite_path) = open_sync_connection_with_path(database_url)?;
-    Some(DbStatQueryBatcher::new_with_path(&conn, &sqlite_path).fetch_snapshot(None))
+    Some(DbStatQueryBatcher::new_with_paths(&conn, &sqlite_path, &sqlite_path).fetch_snapshot(None))
 }
 
 fn open_poller_connection_state(
     database_url: &str,
     storage_root: &std::path::Path,
 ) -> Option<PollerConnectionState> {
-    let (conn, sqlite_path, snapshot_dir) =
-        open_sync_connection_with_path_and_storage_root(database_url, storage_root)?;
+    let observed = match crate::open_observability_sync_db_connection(
+        database_url,
+        storage_root,
+        "tui db poller",
+    ) {
+        Ok(db) => db?,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                database_url,
+                storage_root = %storage_root.display(),
+                "tui db poller observability snapshot unavailable"
+            );
+            return None;
+        }
+    };
+    let primary_sqlite_path = observed.primary_sqlite_path().to_owned();
+    let (conn, sqlite_path, snapshot_dir) = observed.into_parts();
     Some(PollerConnectionState {
         conn,
         sqlite_path,
+        primary_sqlite_path,
         _snapshot_dir: snapshot_dir,
         last_data_version: None,
         last_reservation_snapshot_gap_refresh_micros: 0,
@@ -855,10 +881,14 @@ fn fetch_db_stats_with_clock(
         (Some(current), Some(prev)) => current == prev,
         _ => false,
     };
+    let batcher = DbStatQueryBatcher::new_with_paths(
+        &state.conn,
+        &state.sqlite_path,
+        &state.primary_sqlite_path,
+    );
     if version_unchanged && previous.timestamp_micros > 0 {
         let update = if must_refresh_for_detail_gap {
-            let snapshot = DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
-                .fetch_snapshot(Some(previous));
+            let snapshot = batcher.fetch_snapshot(Some(previous));
             state.last_full_snapshot_micros = clock();
             snapshot
         } else if must_refresh_for_expiry || must_refresh_for_snapshot_gap {
@@ -894,8 +924,7 @@ fn fetch_db_stats_with_clock(
     {
         return Some(DbPollSnapshotUpdate::TimestampOnly(now));
     }
-    let snapshot = DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
-        .fetch_snapshot(Some(previous));
+    let snapshot = batcher.fetch_snapshot(Some(previous));
     // Include query and fallback-connection work in the attempt. Slow work
     // must not consume its own pause and immediately schedule another scan.
     state.last_full_snapshot_micros = clock();
@@ -1151,25 +1180,6 @@ pub fn open_sync_write_connection_pub(database_url: &str) -> Option<DbConn> {
 #[cfg(test)]
 fn open_sync_connection(database_url: &str) -> Option<DbConn> {
     open_sync_connection_with_path(database_url).map(|(conn, _)| conn)
-}
-
-fn open_sync_connection_with_path_and_storage_root(
-    database_url: &str,
-    storage_root: &std::path::Path,
-) -> Option<(DbConn, String, Option<crate::SnapshotDirGuard>)> {
-    match crate::open_observability_sync_db_connection(database_url, storage_root, "tui db poller")
-    {
-        Ok(db) => db.map(crate::ObservabilitySyncDb::into_parts),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                database_url,
-                storage_root = %storage_root.display(),
-                "tui db poller observability snapshot unavailable"
-            );
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1540,6 +1550,7 @@ fn unique_previous_contact_summary<'a>(
 fn refill_missing_detail_lists_from_sqlite(
     snapshot: &mut DbStatSnapshot,
     sqlite_path: Option<&str>,
+    primary_sqlite_path: Option<&str>,
     reservation_counts: &HashMap<i64, u64>,
 ) {
     if !snapshot_has_missing_detail_lists(snapshot) {
@@ -1556,7 +1567,7 @@ fn refill_missing_detail_lists_from_sqlite(
     let conn = guard_db_conn(conn, "tui_poller::refill_missing_detail_lists");
 
     if snapshot.agents > 0 && snapshot.agents_list.is_empty() {
-        snapshot.agents_list = fetch_agents_list(&conn);
+        snapshot.agents_list = fetch_agents_list(&conn, primary_sqlite_path);
     }
     if snapshot.projects > 0 && snapshot.projects_list.is_empty() {
         snapshot.projects_list =
@@ -1638,12 +1649,12 @@ pub(crate) fn timestamp_sort_expr(column: &str) -> String {
 }
 
 /// Fetch the agent list ordered by most recently active.
-fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
+fn fetch_agents_list(conn: &DbConn, primary_sqlite_path: Option<&str>) -> Vec<AgentSummary> {
     let base_rows = fetch_agent_list_rows(conn);
     if base_rows.is_empty() {
         return Vec::new();
     }
-    let health_inputs = fetch_agent_health_inputs(conn, &base_rows);
+    let health_inputs = fetch_agent_health_inputs(conn, &base_rows, primary_sqlite_path);
     base_rows
         .into_iter()
         .map(|row| {
@@ -1798,6 +1809,7 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
 fn fetch_agent_health_inputs(
     conn: &DbConn,
     agents: &[AgentListRow],
+    primary_sqlite_path: Option<&str>,
 ) -> HashMap<i64, AgentHealthInputs> {
     if agents.is_empty() {
         return HashMap::new();
@@ -1827,7 +1839,7 @@ fn fetch_agent_health_inputs(
     } else {
         HashMap::new()
     };
-    let decision_counts = fetch_agent_decision_counts(agents, window_start);
+    let decision_counts = fetch_agent_decision_counts(primary_sqlite_path, agents, window_start);
 
     agents
         .iter()
@@ -2463,20 +2475,13 @@ fn classify_contact_policy_rows(
     (respected, violation)
 }
 
-fn fetch_agent_decision_counts(agents: &[AgentListRow], window_start: i64) -> HashMap<String, u64> {
-    if agents.is_empty() {
-        return HashMap::new();
-    }
-    // ATC experiences live in the dedicated sidecar DB (br-bvq1x.11.7); read
-    // per-agent decision counts from there. No sidecar (ATC never wrote, or the
-    // DB is in-memory) => no telemetry => empty counts.
-    let config = mcp_agent_mail_core::Config::from_env();
-    let Some(resolved) =
-        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()
-    else {
-        return HashMap::new();
-    };
-    let Some(atc_conn) = mcp_agent_mail_db::pool::open_atc_sidecar_conn(&resolved.canonical_path)
+fn fetch_agent_decision_counts(
+    primary_sqlite_path: Option<&str>,
+    agents: &[AgentListRow],
+    window_start: i64,
+) -> HashMap<String, u64> {
+    let Some(atc_conn) =
+        primary_sqlite_path.and_then(mcp_agent_mail_db::pool::open_atc_sidecar_conn)
     else {
         return HashMap::new();
     };
@@ -4264,6 +4269,76 @@ mod tests {
         .expect("create message_recipients");
     }
 
+    fn seed_atc_decisions(primary: &std::path::Path, subject: &str, count: u64) {
+        let primary = primary.to_str().expect("test path");
+        let atc_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary);
+        let atc = mcp_agent_mail_db::CanonicalDbConn::open_file(&atc_path).expect("create sidecar");
+        atc.execute_raw("CREATE TABLE atc_experiences (subject TEXT, created_ts INTEGER)")
+            .expect("create ATC experiences");
+        for _ in 0..count {
+            atc.execute_sync(
+                "INSERT INTO atc_experiences (subject, created_ts) VALUES (?, ?)",
+                &[
+                    Value::Text(subject.to_string()),
+                    Value::BigInt(now_micros()),
+                ],
+            )
+            .expect("insert ATC decision");
+        }
+    }
+
+    #[test]
+    fn agent_health_decisions_follow_the_observed_mailbox() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut fixtures = Vec::new();
+        for (name, count) in [("selected", 2), ("ambient", 5), ("no-telemetry", 0)] {
+            let mailbox = root.path().join(name);
+            std::fs::create_dir(&mailbox).expect("create mailbox directory");
+            let primary = mailbox.join("storage.sqlite3");
+            let conn = DbConn::open_file(primary.to_str().expect("test path")).expect("open");
+            create_empty_mail_schema(&conn);
+            conn.execute_sync(
+                "INSERT INTO projects VALUES (1, 'agents', '/agents', 1)",
+                &[],
+            )
+            .expect("insert project");
+            conn.execute_sync(
+                "INSERT INTO agents VALUES (1, 1, 'BlueLake', 'fixture', 1)",
+                &[],
+            )
+            .expect("insert agent");
+            drop(conn);
+            if count > 0 {
+                seed_atc_decisions(&primary, "BlueLake", count);
+            }
+            fixtures.push((mailbox, format!("sqlite://{}", primary.display()), count));
+        }
+
+        let ambient_url = &fixtures[1].1;
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", ambient_url)],
+            || {
+                for (mailbox, url, expected) in &fixtures {
+                    let mut state =
+                        open_poller_connection_state(url, mailbox).expect("open selected mailbox");
+                    let snapshot = require_full_update(fetch_db_stats_with_connection(
+                        &mut state,
+                        &DbStatSnapshot::default(),
+                    ));
+                    assert_eq!(snapshot.agents_list.len(), 1);
+                    let agent = &snapshot.agents_list[0];
+                    assert_eq!(agent.name, "BlueLake");
+                    assert_eq!(
+                        agent.health.as_ref().expect("health").decision_count,
+                        *expected,
+                        "wrong decision count for {}",
+                        mailbox.display()
+                    );
+                }
+            },
+        );
+    }
+
     #[test]
     fn fetch_db_stats_with_connection_allows_empty_healthy_startup_snapshot() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4277,6 +4352,7 @@ mod tests {
         let (conn, sqlite_path) = open_sync_connection_with_path(&db_url).expect("open conn");
         let mut state = PollerConnectionState {
             conn,
+            primary_sqlite_path: sqlite_path.clone(),
             sqlite_path,
             _snapshot_dir: None,
             last_data_version: None,
@@ -4376,8 +4452,7 @@ mod tests {
     }
 
     #[test]
-    fn open_sync_connection_with_path_and_storage_root_uses_archive_snapshot_when_live_db_is_stale()
-    {
+    fn poller_archive_snapshot_uses_the_original_mailbox_for_atc_decisions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage_root = dir.path().join("storage");
         let db_path = dir.path().join("poller-stale.sqlite3");
@@ -4413,24 +4488,40 @@ first body
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
         create_empty_mail_schema(&conn);
         drop(conn);
+        seed_atc_decisions(&db_path, "Alice", 3);
 
         let db_url = format!("sqlite:///{}", db_path.display());
-        let (conn, sqlite_path, snapshot_dir) =
-            open_sync_connection_with_path_and_storage_root(&db_url, &storage_root)
-                .expect("open poller snapshot db");
+        let mut state =
+            open_poller_connection_state(&db_url, &storage_root).expect("open poller snapshot db");
         assert!(
-            snapshot_dir.is_some(),
+            state._snapshot_dir.is_some(),
             "poller should hold an archive-backed snapshot when the live db lags"
         );
         assert_ne!(
-            sqlite_path,
+            state.sqlite_path,
             db_path.to_string_lossy(),
             "poller should switch away from the stale live sqlite file"
         );
-        let rows = conn
+        let rows = state
+            .conn
             .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
             .expect("query snapshot messages");
         assert_eq!(rows[0].get_named::<i64>("c").unwrap_or(0), 1);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", "sqlite:///:memory:")],
+            || {
+                let snapshot = require_full_update(fetch_db_stats_with_connection(
+                    &mut state,
+                    &DbStatSnapshot::default(),
+                ));
+                let alice = snapshot
+                    .agents_list
+                    .iter()
+                    .find(|agent| agent.name == "Alice")
+                    .expect("archived agent");
+                assert_eq!(alice.health.as_ref().expect("health").decision_count, 3);
+            },
+        );
     }
 
     #[test]
@@ -4447,6 +4538,7 @@ first body
         let (conn, sqlite_path) = open_sync_connection_with_path(&db_url).expect("open conn");
         let mut state = PollerConnectionState {
             conn,
+            primary_sqlite_path: sqlite_path.clone(),
             sqlite_path,
             _snapshot_dir: None,
             last_data_version: None,
@@ -4491,6 +4583,7 @@ first body
         let (conn, sqlite_path) = open_sync_connection_with_path(&db_url).expect("open conn");
         let mut state = PollerConnectionState {
             conn,
+            primary_sqlite_path: sqlite_path.clone(),
             sqlite_path,
             _snapshot_dir: None,
             last_data_version: None,
@@ -4583,6 +4676,7 @@ first body
         let (conn, sqlite_path) = open_sync_connection_with_path(&db_url).expect("open conn");
         let mut state = PollerConnectionState {
             conn,
+            primary_sqlite_path: sqlite_path.clone(),
             sqlite_path,
             _snapshot_dir: None,
             last_data_version: None,
@@ -4791,6 +4885,7 @@ first body
         let state = PollerConnectionState {
             conn,
             sqlite_path: ":memory:".to_string(),
+            primary_sqlite_path: ":memory:".to_string(),
             _snapshot_dir: None,
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
@@ -5040,7 +5135,8 @@ first body
         )
         .expect("insert recipient");
 
-        let previous = DbStatQueryBatcher::new_with_path(&conn, &db_path_str).fetch_snapshot(None);
+        let previous = DbStatQueryBatcher::new_with_paths(&conn, &db_path_str, &db_path_str)
+            .fetch_snapshot(None);
 
         let lock_conn = DbConn::open_file(&db_path_str).expect("open lock conn");
         lock_conn
@@ -5052,7 +5148,7 @@ first body
             .execute_sync("PRAGMA busy_timeout = 1", &[])
             .expect("set busy timeout");
 
-        let snapshot = DbStatQueryBatcher::new_with_path(&read_conn, &db_path_str)
+        let snapshot = DbStatQueryBatcher::new_with_paths(&read_conn, &db_path_str, &db_path_str)
             .fetch_snapshot(Some(&previous));
 
         lock_conn
@@ -6047,7 +6143,7 @@ first body
         let db_path = dir.path().join("test_agents_no_table.db");
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
         // No tables created
-        let agents = fetch_agents_list(&conn);
+        let agents = fetch_agents_list(&conn, None);
         assert_eq!(agents, [] as [AgentSummary; 0]);
     }
 
@@ -6117,7 +6213,12 @@ first body
             messages: 1,
             ..DbStatSnapshot::default()
         };
-        refill_missing_detail_lists_from_sqlite(&mut snapshot, Some(&db_path_str), &HashMap::new());
+        refill_missing_detail_lists_from_sqlite(
+            &mut snapshot,
+            Some(&db_path_str),
+            Some(&db_path_str),
+            &HashMap::new(),
+        );
 
         assert_eq!(snapshot.agents_list.len(), 1);
         assert_eq!(snapshot.agents_list[0].name, "BlueLake");
@@ -6426,7 +6527,7 @@ first body
         )
         .expect("insert");
 
-        let agents = fetch_agents_list(&conn);
+        let agents = fetch_agents_list(&conn, None);
         assert_eq!(agents.len(), 3);
         assert_eq!(agents[0].name, "NewAgent");
         assert_eq!(agents[1].name, "MidAgent");
@@ -6472,7 +6573,7 @@ first body
         )
         .expect("insert deregistration");
 
-        let agents = fetch_agents_list(&conn);
+        let agents = fetch_agents_list(&conn, None);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "ActiveAgent");
     }
@@ -6496,7 +6597,7 @@ first body
         )
         .expect("insert");
 
-        let agents = fetch_agents_list(&conn);
+        let agents = fetch_agents_list(&conn, None);
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0].name, "Beta");
         assert_eq!(agents[1].name, "Alpha");
@@ -6521,7 +6622,7 @@ first body
         )
         .expect("insert");
 
-        let agents = fetch_agents_list(&conn);
+        let agents = fetch_agents_list(&conn, None);
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0].name, "FreshAgent");
         assert_eq!(agents[1].name, "LegacyAgent");
@@ -6547,7 +6648,7 @@ first body
         )
         .expect("insert");
 
-        let agents = fetch_agents_list(&conn);
+        let agents = fetch_agents_list(&conn, None);
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0].name, "[unknown-agent-7]");
         assert_eq!(agents[0].program, "");
@@ -7421,6 +7522,7 @@ first body
                 model: String::new(),
                 last_active_ts: now.saturating_sub(1_000_000),
             }],
+            None,
         );
 
         let input = inputs.get(&7).expect("health input retained");
@@ -7966,6 +8068,7 @@ first body
             dir,
             PollerConnectionState {
                 conn,
+                primary_sqlite_path: sqlite_path.clone(),
                 sqlite_path,
                 _snapshot_dir: None,
                 last_data_version: None,
