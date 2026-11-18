@@ -318,11 +318,11 @@ pub(crate) fn trusted_release_keys() -> Result<Vec<MinisignPublicKey>, String> {
     }
 }
 
-/// Find the SHA-256 for `filename` in an (already authenticated) `SHA256SUMS`
-/// manifest. Accepts the `sha256sum` conventions `hash  name`, `hash *name`
-/// (binary mode) and `hash  ./name`; the match is on the exact file name so
-/// sidecars such as `name.minisig` never match.
+/// Require exactly one SHA-256 for `filename` in an authenticated `SHA256SUMS`
+/// manifest. Accepts the optional `sha256sum` binary marker `*` and `./` path
+/// prefix. Only rows for the exact filename count toward the match.
 pub(crate) fn manifest_sha256_for(manifest: &str, filename: &str) -> Result<String, String> {
+    let mut checksum = None;
     for line in manifest.lines() {
         let mut parts = line.split_whitespace();
         let Some(hash) = parts.next() else {
@@ -334,21 +334,22 @@ pub(crate) fn manifest_sha256_for(manifest: &str, filename: &str) -> Result<Stri
         if parts.next().is_some() {
             continue;
         }
-        let name = name
-            .strip_prefix('*')
-            .or_else(|| name.strip_prefix("./"))
-            .unwrap_or(name);
+        let name = name.strip_prefix('*').unwrap_or(name);
+        let name = name.strip_prefix("./").unwrap_or(name);
         if name != filename {
             continue;
+        }
+        if checksum.is_some() {
+            return Err(format!("multiple checksums for {filename} in SHA256SUMS"));
         }
         if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(format!(
                 "SHA256SUMS entry for {filename} is not a 64-hex-digit SHA-256 digest"
             ));
         }
-        return Ok(hash.to_ascii_lowercase());
+        checksum = Some(hash.to_ascii_lowercase());
     }
-    Err(format!("no checksum found for {filename} in SHA256SUMS"))
+    checksum.ok_or_else(|| format!("no checksum found for {filename} in SHA256SUMS"))
 }
 
 #[cfg(test)]
@@ -768,6 +769,7 @@ mod tests {
             format!("{hash}  {name}"),
             format!("{hash} *{name}"),
             format!("{hash}  ./{name}"),
+            format!("{hash} *./{name}"),
             format!("{}  {name}", hash.to_uppercase()),
         ] {
             let manifest = format!("aaaa  {name}.minisig\n{line}\n");
@@ -784,5 +786,38 @@ mod tests {
         assert!(manifest_sha256_for(&format!("nothex  {name}\n"), name).is_err());
         // Three-column lines are not sha256sum output.
         assert!(manifest_sha256_for(&format!("{hash}  {name}  extra\n"), name).is_err());
+    }
+
+    #[test]
+    fn signed_manifest_rejects_duplicate_archive_checksums() {
+        let key = TestKey::new(12);
+        let name = "mcp-agent-mail-x86_64-unknown-linux-gnu.tar.xz";
+        let first_hash = "a".repeat(64);
+        let different_hash = "b".repeat(64);
+        for (duplicate_hash, duplicate_name) in [
+            (first_hash.as_str(), name.to_string()),
+            (different_hash.as_str(), format!("*{name}")),
+            (different_hash.as_str(), format!("./{name}")),
+            (different_hash.as_str(), format!("*./{name}")),
+        ] {
+            let manifest = format!("{first_hash}  {name}\n{duplicate_hash}  {duplicate_name}\n");
+            let signature = key.sign(
+                manifest.as_bytes(),
+                "mcp_agent_mail_rust v1.2.3 SHA256SUMS",
+                true,
+            );
+            verify_release_manifest_signature(
+                manifest.as_bytes(),
+                &signature,
+                &[key.public()],
+                "1.2.3",
+            )
+            .expect("fixture must authenticate for its release");
+            assert_eq!(
+                manifest_sha256_for(&manifest, name).unwrap_err(),
+                format!("multiple checksums for {name} in SHA256SUMS"),
+                "duplicate checksum row for {duplicate_name}"
+            );
+        }
     }
 }

@@ -1,5 +1,47 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 18 release checksum and publication checks
+
+- [x] Compare the deployed DSR profile with the six archives advertised by
+  the installer, including the separate Linux GNU and musl variants.
+- [x] Run the installed DSR publisher in dry-run mode against three private
+  manifests. It rejects an omitted Intel entry, an incorrect Intel archive
+  name, and a complete archive inventory with no native policy receipts.
+  All three exit 4, with distinct inventory, binding, and receipt diagnostics.
+- [x] Trace `am self-update` from the release tag and Minisign verification
+  to checksum selection and the first archive request.
+- [x] Claim `br-l8z1h` and make the native updater require one checksum for
+  its archive. Treat sha256sum's binary marker and `./` prefix as aliases
+  for the same filename.
+- [x] Sign fixtures with identical and conflicting duplicate rows. Check
+  the normal filename, binary marker, relative prefix, and both together.
+- [x] Reproduce the bug over loopback with the previous Mac binary. It
+  authenticates a manifest with duplicate rows and requests the archive.
+- [x] Run the signed test against `9d849082` before applying the fix. It
+  fails because the original parser returns the first digest.
+- [x] Run the full release-signing module on the patched arm64 Mac build.
+  All 18 tests pass, including the real v0.3.32 signature fixture.
+- [x] Build `am` from `mcp-agent-mail-cli` and run it over loopback. The
+  identical and conflicting duplicate manifests both authenticate and
+  stop before an archive request. The unique `*./` row reaches the archive
+  request and receives the expected fixture 404. The initial build used
+  the wrong Cargo package and stopped before compilation.
+- [x] Run separate production and all-target workspace checks and strict
+  workspace Clippy on the matched arm64 Mac source. All three pass.
+- [x] Check formatting and whitespace and review the diff and bug scan.
+  UBS exits 1 with one critical finding and 68 warnings. The critical
+  finding is the same public Minisign key-ID comparison on the baseline.
+  Added warnings flag test assertions, test formatting, and one allocation
+  on the immediate duplicate-error return.
+- [x] Record verified results on `br-s1ejh` and `br-l8z1h` and check the Beads
+  graph for cycles.
+- [ ] Run a positive exact-source DSR candidate with all six native receipts,
+  archive bytes, checksums, and signatures. Verify the signing refusal cases
+  through the canonical publisher and confirm the public artifact coverage.
+- [ ] Require the same checksum uniqueness in the shell and PowerShell
+  installers. Qualify the raw shell installer change with the downstream
+  ACFS checksum and verify both native installer entry points.
+
 ## November 18 native macOS database and TUI verification
 
 - [x] Read the original `br-ah0au` reports and follow the existing fixes
