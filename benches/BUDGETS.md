@@ -175,21 +175,21 @@ Baseline captured via `am bench --quick` (2026-02-09). Seeded with 60 messages (
 | `am lint` | 457ms | < 1000ms | Heavy static analysis |
 | `am typecheck` | 399ms | < 800ms | Heavy type checking |
 
-### Era note (2026-08-18): the 2026-02 operational baselines do not reproduce on current gate hardware — and it is NOT an engine regression
+### August 2026 pipeline latency calibration
 
-A same-host A/B settled this during the v0.3.28 release gating: the v0.3.27
-tree (pre-registry fsqlite engine, rebuilt from the preserved 0.3.27 release
-buildroot) and current main (registry fsqlite 0.3.4), run back-to-back on the
-same idle 64-core host, produce statistically identical results — `am mail
-send` ~336ms and `am mail inbox` ~2.8s under both engines (vs the 27ms/11.5ms
-recorded above), and the 30-agent DB+Git pipeline at p99 ≈ 38–47s under both
-(fully correct, 150/150, 0 errors). The four latency-budget stress suites that
-assume the older numbers (`p99 < 10s` pipeline plus the three 240s-watchdog
-suites) are therefore red on this host for *environment-era* reasons, and they
-are deliberately left unmasked pending a conscious per-host budget
-recalibration — do not "fix" them by hunting for an engine regression (that
-attribution was made twice during gating and retracted twice; see the
-FrankenSQLite tracker bd-pr6ii retraction). When recalibrating, capture fresh
+During v0.3.28 release verification, the v0.3.27 build (pre-registry fsqlite)
+and the v0.3.28 candidate (registry fsqlite 0.3.4) ran back-to-back on the
+same idle 64-core host. Both took about 336 ms for `am mail send` and 2.8 s
+for `am mail inbox`. The February baselines above were 27 ms and 11.5 ms,
+respectively. Each build completed all 150 sends in the 30-agent DB+Git
+pipeline with zero errors. Their p99 latencies were in the 38–47 s range,
+above the ten-second limit in v0.3.27.
+
+Commit `df8d3b77` changed that assertion to **p99 < 120 s**
+in `stress_concurrent_message_pipeline_30_agents`. The three 240-second
+suite watchdogs were outside that change. The pipeline test reports the
+measured p99 alongside operation and error counts, even on a passing run.
+When recalibrating, capture fresh
 `am bench --quick` numbers on the target host with an isolated
 `AGENT_MAIL_HOME`/`AGENT_MAIL_DB` (measurements against a live shared mailbox
 absorb daemon contention and are not comparable to these seeded-fixture

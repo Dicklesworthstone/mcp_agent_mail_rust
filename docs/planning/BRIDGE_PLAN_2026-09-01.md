@@ -16,7 +16,16 @@
 - [x] Register five identities in two private projects through
   `am macros start-session`. The rebuilt `am robot agents --health` returned
   counts of 3, 1 and 0, then 1, 1 and 0 after two decisions aged out.
-- [ ] Measure CPU on the original production Mac for `br-bdo5g`.
+- [x] Inspect both live Mac daemons by PID and executable inode. Both were
+  headless. Over 60 seconds the original Mac mini used 5.30 CPU seconds on
+  0.3.38 and the Studio used 33.59 on 0.3.40.
+- [x] Compare the 0.3.38 and 0.3.40 release TUIs in separate 200×50 terminals
+  on the Studio. Each private mailbox retained 8,192 seeded deliveries and
+  ten additional MCP sends. The idle 30-second intervals used 3.31 and
+  3.23 CPU seconds respectively. With one send every three seconds they used
+  9.49 and 5.32. Both TUIs exited normally.
+- [ ] Observe the upgraded production TUI for `br-bdo5g` when one is running.
+  The original Mac mini's live 18-day process still uses 0.3.38 with `--no-tui`.
 
 ### Installer recovery on Windows
 
@@ -35,6 +44,69 @@
   `br-r1say`. The Windows fixture uses terminating function faults.
 - [ ] Complete a full Windows installer invocation and the publisher
   acceptance in `br-8tszv`. The Windows version probes used a private directory.
+
+### Storage recovery and concurrent writes
+
+- [x] Give each of the 12 refusal, seven competing-write and five revision
+  fixtures its own 60-second child deadline in `br-kw4yv`. Preserve each
+  test's existing assertions and the timeout diagnostic.
+- [x] Run all 36 active-reservation recovery tests on Apple Silicon. They
+  passed on local storage in 31.11 s and under Nextest on the mounted APFS
+  volume in 498.15 s.
+- [x] Space out the 12 real child processes by pausing the parent between
+  cases. All 12 completed in 65.30 s. With the same test binary
+  (`49b03c608940`), stalling the first child alone failed in 60.06 s,
+  with exit 101 and `case=Some(0) failed (timeout=true)`.
+- [x] Close `br-kw4yv` after all 36 tests passed on Linux in 117.80 s
+  (RCH job `30097306372014091`). On the original 128-core host, the same
+  executable (`33748589c3d9`) ran all 12 spaced fixtures in 74.50 s.
+  Stalling fixture 0 produced the timeout diagnostic and exit 101 in 60.21 s.
+- [x] Trace the two `br-ra7jp` failures to v0.3.27. Line 401 checks the
+  ten-second message p99. Line 932 joins a worker whose line 97 reports a
+  non-retryable database error. The retained issue omits the error payload.
+- [x] Run both original stress cases with the retained October binary on
+  the 128-core host. At load 6.42 they completed all 150 sends, 80 mixed
+  sends and 80 reservations, with zero errors.
+- [x] Repeat with the same October binary at nice 19 as host load rose
+  from 58 to 70. All 230 sends and 80 reservations succeeded. The 30-agent
+  pipeline p99 was 9.19 s. The mixed workload finished in 44.23 s.
+- [x] Run the current RCH-built storage binary `d3e96a32eb43` on that host.
+  Both cases passed at load 11.33 with 32 CPUs available to the session.
+  The 30-agent p99 was 680 ms. Four simultaneous runs sharing one CPU
+  also passed, with message p99s of 3.25 and 3.30 seconds. Across all
+  six runs, 690 sends and 240 reservations succeeded with zero errors.
+- [x] Limit each test process to 5% of one CPU on the same host. All 150
+  pipeline sends succeeded at p99 25.40 s. That exceeds the v0.3.27 gate
+  of 10 s and passes the 120 s gate introduced in `df8d3b77`. The mixed
+  case completed all 80 sends and 80 reservations in 129.90 s.
+- [ ] Recover the original mixed worker's database error or reproduce it
+  near the reported system load of 100. The CPU-quota runs produced no
+  database errors.
+
+### Acknowledged message delivery
+
+- [x] Trace `br-amhym` through the real `send_message` test and archive
+  dispatcher. The test accepted a positive response ID and an empty retry
+  queue without reading the acknowledged message.
+- [x] Keep the 25-second reply limit. Before flushing the archive, read
+  the committed message, body and recipient from a second DB connection.
+  After the flush, check the canonical, outbox and inbox blobs in Git HEAD.
+- [x] Run the revised test on Apple Silicon. The 6 KiB send returned in
+  46.6 ms. Eight concurrent processes with independent mailboxes passed
+  the same DB and Git assertions with reply times of 128–188 ms.
+- [x] Register two identities with the signed Windows v0.3.40 `am.exe`.
+  Send a private message, read the recipient's inbox, query SQLite
+  independently, and compare the three committed Git blobs. All returned
+  message 1 and the same 39-byte body.
+- [x] Check the line reported for the August failure against both the
+  v0.3.27 tag and the commit that filed the issue. Line 4726 unwraps the
+  send result. The 25-second assertion starts at line 4731.
+- [x] Run the October tools binary (`f0ff3327dfb3`) on the original Linux
+  host. Its send returned in 618 ms alongside both storage stress cases.
+  Starting at load 70, all 198 messaging tests passed in 157.77 s with
+  32 test threads. The same send returned in 375 ms within that run.
+- [ ] Recover the original panic message or reproduce the Linux tools-suite
+  failure on `trj`. The recorded line alone cannot identify its cause.
 
 ## November 18 robot and TUI decision attribution
 

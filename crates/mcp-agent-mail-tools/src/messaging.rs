@@ -154,8 +154,8 @@ pub(crate) fn notice_archive_json(
 /// Write a message bundle to the git archive (best-effort).
 /// Failures are logged but never fail the tool call.
 ///
-/// Uses the write-behind queue when available. If the queue is unavailable,
-/// falls back to the direct storage path before giving up.
+/// Uses the write-behind queue. If it is unavailable, dispatch submits the
+/// bundle to the archive retry backlog.
 pub fn try_write_message_archive(
     config: &Config,
     project_slug: &str,
@@ -6825,23 +6825,26 @@ mod tests {
         // returns as soon as the SQLite row is durable; git-archive materialization is
         // strictly asynchronous. send_message must (a) return well under the 30s
         // ecosystem client deadline (bounded by DB commit, not the archive path),
-        // (b) be durable in the DB at reply time (a real row id is assigned), and the
+        // (b) be visible to an independent DB reader at reply time, and the
         // archive must converge afterward with the lag metric returning to zero.
-        with_messaging_mailbox(&[("CONTACT_ENFORCEMENT_ENABLED", "0")], |_| {
+        with_messaging_mailbox(&[("CONTACT_ENFORCEMENT_ENABLED", "0")], |mailbox| {
             let rt = RuntimeBuilder::current_thread()
                 .build()
                 .expect("build runtime");
             rt.block_on(async {
                 let cx = Cx::current().expect("runtime installs durable reply test context");
                 let ctx = McpContext::new(cx.clone(), 1);
-                let project_key = format!(
-                    "/data/projects/ack-fast-{}",
-                    mcp_agent_mail_db::now_micros()
-                );
+                // Register a logical workspace on this platform's filesystem root.
+                // The mailbox itself lives in a tempdir that project admission rejects.
+                let project_key = mailbox.database_path.ancestors().last().unwrap()
+                    .join("projects/ack-fast-storage-commit")
+                    .to_str().unwrap().to_owned();
                 eprintln!("[ack-fast setup] ensuring project");
-                crate::ensure_project(&ctx, project_key.clone(), None)
+                let project = crate::ensure_project(&ctx, project_key.clone(), None)
                     .await
                     .expect("ensure project");
+                let project: serde_json::Value = serde_json::from_str(&project).unwrap();
+                let slug = project["slug"].as_str().expect("created project slug");
                 eprintln!("[ack-fast setup] registering sender");
                 crate::register_agent(
                     &ctx,
@@ -6885,7 +6888,7 @@ mod tests {
                     "BlueLake".to_string(),
                     vec!["GreenStone".to_string()],
                     "ack-fast latency probe".to_string(),
-                    body,
+                    body.clone(),
                     None,
                     None,
                     None,
@@ -6910,13 +6913,9 @@ mod tests {
                     "send_message reply must be bounded by DB commit and stay under the 30s \
                          deadline, not track the archive coalescer; took {elapsed:?}"
                 );
-                eprintln!(
-                    "[ack-fast acceptance a] send_message reply latency (archive async, \
-                         coalescer window pinned to 5s): {elapsed:?}"
-                );
+                eprintln!("[ack-fast acceptance a] send_message reply latency: {elapsed:?}");
 
-                // Durable in the DB at reply time: the response carries a real row id
-                // (assigned by the committed INSERT), before any git commit runs.
+                // Read before asking either archive queue to flush.
                 let response_json: serde_json::Value =
                     serde_json::from_str(&response).expect("parse send response");
                 assert_eq!(
@@ -6927,10 +6926,32 @@ mod tests {
                 let message_id = response_json["deliveries"][0]["payload"]["id"]
                     .as_i64()
                     .expect("message id in response");
-                assert!(
-                    message_id > 0,
-                    "message must be durable (assigned a DB row id) at reply time"
-                );
+                assert!(message_id > 0);
+                let reader = mcp_agent_mail_db::DbConn::open_file(
+                    mailbox.database_path.to_str().unwrap(),
+                )
+                .expect("open independent mailbox reader after reply");
+                let delivery = reader.query_sync(
+                    "SELECT m.body_md, m.created_ts FROM messages m \
+                     JOIN projects p ON p.id = m.project_id \
+                     JOIN agents sender ON sender.id = m.sender_id \
+                     JOIN message_recipients r ON r.message_id = m.id \
+                     JOIN agents recipient ON recipient.id = r.agent_id \
+                     WHERE m.id = ? AND p.slug = ? AND m.subject = 'ack-fast latency probe' \
+                       AND sender.name = 'BlueLake' AND recipient.name = 'GreenStone' AND r.kind = 'to'",
+                    &[
+                        sqlmodel_core::Value::BigInt(message_id),
+                        sqlmodel_core::Value::Text(slug.to_owned()),
+                    ],
+                )
+                .expect("read committed message and recipient at reply");
+                assert_eq!(delivery.len(), 1, "the acknowledged delivery must be visible");
+                assert_eq!(delivery[0].get_named::<String>("body_md").unwrap(), body);
+                let created = chrono::DateTime::from_timestamp_micros(
+                    delivery[0].get_named("created_ts").unwrap(),
+                )
+                .expect("valid message timestamp");
+                drop(reader);
 
                 // (b) the archive converges once materialization runs, and the lag
                 // metric returns to zero backlog.
@@ -6950,6 +6971,25 @@ mod tests {
                     lag.backlog_depth, 0,
                     "archive retry backlog must converge to empty after flush: {lag:?}"
                 );
+                let repo = git2::Repository::open(&mailbox.storage_root).expect("open Git archive");
+                let head = repo.head().unwrap().peel_to_tree().unwrap();
+                let date = created.format("%Y/%m/%Y-%m-%dT%H-%M-%SZ");
+                for folder in ["messages", "agents/BlueLake/outbox", "agents/GreenStone/inbox"] {
+                    let path = format!(
+                        "projects/{slug}/{folder}/{date}__ack-fast-latency-probe__{message_id}.md"
+                    );
+                    let entry = head
+                        .get_path(std::path::Path::new(&path))
+                        .unwrap_or_else(|error| panic!("missing {path} in archive HEAD: {error}"));
+                    let blob = repo.find_blob(entry.id()).unwrap();
+                    let content = std::str::from_utf8(blob.content()).unwrap();
+                    let (frontmatter, archived_body) = content
+                        .strip_prefix("---json\n").unwrap()
+                        .split_once("\n---\n\n").unwrap();
+                    let envelope: serde_json::Value = serde_json::from_str(frontmatter).unwrap();
+                    assert_eq!(envelope["id"], message_id, "{path}");
+                    assert_eq!(archived_body, body, "{path}");
+                }
                 eprintln!("[ack-fast acceptance b] archive lag after convergence: {lag:?}");
             });
         });
