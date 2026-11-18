@@ -687,12 +687,20 @@ try {
             throw "trust environment was not restored: $($entry.Key)"
         }
     }
-    $cosignArgs = $global:ObservedCosignArgs -join [Environment]::NewLine
-    if ($cosignArgs -notmatch "(?m)^--new-bundle-format$") {
+    $cosignArgs = $global:ObservedCosignArgs
+    if ($cosignArgs -cnotcontains "--new-bundle-format") {
         throw "cosign did not receive --new-bundle-format"
     }
-    if ($cosignArgs -notmatch [regex]::Escape($global:CosignIdentity)) {
-        throw "cosign did not receive the exact certificate identity"
+    $bindings = @{
+        "--certificate-identity" = $global:CosignIdentity
+        "--certificate-oidc-issuer" = $global:CosignOidcIssuer
+    }
+    foreach ($binding in $bindings.GetEnumerator()) {
+        $index = [Array]::IndexOf($cosignArgs, $binding.Key)
+        if ($index -lt 0 -or $index + 1 -ge $cosignArgs.Count -or
+            $cosignArgs[$index + 1] -cne $binding.Value) {
+            throw "cosign did not receive the expected value for $($binding.Key)"
+        }
     }
 } finally {
     if ([Environment]::GetEnvironmentVariable("AM_E2E_KEEP_TMP") -ceq "1") {
