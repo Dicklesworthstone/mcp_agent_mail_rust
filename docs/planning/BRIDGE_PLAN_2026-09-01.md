@@ -16,14 +16,19 @@
 - [x] Verify that the archive-backed poller reads the archived agent and
   that agent's three decisions from the original mailbox sidecar.
 - [x] Run the 118-test poller and observability cohort. Four timing
-  assertions failed in parallel. All 118 tests passed on the unchanged
-  Apple Silicon build when run serially.
+  assertions failed in the first parallel run. All 118 tests passed on
+  the unchanged Apple Silicon build in both the serial run and the
+  parallel repeat.
 - [x] Run the separate production and all-target workspace checks,
   strict Clippy, and formatting on the patched source.
-- [ ] Review the scoped bug scan and RCH outcomes, record the result on
-  `br-bdo5g`, and check dependency cycles.
+- [x] Review the scoped bug scan and RCH outcomes. Strict UBS exits 1
+  for warnings, with zero critical findings. The located warnings on
+  changed lines are in test fixtures. The four RCH jobs timed out in
+  the queue before running Cargo.
+- [x] Record the result on `br-bdo5g` and check dependency cycles.
 - [ ] Qualify the production Mac TUI CPU probe for the original
-  `br-bdo5g` acceptance.
+  `br-bdo5g` acceptance. SSH required Tailscale authentication before
+  the read-only observation could start.
 
 ## November 18 recovery quarantine reporting
 
