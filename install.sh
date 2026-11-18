@@ -8454,10 +8454,27 @@ verify_minisign_signed_checksum() {
   ok "Release manifest signature and exact release identity verified (minisign)"
   verbose "verify_minisign:ok manifest=${sha256sums_file}"
 
-  expected_checksum=$(awk -v artifact="$artifact_name" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$sha256sums_file")
+  if ! expected_checksum=$(awk -v artifact="$artifact_name" '
+    { sub(/\r$/, "") }
+    NF == 2 {
+      name = $2
+      sub(/^\*/, "", name)
+      sub(/^\.\//, "", name)
+      if (name == artifact) print $1
+    }
+  ' "$sha256sums_file"); then
+    err "Could not read the authenticated SHA256SUMS manifest."
+    error_support_hint
+    return 1
+  fi
   if [ -z "$expected_checksum" ]; then
     err "The authenticated SHA256SUMS manifest has no entry for ${artifact_name}."
     err "The release asset inventory is incomplete; do not install it."
+    error_support_hint
+    return 1
+  fi
+  if [[ "$expected_checksum" == *$'\n'* ]]; then
+    err "The authenticated SHA256SUMS manifest has multiple checksums for ${artifact_name}."
     error_support_hint
     return 1
   fi

@@ -31,7 +31,10 @@ fi
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 step() { echo "[ARTIFACT_FALLBACK_TEST $(ts)] $*" >&2; }
 
-tmp="$(mktemp -d)"
+# Lock tests require a physical path, including when macOS uses /var or /tmp
+# aliases for the system temporary directory.
+tmp_parent="$(cd -- "${TMPDIR:-/tmp}" && pwd -P)"
+tmp="$(mktemp -d "$tmp_parent/mcp-agent-mail-artifact-fallback.XXXXXX")"
 cleanup_tmp() {
     if [ "${AM_E2E_KEEP_TMP:-0}" = "1" ] || [ "${AM_E2E_KEEP_TMP:-0}" = "true" ]; then
         step "retaining temporary directory (AM_E2E_KEEP_TMP=1): $tmp"
@@ -1209,6 +1212,41 @@ for valid_comment in exact-manifest exact-commit exact-source exact-prerelease; 
         exit 1
     fi
 done
+
+# A valid signature and release identity cannot make duplicate archive
+# checksums unambiguous.
+archive_digest=$(cut -d' ' -f1 "$minisign_root/exact-manifest/SHA256SUMS")
+while IFS='|' read -r checksum_case additional_row; do
+    fixture_dir="$minisign_root/$checksum_case"
+    mkdir -p "$fixture_dir"
+    printf '%s\n' "$archive_digest  $minisign_artifact_name" "$additional_row" \
+        >"$fixture_dir/SHA256SUMS"
+    "$minisign_bin" -Sm "$fixture_dir/SHA256SUMS" -s "$minisign_root/test.key" \
+        -t 'mcp_agent_mail_rust v9.9.9 SHA256SUMS' >"$fixture_dir/signing.out" 2>&1
+    if run_minisign_case "$checksum_case" v9.9.9 "$fixture_dir" \
+        "$stable_minisign_archive" "$fixture_minisign_key"; then
+        echo "FAIL: authenticated $checksum_case reached installation" >&2
+        exit 1
+    fi
+    assert_minisign_rejected_before_checksum "$checksum_case" 'multiple checksums for'
+done <<CHECKSUM_CASES
+duplicate-digest|$archive_digest  $minisign_artifact_name
+duplicate-aliased-conflict|$(printf '%064d' 0) *./$minisign_artifact_name
+duplicate-malformed-digest|invalid  ./$minisign_artifact_name
+CHECKSUM_CASES
+
+fixture_dir="$minisign_root/unique-binary-relative"
+mkdir -p "$fixture_dir"
+printf '%s\r\n' "$archive_digest  $minisign_artifact_name.minisig" \
+    "$archive_digest *./$minisign_artifact_name" >"$fixture_dir/SHA256SUMS"
+"$minisign_bin" -Sm "$fixture_dir/SHA256SUMS" -s "$minisign_root/test.key" \
+    -t 'mcp_agent_mail_rust v9.9.9 SHA256SUMS' >"$fixture_dir/signing.out" 2>&1
+run_minisign_case unique-binary-relative v9.9.9 "$fixture_dir" \
+    "$stable_minisign_archive" "$fixture_minisign_key"
+if [ "$(cat "$minisign_root/cases/unique-binary-relative/stages")" != "$expected_minisign_stages" ]; then
+    echo "FAIL: a unique signed binary relative entry did not reach installation" >&2
+    exit 1
+fi
 
 # Every negative below is freshly signed with a real key. The signature is
 # valid; only the authenticated release/comment grammar makes it unacceptable.
