@@ -19,7 +19,9 @@ use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::guard_db_conn;
 use mcp_agent_mail_db::is_sqlite_recovery_error_message;
 use mcp_agent_mail_db::mail_explorer::ExplorerQuery;
-use mcp_agent_mail_db::pool::{DbPoolConfig, SyncQuery};
+use mcp_agent_mail_db::pool::{
+    DbPoolConfig, SyncQuery, open_atc_sidecar_conn, read_agent_decision_counts,
+};
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
 
@@ -1839,8 +1841,15 @@ fn fetch_agent_health_inputs(
     } else {
         HashMap::new()
     };
-    let decision_counts =
-        fetch_agent_decision_counts(conn, primary_sqlite_path, agents, window_start);
+    let decision_counts = primary_sqlite_path
+        .and_then(open_atc_sidecar_conn)
+        .map_or_else(HashMap::new, |sidecar| {
+            let identities: Vec<_> = agents
+                .iter()
+                .map(|agent| (agent.id, agent.name.as_str()))
+                .collect();
+            read_agent_decision_counts(conn, &sidecar, &identities, window_start)
+        });
 
     agents
         .iter()
@@ -1871,7 +1880,7 @@ fn fetch_agent_health_inputs(
                     contact_policy_violation_count: contact_observed
                         .then_some(contact.violation_count),
                     last_active_age_micros: age,
-                    decision_count: decision_counts.get(&agent.name).copied().unwrap_or(0),
+                    decision_count: decision_counts.get(&agent.id).copied().unwrap_or(0),
                 },
             )
         })
@@ -2474,105 +2483,6 @@ fn classify_contact_policy_rows(
         _ => false,
     };
     (respected, violation)
-}
-
-fn fetch_agent_decision_counts(
-    conn: &DbConn,
-    primary_sqlite_path: Option<&str>,
-    agents: &[AgentListRow],
-    window_start: i64,
-) -> HashMap<String, u64> {
-    let Some(atc_conn) =
-        primary_sqlite_path.and_then(mcp_agent_mail_db::pool::open_atc_sidecar_conn)
-    else {
-        return HashMap::new();
-    };
-    let mut name_counts: HashMap<&str, usize> = HashMap::new();
-    for agent in agents {
-        *name_counts.entry(agent.name.as_str()).or_insert(0) += 1;
-    }
-    let unique_names: Vec<&str> = agents
-        .iter()
-        .map(|agent| agent.name.as_str())
-        .filter(|name| name_counts.get(name).copied().unwrap_or(0) == 1)
-        .collect();
-    if unique_names.is_empty() {
-        return HashMap::new();
-    }
-
-    let placeholders = std::iter::repeat_n("?", unique_names.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut params = vec![Value::BigInt(window_start)];
-    params.extend(
-        unique_names
-            .iter()
-            .map(|name| Value::Text((*name).to_string())),
-    );
-    let sql = format!(
-        "SELECT subject AS agent_name, COUNT(*) AS decision_count \
-         FROM atc_experiences \
-         WHERE created_ts >= ? \
-           AND subject IN ({placeholders}) \
-         GROUP BY subject"
-    );
-    let Ok(rows) = atc_conn.query_sync(&sql, &params) else {
-        return HashMap::new();
-    };
-    let mut counts: HashMap<String, u64> = rows
-        .into_iter()
-        .filter_map(|row| {
-            let name = row
-                .get_named::<String>("agent_name")
-                .ok()
-                .or_else(|| row.get_as::<String>(0).ok())?;
-            let count = nonnegative_i64_to_u64(parse_raw_i64(&row, "decision_count")?);
-            Some((name, count))
-        })
-        .collect();
-    if counts.is_empty() {
-        return counts;
-    }
-
-    // ATC subjects carry no project or agent ID. The display cap and lifecycle
-    // filters must not hide a competing owner of one of these historical names.
-    let subject_names: Vec<_> = counts
-        .keys()
-        .map(|name| Value::Text(name.to_ascii_lowercase()))
-        .collect();
-    let placeholders = std::iter::repeat_n("?", subject_names.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT id, name \
-         FROM agents \
-         WHERE lower(trim(name)) IN ({placeholders})"
-    );
-    let Ok(owners) = conn.query_sync(&sql, &subject_names) else {
-        return HashMap::new();
-    };
-    let mut unique_owner_by_name = HashMap::new();
-    for row in owners {
-        let Ok(name) = row.get_named::<String>("name") else {
-            return HashMap::new();
-        };
-        unique_owner_by_name
-            .entry(name.trim_matches(' ').to_ascii_lowercase())
-            .and_modify(|owner| *owner = None)
-            .or_insert_with(|| parse_raw_i64(&row, "id"));
-    }
-    for agent in agents {
-        if let Some(count) = counts.get_mut(&agent.name)
-            && unique_owner_by_name
-                .get(&agent.name.to_ascii_lowercase())
-                .copied()
-                .flatten()
-                != Some(agent.id)
-        {
-            *count = 0;
-        }
-    }
-    counts
 }
 
 /// Fetch the project list with per-project agent/message/reservation counts.
@@ -4316,7 +4226,7 @@ mod tests {
         let atc_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary);
         let atc = mcp_agent_mail_db::CanonicalDbConn::open_file(&atc_path).expect("create sidecar");
         atc.execute_raw(
-            "CREATE TABLE IF NOT EXISTS atc_experiences (subject TEXT, created_ts INTEGER)",
+            "CREATE TABLE IF NOT EXISTS atc_experiences (subject TEXT, project_key TEXT, created_ts INTEGER)",
         )
         .expect("ensure ATC experiences table");
         for _ in 0..count {

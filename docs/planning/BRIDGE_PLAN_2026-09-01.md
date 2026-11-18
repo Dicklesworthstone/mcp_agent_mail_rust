@@ -1,5 +1,42 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 18 robot and TUI decision attribution
+
+- [x] Trace `am robot agents --health` from the selected project roster to
+  the name-only ATC sidecar. Its project filter hid competing identities.
+- [x] Reproduce the wrong count through the robot command and JSON output.
+  The baseline gives `BlueLake` two decisions despite a second owner in
+  another project. The unique-name control gives `GoldFox` four.
+- [x] Move the mailbox-wide ownership check into the existing ATC DB path.
+  Use it for both robot agent health and the TUI poller, keyed by roster ID.
+- [x] Trace the writer and its canonical project key. Count project-scoped
+  decisions under their recorded human key. Require mailbox-wide uniqueness
+  when the sidecar row has no project key.
+- [x] Bound the bind count for large projects and put the CLI fixture's
+  unique-name control after the first 500 rows. Include a retired case
+  variant and decisions with a matching project, another project, an empty
+  key, an expired timestamp, and a subject outside the mailbox roster.
+- [x] Verify JSON counts of one, zero, and four for `BlueLake`,
+  `GreenStone`, and `GoldFox`. The Apple Silicon cohort passes 124/124,
+  including the existing hidden-duplicate and mailbox sidecar controls.
+- [x] Match 662 tracked Rust and Cargo inputs across both checkouts. Hash
+  the two test executables and rerun all four focused controls directly.
+- [x] Pass both workspace compiler graphs, strict Clippy, formatting,
+  and default UBS. Review the 28 warnings on changed lines in strict UBS.
+  Twenty-four are in the fixture and four flag bounded allocations for
+  bind placeholders and owned project/name keys.
+- [x] Retain the strict RCH refusals. Preflight caught two superseded source
+  selections and the final selection timed out in the queue. Cargo never
+  started on a Linux worker. The completed runs used the pinned nightly
+  on Apple Silicon.
+- [x] Add the evidence to `br-bdo5g` and verify zero dependency cycles.
+- [ ] Complete the original production Mac CPU observation for `br-bdo5g`.
+
+Nextest run `66ceb16c-dd40-496e-aae0-9f882ae6f617` used source manifest
+`caaf458d45c6`, CLI test binary `575b2cbe12da`, and server test binary
+`83f62cbfbe99`. Strict UBS exited 1 with 0 critical findings, 9,246 warnings,
+and 3,710 informational findings across the three Rust files.
+
 ## November 18 TUI telemetry agent attribution
 
 - [x] Trace name-only ATC subjects through the 500-row agent projection.

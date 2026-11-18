@@ -12169,15 +12169,15 @@ fn build_agents_with_health(
         })
         .collect();
     let health_inputs = if health_enabled {
-        let agent_ids = raw_agents
+        let identities = raw_agents
             .iter()
-            .map(|row| row.agent_id)
+            .map(|row| (row.agent_id, row.name.as_str()))
             .collect::<Vec<_>>();
         let last_active_by_id = raw_agents
             .iter()
             .map(|row| (row.agent_id, row.last_active_ts))
             .collect::<HashMap<_, _>>();
-        fetch_agent_health_inputs(conn, project_id, &agent_ids, &last_active_by_id)
+        fetch_agent_health_inputs(conn, project_id, &identities, &last_active_by_id)
     } else {
         HashMap::new()
     };
@@ -12845,18 +12845,18 @@ fn agent_health_metric_row(metric: &AgentHealthMetric) -> AgentHealthMetricRow {
 fn fetch_agent_health_inputs(
     conn: &DbConn,
     project_id: i64,
-    agent_ids: &[i64],
+    identities: &[(i64, &str)],
     last_active_by_id: &HashMap<i64, i64>,
 ) -> HashMap<i64, AgentHealthInputs> {
-    if agent_ids.is_empty() {
+    if identities.is_empty() {
         return HashMap::new();
     }
 
     let now = mcp_agent_mail_db::now_micros();
     let window_start = now.saturating_sub(30 * 24 * 60 * 60 * 1_000_000);
-    let agent_ids_sql = agent_ids
+    let agent_ids_sql = identities
         .iter()
-        .map(i64::to_string)
+        .map(|(id, _)| id.to_string())
         .collect::<Vec<_>>()
         .join(",");
 
@@ -12865,11 +12865,17 @@ fn fetch_agent_health_inputs(
         fetch_robot_agent_reservation_stats(conn, project_id, &agent_ids_sql, window_start, now);
     let contact_stats =
         fetch_robot_agent_contact_stats(conn, project_id, &agent_ids_sql, window_start, now);
-    let decision_counts =
-        fetch_robot_agent_decision_counts(conn, project_id, agent_ids, window_start);
+    let decision_counts = open_local_atc_sidecar_conn().map_or_else(HashMap::new, |sidecar| {
+        mcp_agent_mail_db::pool::read_agent_decision_counts(
+            conn,
+            &sidecar,
+            identities,
+            window_start,
+        )
+    });
 
     let mut inputs = HashMap::new();
-    for agent_id in agent_ids {
+    for (agent_id, _) in identities {
         let ack = ack_stats.get(agent_id).cloned().unwrap_or_default();
         let reservation = reservation_stats.get(agent_id).cloned().unwrap_or_default();
         let contact = contact_stats.get(agent_id).cloned().unwrap_or_default();
@@ -13140,70 +13146,6 @@ fn fetch_robot_agent_contact_stats(
         return HashMap::new();
     }
     stats
-}
-
-fn fetch_robot_agent_decision_counts(
-    conn: &DbConn,
-    project_id: i64,
-    agent_ids: &[i64],
-    window_start: i64,
-) -> HashMap<i64, u64> {
-    if agent_ids.is_empty() {
-        return HashMap::new();
-    }
-    // ATC experiences live in the sidecar (br-bvq1x.11.7), but agent identity
-    // lives in the mailbox DB — so the historic single-statement JOIN is split:
-    // count decisions per subject in the sidecar, then map subjects to the
-    // requested agent ids via the mailbox connection (preserving the original
-    // exact `agents.name = atc_experiences.subject` match). No sidecar => no
-    // decision history => empty map.
-    let Some(atc_conn) = open_local_atc_sidecar_conn() else {
-        return HashMap::new();
-    };
-    let subject_rows = match atc_conn.query_sync(
-        "SELECT subject, COUNT(*) AS decision_count \
-         FROM atc_experiences \
-         WHERE created_ts >= ? \
-         GROUP BY subject",
-        &[Value::BigInt(window_start)],
-    ) {
-        Ok(rows) => rows,
-        Err(_) => return HashMap::new(),
-    };
-    let mut counts_by_subject: HashMap<String, u64> = HashMap::new();
-    for row in &subject_rows {
-        let subject: String = row.get_named("subject").unwrap_or_default();
-        if subject.is_empty() {
-            continue;
-        }
-        let count = row.get_named::<i64>("decision_count").unwrap_or(0).max(0) as u64;
-        *counts_by_subject.entry(subject).or_insert(0) += count;
-    }
-    if counts_by_subject.is_empty() {
-        return HashMap::new();
-    }
-
-    let agent_ids_sql = agent_ids
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT id AS agent_id, name FROM agents \
-         WHERE project_id = ? AND id IN ({agent_ids_sql})"
-    );
-    conn.query_sync(&sql, &[Value::BigInt(project_id)])
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let agent_id = row.get_named::<i64>("agent_id").unwrap_or(0);
-                    let name: String = row.get_named("name").unwrap_or_default();
-                    counts_by_subject.get(&name).map(|count| (agent_id, *count))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn median_micros(values: &mut [u64]) -> u64 {
@@ -26289,6 +26231,97 @@ mod tests {
             err.to_string().contains("ambiguous agent name"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn robot_agents_health_requires_mailbox_wide_decision_ownership() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("storage.sqlite3");
+        let storage_root = temp_dir.path().join("archive");
+        std::fs::create_dir(&storage_root).expect("create fixture archive");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES
+                (1, 'visible', '/visible', 1), (2, 'other', '/other', 1)",
+            &[],
+        )
+        .expect("insert projects");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts, retired_at) VALUES
+                (1, 1, 'GoldFox', 'test', 'test', 1, 1, NULL),
+                (2, 1, 'BlueLake', 'test', 'test', 1, 1, NULL),
+                (3, 1, 'GreenStone', 'test', 'test', 1, 1, NULL),
+                (4, 2, 'BlueLake', 'test', 'test', 1, 1, NULL),
+                (5, 2, 'greenstone', 'test', 'test', 1, 1, 2)",
+            &[],
+        )
+        .expect("insert active and historical agents");
+        // GoldFox sorts last and tests attribution beyond the first bind batch.
+        conn.execute_raw("BEGIN IMMEDIATE").expect("begin roster");
+        for index in 0..498 {
+            conn.execute_sync(
+                "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, ?, 'test', 'test', 1, 1)",
+                &[sqlmodel_core::Value::Text(format!("Fixture-{index}"))],
+            )
+            .expect("insert roster member");
+        }
+        conn.execute_raw("COMMIT").expect("commit roster");
+        drop(conn);
+
+        let db_path = db_path.to_str().expect("fixture database path");
+        let sidecar_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(db_path);
+        let sidecar =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar_path).expect("open ATC sidecar");
+        sidecar
+            .execute_raw(
+                "CREATE TABLE atc_experiences (subject TEXT, project_key TEXT, created_ts INTEGER)",
+            )
+            .expect("create experience table");
+        sidecar
+            .execute_sync(
+                "INSERT INTO atc_experiences (subject, project_key, created_ts) VALUES
+                    ('BlueLake', NULL, ?1), ('BlueLake', NULL, ?1),
+                    ('BlueLake', '/visible', ?1), ('BlueLake', '/other', ?1),
+                    ('GreenStone', NULL, ?1), ('GreenStone', '/other', ?1),
+                    ('GoldFox', NULL, ?1), ('GoldFox', NULL, ?1),
+                    ('GoldFox', '/visible', ?1), ('GoldFox', '/visible', ?1),
+                    ('GoldFox', '/other', ?1), ('GoldFox', '', ?1),
+                    ('GoldFox', '/visible', 1), ('NotAnAgent', '/visible', ?1)",
+                &[sqlmodel_core::Value::BigInt(mcp_agent_mail_db::now_micros())],
+            )
+            .expect("insert recent and out-of-window decisions");
+        drop(sidecar);
+
+        let output = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: Some("visible".into()),
+                agent: None,
+                command: RobotSubcommand::Agents {
+                    active: false,
+                    health: Some("__all__".into()),
+                    threshold: None,
+                    sort: None,
+                },
+            },
+            &format!("sqlite://{db_path}"),
+            storage_root.to_str().expect("fixture archive path"),
+        );
+        let agents = output["agents"].as_array().expect("visible agents");
+        assert_eq!(agents.len(), 501);
+        let decision_count = |name| {
+            agents
+                .iter()
+                .find(|agent| agent["name"].as_str() == Some(name))
+                .expect("agent in selected project")["health"]["decision_count"]
+                .as_u64()
+                .expect("decision count in health output")
+        };
+        assert_eq!(decision_count("GoldFox"), 4);
+        assert_eq!(decision_count("BlueLake"), 1);
+        assert_eq!(decision_count("GreenStone"), 0);
     }
 
     #[test]
