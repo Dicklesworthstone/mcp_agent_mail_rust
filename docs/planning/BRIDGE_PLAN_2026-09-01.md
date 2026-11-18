@@ -1,5 +1,38 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 18 TUI telemetry agent attribution
+
+- [x] Trace name-only ATC subjects through the 500-row agent projection.
+  The previous duplicate check saw only the projected names.
+- [x] Reproduce the error on a real mailbox with 502 agents. The older
+  second `BlueLake` stays outside the list and the baseline attributes
+  two unscoped decisions to the visible `BlueLake`.
+- [x] Check telemetry subjects against all retained identities in the
+  selected mailbox, including case variants. Require the sole matching
+  ID to agree with the visible row before reporting a count.
+- [x] Reject the first implementation after its grouped roster query
+  suppressed the unique-name control and the archive-backed count.
+  Query matching roster rows and resolve uniqueness in Rust.
+- [x] Verify the hidden exact duplicate and case variant each report zero
+  and the unique `GoldFox` retains four. Rerun the live and archive-backed
+  sidecar tests in the 119-case Apple Silicon poller and observability run.
+- [x] Pass production and all-target workspace checks, strict Clippy,
+  formatting, and the default UBS scan. Review the 19 changed-line
+  warnings from strict UBS. All are in test fixtures.
+- [x] Retain the failed baseline, first implementation, and four RCH
+  transfer refusals. The selected test run and compiler checks used the
+  pinned nightly on Apple Silicon.
+- [x] Record the result in `br-bdo5g` and check the dependency graph.
+- [ ] Observe TUI CPU on the original production Mac after the existing
+  upgrade/restart prerequisite. Read-only SSH reached a Tailscale
+  authentication prompt before collecting measurements.
+
+Source `824af6d2b92d` and server test binary `bc53f99d8328` are bound to
+nextest run `1f175b6e-d0b8-4dc8-9905-f2de5d913cc6`. Strict UBS exited 1
+with zero critical findings, 874 warnings and 124 informational findings.
+The final Apple Silicon checks include the separate production feature
+graph. The production Mac CPU observation remains open on `br-bdo5g`.
+
 ## November 18 TUI telemetry mailbox identity
 
 - [x] Trace the agent health projection from the selected poller database

@@ -1839,7 +1839,8 @@ fn fetch_agent_health_inputs(
     } else {
         HashMap::new()
     };
-    let decision_counts = fetch_agent_decision_counts(primary_sqlite_path, agents, window_start);
+    let decision_counts =
+        fetch_agent_decision_counts(conn, primary_sqlite_path, agents, window_start);
 
     agents
         .iter()
@@ -2476,6 +2477,7 @@ fn classify_contact_policy_rows(
 }
 
 fn fetch_agent_decision_counts(
+    conn: &DbConn,
     primary_sqlite_path: Option<&str>,
     agents: &[AgentListRow],
     window_start: i64,
@@ -2514,23 +2516,63 @@ fn fetch_agent_decision_counts(
            AND subject IN ({placeholders}) \
          GROUP BY subject"
     );
-    atc_conn
-        .query_sync(&sql, &params)
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let name = row
-                        .get_named::<String>("agent_name")
-                        .ok()
-                        .or_else(|| row.get_as::<String>(0).ok())?;
-                    let count =
-                        nonnegative_i64_to_u64(parse_raw_i64(&row, "decision_count").unwrap_or(0));
-                    Some((name, count))
-                })
-                .collect()
+    let Ok(rows) = atc_conn.query_sync(&sql, &params) else {
+        return HashMap::new();
+    };
+    let mut counts: HashMap<String, u64> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let name = row
+                .get_named::<String>("agent_name")
+                .ok()
+                .or_else(|| row.get_as::<String>(0).ok())?;
+            let count = nonnegative_i64_to_u64(parse_raw_i64(&row, "decision_count")?);
+            Some((name, count))
         })
-        .unwrap_or_default()
+        .collect();
+    if counts.is_empty() {
+        return counts;
+    }
+
+    // ATC subjects carry no project or agent ID. The display cap and lifecycle
+    // filters must not hide a competing owner of one of these historical names.
+    let subject_names: Vec<_> = counts
+        .keys()
+        .map(|name| Value::Text(name.to_ascii_lowercase()))
+        .collect();
+    let placeholders = std::iter::repeat_n("?", subject_names.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, name \
+         FROM agents \
+         WHERE lower(trim(name)) IN ({placeholders})"
+    );
+    let Ok(owners) = conn.query_sync(&sql, &subject_names) else {
+        return HashMap::new();
+    };
+    let mut unique_owner_by_name = HashMap::new();
+    for row in owners {
+        let Ok(name) = row.get_named::<String>("name") else {
+            return HashMap::new();
+        };
+        unique_owner_by_name
+            .entry(name.trim_matches(' ').to_ascii_lowercase())
+            .and_modify(|owner| *owner = None)
+            .or_insert_with(|| parse_raw_i64(&row, "id"));
+    }
+    for agent in agents {
+        if let Some(count) = counts.get_mut(&agent.name)
+            && unique_owner_by_name
+                .get(&agent.name.to_ascii_lowercase())
+                .copied()
+                .flatten()
+                != Some(agent.id)
+        {
+            *count = 0;
+        }
+    }
+    counts
 }
 
 /// Fetch the project list with per-project agent/message/reservation counts.
@@ -4273,8 +4315,10 @@ mod tests {
         let primary = primary.to_str().expect("test path");
         let atc_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary);
         let atc = mcp_agent_mail_db::CanonicalDbConn::open_file(&atc_path).expect("create sidecar");
-        atc.execute_raw("CREATE TABLE atc_experiences (subject TEXT, created_ts INTEGER)")
-            .expect("create ATC experiences");
+        atc.execute_raw(
+            "CREATE TABLE IF NOT EXISTS atc_experiences (subject TEXT, created_ts INTEGER)",
+        )
+        .expect("ensure ATC experiences table");
         for _ in 0..count {
             atc.execute_sync(
                 "INSERT INTO atc_experiences (subject, created_ts) VALUES (?, ?)",
@@ -4337,6 +4381,74 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[test]
+    fn agent_health_decisions_require_mailbox_wide_name_uniqueness() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let primary = root.path().join("storage.sqlite3");
+        let conn = DbConn::open_file(primary.to_str().expect("test path")).expect("open mailbox");
+        create_empty_mail_schema(&conn);
+        conn.execute_sync("BEGIN IMMEDIATE", &[])
+            .expect("seed transaction");
+        conn.execute_sync(
+            "INSERT INTO projects VALUES (1, 'visible', '/visible', 1), (2, 'older', '/older', 1)",
+            &[],
+        )
+        .expect("insert projects");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, last_active_ts) VALUES
+                (1, 'BlueLake', 'fixture', 10),
+                (1, 'GreenStone', 'fixture', 10),
+                (1, 'GoldFox', 'fixture', 10),
+                (2, 'BlueLake', 'fixture', 1),
+                (2, 'greenstone', 'fixture', 1)",
+            &[],
+        )
+        .expect("insert witnesses");
+        for index in 0..MAX_AGENTS - 3 {
+            conn.execute_sync(
+                "INSERT INTO agents (project_id, name, program, last_active_ts)
+                 VALUES (1, ?, 'fixture', 9)",
+                &[Value::Text(format!("Filler{index}"))],
+            )
+            .expect("fill visible list");
+        }
+        conn.execute_sync("COMMIT", &[]).expect("commit fixtures");
+        drop(conn);
+
+        seed_atc_decisions(&primary, "BlueLake", 2);
+        seed_atc_decisions(&primary, "GreenStone", 3);
+        seed_atc_decisions(&primary, "GoldFox", 4);
+
+        let db_url = format!("sqlite://{}", primary.display());
+        let mut state = open_poller_connection_state(&db_url, root.path()).expect("open poller");
+        let snapshot = require_full_update(fetch_db_stats_with_connection(
+            &mut state,
+            &DbStatSnapshot::default(),
+        ));
+        assert_eq!(snapshot.agents, u64::try_from(MAX_AGENTS + 2).unwrap());
+        assert_eq!(snapshot.agents_list.len(), MAX_AGENTS);
+        assert!(
+            snapshot
+                .agents_list
+                .iter()
+                .all(|row| row.project == "visible")
+        );
+        let decision_count = |name| {
+            snapshot
+                .agents_list
+                .iter()
+                .find(|agent| agent.name == name)
+                .expect("visible agent")
+                .health
+                .as_ref()
+                .expect("agent health")
+                .decision_count
+        };
+        assert_eq!(decision_count("GoldFox"), 4);
+        assert_eq!(decision_count("BlueLake"), 0);
+        assert_eq!(decision_count("GreenStone"), 0);
     }
 
     #[test]
