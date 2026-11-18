@@ -1,5 +1,23 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 18 agent health on a quiet mailbox
+
+- [x] Reproduce a stale TUI count after a sidecar-only write and a robot count
+  of six for four decisions. Both regressions failed on `0cce85bd`.
+- [x] Count each eligible decision once per agent across effects and scopes.
+  Cover a restarted engine reusing an ID, two IDs sharing a trace, hidden
+  and retired namesakes, and 501 agents crossing SQL bind batches.
+- [x] Refresh sidecar counts every 30 seconds on a quiet primary. Cover
+  first creation, disappearance, read failure, rolling-window expiry, and
+  a simultaneous reservation expiry. Check the full-snapshot clock stays put.
+- [x] Run 197 selected Apple Silicon tests, both workspace compiler graphs,
+  Clippy and formatting. Strict UBS reported 0 critical and 9,282 warnings
+  across the three health files. Nextest run `c9ecbbbf-45f7-42a4-9f9f-cf6d5d16cfd2`.
+- [x] Register five identities in two private projects through
+  `am macros start-session`. The rebuilt `am robot agents --health` returned
+  counts of 3, 1 and 0, then 1, 1 and 0 after two decisions aged out.
+- [ ] Measure CPU on the original production Mac for `br-bdo5g`.
+
 ## November 18 robot and TUI decision attribution
 
 - [x] Trace `am robot agents --health` from the selected project roster to
