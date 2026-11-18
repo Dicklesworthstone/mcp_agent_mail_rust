@@ -11,11 +11,17 @@
 - [x] Retain the selected primary path when the poller switches to a
   private archive snapshot. Use that path for agent health telemetry,
   including the detail-list refill.
-- [ ] Verify the selected, ambient, and missing-sidecar cases and the
-  archive fallback on the patched poller.
-- [ ] Run the poller cohort, production and all-target workspace checks,
-  strict Clippy, formatting, and scoped bug scans. Record the result on
-  `br-bdo5g` and check dependency cycles.
+- [x] Verify the selected, ambient, and missing-sidecar cases. The real
+  sidecars give the expected counts of two, five, and zero.
+- [x] Verify that the archive-backed poller reads the archived agent and
+  that agent's three decisions from the original mailbox sidecar.
+- [x] Run the 118-test poller and observability cohort. Four timing
+  assertions failed in parallel. All 118 tests passed on the unchanged
+  Apple Silicon build when run serially.
+- [x] Run the separate production and all-target workspace checks,
+  strict Clippy, and formatting on the patched source.
+- [ ] Review the scoped bug scan and RCH outcomes, record the result on
+  `br-bdo5g`, and check dependency cycles.
 - [ ] Qualify the production Mac TUI CPU probe for the original
   `br-bdo5g` acceptance.
 
