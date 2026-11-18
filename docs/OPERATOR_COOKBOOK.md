@@ -684,7 +684,7 @@ am doctor health                      # one-line multi-verdict health rollup; ex
 am doctor locks --json                # owner intelligence: who holds the mailbox (live/wedged/stale)
 am doctor drain                       # is it safe_to_mutate right now? (no live owner)
 am doctor mcp-selftest --format json  # live MCP round-trip self-test
-am doctor reclaim --dry-run           # preview consolidation of stale .doctor run debris
+am doctor reclaim --dry-run           # preview consolidation of stale recovery artifacts
 am doctor support-bundle --json       # sanitized incident bundle for maintainer triage (no raw DB/bodies)
 ```
 
@@ -704,6 +704,13 @@ drain it via your supervisor first (never kill `am` directly).
 reconciler is visibly republishing (one repaired within the last 10 minutes).
 If that reconciler is not running or has stopped making progress, health exits
 1 and names the `am doctor fix --only ... --yes` command that repairs the drift.
+
+When `am doctor reclaim --yes --json` reports individual move failures, it
+emits the report and exits 1. `moved` counts confirmed moves, and `moved_to`
+is the requested quarantine path on an incomplete run. Each
+`unconfirmed_moves` entry gives the source and requested destination of a
+completed rename whose durability or directory identity could not be
+confirmed. Keep the staged evidence and review `failures` before retrying.
 
 **Troubleshooting:** If the mailbox lock is busy, wait for the current archive
 operation to finish and retry. Run repair commands only after reading the doctor

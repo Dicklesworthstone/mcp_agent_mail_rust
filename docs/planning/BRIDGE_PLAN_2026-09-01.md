@@ -17,16 +17,48 @@
   Give an empty apply the same no-debris message as an empty preview.
 - [x] Check the CLI fixture's exact quarantined payloads, live database,
   and backup. Assert that non-Unix builds refuse apply before mutation.
-- [ ] Run the patched executable on successful, empty, and
-  cross-filesystem partial reclaims. Verify exit codes, output, and all
-  source and destination bytes.
-- [ ] Run the retained-namespace and backup-rotation tests on Linux and
-  macOS. Verify how an injected failure after rename is surfaced.
+- [x] Verify preview with `--yes --dry-run`, successful apply, and empty
+  apply on the patched Linux executable. Verify exact payloads and
+  confirm the new run directory has mode 0700.
+- [x] Verify cross-filesystem partial reclaim in JSON and human output.
+  Both commands exit 1. The JSON confirms one moved bundle and an
+  ordinary failure for the file that stays at its source.
+- [x] Inject `EIO` into the destination directory's first sync after one
+  real no-replace rename. Confirm exit 1, zero confirmed moves, the
+  structured source and requested destination, and preserved bytes.
+- [x] Reproduce the same reporting defect on one filesystem with a
+  symlinked forensic ancestor. Confirm the patched executable preserves
+  the symlink, the refused source, and the moved payload.
+- [x] Run the CLI smoke regression through Cargo's integration-test
+  entry point. It passes on the patched binary and fails against the
+  prior installed binary, which omits `unconfirmed_moves`.
+- [x] Run the Linux DB retention cohort and both CLI reclaim paths.
+  With a private process namespace and the host compiler and Python,
+  all 119 DB tests pass. The three CLI unit tests pass as well. The
+  initial host run stopped on an unreadable process descriptor.
+- [x] Diagnose the backup-rotation fixture that still expected two
+  per-file failures. Assert the exact grouped snapshot-authority refusal
+  and verify all three payloads in place.
+- [x] Diagnose both macOS raw-name fixture failures. APFS refuses
+  invalid UTF-8 pathnames with `EILSEQ`. Keep byte-exact classification
+  assertions and test real rotation and collision handling on APFS with
+  representable names. Use a physical fixture root for snapshot pinning.
+- [x] Rerun the Linux rotation cohort with all fixture corrections. All
+  88 tests pass using a private process namespace and a tmpfs test root.
+- [x] Rerun the macOS focused cohort. All four corrected fixtures pass.
+  The two stress tests tracked by `br-kp1in.63` reach the unchanged
+  240-second limit. The cohort records 156 passes from 158 tests.
+- [ ] Clear both original macOS stress workloads within their existing
+  deadline, as tracked by `br-kp1in.63`.
 - [ ] Run the native Windows refusal or supported paths for both debris
   reclaim and backup rotation before closing the bead.
-- [ ] Run the production and all-target workspace checks, strict Clippy,
-  formatting, and the targeted bug scan. Record scope and remaining
-  acceptance on the bead and check dependency cycles.
+- [x] Verify the separate production and all-target workspace checks,
+  strict Clippy, and formatting on Linux and Apple Silicon.
+- [x] Review the strict UBS results. UBS exits 1 for warnings and flags
+  one pre-existing explicit test panic in the CLI smoke file. None of
+  the changed production lines has a located warning or critical finding.
+- [x] Record the receipts and remaining platform acceptance on
+  `br-3p187`. Verify that the Beads graph has no dependency cycles.
 
 ## November 18 manual source container identity
 

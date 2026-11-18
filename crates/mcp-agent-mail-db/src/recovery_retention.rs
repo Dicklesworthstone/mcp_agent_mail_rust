@@ -846,7 +846,8 @@ impl ReclaimOutcome {
                         requested_destination: moved.requested_destination().to_path_buf(),
                     });
                 }
-                self.failures.push((artifact.path.clone(), error.to_string()));
+                self.failures
+                    .push((artifact.path.clone(), error.to_string()));
             }
         }
     }

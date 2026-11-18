@@ -4850,8 +4850,9 @@ mod tests {
     #[test]
     fn rotation_pins_the_metadata_authorized_backup_generation() {
         let tmp = TempDir::new().unwrap();
-        let archive = tmp.path().join("archive");
-        let database_dir = tmp.path().join("database");
+        let root = tmp.path().canonicalize().unwrap();
+        let archive = root.join("archive");
+        let database_dir = root.join("database");
         fs::create_dir(&database_dir).unwrap();
         let primary = database_dir.join("custom-mail.db");
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(primary.to_str().unwrap())
@@ -4984,10 +4985,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rotation_matches_non_unicode_database_basename_without_aliasing() {
+    fn rotation_preserves_database_basename_without_aliasing() {
+        use std::ffi::{OsStr, OsString};
         use std::os::unix::ffi::OsStringExt;
         let tmp = TempDir::new().unwrap();
-        let name = std::ffi::OsString::from_vec(b"mail-\xff.db".to_vec());
+        let name = OsString::from_vec(b"mail-\xff.db".to_vec());
+        let alias_name = OsStr::new("mail-�.db.bak.20260101_000000");
+        let mut raw_backup = name.clone();
+        raw_backup.push(".bak.20260101_000000");
+        assert_eq!(
+            super::classify_backup_file(&name, &raw_backup),
+            Some(BackupKind::ManualBackup)
+        );
+        assert_eq!(super::classify_backup_file(&name, alias_name), None);
+
+        // APFS refuses invalid UTF-8 path creation. Keep the byte-level
+        // classifier checks above and use an encodable basename for rotation.
+        #[cfg(target_os = "macos")]
+        let name = OsString::from("mail-郵.db");
         let primary = tmp.path().join(&name);
         let mut old_name = name.clone();
         old_name.push(".bak.20260101_000000");
@@ -4995,7 +5010,7 @@ mod tests {
         new_name.push(".bak.20260102_000000");
         touch(&tmp.path().join(&old_name), 11);
         touch(&tmp.path().join(&new_name), 13);
-        let alias = tmp.path().join("mail-�.db.bak.20260101_000000");
+        let alias = tmp.path().join(alias_name);
         touch(&alias, 19);
         assert_eq!(
             inspect_storage_backups(&primary).unwrap().resident_bytes,
@@ -5192,38 +5207,44 @@ mod tests {
     }
 
     #[test]
-    fn rotation_delete_requires_explicit_optin() {
+    fn rotation_delete_optin_does_not_replace_snapshot_authority() {
         let tmp = TempDir::new().unwrap();
-        for i in 0..3 {
-            touch(
-                &tmp.path()
-                    .join(format!("storage.sqlite3.corrupt-20260419_12000{i}_000")),
-                10,
-            );
+        let primary = tmp.path().join("storage.sqlite3");
+        let quarantine_path = |i| {
+            tmp.path()
+                .join(format!("storage.sqlite3.corrupt-20260419_12000{i}_000"))
+        };
+        for i in 0..3_u8 {
+            fs::write(quarantine_path(i), [i; 10]).unwrap();
             sleep(Duration::from_millis(5));
         }
 
         let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_BACKUP_ROTATION_DELETE", "1")],
-            || {
-                rotate_storage_backups(tmp.path(), &tmp.path().join("storage.sqlite3"), 1)
-                    .expect("rotate")
-            },
+            || rotate_storage_backups(tmp.path(), &primary, 1).expect("rotate"),
         );
 
         assert_eq!(report.staged, 0);
         assert!(!tmp.path().join("doctor").exists());
-        let oldest = tmp
-            .path()
-            .join("storage.sqlite3.corrupt-20260419_120000_000");
         assert_eq!(
             report.deleted, 0,
             "opt-in cannot replace verification authority"
         );
         assert_eq!(report.kept, 3);
         assert_eq!(report.bytes_deleted, 0);
-        assert_eq!(report.failures.len(), 2);
-        assert!(oldest.exists());
+        assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+        let refusal = &report.failures[0];
+        assert_eq!(
+            refusal.source,
+            mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary)
+        );
+        assert!(refusal.error.contains("snapshot authority is unresolved"));
+        assert!(!refusal.rename_completed);
+        assert!(!refusal.deletion_completed);
+        assert_eq!(refusal.requested_destination, None);
+        for i in 0..3_u8 {
+            assert_eq!(fs::read(quarantine_path(i)).unwrap(), [i; 10]);
+        }
     }
 
     #[test]
@@ -5391,10 +5412,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn staging_collision_suffix_preserves_raw_filename_bytes() {
-        use std::os::unix::ffi::OsStringExt;
         let root = TempDir::new().unwrap();
         let directory = RotationQuarantine::claim(&root.path().join("quarantine")).unwrap();
-        let name = std::ffi::OsString::from_vec(b"backup-\xff".to_vec());
+        #[cfg(not(target_os = "macos"))]
+        let name = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(b"backup-\xff".to_vec())
+        };
+        // APFS requires valid UTF-8 while still allowing multibyte names.
+        #[cfg(target_os = "macos")]
+        let name = std::ffi::OsString::from("backup-郵");
         let source = root.path().join(&name);
         fs::write(&source, b"source").unwrap();
         let inventoried = fs::symlink_metadata(&source).unwrap();

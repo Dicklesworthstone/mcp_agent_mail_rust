@@ -66,6 +66,66 @@ fn run_am(tempdir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+#[cfg(unix)]
+#[test]
+fn am_reports_partial_reclaim_and_keeps_both_artifacts() {
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path().canonicalize().unwrap();
+    let mailbox = root.join("mailbox");
+    std::fs::create_dir_all(mailbox.join("doctor")).unwrap();
+    let db = mailbox.join("storage.sqlite3");
+    std::fs::write(&db, b"live database").unwrap();
+    let quarantine = "storage.sqlite3.corrupt-20260101_000000_000";
+    std::fs::write(mailbox.join(quarantine), b"corrupt database").unwrap();
+
+    let forensics = root.join("other-forensics");
+    let bundle_id = "repair-20260101_000000_000";
+    let bundle = forensics.join("storage.sqlite3").join(bundle_id);
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(bundle.join("witness"), b"forensic evidence").unwrap();
+    // The bundle is visible to inventory, but the mover refuses its symlinked ancestor.
+    let forensics_link = mailbox.join("doctor/forensics");
+    std::os::unix::fs::symlink(&forensics, &forensics_link).unwrap();
+
+    let (code, stdout, stderr) = run_am(
+        &mailbox,
+        &[
+            "doctor",
+            "reclaim",
+            "--yes",
+            "--keep",
+            "0",
+            "--max-age-days",
+            "0",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["reclaimable_artifacts"], 2);
+    assert_eq!(report["moved"], 1);
+    assert_eq!(report["unconfirmed_moves"], serde_json::json!([]));
+    let failures = report["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].as_str().unwrap().contains(bundle_id));
+    let note = report["note"].as_str().unwrap();
+    assert!(note.starts_with("Reclaim incomplete."));
+    assert!(!note.contains("rm -rf"));
+
+    let staged = PathBuf::from(report["moved_to"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(staged.join(quarantine)).unwrap(),
+        b"corrupt database"
+    );
+    assert!(!mailbox.join(quarantine).exists());
+    assert_eq!(std::fs::read_link(forensics_link).unwrap(), forensics);
+    assert_eq!(
+        std::fs::read(bundle.join("witness")).unwrap(),
+        b"forensic evidence"
+    );
+    assert_eq!(std::fs::read(db).unwrap(), b"live database");
+}
+
 #[test]
 fn am_reports_missing_shared_archive_head_and_preserves_database_mail() {
     let td = tempfile::TempDir::new().expect("tempdir");
