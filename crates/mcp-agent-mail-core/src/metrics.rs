@@ -1130,6 +1130,11 @@ impl DescriptorFloorTracker {
         }
     }
 
+    // A clock rollback or an entirely unsampled window breaks the series.
+    const fn follows_last_sample(&self, now_us: u64, last_us: u64) -> bool {
+        now_us >= last_us && now_us / self.window_us <= (last_us / self.window_us).saturating_add(1)
+    }
+
     /// Record one sample taken at `now_us` on a monotonic microsecond clock.
     pub fn record(&mut self, now_us: u64, open_fds: u64) {
         let window = now_us / self.window_us;
@@ -1137,13 +1142,9 @@ impl DescriptorFloorTracker {
             count: open_fds,
             observed_us: now_us,
         };
-        // A restarted monitor has a fresh elapsed-time origin. A missed whole
-        // window also breaks consecutive evidence: never interpolate missing
-        // minima or keep a stale alert until the new clock catches the old one.
-        if self.last_sample_us.is_some_and(|last| now_us < last)
-            || self
-                .current
-                .is_some_and(|(previous, _)| window > previous.saturating_add(1))
+        if self
+            .last_sample_us
+            .is_some_and(|last| !self.follows_last_sample(now_us, last))
         {
             self.floors.clear();
             self.current = None;
@@ -1169,7 +1170,7 @@ impl DescriptorFloorTracker {
         };
     }
 
-    /// The rising floor series, if every one of the last windows rose.
+    /// The rising floor series as of the most recent recorded sample.
     #[must_use]
     pub fn growth(&self) -> Option<DescriptorFloorGrowth> {
         if self.floors.len() < self.windows {
@@ -1203,6 +1204,19 @@ impl DescriptorFloorTracker {
             per_hour,
         })
     }
+
+    /// The rising floor series at `now_us`, on the same clock as the samples.
+    ///
+    /// Once an entire sampling window elapses without observations, the
+    /// earlier windows no longer provide evidence of current growth.
+    #[must_use]
+    pub fn growth_at(&self, now_us: u64) -> Option<DescriptorFloorGrowth> {
+        let last_us = self.last_sample_us?;
+        if !self.follows_last_sample(now_us, last_us) {
+            return None;
+        }
+        self.growth()
+    }
 }
 
 static DESCRIPTOR_FLOORS: LazyLock<Mutex<DescriptorFloorTracker>> = LazyLock::new(|| {
@@ -1213,21 +1227,26 @@ static DESCRIPTOR_FLOORS: LazyLock<Mutex<DescriptorFloorTracker>> = LazyLock::ne
     ))
 });
 
+fn descriptor_clock_us() -> u64 {
+    static ORIGIN: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    u64::try_from(ORIGIN.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 /// Feed this process's open-descriptor count to the leak detector.
-pub fn record_descriptor_sample(now_us: u64, open_fds: u64) {
+pub fn record_descriptor_sample(open_fds: u64) {
     DESCRIPTOR_FLOORS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .record(now_us, open_fds);
+        .record(descriptor_clock_us(), open_fds);
 }
 
-/// This process's rising descriptor floor, if the leak detector sees one.
+/// This process's rising descriptor floor, if supported by recent samples.
 #[must_use]
 pub fn descriptor_floor_growth() -> Option<DescriptorFloorGrowth> {
     DESCRIPTOR_FLOORS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .growth()
+        .growth_at(descriptor_clock_us())
 }
 
 #[inline]
@@ -2953,11 +2972,19 @@ mod tests {
     fn descriptor_floor_tracker_does_not_bridge_unsampled_windows() {
         let mut tracker = floor_tracker();
         feed_floor_windows(&mut tracker, &[100, 130, 170, 220]);
-        assert!(tracker.growth().is_some());
+        assert_eq!(tracker.growth_at(239_999_999), None, "before last sample");
+        let growth = tracker.growth_at(240_000_000).expect("current growth");
+        assert_eq!(growth.floors, vec![100, 130, 170, 220]);
+        assert_eq!(tracker.growth_at(359_999_999), Some(growth));
+        assert_eq!(
+            tracker.growth_at(360_000_000),
+            None,
+            "reading after a completely missed window must expire growth without a new sample"
+        );
 
         tracker.record(365_000_000, 400);
         assert_eq!(
-            tracker.growth(),
+            tracker.growth_at(365_000_000),
             None,
             "an unobserved window is not growth evidence"
         );

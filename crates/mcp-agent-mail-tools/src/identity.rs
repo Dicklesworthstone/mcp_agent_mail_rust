@@ -2001,7 +2001,7 @@ fn descriptor_health_detail(
         .utilization_pct
         .map_or_else(String::new, |p| format!(" ({p}%)"));
     let floor = growth.map_or_else(
-        || "floor not rising".to_string(),
+        || "no current descriptor floor growth estimate".to_string(),
         |growth| {
             let mut detail = format!(
                 "floor rose in every window {:?} (+{}/h): possible descriptor leak",
@@ -7066,8 +7066,12 @@ mod tests {
             ..snapshot
         };
         assert!(!descriptor_health_detail(&unknown_limit, Some(&growth)).contains("exhaustion"));
-        let steady = descriptor_health_detail(&snapshot, None);
-        assert!(steady.ends_with("floor not rising"), "{steady}");
+        let no_estimate = descriptor_health_detail(&snapshot, None);
+        assert!(
+            no_estimate.ends_with("no current descriptor floor growth estimate"),
+            "{no_estimate}"
+        );
+        assert!(!no_estimate.contains("exhaustion"), "{no_estimate}");
     }
 
     #[test]
@@ -7762,7 +7766,10 @@ body
                 assert_eq!(descriptors["level"], "green", "{descriptors}");
                 let detail = descriptors["detail"].as_str().expect("detail");
                 assert!(detail.contains(" open of soft limit "), "{detail}");
-                assert!(detail.ends_with("floor not rising"), "{detail}");
+                assert!(
+                    detail.ends_with("no current descriptor floor growth estimate"),
+                    "{detail}"
+                );
             },
         );
     }

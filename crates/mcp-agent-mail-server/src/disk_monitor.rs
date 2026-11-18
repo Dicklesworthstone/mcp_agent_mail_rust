@@ -303,14 +303,11 @@ fn should_emit_pressure_change_alert(previous: DiskPressure, current: DiskPressu
 
 /// Feed the descriptor leak detector (br-kp1in.17) and warn once each time
 /// it starts reporting a rising floor. Returns whether growth is reported.
-fn sample_descriptors(elapsed: Duration, reported: bool) -> bool {
+fn sample_descriptors(reported: bool) -> bool {
     let Some(open_fds) = mcp_agent_mail_core::count_open_fds() else {
         return reported;
     };
-    mcp_agent_mail_core::record_descriptor_sample(
-        u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-        open_fds,
-    );
+    mcp_agent_mail_core::record_descriptor_sample(open_fds);
     let growth = mcp_agent_mail_core::descriptor_floor_growth();
     if let Some(growth) = growth.as_ref().filter(|_| !reported) {
         let (soft_limit, _) = mcp_agent_mail_core::read_fd_limits();
@@ -451,8 +448,7 @@ fn monitor_loop(
                 );
             }
             last_memory_pressure = sample.pressure;
-            descriptor_growth_reported =
-                sample_descriptors(started.elapsed(), descriptor_growth_reported);
+            descriptor_growth_reported = sample_descriptors(descriptor_growth_reported);
         }
 
         if disk_due && !SHUTDOWN.load(Ordering::Acquire) {
