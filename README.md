@@ -342,8 +342,10 @@ project's GitHub repository.
 ```bash
 revision=$(git rev-parse --verify 'HEAD^{commit}')
 build_dir=$(mktemp -d)
-docker buildx build --file Dockerfile --build-arg "AM_REF=$revision" \
-  --load --iidfile "$build_dir/image-id" "$build_dir" &&
+BUILDX_METADATA_PROVENANCE=max docker buildx build \
+  --file Dockerfile --build-arg "AM_REF=$revision" \
+  --load --iidfile "$build_dir/image-id" \
+  --metadata-file "$build_dir/build-metadata.json" "$build_dir" &&
 image_id=$(cat "$build_dir/image-id") &&
 docker image tag "$image_id" "mcp-agent-mail-rust:source-$revision-${image_id#sha256:}"
 ```
@@ -351,6 +353,8 @@ docker image tag "$image_id" "mcp-agent-mail-rust:source-$revision-${image_id#sh
 The resulting image exposes its commit in `org.opencontainers.image.revision`.
 It also records the Cargo lockfile and Rust toolchain file digests in
 `/usr/share/mcp-agent-mail/source-provenance`.
+`build-metadata.json` records the Dockerfile bytes and image config digest.
+[BuildKit metadata reference](https://docs.docker.com/reference/cli/docker/buildx/build/#metadata-file)
 
 ### From Source
 

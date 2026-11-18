@@ -15,13 +15,26 @@
 - [x] Scope the Cargo build cache by commit and architecture. Record
   verified source and toolchain inputs inside the image and label its
   revision. Document local tags derived from both commit and image ID.
-- [ ] Run the actual locked portable Docker build with the final recipe.
-  Read the output image by ID, compare its label and embedded input
-  digests, and run the two binaries.
-- [ ] Verify the local tag resolves to that exact image ID and the
-  conformance tests detect checkout, cache, lock, and label drift.
-- [ ] Check formatting, BuildKit and UBS output. Update `br-8n66x` on
-  exact evidence and check the Beads graph for cycles.
+- [x] Run the actual Linux amd64 locked portable Docker build. The recipe
+  at `e50f85c9` builds application source `98a88cbf`. The image's revision
+  label and both embedded digests match Git, and both binaries run. MCP
+  stdio initializes, lists 45 tools, and exits cleanly with stdin closed.
+- [x] Compare the Dockerfile bytes from full BuildKit metadata with the
+  tracked recipe and match the metadata's image config digest to the
+  loaded image. Document how the local build retains that metadata.
+- [x] Verify the content-addressed local tag. Advance each historical
+  sibling fixture independently and confirm the image ID stays the same.
+  Change the Docker recipe and verify the old and new tags preserve their
+  respective image IDs. Cargo metadata reports zero outside path dependencies.
+- [x] Run the three container contract tests including checkout, cache,
+  lock, and label mutations. Strict RCH reports a queue timeout and a
+  draining worker. The same three test functions pass in an isolated
+  Apple Silicon harness with the pinned compiler and fixture tree.
+- [x] Check formatting, BuildKit and UBS output. BuildKit reports no
+  lint warnings. UBS reports zero critical findings and 48 warnings in
+  the existing Rust test file.
+- [x] Record the image and execution evidence on `br-8n66x` and check
+  dependency cycles.
 
 ## November 18 installer checksum uniqueness
 
