@@ -26275,22 +26275,35 @@ mod tests {
             mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar_path).expect("open ATC sidecar");
         sidecar
             .execute_raw(
-                "CREATE TABLE atc_experiences (subject TEXT, project_key TEXT, created_ts INTEGER)",
+                "CREATE TABLE atc_experiences (subject TEXT, project_key TEXT, created_ts INTEGER,
+                    decision_id INTEGER NOT NULL, trace_id TEXT NOT NULL, effect_id INTEGER NOT NULL,
+                    UNIQUE(decision_id, effect_id))",
             )
             .expect("create experience table");
         sidecar
             .execute_sync(
-                "INSERT INTO atc_experiences (subject, project_key, created_ts) VALUES
-                    ('BlueLake', NULL, ?1), ('BlueLake', NULL, ?1),
-                    ('BlueLake', '/visible', ?1), ('BlueLake', '/other', ?1),
-                    ('GreenStone', NULL, ?1), ('GreenStone', '/other', ?1),
-                    ('GoldFox', NULL, ?1), ('GoldFox', NULL, ?1),
-                    ('GoldFox', '/visible', ?1), ('GoldFox', '/visible', ?1),
-                    ('GoldFox', '/other', ?1), ('GoldFox', '', ?1),
-                    ('GoldFox', '/visible', 1), ('NotAnAgent', '/visible', ?1)",
+                "INSERT INTO atc_experiences VALUES
+                    ('BlueLake', NULL, ?1, 1, 'blue', 1), ('BlueLake', NULL, ?1, 1, 'blue', 2),
+                    ('BlueLake', '/visible', ?1, 1, 'blue', 3), ('BlueLake', '/other', ?1, 1, 'blue', 4),
+                    ('GreenStone', NULL, ?1, 2, 'green', 5), ('GreenStone', '/other', ?1, 2, 'green', 6),
+                    ('GoldFox', NULL, ?1, 3, 'first-run', 7), ('GoldFox', NULL, ?1, 3, 'first-run', 8),
+                    ('GoldFox', '/visible', ?1, 3, 'first-run', 9),
+                    ('GoldFox', '/visible', ?1, 3, 'second-run', 10),
+                    ('GoldFox', '/visible', ?1, 4, 'second-run', 11),
+                    ('GoldFox', NULL, ?1, 5, 'last', 12),
+                    ('GoldFox', '/other', ?1, 6, 'foreign', 13), ('GoldFox', '', ?1, 7, 'empty', 14),
+                    ('GoldFox', '/visible', 1, 8, 'old', 15), ('NotAnAgent', '/visible', ?1, 9, 'absent', 16)",
                 &[sqlmodel_core::Value::BigInt(mcp_agent_mail_db::now_micros())],
             )
             .expect("insert recent and out-of-window decisions");
+        sidecar
+            .execute_sync(
+                "WITH RECURSIVE filler(i) AS (VALUES(0) UNION ALL SELECT i + 1 FROM filler WHERE i < 497)
+                 INSERT INTO atc_experiences
+                 SELECT 'Fixture-' || i, '/visible', ?1, 1000 + i, 'bulk', 1000 + i FROM filler",
+                &[sqlmodel_core::Value::BigInt(mcp_agent_mail_db::now_micros())],
+            )
+            .expect("exercise multiple batches of attributed subjects");
         drop(sidecar);
 
         let output = run_robot_json_capture(
@@ -26311,17 +26324,23 @@ mod tests {
         );
         let agents = output["agents"].as_array().expect("visible agents");
         assert_eq!(agents.len(), 501);
-        let decision_count = |name| {
-            agents
-                .iter()
-                .find(|agent| agent["name"].as_str() == Some(name))
-                .expect("agent in selected project")["health"]["decision_count"]
-                .as_u64()
-                .expect("decision count in health output")
-        };
-        assert_eq!(decision_count("GoldFox"), 4);
-        assert_eq!(decision_count("BlueLake"), 1);
-        assert_eq!(decision_count("GreenStone"), 0);
+        let counts: HashMap<_, _> = agents
+            .iter()
+            .map(|agent| {
+                (
+                    agent["name"].as_str().expect("agent in selected project"),
+                    agent["health"]["decision_count"]
+                        .as_u64()
+                        .expect("decision count in health output"),
+                )
+            })
+            .collect();
+        assert_eq!(counts.get("GoldFox"), Some(&4));
+        assert_eq!(counts.get("BlueLake"), Some(&1));
+        assert_eq!(counts.get("GreenStone"), Some(&0));
+        for index in 0..498 {
+            assert_eq!(counts.get(format!("Fixture-{index}").as_str()), Some(&1));
+        }
     }
 
     #[test]

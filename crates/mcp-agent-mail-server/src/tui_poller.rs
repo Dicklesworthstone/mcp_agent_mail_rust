@@ -21,6 +21,7 @@ use mcp_agent_mail_db::is_sqlite_recovery_error_message;
 use mcp_agent_mail_db::mail_explorer::ExplorerQuery;
 use mcp_agent_mail_db::pool::{
     DbPoolConfig, SyncQuery, open_atc_sidecar_conn, read_agent_decision_counts,
+    read_agent_decisions_for_subjects, try_open_atc_sidecar_conn,
 };
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
@@ -41,9 +42,8 @@ const RESERVATION_SNAPSHOT_GAP_REFRESH_INTERVAL: Duration = Duration::from_mins(
 /// After readiness warmup fails, let the poller retry opening `SQLite` only
 /// occasionally so degraded startup does not turn into repeated DB hammering.
 const DB_WARMUP_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-/// When `data_version` is unavailable, throttle full snapshots to avoid
-/// expensive no-op scans on every poll cycle.
-const NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS: i64 = 30_000_000;
+/// Pause between full retries or independent ATC reads on a quiet mailbox.
+const PROJECTION_RETRY_INTERVAL_MICROS: i64 = 30_000_000;
 
 /// Maximum agents to fetch per poll cycle.  Raised from 50 to 500 to avoid
 /// silently truncating the agent list in large deployments (B4 truthfulness).
@@ -441,6 +441,7 @@ struct PollerConnectionState {
     /// Completion time of the last full projection, including detail fallback.
     /// Bounds unknown-version polling and repeated unchanged detail gaps.
     last_full_snapshot_micros: i64,
+    last_decision_refresh_micros: i64,
 }
 
 /// Handle returned by [`DbPoller::start`].
@@ -836,6 +837,7 @@ fn open_poller_connection_state(
         last_data_version: None,
         last_reservation_snapshot_gap_refresh_micros: 0,
         last_full_snapshot_micros: 0,
+        last_decision_refresh_micros: 0,
     })
 }
 
@@ -856,10 +858,10 @@ fn fetch_db_stats_with_connection(
 /// visible agent list deliberately excludes them. Retry the full projection at
 /// the fallback cadence, not on every poll forever (GH#354). A backward clock
 /// jump permits one refresh; its completion establishes the new clock anchor.
-const fn full_snapshot_retry_due(now: i64, last_completed: i64) -> bool {
+const fn projection_refresh_due(now: i64, last_completed: i64) -> bool {
     last_completed <= 0
         || now < last_completed
-        || now.saturating_sub(last_completed) >= NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS
+        || now.saturating_sub(last_completed) >= PROJECTION_RETRY_INTERVAL_MICROS
 }
 
 fn fetch_db_stats_with_clock(
@@ -875,7 +877,7 @@ fn fetch_db_stats_with_clock(
         now,
         state.last_reservation_snapshot_gap_refresh_micros,
     );
-    let full_retry_due = full_snapshot_retry_due(now, state.last_full_snapshot_micros);
+    let full_retry_due = projection_refresh_due(now, state.last_full_snapshot_micros);
     let must_refresh_for_detail_gap = snapshot_has_missing_detail_lists(previous) && full_retry_due;
     // A changed or newly available version still refreshes immediately. Only
     // repeated attempts against unchanged/unknown revisions use the retry gate.
@@ -892,27 +894,30 @@ fn fetch_db_stats_with_clock(
         let update = if must_refresh_for_detail_gap {
             let snapshot = batcher.fetch_snapshot(Some(previous));
             state.last_full_snapshot_micros = clock();
-            snapshot
-        } else if must_refresh_for_expiry || must_refresh_for_snapshot_gap {
-            refresh_reservation_time_sensitive_snapshot(state, previous, now)
+            state.last_decision_refresh_micros = state.last_full_snapshot_micros;
+            Some(snapshot)
         } else {
-            state.last_data_version = data_version;
-            update_reservation_snapshot_gap_refresh_state(
-                state,
-                must_refresh_for_snapshot_gap,
-                previous,
-                now,
-            );
-            return Some(DbPollSnapshotUpdate::TimestampOnly(now));
+            let mut update = (must_refresh_for_expiry || must_refresh_for_snapshot_gap)
+                .then(|| refresh_reservation_time_sensitive_snapshot(state, previous, now));
+            if !previous.agents_list.is_empty()
+                && projection_refresh_due(now, state.last_decision_refresh_micros)
+            {
+                refresh_quiet_agent_decisions(state, previous, now, &mut update);
+                state.last_decision_refresh_micros = clock();
+            }
+            update
         };
         state.last_data_version = data_version;
         update_reservation_snapshot_gap_refresh_state(
             state,
             must_refresh_for_snapshot_gap,
-            &update,
+            update.as_ref().unwrap_or(previous),
             now,
         );
-        return Some(DbPollSnapshotUpdate::Snapshot(update));
+        return Some(update.map_or(
+            DbPollSnapshotUpdate::TimestampOnly(now),
+            DbPollSnapshotUpdate::Snapshot,
+        ));
     }
     // Unknown versions use the same completion-based budget. A detail gap
     // cannot override it, but reservation expiry and gap recovery retain their
@@ -930,6 +935,7 @@ fn fetch_db_stats_with_clock(
     // Include query and fallback-connection work in the attempt. Slow work
     // must not consume its own pause and immediately schedule another scan.
     state.last_full_snapshot_micros = clock();
+    state.last_decision_refresh_micros = state.last_full_snapshot_micros;
     if snapshot_is_empty(&snapshot)
         && required_mail_schema_state(&state.conn) != RequiredMailSchemaState::Present
     {
@@ -1061,6 +1067,58 @@ fn refresh_reservation_time_sensitive_snapshot(
         return snapshot;
     };
     apply_reservation_bundle_to_snapshot(previous, bundle, now_micros)
+}
+
+/// The primary DB version does not advance when ATC writes to its sidecar or
+/// when a decision ages out. Read just the visible subjects and update a
+/// snapshot only if an operator-visible count changed.
+fn refresh_quiet_agent_decisions(
+    state: &PollerConnectionState,
+    previous: &DbStatSnapshot,
+    now: i64,
+    update: &mut Option<DbStatSnapshot>,
+) {
+    let Ok(sidecar) = try_open_atc_sidecar_conn(&state.primary_sqlite_path) else {
+        return;
+    };
+    let rows = if let Some(sidecar) = sidecar {
+        let subjects = previous
+            .agents_list
+            .iter()
+            .filter(|agent| agent.health.is_some())
+            .map(|agent| agent.name.as_str());
+        let Some(rows) = read_agent_decisions_for_subjects(
+            &state.conn,
+            &sidecar,
+            subjects,
+            now.saturating_sub(AGENT_HEALTH_WINDOW_MICROS),
+        ) else {
+            return;
+        };
+        rows
+    } else {
+        Vec::new()
+    };
+    let counts: HashMap<_, _> = rows
+        .iter()
+        .map(|row| ((row.project_slug.as_str(), row.subject.as_str()), row.count))
+        .collect();
+    for (index, agent) in previous.agents_list.iter().enumerate() {
+        let Some(health) = &agent.health else {
+            continue;
+        };
+        let count = counts
+            .get(&(agent.project.as_str(), agent.name.as_str()))
+            .copied()
+            .unwrap_or(0);
+        if count != health.decision_count {
+            let snapshot = update.get_or_insert_with(|| previous.clone());
+            if let Some(health) = &mut snapshot.agents_list[index].health {
+                health.decision_count = count;
+            }
+            snapshot.timestamp_micros = now;
+        }
+    }
 }
 
 fn apply_reservation_bundle_to_snapshot(
@@ -4226,7 +4284,8 @@ mod tests {
         let atc_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary);
         let atc = mcp_agent_mail_db::CanonicalDbConn::open_file(&atc_path).expect("create sidecar");
         atc.execute_raw(
-            "CREATE TABLE IF NOT EXISTS atc_experiences (subject TEXT, project_key TEXT, created_ts INTEGER)",
+            "CREATE TABLE IF NOT EXISTS atc_experiences (decision_id INTEGER PRIMARY KEY,
+                 trace_id TEXT NOT NULL DEFAULT 'poller-test', subject TEXT, project_key TEXT, created_ts INTEGER)",
         )
         .expect("ensure ATC experiences table");
         for _ in 0..count {
@@ -4239,6 +4298,95 @@ mod tests {
             )
             .expect("insert ATC decision");
         }
+    }
+
+    #[test]
+    fn quiet_mailbox_refreshes_sidecar_decisions_and_their_rolling_window() {
+        let (_dir, mut state) = retired_poller_fixture();
+        state.conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, last_active_ts) VALUES (3, 1, 'GoldFox', 'test', 1)",
+            &[],
+        ).expect("insert active agent");
+        let start = now_micros();
+        let boundary = start + 30_000_000;
+        let reservation_expiry = start + 3_600_000_000;
+        state.conn.execute_sync(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, \"exclusive\", created_ts, expires_ts)
+             VALUES (1, 1, 3, 'src/**', 1, ?, ?)",
+            &[Value::BigInt(start), Value::BigInt(reservation_expiry)],
+        ).expect("insert active reservation");
+        let previous = require_snapshot_update(fetch_db_stats_with_clock(
+            &mut state,
+            &DbStatSnapshot::default(),
+            || start,
+        ));
+        let count = |snapshot: &DbStatSnapshot| {
+            assert_eq!(snapshot.agents_list.len(), 1);
+            let agent = &snapshot.agents_list[0];
+            assert_eq!(agent.name, "GoldFox");
+            agent.health.as_ref().expect("health").decision_count
+        };
+        assert_eq!(count(&previous), 0);
+        assert_eq!(previous.file_reservations, 1);
+        let version = state.last_data_version.expect("file-backed data_version");
+        seed_atc_decisions(
+            std::path::Path::new(&state.primary_sqlite_path),
+            "GoldFox",
+            2,
+        );
+        let sidecar = open_atc_sidecar_conn(&state.primary_sqlite_path).expect("open sidecar");
+        sidecar
+            .execute_sync(
+                "UPDATE atc_experiences SET created_ts = ? WHERE decision_id = 1",
+                &[Value::BigInt(boundary - AGENT_HEALTH_WINDOW_MICROS)],
+            )
+            .expect("place one decision exactly on the window boundary");
+        assert_eq!(
+            query_data_version(&state.conn, Some(&state.sqlite_path)),
+            Some(version)
+        );
+        assert!(matches!(
+            fetch_db_stats_with_clock(&mut state, &previous, || boundary - 1),
+            Some(DbPollSnapshotUpdate::TimestampOnly(_))
+        ));
+        let appended =
+            require_snapshot_update(fetch_db_stats_with_clock(&mut state, &previous, || {
+                boundary
+            }));
+        assert_eq!(count(&appended), 2);
+        assert_eq!(appended.file_reservations, 1);
+        let aged =
+            require_snapshot_update(fetch_db_stats_with_clock(&mut state, &appended, || {
+                reservation_expiry
+            }));
+        assert_eq!(count(&aged), 1);
+        assert_eq!(aged.file_reservations, 0);
+        assert_eq!(aged.projects_list[0].reservation_count, 0);
+        assert!(matches!(
+            fetch_db_stats_with_clock(&mut state, &aged, || reservation_expiry + 30_000_000),
+            Some(DbPollSnapshotUpdate::TimestampOnly(_))
+        ));
+        sidecar
+            .execute_raw("ALTER TABLE atc_experiences RENAME TO held_experiences")
+            .expect("make the independent read fail");
+        assert!(
+            matches!(
+                fetch_db_stats_with_clock(&mut state, &aged, || reservation_expiry + 60_000_000),
+                Some(DbPollSnapshotUpdate::TimestampOnly(_))
+            ),
+            "a failed query must preserve the last observed count"
+        );
+        drop(sidecar);
+        let path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(&state.primary_sqlite_path);
+        std::fs::rename(&path, format!("{path}.parked")).expect("park sidecar");
+        let absent = require_snapshot_update(fetch_db_stats_with_clock(&mut state, &aged, || {
+            reservation_expiry + 90_000_000
+        }));
+        assert_eq!(count(&absent), 0);
+        assert_eq!(
+            state.last_full_snapshot_micros, start,
+            "decision updates must not rerun the full mailbox projection"
+        );
     }
 
     #[test]
@@ -4275,7 +4423,7 @@ mod tests {
                 for (mailbox, url, expected) in &fixtures {
                     let mut state =
                         open_poller_connection_state(url, mailbox).expect("open selected mailbox");
-                    let snapshot = require_full_update(fetch_db_stats_with_connection(
+                    let snapshot = require_snapshot_update(fetch_db_stats_with_connection(
                         &mut state,
                         &DbStatSnapshot::default(),
                     ));
@@ -4333,7 +4481,7 @@ mod tests {
 
         let db_url = format!("sqlite://{}", primary.display());
         let mut state = open_poller_connection_state(&db_url, root.path()).expect("open poller");
-        let snapshot = require_full_update(fetch_db_stats_with_connection(
+        let snapshot = require_snapshot_update(fetch_db_stats_with_connection(
             &mut state,
             &DbStatSnapshot::default(),
         ));
@@ -4380,6 +4528,7 @@ mod tests {
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
             last_full_snapshot_micros: 0,
+            last_decision_refresh_micros: 0,
         };
 
         let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
@@ -4532,7 +4681,7 @@ first body
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("DATABASE_URL", "sqlite:///:memory:")],
             || {
-                let snapshot = require_full_update(fetch_db_stats_with_connection(
+                let snapshot = require_snapshot_update(fetch_db_stats_with_connection(
                     &mut state,
                     &DbStatSnapshot::default(),
                 ));
@@ -4566,6 +4715,7 @@ first body
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
             last_full_snapshot_micros: 0,
+            last_decision_refresh_micros: 0,
         };
 
         let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
@@ -4611,6 +4761,7 @@ first body
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
             last_full_snapshot_micros: 0,
+            last_decision_refresh_micros: 0,
         };
 
         let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
@@ -4704,6 +4855,7 @@ first body
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
             last_full_snapshot_micros: 0,
+            last_decision_refresh_micros: 0,
         };
 
         let update = fetch_db_stats_with_connection(&mut state, &DbStatSnapshot::default());
@@ -4912,6 +5064,7 @@ first body
             last_data_version: None,
             last_reservation_snapshot_gap_refresh_micros: 0,
             last_full_snapshot_micros: 0,
+            last_decision_refresh_micros: 0,
         };
         let previous = DbStatSnapshot {
             file_reservations: 2,
@@ -8096,14 +8249,15 @@ first body
                 last_data_version: None,
                 last_reservation_snapshot_gap_refresh_micros: 0,
                 last_full_snapshot_micros: 0,
+                last_decision_refresh_micros: 0,
             },
         )
     }
 
-    fn require_full_update(update: Option<DbPollSnapshotUpdate>) -> DbStatSnapshot {
+    fn require_snapshot_update(update: Option<DbPollSnapshotUpdate>) -> DbStatSnapshot {
         match update {
             Some(DbPollSnapshotUpdate::Snapshot(snapshot)) => snapshot,
-            _ => panic!("expected a real full snapshot"),
+            _ => panic!("expected updated snapshot data"),
         }
     }
 
@@ -8147,7 +8301,7 @@ first body
         let start = now_micros();
         let completed = start + 120_000_000;
         let mut ticks = [start, completed].into_iter();
-        let previous = require_full_update(fetch_db_stats_with_clock(
+        let previous = require_snapshot_update(fetch_db_stats_with_clock(
             &mut state,
             &DbStatSnapshot::default(),
             || ticks.next().expect("unexpected clock read"),
@@ -8162,7 +8316,7 @@ first body
         }
         let next = completed + 30_000_000;
         let refreshed =
-            require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || next));
+            require_snapshot_update(fetch_db_stats_with_clock(&mut state, &previous, || next));
         assert_eq!(refreshed.agents, 2);
         assert_eq!(refreshed.agents_list.len(), 0);
     }
@@ -8172,7 +8326,7 @@ first body
         let (_dir, mut state) = retired_poller_fixture();
         let now = now_micros();
         state.last_full_snapshot_micros = now;
-        let previous = require_full_update(fetch_db_stats_with_clock(
+        let previous = require_snapshot_update(fetch_db_stats_with_clock(
             &mut state,
             &DbStatSnapshot::default(),
             || now,
@@ -8198,7 +8352,7 @@ first body
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let (_dir, mut state) = retired_poller_fixture();
             let now = now_micros();
-            let previous = require_full_update(fetch_db_stats_with_clock(
+            let previous = require_snapshot_update(fetch_db_stats_with_clock(
                 &mut state,
                 &DbStatSnapshot::default(),
                 || now,
@@ -8223,7 +8377,7 @@ first body
                 now + 30_000_000
             };
             let refreshed =
-                require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || {
+                require_snapshot_update(fetch_db_stats_with_clock(&mut state, &previous, || {
                     observed_at
                 }));
             assert_eq!(refreshed.agents, 3);
@@ -8240,7 +8394,7 @@ first body
     fn gh354_detail_gap_cooldown_does_not_block_reservation_expiry() {
         let (_dir, mut state) = retired_poller_fixture();
         let now = now_micros();
-        let mut previous = require_full_update(fetch_db_stats_with_clock(
+        let mut previous = require_snapshot_update(fetch_db_stats_with_clock(
             &mut state,
             &DbStatSnapshot::default(),
             || now,
@@ -8264,7 +8418,7 @@ first body
             released_ts: None,
         }];
         let refreshed =
-            require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || now + 1));
+            require_snapshot_update(fetch_db_stats_with_clock(&mut state, &previous, || now + 1));
         assert_eq!(refreshed.file_reservations, 0);
         assert_eq!(refreshed.projects_list[0].reservation_count, 0);
         assert_eq!(refreshed.reservation_snapshots.len(), 0);
@@ -8284,12 +8438,12 @@ first body
     #[test]
     fn gh354_full_snapshot_retry_clock_boundaries_are_safe() {
         let start = 1_000_000;
-        assert!(full_snapshot_retry_due(start, 0));
-        assert!(!full_snapshot_retry_due(start, start));
-        assert!(!full_snapshot_retry_due(start + 29_999_999, start));
-        assert!(full_snapshot_retry_due(start + 30_000_000, start));
-        assert!(full_snapshot_retry_due(start - 1, start));
-        assert!(full_snapshot_retry_due(i64::MAX, 1));
-        assert!(full_snapshot_retry_due(i64::MIN, i64::MAX));
+        assert!(projection_refresh_due(start, 0));
+        assert!(!projection_refresh_due(start, start));
+        assert!(!projection_refresh_due(start + 29_999_999, start));
+        assert!(projection_refresh_due(start + 30_000_000, start));
+        assert!(projection_refresh_due(start - 1, start));
+        assert!(projection_refresh_due(i64::MAX, 1));
+        assert!(projection_refresh_due(i64::MIN, i64::MAX));
     }
 }

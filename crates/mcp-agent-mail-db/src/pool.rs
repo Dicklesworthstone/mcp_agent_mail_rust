@@ -12780,8 +12780,19 @@ pub fn atc_sidecar_sqlite_path(primary: &str) -> String {
 /// not exist yet (ATC never wrote) — callers then report empty ATC telemetry.
 #[must_use]
 pub fn open_atc_sidecar_conn(primary_sqlite_path: &str) -> Option<crate::CanonicalDbConn> {
+    try_open_atc_sidecar_conn(primary_sqlite_path)
+        .ok()
+        .flatten()
+}
+
+/// Open the ATC sidecar, distinguishing an empty mailbox from a failed read.
+///
+/// Returns `Ok(None)` for an in-memory mailbox or an absent or empty sidecar.
+pub fn try_open_atc_sidecar_conn(
+    primary_sqlite_path: &str,
+) -> DbResult<Option<crate::CanonicalDbConn>> {
     if primary_sqlite_path == ":memory:" {
-        return None;
+        return Ok(None);
     }
     let atc_path = atc_sidecar_sqlite_path(primary_sqlite_path);
     // A 0-byte sidecar is indistinguishable from an absent one: SQLite creates
@@ -12789,12 +12800,15 @@ pub fn open_atc_sidecar_conn(primary_sqlite_path: &str) -> Option<crate::Canonic
     // open (e.g. a maintenance probe) can leave an empty file with no ATC
     // schema behind. Treat it as the normal "ATC never wrote" state (GH#232).
     match std::fs::metadata(&atc_path) {
-        Ok(meta) if meta.len() > 0 => {}
-        _ => return None,
+        Ok(meta) if meta.len() == 0 => return Ok(None),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(DbError::Sqlite(format!("inspect {atc_path}: {error}"))),
     }
-    let conn = crate::CanonicalDbConn::open_file(atc_path.as_str()).ok()?;
+    let conn = crate::CanonicalDbConn::open_file(&atc_path)
+        .map_err(|error| DbError::Sqlite(format!("open {atc_path}: {error}")))?;
     let _ = conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL);
-    Some(conn)
+    Ok(Some(conn))
 }
 
 /// Attribute ATC decisions to roster IDs in the observed mailbox.
@@ -12808,60 +12822,105 @@ pub fn read_agent_decision_counts(
     agents: &[(i64, &str)],
     window_start: i64,
 ) -> HashMap<i64, u64> {
-    let mut counts = HashMap::<i64, u64>::new();
+    let requested: HashMap<_, _> = agents.iter().copied().collect();
+    read_agent_decisions_for_subjects(
+        mailbox,
+        sidecar,
+        agents.iter().map(|(_, name)| *name),
+        window_start,
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|row| requested.get(&row.agent_id).copied() == Some(row.subject.as_str()))
+    .map(|row| (row.agent_id, row.count))
+    .collect()
+}
+
+/// Distinct decisions belonging to a single mailbox identity.
+pub struct AgentDecisionCount {
+    pub agent_id: i64,
+    pub project_slug: String,
+    pub subject: String,
+    pub count: u64,
+}
+
+struct DecisionOwner {
+    identity: AgentDecisionCount,
+    project_key: Option<String>,
+    accepts_unscoped: bool,
+}
+
+/// Read only decision telemetry and the mailbox identities needed to attribute it.
+///
+/// A failed read returns `None` so a poller can retain its last observation.
+pub fn read_agent_decisions_for_subjects<'a>(
+    mailbox: &impl SyncQuery,
+    sidecar: &crate::CanonicalDbConn,
+    subjects: impl Iterator<Item = &'a str>,
+    window_start: i64,
+) -> Option<Vec<AgentDecisionCount>> {
+    let mut seen = HashSet::new();
+    let subjects: Vec<_> = subjects.filter(|name| seen.insert(*name)).collect();
+    let mut result = Vec::new();
     // Bound bind counts for large CLI projects. The TUI's 500-row projection
     // fits in a single batch.
-    for agents in agents.chunks(500) {
-        let placeholders = vec!["?"; agents.len()].join(", ");
+    for subjects in subjects.chunks(500) {
+        let placeholders = vec!["?"; subjects.len()].join(", ");
         let mut params = vec![Value::BigInt(window_start)];
-        params.extend(agents.iter().map(|(_, name)| Value::Text((*name).into())));
+        params.extend(subjects.iter().map(|name| Value::Text((*name).into())));
         let sql = format!(
-            "SELECT subject, project_key, COUNT(*) AS decision_count FROM atc_experiences \
-             WHERE created_ts >= ? AND subject IN ({placeholders}) GROUP BY subject, project_key"
+            "SELECT DISTINCT subject FROM atc_experiences WHERE created_ts >= ? AND subject IN ({placeholders})"
         );
-        let Ok(rows) = sidecar.query_sync(&sql, &params) else {
-            continue;
-        };
-        let observations: Vec<(String, Option<String>, u64)> = rows
-            .into_iter()
-            .filter_map(|row| {
-                let project = match row.get_by_name("project_key")? {
-                    Value::Null => None,
-                    Value::Text(key) if !key.is_empty() => Some(key.clone()),
-                    _ => return None,
-                };
-                Some((
-                    row.get_named("subject").ok()?,
-                    project,
-                    u64::try_from(row.get_named::<i64>("decision_count").ok()?).ok()?,
-                ))
-            })
-            .collect();
-        if observations.is_empty() {
+        let mut observed = HashSet::new();
+        for row in sidecar.query_sync(&sql, &params).ok()? {
+            observed.insert(row.get_named::<String>("subject").ok()?);
+        }
+        if observed.is_empty() {
             continue;
         }
 
-        let names: HashSet<_> = observations
+        let names: Vec<_> = observed
             .iter()
-            .map(|(subject, _, _)| subject.to_ascii_lowercase())
+            .map(|name| Value::Text(name.to_ascii_lowercase()))
             .collect();
-        let names: Vec<_> = names.into_iter().map(Value::Text).collect();
         let placeholders = vec!["?"; names.len()].join(", ");
         let sql = format!(
-            "SELECT a.id, a.name, p.human_key AS project_key FROM agents a \
+            "SELECT a.id, a.name, a.project_id, p.slug, p.human_key AS project_key FROM agents a \
              LEFT JOIN projects p ON p.id = a.project_id \
              WHERE lower(trim(a.name)) IN ({placeholders})"
         );
-        let Ok(owners) = mailbox.query_sync(&sql, &names) else {
-            continue;
-        };
+        let owners = mailbox.query_sync(&sql, &names).ok()?;
         let mut unique_owners = HashMap::new();
+        let mut identities = HashMap::new();
         for row in owners {
-            let Ok(name) = row.get_named::<String>("name") else {
-                return HashMap::new();
+            let name = row.get_named::<String>("name").ok()?;
+            let name = name.trim_matches(' ');
+            let id = row.get_named::<i64>("id").ok()?;
+            let slug = row.get_named::<String>("slug").unwrap_or_default();
+            let slug = if slug.trim().is_empty() {
+                format!(
+                    "[unknown-project-{}]",
+                    row.get_named::<i64>("project_id").unwrap_or(0)
+                )
+            } else {
+                slug.trim().to_owned()
             };
-            let name = name.trim_matches(' ').to_ascii_lowercase();
-            let id = row.get_named::<i64>("id").ok();
+            if observed.contains(name) {
+                identities.insert(
+                    id,
+                    DecisionOwner {
+                        identity: AgentDecisionCount {
+                            agent_id: id,
+                            project_slug: slug,
+                            subject: name.to_owned(),
+                            count: 0,
+                        },
+                        project_key: None,
+                        accepts_unscoped: false,
+                    },
+                );
+            }
+            let name = name.to_ascii_lowercase();
             let project = row
                 .get_named::<String>("project_key")
                 .ok()
@@ -12870,20 +12929,64 @@ pub fn read_agent_decision_counts(
                 unique_owners
                     .entry((name.clone(), scope))
                     .and_modify(|owner| *owner = None)
-                    .or_insert(id);
+                    .or_insert(Some(id));
             }
         }
-        let requested_names: HashMap<_, _> = agents.iter().copied().collect();
-        for (subject, project, count) in observations {
-            if let Some(Some(id)) = unique_owners.get(&(subject.to_ascii_lowercase(), project))
-                && requested_names.get(id).copied() == Some(subject.as_str())
-            {
-                let total = counts.entry(*id).or_default();
-                *total = total.saturating_add(count);
+        for ((_, scope), owner) in unique_owners {
+            if let Some(identity) = owner.and_then(|id| identities.get_mut(&id)) {
+                if scope.is_some() {
+                    identity.project_key = scope;
+                } else {
+                    identity.accepts_unscoped = true;
+                }
             }
+        }
+        let owners: Vec<_> = identities
+            .into_values()
+            .filter(|owner| owner.accepts_unscoped || owner.project_key.is_some())
+            .collect();
+        result.extend(count_owned_decisions(sidecar, owners, window_start)?);
+    }
+    Some(result)
+}
+
+fn count_owned_decisions(
+    sidecar: &crate::CanonicalDbConn,
+    mut owners: Vec<DecisionOwner>,
+    window_start: i64,
+) -> Option<Vec<AgentDecisionCount>> {
+    // Four binds per owner plus the window, below SQLite's 999-bind limit.
+    for batch in owners.chunks_mut(249) {
+        let values = vec!["(?, ?, ?, ?)"; batch.len()].join(", ");
+        let mut params = Vec::with_capacity(4 * batch.len() + 1);
+        for (index, owner) in batch.iter().enumerate() {
+            params.extend([
+                Value::BigInt(i64::try_from(index).ok()?),
+                Value::Text(owner.identity.subject.clone()),
+                owner.project_key.clone().map_or(Value::Null, Value::Text),
+                Value::BigInt(i64::from(owner.accepts_unscoped)),
+            ]);
+        }
+        params.push(Value::BigInt(window_start));
+        // Drive the indexed subject/time lookup from the small roster. Effects
+        // count once per owner and decision, even across scopes. The trace
+        // distinguishes a numeric decision ID reused after an engine restart.
+        let sql = format!(
+            "WITH owners(owner_index, subject, project_key, unscoped) AS (VALUES {values}) \
+             SELECT owner_index, COUNT(*) AS n FROM (\
+                 SELECT o.owner_index FROM owners o CROSS JOIN atc_experiences e \
+                 WHERE e.subject = o.subject AND e.created_ts >= ? \
+                   AND (e.project_key = o.project_key OR (e.project_key IS NULL AND o.unscoped)) \
+                 GROUP BY o.owner_index, e.decision_id, e.trace_id\
+             ) GROUP BY owner_index"
+        );
+        for row in sidecar.query_sync(&sql, &params).ok()? {
+            let index = usize::try_from(row.get_named::<i64>("owner_index").ok()?).ok()?;
+            batch.get_mut(index)?.identity.count =
+                u64::try_from(row.get_named::<i64>("n").ok()?).ok()?;
         }
     }
-    counts
+    Some(owners.into_iter().map(|owner| owner.identity).collect())
 }
 
 /// Health snapshot of the ATC telemetry sidecar (`atc.sqlite3`) for surfacing in
