@@ -1,5 +1,24 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 18 descriptor watchdog freshness
+
+- [x] Follow the descriptor count from the daemon sampler through
+  `health_check` to the robot and doctor health consumers.
+- [x] Make the sampler and health reads use one process-monotonic clock.
+  Apply the same consecutive-window rule when reading growth and when
+  accepting a new sample.
+- [x] Explain absent growth evidence in health output and retain the
+  utilization thresholds based on measured headroom.
+- [x] Cover a current estimate, the exact expiry boundary, an out-of-order
+  read, and the first sample after a gap. Check health text with and without
+  a current estimate and exercise the real `health_check` response.
+- [ ] Run the descriptor regressions, production and all-target workspace
+  checks, and strict Clippy on the frozen source. Inspect the scoped UBS
+  findings alongside formatting and diff checks.
+- [ ] Keep `br-kp1in.29` open for the broader lock, queue and resource
+  watchdog acceptance, including the 1,000-run false-alarm test, the shared
+  sustained-suite predicates, and the release send-p50 overhead comparison.
+
 ## November 17 live verification compatibility wrapper
 
 - [x] Recheck the ready release and storage Beads. Continue `br-qpacg`
