@@ -26112,6 +26112,7 @@ fn remove_storage_root_entry_for_reset(path: &Path) -> CliResult<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MailboxSupervisor {
     /// A systemd unit; `user` selects the per-user manager (`systemctl --user`).
+    #[cfg(any(test, target_os = "linux"))]
     Systemd { unit: String, user: bool },
     /// The LaunchAgent that `am service install` registers on macOS.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -26121,7 +26122,9 @@ enum MailboxSupervisor {
 impl MailboxSupervisor {
     fn display_name(&self) -> String {
         match self {
+            #[cfg(any(test, target_os = "linux"))]
             Self::Systemd { unit, user: true } => format!("{unit} (systemd user service)"),
+            #[cfg(any(test, target_os = "linux"))]
             Self::Systemd { unit, user: false } => format!("{unit} (systemd system service)"),
             Self::Launchd => format!("{LAUNCHD_LABEL} (launchd agent)"),
         }
@@ -26130,7 +26133,9 @@ impl MailboxSupervisor {
     /// The command an operator runs to start the unit by hand.
     fn manual_start_command(&self) -> String {
         match self {
+            #[cfg(any(test, target_os = "linux"))]
             Self::Systemd { unit, user: true } => format!("systemctl --user start {unit}"),
+            #[cfg(any(test, target_os = "linux"))]
             Self::Systemd { unit, user: false } => format!("sudo systemctl start {unit}"),
             Self::Launchd => "am service restart".to_string(),
         }
@@ -26226,9 +26231,11 @@ impl MailboxQuiesceHost for LiveMailboxQuiesceHost {
 
     fn stop_supervisor(&self, supervisor: &MailboxSupervisor) -> CliResult<()> {
         match supervisor {
+            #[cfg(any(test, target_os = "linux"))]
             MailboxSupervisor::Systemd { unit, user: true } => {
                 run_systemctl_user(&["stop", unit.as_str()])
             }
+            #[cfg(any(test, target_os = "linux"))]
             MailboxSupervisor::Systemd { unit, user: false } => {
                 run_cmd("systemctl", &["stop", unit.as_str()])
             }
@@ -26238,9 +26245,11 @@ impl MailboxQuiesceHost for LiveMailboxQuiesceHost {
 
     fn start_supervisor(&self, supervisor: &MailboxSupervisor) -> CliResult<()> {
         match supervisor {
+            #[cfg(any(test, target_os = "linux"))]
             MailboxSupervisor::Systemd { unit, user: true } => {
                 run_systemctl_user(&["start", unit.as_str()])
             }
+            #[cfg(any(test, target_os = "linux"))]
             MailboxSupervisor::Systemd { unit, user: false } => {
                 run_cmd("systemctl", &["start", unit.as_str()])
             }

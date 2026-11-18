@@ -1,5 +1,71 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 18 native macOS database and TUI verification
+
+- [x] Read the original `br-ah0au` reports and follow the existing fixes
+  for snapshot identity, the FIFO fixture, descriptor helpers, the TUI
+  resolver, and the closed Python source connection.
+- [x] Claim `br-ah0au` and confirm an available arm64 Mac with the pinned
+  nightly and an isolated checkout of `c632993a`.
+- [x] Match the lockfile, toolchain pin, and migration and resolver source
+  hashes between the published revision and the Mac checkout.
+- [x] Route the tests to the Mac itself with the isolated checkout's
+  documented RCH configuration. Retain the initial exit 103 results as
+  routing refusals before Cargo ran.
+- [x] Run the previously failing database migration on the default feature
+  graph. Repeat the migration module against a private macOS temporary root.
+- [x] Reproduce the recovery-breaker fixture failure with a long temporary
+  path. The migration module passed 52 cases and the unsafe-family test
+  passed. The unsafe-shapes test stopped at Darwin's socket bind length limit.
+- [x] Bind the recovery-breaker socket through a private short parent alias
+  so the real socket inode lands in the guarded directory.
+- [x] Rebuild and run all 52 recovery-breaker cases with the same long
+  temporary-path layout. The unsafe-shapes case passed with all file types.
+  A fresh invocation passed that exact case and all 52 migration cases.
+- [x] Run the TUI resolver body against the default native feature graph.
+- [x] Repeat the resolver with a private `/var/tmp` directory that resolves
+  through the macOS `/private/var` alias. The arm64 test binary passed both
+  runs and the isolated resolver child executed in each.
+- [x] Run strict database Clippy on the rebuilt Darwin candidate.
+- [x] Run the Darwin production and all-target workspace checks on the
+  first candidate. Both compiled, but strict workspace Clippy rejected
+  the unconstructed Linux-only `MailboxSupervisor::Systemd` variant.
+- [x] Match the CLI variant and its dispatch arms to the same Linux/test
+  configuration as the code that constructs it.
+- [x] Re-run the Darwin production and all-target workspace checks and
+  strict workspace Clippy with both changes. All three passed on the Mac.
+- [x] Run the existing systemd classification, quiesce-plan, and launchd
+  parser cases from the rebuilt native CLI test binary. All three passed.
+- [x] Run the real legacy import fixture against canonical SQLite and the
+  native runtime, and exercise snapshot publication and selection, including
+  exclusion across processes and recovery after owner death. All four passed.
+- [x] Build both arm64 Mach-O binaries from the final source and run them
+  with separate private mailboxes. The CLI serves all 45 tools over stdio,
+  and the HTTP server answers `/health/liveness` with status 200.
+- [x] Review formatting, diff checks, and the native failure-to-pass diff.
+- [x] Complete and review the full changed-file UBS scan. The initial run
+  timed out after 300 seconds. The longer run completed in 764 seconds
+  with zero critical findings and 11,065 warnings across the two files.
+  The changed-line warnings are confined to socket fixture setup.
+- [x] Record the native results on `br-ah0au` and close it after the fresh
+  rerun. Check the Beads graph for cycles.
+
+## November 18 published Intel macOS archive
+
+- [x] Verify the v0.3.40 Minisign signature and authenticated product/tag
+  comment using the installer-pinned key. The signed manifest contains one
+  checksum for each of the six README targets.
+- [x] Match the published Intel archive to its signed SHA-256 and confirm
+  Mach-O x86_64 for both packaged executables.
+- [x] Run the archive under Rosetta with private mailboxes. The corrective
+  stdio invocation uses `am serve-stdio`; MCP initialization, listing 45
+  tools, and shutdown pass. The packaged `mcp-agent-mail serve` answers
+  `/health/liveness` with HTTP 200 on loopback.
+- [x] Record the signed artifact and runtime results on `br-s1ejh`.
+- [ ] Prove the canonical DSR publication transition enforces the advertised
+  target matrix before upload. The published artifact result advances
+  `br-s1ejh` and the publication gate still needs evidence.
+
 ## November 18 descriptor watchdog freshness
 
 - [x] Follow the descriptor count from the daemon sampler through

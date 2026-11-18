@@ -2758,7 +2758,14 @@ mod tests {
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
-                        Some(std::os::unix::net::UnixListener::bind(&sidecar).unwrap())
+                        // sockaddr_un limits the spelling passed to bind. A short
+                        // parent alias creates the socket in the guarded directory
+                        // even when the test runner uses a long TMPDIR.
+                        let short_root = tempfile::tempdir_in("/tmp").unwrap();
+                        let short_parent = short_root.path().join("p");
+                        symlink(&parents.active, &short_parent).unwrap();
+                        let socket_path = short_parent.join(sidecar.file_name().unwrap());
+                        Some(std::os::unix::net::UnixListener::bind(socket_path).unwrap())
                     }
                 }
                 _ => unreachable!(),
