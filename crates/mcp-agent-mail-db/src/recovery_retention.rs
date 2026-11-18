@@ -808,6 +808,14 @@ pub fn retention_resident_stats(
     })
 }
 
+/// A reclaim rename completed, but durability or namespace revalidation failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnconfirmedReclaimMove {
+    pub source: PathBuf,
+    /// Requested destination spelling. A concurrent move may have changed it.
+    pub requested_destination: PathBuf,
+}
+
 /// Outcome of [`consolidate_debris`].
 #[derive(Debug, Clone, Default)]
 pub struct ReclaimOutcome {
@@ -819,6 +827,29 @@ pub struct ReclaimOutcome {
     /// requested destination and preserves evidence in the retained directory.
     /// Its pathname may have changed; never blindly retry or roll back it.
     pub failures: Vec<(PathBuf, String)>,
+    /// The subset of failures for which a rename already completed.
+    pub unconfirmed_moves: Vec<UnconfirmedReclaimMove>,
+}
+
+#[cfg(unix)]
+impl ReclaimOutcome {
+    fn record_move(&mut self, artifact: &DebrisArtifact, result: std::io::Result<PathBuf>) {
+        match result {
+            Ok(_) => {
+                self.moved += 1;
+                self.moved_bytes = self.moved_bytes.saturating_add(artifact.bytes);
+            }
+            Err(error) => {
+                if let Some(moved) = CompletedReclaimMove::from_io_error(&error) {
+                    self.unconfirmed_moves.push(UnconfirmedReclaimMove {
+                        source: artifact.path.clone(),
+                        requested_destination: moved.requested_destination().to_path_buf(),
+                    });
+                }
+                self.failures.push((artifact.path.clone(), error.to_string()));
+            }
+        }
+    }
 }
 
 /// Consolidate (MOVE — never delete) the planned debris into `dest_dir`.
@@ -861,13 +892,8 @@ pub fn consolidate_debris(plan: &ReclaimPlan, dest_dir: &Path) -> std::io::Resul
         let destination = namespace::claim_reclaim_directory(&absolute(dest_dir))?;
         let mut outcome = ReclaimOutcome::default();
         for art in &plan.prune {
-            match namespace::move_recovery_debris_into(&absolute(&art.path), &destination) {
-                Ok(_) => {
-                    outcome.moved += 1;
-                    outcome.moved_bytes = outcome.moved_bytes.saturating_add(art.bytes);
-                }
-                Err(error) => outcome.failures.push((art.path.clone(), error.to_string())),
-            }
+            let result = namespace::move_recovery_debris_into(&absolute(&art.path), &destination);
+            outcome.record_move(art, result);
         }
         Ok(outcome)
     }
@@ -1997,7 +2023,26 @@ mod tests {
         assert!(message.contains(&dest.join("evidence").display().to_string()));
         assert!(message.contains("durability is unconfirmed"));
         assert!(message.contains("do not retry or roll back"));
-        assert_eq!(std::fs::read_dir(dest).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+
+        let artifact = DebrisArtifact {
+            path: source.clone(),
+            bytes: 15,
+            modified_us: 0,
+            category: DebrisCategory::CorruptQuarantine,
+        };
+        let mut outcome = ReclaimOutcome::default();
+        outcome.record_move(&artifact, Err(error));
+        assert_eq!(outcome.moved, 0);
+        assert_eq!(outcome.moved_bytes, 0);
+        assert_eq!(outcome.failures, [(source.clone(), message)]);
+        assert_eq!(
+            outcome.unconfirmed_moves,
+            [UnconfirmedReclaimMove {
+                source,
+                requested_destination: dest.join("evidence"),
+            }],
+        );
     }
 
     #[cfg(unix)]
