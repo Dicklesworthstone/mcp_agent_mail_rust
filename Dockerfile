@@ -107,6 +107,8 @@ RUN set -eu; \
 FROM source AS builder
 ARG CARGO_BUILD_JOBS
 ARG TARGETARCH
+# Use the same Git client for locked Git dependencies as the source checkout.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 # Pre-install the pinned nightly toolchain so the build step's diagnostics
 # don't interleave a toolchain download with cargo output. `rustup show` is
