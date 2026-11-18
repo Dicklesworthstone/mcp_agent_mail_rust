@@ -1212,14 +1212,25 @@ mod tests {
 
     // These tests deliberately hold process-global admission locks. Isolate
     // them from unrelated libtests, while bounding a regressed child's life.
-    fn isolated() -> bool {
+    fn isolated(case: Option<usize>) -> bool {
         const CHILD: &str = "AM_TEST_ACTIVE_RESERVATION_ADMISSION_CHILD";
+        const CASE: &str = "AM_TEST_ACTIVE_RESERVATION_ADMISSION_CASE";
         let thread = std::thread::current();
         let name = thread.name().expect("named libtest thread");
         if std::env::var(CHILD).as_deref() == Ok(name) {
+            if let (Some(index), Ok(selected)) = (case, std::env::var(CASE)) {
+                return index != selected.parse::<usize>().expect("isolated fixture index");
+            }
             return false;
         }
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        if let Some(index) = case {
+            // Give each independent database and archive its own stall deadline.
+            command.env(CASE, index.to_string());
+        } else {
+            command.env_remove(CASE);
+        }
+        let mut child = command
             .args(["--exact", name, "--nocapture"])
             .env(CHILD, name)
             .stdout(std::process::Stdio::piped())
@@ -1240,14 +1251,14 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             !expired && output.status.success() && stdout.contains("1 passed; 0 failed"),
-            "isolated {name} failed (timeout={expired}): {stdout}\n{}",
+            "isolated {name} case={case:?} failed (timeout={expired}): {stdout}\n{}",
             String::from_utf8_lossy(&output.stderr),
         );
         true
     }
 
     fn fixture(test: impl FnOnce(&Cx, &DbPool, &Config)) {
-        if isolated() {
+        if isolated(None) {
             return;
         }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
@@ -1905,10 +1916,13 @@ mod tests {
 
     #[test]
     fn active_repair_preserves_equal_newer_and_malformed_revision_evidence() {
-        if isolated() {
-            return;
-        }
-        for revision in [json!(2), json!(3), json!(-1), json!("1"), Value::Null] {
+        for (index, revision) in [json!(2), json!(3), json!(-1), json!("1"), Value::Null]
+            .into_iter()
+            .enumerate()
+        {
+            if isolated(Some(index)) {
+                continue;
+            }
             fixture(|cx, pool, config| {
                 let conn = outcome(block_on(pool.acquire(cx))).unwrap();
                 conn.execute_raw("UPDATE file_reservations SET revision=2 WHERE id=401")
@@ -2020,10 +2034,7 @@ mod tests {
 
     #[test]
     fn renewal_refuses_terminal_newer_foreign_or_conflicting_surviving_evidence() {
-        if isolated() {
-            return;
-        }
-        for field in [
+        for (index, field) in [
             "released_ts",
             "expires_ts",
             "db_generation",
@@ -2036,7 +2047,13 @@ mod tests {
             "reason",
             "missing_expiry",
             "malformed",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if isolated(Some(index)) {
+                continue;
+            }
             fixture(|cx, pool, config| {
                 let source = seed_lost_renewal(cx, pool, config);
                 let path = target(config);
@@ -2112,10 +2129,7 @@ mod tests {
 
     #[test]
     fn staged_renewal_observes_independent_source_commits_and_preserves_archive_winners() {
-        if isolated() {
-            return;
-        }
-        for change in [
+        for (index, change) in [
             "release",
             "renewal",
             "revision",
@@ -2123,7 +2137,13 @@ mod tests {
             "terminal_file",
             "newer_file",
             "cancel",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if isolated(Some(index)) {
+                continue;
+            }
             fixture(|cx, pool, config| {
                 let source = seed_lost_renewal(cx, pool, config);
                 let path = target(config);
