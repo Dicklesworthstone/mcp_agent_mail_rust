@@ -8845,15 +8845,22 @@ fn auto_reclaim_recovery_debris_after_heal(database_url: &str, storage_root: &Pa
     let dest = storage_root.join("doctor").join("reclaimable").join(&ts);
     match rr::consolidate_debris(&plan, &dest) {
         Ok(outcome) => {
-            output::info(&format!(
-                "Consolidated {} stale recovery artifact(s) ({}) from the resolved incident into {} (moved, never deleted; remove that directory to free the disk)",
-                outcome.moved,
-                format_bytes(outcome.moved_bytes),
-                dest.display()
-            ));
+            if outcome.moved > 0 {
+                let destination_label = if outcome.failures.is_empty() {
+                    "Quarantine"
+                } else {
+                    "Requested quarantine"
+                };
+                output::info(&format!(
+                    "Consolidated {} stale recovery artifact(s) ({}). {destination_label} at {}",
+                    outcome.moved,
+                    format_bytes(outcome.moved_bytes),
+                    dest.display()
+                ));
+            }
             for (path, error) in &outcome.failures {
                 output::warn(&format!(
-                    "post-heal reclaim could not move {}: {error}",
+                    "post-heal reclaim incomplete for {}: {error}",
                     path.display()
                 ));
             }
@@ -11420,6 +11427,12 @@ struct DoctorReclaimArtifact {
 }
 
 #[derive(serde::Serialize)]
+struct DoctorReclaimUnconfirmedMove {
+    source: String,
+    requested_destination: String,
+}
+
+#[derive(serde::Serialize)]
 struct DoctorReclaimReport {
     storage_root: String,
     database: String,
@@ -11434,6 +11447,7 @@ struct DoctorReclaimReport {
     reclaimable_bytes: u64,
     kept_artifacts: usize,
     reclaimable: Vec<DoctorReclaimArtifact>,
+    /// Requested quarantine path when the reclaim is incomplete.
     #[serde(skip_serializing_if = "Option::is_none")]
     moved_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11441,6 +11455,7 @@ struct DoctorReclaimReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     moved_bytes: Option<u64>,
     failures: Vec<String>,
+    unconfirmed_moves: Vec<DoctorReclaimUnconfirmedMove>,
     note: String,
 }
 
@@ -12024,7 +12039,8 @@ fn handle_doctor_reclaim(
     let mut moved_to = None;
     let mut moved = None;
     let mut moved_bytes = None;
-    let mut failures: Vec<String> = Vec::new();
+    let mut failures = Vec::new();
+    let mut unconfirmed_moves = Vec::new();
 
     if apply && plan.has_reclaimable() {
         let ts = doctor_reclaim_directory_stamp();
@@ -12036,20 +12052,33 @@ fn handle_doctor_reclaim(
         moved_bytes = Some(outcome.moved_bytes);
         failures = outcome
             .failures
-            .iter()
+            .into_iter()
             .map(|(p, e)| format!("{}: {e}", p.display()))
+            .collect();
+        unconfirmed_moves = outcome
+            .unconfirmed_moves
+            .into_iter()
+            .map(|entry| DoctorReclaimUnconfirmedMove {
+                source: entry.source.display().to_string(),
+                requested_destination: entry.requested_destination.display().to_string(),
+            })
             .collect();
     }
 
-    let note = if apply {
+    let incomplete = !failures.is_empty();
+    let note = if !plan.has_reclaimable() {
+        "No stale recovery debris beyond the retention policy.".to_string()
+    } else if !apply {
+        "Preview only. Re-run with --yes to consolidate the stale debris into doctor/reclaimable/."
+            .to_string()
+    } else if incomplete {
+        "Reclaim incomplete. Keep the staged evidence and review the failures before retrying."
+            .to_string()
+    } else {
         format!(
-            "Moved {} stale artifact(s) into a reclaimable directory (nothing was deleted). Remove that directory with `rm -rf` to free the disk.",
+            "Moved {} stale artifact(s) into quarantine for review.",
             moved.unwrap_or(0)
         )
-    } else if plan.has_reclaimable() {
-        "Preview only — re-run with --yes to consolidate the stale debris into doctor/reclaimable/ (nothing is ever deleted automatically).".to_string()
-    } else {
-        "No stale recovery debris beyond the retention policy.".to_string()
     };
 
     let report = DoctorReclaimReport {
@@ -12077,7 +12106,8 @@ fn handle_doctor_reclaim(
         moved_to,
         moved,
         moved_bytes,
-        failures: failures.clone(),
+        failures,
+        unconfirmed_moves,
         note,
     };
 
@@ -12113,9 +12143,7 @@ fn handle_doctor_reclaim(
             ),
         );
         output::kv("Kept", &report.kept_artifacts.to_string());
-        if report.reclaimable.is_empty() {
-            output::emit_empty(fmt, "No stale recovery debris beyond the retention policy.");
-        } else {
+        if !report.reclaimable.is_empty() {
             ftui_runtime::ftui_println!("");
             output::section("  Reclaimable (oldest first):");
             let mut table = output::CliTable::new(vec!["CATEGORY", "SIZE", "PATH"]);
@@ -12130,7 +12158,12 @@ fn handle_doctor_reclaim(
         }
         if let Some(dest) = &report.moved_to {
             ftui_runtime::ftui_println!("");
-            output::kv("Moved to", dest);
+            let destination_label = if report.failures.is_empty() {
+                "Moved to"
+            } else {
+                "Requested quarantine"
+            };
+            output::kv(destination_label, dest);
             output::kv(
                 "Moved",
                 &format!(
@@ -12138,6 +12171,12 @@ fn handle_doctor_reclaim(
                     report.moved.unwrap_or(0),
                     format_bytes(report.moved_bytes.unwrap_or(0))
                 ),
+            );
+        }
+        if !report.unconfirmed_moves.is_empty() {
+            output::kv(
+                "Unconfirmed moves",
+                &report.unconfirmed_moves.len().to_string(),
             );
         }
         if !report.failures.is_empty() {
@@ -12151,7 +12190,7 @@ fn handle_doctor_reclaim(
         ftui_runtime::ftui_println!("{}", report.note);
     });
 
-    if !failures.is_empty() {
+    if incomplete {
         return Err(CliError::ExitCode(1));
     }
     Ok(())
@@ -67760,43 +67799,43 @@ startup_timeout_sec = 42
             &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
             || handle_doctor_reclaim(false, true, Some(0), Some(0), true),
         );
-        assert!(applied.is_ok(), "apply should succeed: {applied:?}");
-        assert!(!quarantine.exists(), "apply must move the quarantine out");
-        assert!(db_path.exists(), "apply must never touch the live DB");
-        assert!(
-            storage_root.join("storage.sqlite3.bak").exists(),
-            "apply must never touch the .bak"
+        assert_eq!(std::fs::read(db_path).unwrap(), b"live-db");
+        assert_eq!(
+            std::fs::read(storage_root.join("storage.sqlite3.bak")).unwrap(),
+            b"bak"
         );
         let reclaimable = storage_root.join("doctor").join("reclaimable");
-        assert!(
-            reclaimable.is_dir(),
-            "apply must create the reclaimable staging dir"
-        );
-        // The consolidated quarantine landed under reclaimable/<ts>/.
-        let found = walkdir_contains(&reclaimable, "storage.sqlite3.corrupt-20260101_000000_000");
-        assert!(
-            found,
-            "consolidated quarantine should exist under reclaimable/"
-        );
-    }
 
-    fn walkdir_contains(root: &Path, needle: &str) -> bool {
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.file_name().and_then(|n| n.to_str()) == Some(needle) {
-                    return true;
-                }
-                if path.is_dir() {
-                    stack.push(path);
-                }
-            }
+        #[cfg(unix)]
+        {
+            assert!(applied.is_ok(), "apply should succeed: {applied:?}");
+            assert!(!quarantine.exists());
+            assert!(!bundle.exists());
+            let mut runs = std::fs::read_dir(reclaimable).unwrap();
+            let run = runs.next().unwrap().unwrap().path();
+            assert!(runs.next().is_none());
+            assert_eq!(
+                std::fs::read(run.join(quarantine.file_name().unwrap())).unwrap(),
+                [0_u8; 64]
+            );
+            assert_eq!(
+                std::fs::read(run.join("repair-20260101_000000_000/sqlite/storage.sqlite3"))
+                    .unwrap(),
+                [0_u8; 128]
+            );
         }
-        false
+
+        #[cfg(not(unix))]
+        {
+            let error = applied.unwrap_err().to_string();
+            assert!(error.contains("consolidation is unsupported on this platform"));
+            assert_eq!(std::fs::read(quarantine).unwrap(), [0_u8; 64]);
+            assert_eq!(
+                std::fs::read(bundle.join("storage.sqlite3")).unwrap(),
+                [0_u8; 128]
+            );
+            assert!(!reclaimable.exists());
+        }
     }
 
     #[cfg(unix)]

@@ -1,5 +1,33 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 18 recovery quarantine reporting
+
+- [x] Claim `br-3p187` and trace the active manual and post-heal reclaim
+  paths to the shared directory-relative mover. Review backup rotation
+  separately because it has its own staging path.
+- [x] Reproduce a partial reclaim using a private SQLite database on
+  tmpfs and a forensic bundle on ext4. The prior binary moves the bundle,
+  leaves the cross-filesystem source, exits 1, and still tells the
+  operator to remove the quarantine.
+- [x] Carry the requested destination of a completed rename with
+  uncertain durability or directory identity through the DB result.
+  Keep failure details and count only confirmed moves and bytes.
+- [x] Expose those renames in `am doctor reclaim --json`. Report partial
+  results in human output and post-heal logs without suggesting removal.
+  Give an empty apply the same no-debris message as an empty preview.
+- [x] Check the CLI fixture's exact quarantined payloads, live database,
+  and backup. Assert that non-Unix builds refuse apply before mutation.
+- [ ] Run the patched executable on successful, empty, and
+  cross-filesystem partial reclaims. Verify exit codes, output, and all
+  source and destination bytes.
+- [ ] Run the retained-namespace and backup-rotation tests on Linux and
+  macOS. Verify how an injected failure after rename is surfaced.
+- [ ] Run the native Windows refusal or supported paths for both debris
+  reclaim and backup rotation before closing the bead.
+- [ ] Run the production and all-target workspace checks, strict Clippy,
+  formatting, and the targeted bug scan. Record scope and remaining
+  acceptance on the bead and check dependency cycles.
+
 ## November 18 manual source container identity
 
 - [x] Claim `br-8n66x` and trace the live manual Docker build. The
