@@ -1,5 +1,35 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 18 installer checksum uniqueness
+
+- [x] Run the new signed-manifest regressions on `0f837565`. The Unix
+  installer replaces both fixture binaries despite duplicate rows. The
+  PowerShell verifier accepts the duplicate and reaches archive hashing.
+- [x] Make both installers count matching rows after exact-tag Minisign
+  verification. Accept sha256sum's binary marker and `./` prefix. Require
+  the checksum and filename on the same line.
+- [x] Cover a repeated digest, a conflicting aliased digest, an invalid
+  duplicate digest, and a unique aliased row with a sidecar using real
+  signatures. The PowerShell suite also rejects a split checksum row.
+- [x] Run all seven PowerShell cases on Apple Silicon with real Minisign.
+  Try the configured Windows host. Its SSH connection times out.
+- [x] Run the full Unix installer suite on Linux and on macOS system Bash
+  3.2. The first macOS run stopped at the fixture's symlinked temp root.
+  Give the fixture a physical temp path, retain the lock checks, and pass
+  the full suite on both hosts.
+- [x] Verify the current public Unix script against the ACFS pin. ACFS
+  reports five unrelated drifts and the Agent Mail entry matches.
+- [x] Rehearse the canonical targeted ACFS update using the exact local
+  candidate digest. The generated and validated YAML changes only Agent
+  Mail and the timestamp. The live preflight and rehearsal are retained.
+- [x] Publish the PowerShell source and regression and record the Unix
+  result and the ACFS rehearsal on `br-l8z1h` and `br-quq4r`.
+- [ ] Coordinate the Unix script and ACFS pin publication. The two
+  canonical URLs live in separate repositories, and ACFS refuses the
+  installer when those bytes and the pinned digest disagree.
+- [ ] Run the installer on native Windows and qualify the positive
+  six-archive DSR release and its signing controls.
+
 ## November 18 release checksum and publication checks
 
 - [x] Compare the deployed DSR profile with the six archives advertised by

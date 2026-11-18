@@ -437,12 +437,19 @@ function Verify-MinisignSignedChecksum {
     }
     Write-Ok "Release manifest signature and exact release identity verified (minisign)"
 
-    $assetPattern = "(?im)^([a-f0-9]{64})\s+\*?(?:\./)?$([regex]::Escape($AssetName))\s*$"
-    $manifestMatch = [regex]::Match((Get-Content -LiteralPath $sha256sumsPath -Raw), $assetPattern)
-    if (-not $manifestMatch.Success) {
+    $assetPattern = "(?im)^[ \t]*(\S+)[ \t]+\*?(?:\./)?$([regex]::Escape($AssetName))[ \t]*\r?$"
+    $manifestMatches = [regex]::Matches((Get-Content -LiteralPath $sha256sumsPath -Raw), $assetPattern)
+    if ($manifestMatches.Count -eq 0) {
         throw "The authenticated SHA256SUMS manifest has no entry for $AssetName. The release asset inventory is incomplete; do not install it."
     }
-    Verify-ChecksumFile -FilePath $FilePath -ExpectedChecksum $manifestMatch.Groups[1].Value
+    if ($manifestMatches.Count -gt 1) {
+        throw "The authenticated SHA256SUMS manifest has multiple checksums for $AssetName."
+    }
+    $expectedChecksum = $manifestMatches[0].Groups[1].Value
+    if ($expectedChecksum -notmatch "^[a-f0-9]{64}$") {
+        throw "The authenticated SHA256SUMS entry for $AssetName is not a 64-hex-digit SHA-256 digest."
+    }
+    Verify-ChecksumFile -FilePath $FilePath -ExpectedChecksum $expectedChecksum
 }
 
 # LEGACY PATH (releases < $MinisignTrustMinVersion only). Releases >= v0.3.31

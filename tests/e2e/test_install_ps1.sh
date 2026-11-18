@@ -503,7 +503,8 @@ $artifact = Join-Path $root $assetName
 [System.IO.File]::WriteAllText($artifact, "signed installer fixture", $utf8)
 $manifest = Join-Path $global:MinisignFixtureDir "SHA256SUMS"
 $signature = "$manifest.minisig"
-$manifestText = "$(Get-Sha256Hex -FilePath $artifact)  $assetName`n"
+$archiveDigest = Get-Sha256Hex -FilePath $artifact
+$manifestText = "$archiveDigest  $assetName`n"
 [System.IO.File]::WriteAllText($manifest, $manifestText, $utf8)
 $requestedTag = "v9.8.7-rc.1"
 $global:MinisignExpectedBase = "https://example.invalid/releases/download/$requestedTag"
@@ -553,6 +554,25 @@ foreach ($suffix in @("SHA256SUMS", $commit, "source $commit SHA256SUMS")) {
     Verify-Fixture
     $accepted += 1
 }
+
+$differentDigest = "0" * 64
+foreach ($additionalRow in @(
+    "$archiveDigest  $assetName",
+    "$differentDigest *./$assetName",
+    "invalid  ./$assetName"
+)) {
+    [System.IO.File]::WriteAllText($manifest, "$archiveDigest  $assetName`r`n$additionalRow`r`n", $utf8)
+    Sign-Fixture "mcp_agent_mail_rust $requestedTag SHA256SUMS"
+    Assert-Rejected "multiple checksums for $assetName"
+}
+[System.IO.File]::WriteAllText($manifest, "$archiveDigest  $assetName.minisig`r`n$archiveDigest *./$assetName`r`n", $utf8)
+Sign-Fixture "mcp_agent_mail_rust $requestedTag SHA256SUMS"
+Verify-Fixture
+$accepted += 1
+[System.IO.File]::WriteAllText($manifest, "$archiveDigest`r`n$assetName`r`n", $utf8)
+Sign-Fixture "mcp_agent_mail_rust $requestedTag SHA256SUMS"
+Assert-Rejected "has no entry for $assetName"
+[System.IO.File]::WriteAllText($manifest, $manifestText, $utf8)
 
 foreach ($comment in @(
     "mcp_agent_mail_rust v9.8.6 SHA256SUMS",
