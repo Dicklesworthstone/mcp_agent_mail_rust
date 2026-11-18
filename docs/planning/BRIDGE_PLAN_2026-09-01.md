@@ -1,5 +1,28 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 18 manual source container identity
+
+- [x] Claim `br-8n66x` and trace the live manual Docker build. The
+  current Dockerfile uses the locked Cargo graph and no sibling checkout.
+  The historical Actions publisher stays disabled.
+- [x] Require a full lowercase commit, detach at the fetched object, and
+  compare the actual HEAD with the requested commit before building.
+- [x] Export a real BuildKit source stage and inspect its Git checkout,
+  Cargo.lock digest, and Rust toolchain file digest in the container.
+- [x] Run the same source stage with missing, branch, tag, short SHA, and
+  annotated-tag-object inputs. The tag object reaches checkout and fails
+  the HEAD check. The other four stop at input validation.
+- [x] Scope the Cargo build cache by commit and architecture. Record
+  verified source and toolchain inputs inside the image and label its
+  revision. Document local tags derived from both commit and image ID.
+- [ ] Run the actual locked portable Docker build with the final recipe.
+  Read the output image by ID, compare its label and embedded input
+  digests, and run the two binaries.
+- [ ] Verify the local tag resolves to that exact image ID and the
+  conformance tests detect checkout, cache, lock, and label drift.
+- [ ] Check formatting, BuildKit and UBS output. Update `br-8n66x` on
+  exact evidence and check the Beads graph for cycles.
+
 ## November 18 installer checksum uniqueness
 
 - [x] Run the new signed-manifest regressions on `0f837565`. The Unix
@@ -24,9 +47,10 @@
   Mail and the timestamp. The live preflight and rehearsal are retained.
 - [x] Publish the PowerShell source and regression and record the Unix
   result and the ACFS rehearsal on `br-l8z1h` and `br-quq4r`.
-- [ ] Coordinate the Unix script and ACFS pin publication. The two
-  canonical URLs live in separate repositories, and ACFS refuses the
-  installer when those bytes and the pinned digest disagree.
+- [x] Verify the public Unix script and ACFS pin after the maintainer's
+  coordinated publication. Agent Mail `80a64560` publishes the tested
+  script and ACFS `f1d9e7d9` pins the same SHA-256. Both public raw URLs
+  agree. The original DSR publication transition still needs proof.
 - [ ] Run the installer on native Windows and qualify the positive
   six-archive DSR release and its signing controls.
 

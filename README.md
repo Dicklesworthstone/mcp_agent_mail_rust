@@ -333,6 +333,25 @@ docker run -d --name agent-mail -p 127.0.0.1:8765:8765 \
 
 The image runs `mcp-agent-mail serve --no-tui` as the non-root `appuser`, serving MCP on port 8765 at `/mcp/`, with the whole mailbox (Git archive and SQLite) under `/data/mailbox`. Mount a volume there so mail survives replacing the container. Every request needs the token (`Authorization: Bearer <token>`); clients connect to `http://127.0.0.1:8765/mcp/` with it. Keep the published port on loopback unless remote agents should reach it. Docker's healthcheck polls `/health/liveness`. The image packages the release's Linux glibc binaries unchanged ([`Dockerfile.release`](Dockerfile.release)).
 
+For a local source image, resolve the revision before building and tag the
+result by both the source commit and its image ID. A rebuild that produces
+different bytes receives a different tag. Run these commands from the checkout
+with Docker Buildx installed. The selected commit must be fetchable from the
+project's GitHub repository.
+
+```bash
+revision=$(git rev-parse --verify 'HEAD^{commit}')
+build_dir=$(mktemp -d)
+docker buildx build --file Dockerfile --build-arg "AM_REF=$revision" \
+  --load --iidfile "$build_dir/image-id" "$build_dir" &&
+image_id=$(cat "$build_dir/image-id") &&
+docker image tag "$image_id" "mcp-agent-mail-rust:source-$revision-${image_id#sha256:}"
+```
+
+The resulting image exposes its commit in `org.opencontainers.image.revision`.
+It also records the Cargo lockfile and Rust toolchain file digests in
+`/usr/share/mcp-agent-mail/source-provenance`.
+
 ### From Source
 
 ```bash

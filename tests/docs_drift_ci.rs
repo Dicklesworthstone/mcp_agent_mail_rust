@@ -112,10 +112,15 @@ mod container_release_contract {
         }
 
         for needle in [
-            "if printf '%s' \"${AM_REF}\" | grep -Eq '^[0-9a-f]{40}$'; then",
+            "if [ \"${#revision}\" -ne 40 ] || ! printf '%s' \"$revision\" | grep -Eq '^[0-9a-f]{40}$'; then",
             "git fetch --depth 1 origin \"${AM_REF}\";",
-            "git checkout -q FETCH_HEAD;",
+            "git checkout -q --detach FETCH_HEAD;",
+            "if [ \"$(git rev-parse HEAD)\" != \"${AM_REF}\" ]; then",
+            "id=am-target-${TARGETARCH}-${AM_REF},target=/build/mcp_agent_mail_rust/target",
             "    cargo build --release --locked \\\n",
+            "sha256sum Cargo.lock rust-toolchain.toml >> /out/source-provenance",
+            "COPY --from=builder /out/source-provenance /usr/share/mcp-agent-mail/source-provenance",
+            "org.opencontainers.image.revision=\"${AM_REF}\"",
         ] {
             require_exactly_once(source_dockerfile, needle)?;
         }
@@ -332,7 +337,26 @@ mod container_release_contract {
         }
 
         let source_dockerfile_mutations = [
-            source_dockerfile.replacen("git checkout -q FETCH_HEAD;", "git checkout -q main;", 1),
+            source_dockerfile.replacen(
+                "git checkout -q --detach FETCH_HEAD;",
+                "git checkout -q main;",
+                1,
+            ),
+            source_dockerfile.replacen(
+                "if [ \"$(git rev-parse HEAD)\" != \"${AM_REF}\" ]; then",
+                "if false; then",
+                1,
+            ),
+            source_dockerfile.replacen(
+                "org.opencontainers.image.revision=\"${AM_REF}\"",
+                "org.opencontainers.image.revision=\"main\"",
+                1,
+            ),
+            source_dockerfile.replacen(
+                "id=am-target-${TARGETARCH}-${AM_REF},",
+                "id=am-target-${TARGETARCH},",
+                1,
+            ),
             source_dockerfile.replacen(
                 "cargo build --release --locked",
                 "cargo build --release",

@@ -7,16 +7,10 @@
 #
 # Build arguments
 # ---------------
-#   AM_REF       Git ref of mcp_agent_mail_rust to build (default: main).
-#                Pass a tag, branch, or commit SHA.
+#   AM_REF       Full lowercase commit SHA of mcp_agent_mail_rust to build.
+#                Resolve branches and tags before starting the build.
 #
-# Examples
-# --------
-#   # Build the current tip of main:
-#   docker build -t mcp-agent-mail-rust:dev .
-#
-#   # Build the exact current source commit:
-#   docker build --build-arg AM_REF="$(git rev-parse HEAD)" -t mcp-agent-mail-rust:dev .
+# See the README for the local source build and image tag commands.
 #
 # Runtime
 # -------
@@ -28,8 +22,8 @@
 # interactive operator console, override CMD with `am tui` and run with
 # `-it -e TUI_ENABLED=true`.
 
-# ─── Stage 1: builder ────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS builder
+# ─── Build toolchain and pinned source ───────────────────────────────────────
+FROM debian:bookworm-slim AS build-base
 
 # rustup is installed instead of FROM rust:<version>-slim because this
 # workspace pins a specific nightly via rust-toolchain.toml; rustup will
@@ -57,27 +51,25 @@ RUN curl --proto '=https' --tlsv1.2 -sSf \
     | sh -s -- -y --default-toolchain none --no-modify-path \
     && chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
 
-WORKDIR /build
-
-ARG AM_REF=main
-
-# Clone the requested source independently of the local working tree. Full
-# commit SHAs pin the project source; Cargo.lock binds dependency selection.
-# Git's --branch accepts branches/tags, so full SHAs use fetch + checkout.
-RUN set -eu; \
-    if printf '%s' "${AM_REF}" | grep -Eq '^[0-9a-f]{40}$'; then \
-      git init -q /build/mcp_agent_mail_rust; \
-      cd /build/mcp_agent_mail_rust; \
-      git remote add origin https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git; \
-      git fetch --depth 1 origin "${AM_REF}"; \
-      git checkout -q FETCH_HEAD; \
-    else \
-      git clone --depth 1 --branch "${AM_REF}" \
-        https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git \
-        /build/mcp_agent_mail_rust; \
-    fi
-
+FROM build-base AS source
 WORKDIR /build/mcp_agent_mail_rust
+ARG AM_REF
+
+# Fetch by commit and confirm the actual detached checkout before using it.
+RUN set -eu; \
+    revision="${AM_REF:-}"; \
+    if [ "${#revision}" -ne 40 ] || ! printf '%s' "$revision" | grep -Eq '^[0-9a-f]{40}$'; then \
+      echo "AM_REF must be a full lowercase commit SHA" >&2; \
+      exit 1; \
+    fi; \
+    git init -q; \
+    git remote add origin https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git; \
+    git fetch --depth 1 origin "${AM_REF}"; \
+    git checkout -q --detach FETCH_HEAD; \
+    if [ "$(git rev-parse HEAD)" != "${AM_REF}" ]; then \
+      echo "Fetched source does not match AM_REF" >&2; \
+      exit 1; \
+    fi
 
 # GH#256 drift guard: reject missing out-of-tree paths before Cargo starts.
 # Otherwise the failure mode is cargo dying deep into the build
@@ -112,6 +104,10 @@ RUN set -eu; \
     fi; \
     echo "+ every out-of-tree path dependency is present"
 
+FROM source AS builder
+ARG CARGO_BUILD_JOBS
+ARG TARGETARCH
+
 # Pre-install the pinned nightly toolchain so the build step's diagnostics
 # don't interleave a toolchain download with cargo output. `rustup show` is
 # the documented incantation that triggers rust-toolchain.toml resolution.
@@ -121,19 +117,23 @@ RUN rustup show active-toolchain || rustup show
 #   --no-default-features --features portable excludes the hybrid/fastembed
 #   ONNX runtime (its AVX2-only static libs SIGILL on older x86 CPUs).
 #   Portable retains s3fifo + tantivy-engine.
+# Keep the mutable target cache scoped to the verified commit and architecture.
+# Cached source layers can be older than artifacts from a different checkout.
 #
 # strip is applied here (in addition to the workspace `strip = "symbols"`
 # release profile) for belt-and-braces — keeps the runtime image small even
 # if the profile is ever relaxed.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,target=/build/mcp_agent_mail_rust/target,sharing=locked \
+    --mount=type=cache,id=am-target-${TARGETARCH}-${AM_REF},target=/build/mcp_agent_mail_rust/target,sharing=locked \
     cargo build --release --locked \
         -p mcp-agent-mail -p mcp-agent-mail-cli \
         --no-default-features --features portable \
     && mkdir -p /out \
     && cp target/release/mcp-agent-mail /out/mcp-agent-mail \
     && cp target/release/am             /out/am \
+    && printf 'revision=%s\n' "$(git rev-parse HEAD)" > /out/source-provenance \
+    && sha256sum Cargo.lock rust-toolchain.toml >> /out/source-provenance \
     && strip /out/mcp-agent-mail /out/am
 
 # Surface verification: refuse to ship if the two binaries got swapped or
@@ -179,6 +179,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /out/mcp-agent-mail /usr/local/bin/mcp-agent-mail
 COPY --from=builder /out/am             /usr/local/bin/am
+COPY --from=builder /out/source-provenance /usr/share/mcp-agent-mail/source-provenance
 
 # Environment defaults
 #   HTTP_HOST=0.0.0.0  — bind all interfaces (the in-container default of
@@ -219,8 +220,10 @@ ENTRYPOINT ["/usr/bin/tini", "--", "mcp-agent-mail"]
 CMD ["serve", "--no-tui"]
 
 # OCI labels — discoverable via `docker inspect` and shown on the GHCR page.
+ARG AM_REF
 LABEL org.opencontainers.image.title="MCP Agent Mail (Rust)" \
       org.opencontainers.image.description="Multi-agent coordination via MCP — Rust rewrite. Ships mcp-agent-mail (server) and am (operator CLI)." \
       org.opencontainers.image.source="https://github.com/Dicklesworthstone/mcp_agent_mail_rust" \
+      org.opencontainers.image.revision="${AM_REF}" \
       org.opencontainers.image.licenses="LicenseRef-MIT-Rider" \
       org.opencontainers.image.vendor="Jeff Emanuel"
