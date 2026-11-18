@@ -12,12 +12,31 @@
 - [x] Cover a current estimate, the exact expiry boundary, an out-of-order
   read, and the first sample after a gap. Check health text with and without
   a current estimate and exercise the real `health_check` response.
-- [ ] Run the descriptor regressions, production and all-target workspace
-  checks, and strict Clippy on the frozen source. Inspect the scoped UBS
-  findings alongside formatting and diff checks.
-- [ ] Keep `br-kp1in.29` open for the broader lock, queue and resource
-  watchdog acceptance, including the 1,000-run false-alarm test, the shared
-  sustained-suite predicates, and the release send-p50 overhead comparison.
+- [x] Re-read the diff and caller paths, check formatting and whitespace, and
+  review strict UBS findings. UBS exited 1 with 1,237 warnings and zero
+  critical findings across the three files. Changed-line warnings flag test
+  assertions and an expectation. The tracker constructor bounds the window
+  width to at least one microsecond.
+- [x] Run the core and tool descriptor regressions on the frozen source.
+  RCH job `30097323753216463` passed 11 core tests and both tool tests on
+  `ovh-a`, including the serialized health response. The source receipt
+  matches the three changed files, lockfile, and toolchain pin. The earlier
+  two-slot request timed out before Cargo started.
+- [x] Check production libraries and binaries separately from dev targets.
+  The warm-cache run `30097323753216479` passed on `hz2` with a matching
+  source receipt.
+- [x] Check all workspace targets. The warm-cache run `30097323753216472`
+  passed on `hz2` with a matching source receipt.
+- [x] Recover the initial compiler jobs `30097323753216453` and
+  `30097323753216455`. Both timed out at the remote execution limit and
+  recovered with terminal exit 120.
+- [x] Run strict workspace Clippy. RCH job `30097323753216451` passed on
+  `hz2` with `-D warnings` and a matching source receipt.
+- [x] Record the scoped results on `br-kp1in.29` and verify the Beads graph.
+- [ ] Complete the original `br-kp1in.29` acceptance. Remaining work
+  includes anytime-valid resource slopes, the 1,000-run false-alarm test,
+  shared sustained-suite predicates, and the 1% release send-p50 overhead
+  bound.
 
 ## November 17 live verification compatibility wrapper
 
