@@ -46,43 +46,7 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # Helpers
 # ---------------------------------------------------------------------------
 
-send_jsonrpc_session() {
-    local db_path="$1"; shift
-    local env_vars="$1"; shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    env $env_vars DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.3
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=15
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
-}
+export E2E_STDIO_TIMEOUT_SECONDS=7.5
 
 # Extract JSON-RPC result content text by request id
 extract_result() {
@@ -134,7 +98,7 @@ print('false')
 # ---------------------------------------------------------------------------
 e2e_case_banner "Setup: project + agent with worktrees enabled"
 
-SETUP_RESP="$(send_jsonrpc_session "$SLOT_DB" "WORKTREES_ENABLED=true" \
+SETUP_RESP="$(WORKTREES_ENABLED=true e2e_stdio_session "$SLOT_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_PATH}\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"GoldFox\",\"task_description\":\"disabled slot testing\"}}}" \
@@ -157,7 +121,7 @@ fi
 # ---------------------------------------------------------------------------
 e2e_case_banner "acquire_slot_when_disabled_false"
 
-RESP="$(send_jsonrpc_session "$SLOT_DB" "WORKTREES_ENABLED=false" \
+RESP="$(WORKTREES_ENABLED=false e2e_stdio_session "$SLOT_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"acquire_build_slot\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"slot\":\"build-1\",\"ttl_seconds\":3600}}}" \
 )"
@@ -178,7 +142,7 @@ fi
 # ---------------------------------------------------------------------------
 e2e_case_banner "renew_slot_when_disabled_false"
 
-RESP="$(send_jsonrpc_session "$SLOT_DB" "WORKTREES_ENABLED=false" \
+RESP="$(WORKTREES_ENABLED=false e2e_stdio_session "$SLOT_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"renew_build_slot\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"slot\":\"build-1\",\"ttl_seconds\":3600}}}" \
 )"
@@ -196,7 +160,7 @@ fi
 # ---------------------------------------------------------------------------
 e2e_case_banner "release_slot_when_disabled_false"
 
-RESP="$(send_jsonrpc_session "$SLOT_DB" "WORKTREES_ENABLED=false" \
+RESP="$(WORKTREES_ENABLED=false e2e_stdio_session "$SLOT_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"release_build_slot\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"slot\":\"build-1\"}}}" \
 )"
@@ -217,7 +181,7 @@ e2e_case_banner "acquire_slot_when_env_unset"
 # Use env -u to unset the variable entirely
 RESP="$(
     unset WORKTREES_ENABLED
-    send_jsonrpc_session "$SLOT_DB" "WORKTREES_ENABLED_UNRELATED=1" \
+    WORKTREES_ENABLED_UNRELATED=1 e2e_stdio_session "$SLOT_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"acquire_build_slot\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"slot\":\"build-2\",\"ttl_seconds\":3600}}}" \
 )"
@@ -235,7 +199,7 @@ fi
 # ---------------------------------------------------------------------------
 e2e_case_banner "acquire_slot_enabled_control"
 
-RESP="$(send_jsonrpc_session "$SLOT_DB" "WORKTREES_ENABLED=true" \
+RESP="$(WORKTREES_ENABLED=true e2e_stdio_session "$SLOT_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"acquire_build_slot\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"slot\":\"build-ctrl\",\"ttl_seconds\":3600}}}" \
 )"

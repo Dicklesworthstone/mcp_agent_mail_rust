@@ -23,43 +23,8 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 send_jsonrpc_session() {
     local db_path="$1"
     shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.2
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=12
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
-    fi
+    E2E_STDIO_TIMEOUT_SECONDS=3.6 RUST_LOG=error \
+        e2e_stdio_session "$db_path" "$@"
 }
 
 # Helper: check tool call succeeded (id match, no isError)
@@ -155,6 +120,19 @@ RESP="$(send_jsonrpc_session "$UNI_DB" \
 )"
 e2e_save_artifact "case_01_emoji_message.txt" "$RESP"
 assert_tool_ok "send message with emoji subject + CJK body" "$RESP" 100
+EMOJI_MESSAGE_ID="$(RESP="$RESP" python3 - <<'PY'
+import json
+import os
+
+responses = [json.loads(line) for line in os.environ["RESP"].splitlines() if line.strip()]
+response = next(item for item in responses if item.get("id") == 100)
+payload = json.loads(response["result"]["content"][0]["text"])
+message_id = payload["deliveries"][0]["payload"]["id"]
+if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+    raise ValueError("emoji message response did not contain a positive message id")
+print(message_id)
+PY
+)"
 
 # ===========================================================================
 # Case 2: Fetch inbox returns Unicode content intact
@@ -219,10 +197,21 @@ e2e_case_banner "Reply with RTL text"
 
 RESP="$(send_jsonrpc_session "$UNI_DB" \
     "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":500,"method":"tools/call","params":{"name":"reply_message","arguments":{"project_key":"/tmp/e2e_日本語_プロジェクト","message_id":1,"sender_name":"SilverWolf","body_md":"شكراً لك! هذا رائع\n\nתודה רבה! זה נהדר"}}}' \
+    '{"jsonrpc":"2.0","id":500,"method":"tools/call","params":{"name":"reply_message","arguments":{"project_key":"/tmp/e2e_日本語_プロジェクト","message_id":'"${EMOJI_MESSAGE_ID}"',"sender_name":"SilverWolf","body_md":"شكراً لك! هذا رائع\n\nתודה רבה! זה נהדר"}}}' \
 )"
 e2e_save_artifact "case_05_rtl_reply.txt" "$RESP"
 assert_tool_ok "reply with Arabic + Hebrew text" "$RESP" 500
+RTL_REPLY_TO="$(RESP="$RESP" python3 - <<'PY'
+import json
+import os
+
+responses = [json.loads(line) for line in os.environ["RESP"].splitlines() if line.strip()]
+response = next(item for item in responses if item.get("id") == 500)
+payload = json.loads(response["result"]["content"][0]["text"])
+print(payload["reply_to"])
+PY
+)"
+e2e_assert_eq "RTL reply addresses the emoji message" "$EMOJI_MESSAGE_ID" "$RTL_REPLY_TO"
 
 # ===========================================================================
 # Case 6: Message with zero-width characters and combining marks

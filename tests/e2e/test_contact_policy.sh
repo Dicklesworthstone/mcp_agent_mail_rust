@@ -25,45 +25,7 @@ POL_DB="${WORK}/contact_policy.sqlite3"
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-contact-policy","version":"1.0"}}}'
 
 send_jsonrpc_session() {
-    local db_path="$1"
-    shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.2
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=12
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
-    fi
+    E2E_STDIO_TIMEOUT_SECONDS=3.6 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 assert_ok() {

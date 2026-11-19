@@ -30,6 +30,8 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 WORK="$(e2e_mktemp "e2e_timestamps")"
 TS_DB="${WORK}/timestamps_test.sqlite3"
 PROJECT_PATH="/tmp/e2e_timestamps_$$"
+CLOCK_AGENT="RedFox"
+TIMER_AGENT="BlueLake"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-timestamps","version":"1.0"}}}'
 
@@ -38,40 +40,7 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # ---------------------------------------------------------------------------
 
 send_jsonrpc_session() {
-    local db_path="$1"; shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.1  # Short delay for rapid message test
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=30
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+    E2E_STDIO_TIMEOUT_SECONDS=15 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 extract_result() {
@@ -176,13 +145,13 @@ print('NO_MATCH')
 # ===========================================================================
 # Setup: Create project and agents
 # ===========================================================================
-e2e_case_banner "Setup: project + agents (Clock, Timer)"
+e2e_case_banner "Setup: Clock=$CLOCK_AGENT, Timer=$TIMER_AGENT"
 
 SETUP_RESP="$(send_jsonrpc_session "$TS_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_PATH}\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"Clock\",\"task_description\":\"timestamp E2E testing\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"Timer\",\"task_description\":\"timestamp E2E testing\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${CLOCK_AGENT}\",\"task_description\":\"timestamp E2E testing\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${TIMER_AGENT}\",\"task_description\":\"timestamp E2E testing\"}}}" \
 )"
 e2e_save_artifact "case_00_setup.txt" "$SETUP_RESP"
 
@@ -195,11 +164,11 @@ assert_ok "register Timer" "$SETUP_RESP" 12
 # ===========================================================================
 e2e_case_banner "Rapid messages: verify strictly increasing timestamps"
 
-RAPID_RESP="$(send_jsonrpc_session "$TS_DB" \
+RAPID_RESP="$(send_jsonrpc_session --pipeline "$TS_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"Clock\",\"to\":[\"Timer\"],\"subject\":\"Rapid 1\",\"body_md\":\"First rapid message.\",\"thread_id\":\"RAPID-1\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"Clock\",\"to\":[\"Timer\"],\"subject\":\"Rapid 2\",\"body_md\":\"Second rapid message.\",\"thread_id\":\"RAPID-1\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"Clock\",\"to\":[\"Timer\"],\"subject\":\"Rapid 3\",\"body_md\":\"Third rapid message.\",\"thread_id\":\"RAPID-1\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${CLOCK_AGENT}\",\"to\":[\"${TIMER_AGENT}\"],\"subject\":\"Rapid 1\",\"body_md\":\"First rapid message.\",\"thread_id\":\"RAPID-1\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${CLOCK_AGENT}\",\"to\":[\"${TIMER_AGENT}\"],\"subject\":\"Rapid 2\",\"body_md\":\"Second rapid message.\",\"thread_id\":\"RAPID-1\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${CLOCK_AGENT}\",\"to\":[\"${TIMER_AGENT}\"],\"subject\":\"Rapid 3\",\"body_md\":\"Third rapid message.\",\"thread_id\":\"RAPID-1\"}}}" \
 )"
 e2e_save_artifact "case_01_rapid.txt" "$RAPID_RESP"
 
@@ -208,9 +177,9 @@ assert_ok "rapid message 2" "$RAPID_RESP" 21
 assert_ok "rapid message 3" "$RAPID_RESP" 22
 
 # Extract timestamps from responses
-TS1="$(parse_json_field "$(extract_result "$RAPID_RESP" 20)" "created_ts")"
-TS2="$(parse_json_field "$(extract_result "$RAPID_RESP" 21)" "created_ts")"
-TS3="$(parse_json_field "$(extract_result "$RAPID_RESP" 22)" "created_ts")"
+TS1="$(parse_json_field "$(extract_result "$RAPID_RESP" 20)" "deliveries.0.payload.created_ts")"
+TS2="$(parse_json_field "$(extract_result "$RAPID_RESP" 21)" "deliveries.0.payload.created_ts")"
+TS3="$(parse_json_field "$(extract_result "$RAPID_RESP" 22)" "deliveries.0.payload.created_ts")"
 
 e2e_save_artifact "case_01_timestamps.txt" "TS1=$TS1\nTS2=$TS2\nTS3=$TS3"
 
@@ -281,7 +250,7 @@ e2e_case_banner "fetch_inbox: verify timestamp format and ordering"
 
 INBOX_RESP="$(send_jsonrpc_session "$TS_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"Timer\",\"include_bodies\":true}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${TIMER_AGENT}\",\"include_bodies\":true}}}" \
 )"
 e2e_save_artifact "case_03_inbox.txt" "$INBOX_RESP"
 
@@ -396,7 +365,7 @@ e2e_save_artifact "case_04_msg_id.txt" "$MSG_ID"
 if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "" ]; then
     MARK_RESP="$(send_jsonrpc_session "$TS_DB" \
         "$INIT_REQ" \
-        "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"mark_message_read\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"Timer\",\"message_id\":${MSG_ID}}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"mark_message_read\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${TIMER_AGENT}\",\"message_id\":${MSG_ID}}}}" \
     )"
     e2e_save_artifact "case_04_mark_read.txt" "$MARK_RESP"
 
@@ -427,15 +396,15 @@ e2e_case_banner "acknowledge_message: verify ack_ts constraint"
 # Send a message that requires acknowledgment
 ACK_MSG_RESP="$(send_jsonrpc_session "$TS_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"Clock\",\"to\":[\"Timer\"],\"subject\":\"Acknowledge me\",\"body_md\":\"Please acknowledge this message.\",\"ack_required\":true}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${CLOCK_AGENT}\",\"to\":[\"${TIMER_AGENT}\"],\"subject\":\"Acknowledge me\",\"body_md\":\"Please acknowledge this message.\",\"ack_required\":true}}}" \
 )"
 e2e_save_artifact "case_05_send_ack_required.txt" "$ACK_MSG_RESP"
 
 assert_ok "send ack_required message" "$ACK_MSG_RESP" 50
 
 ACK_MSG_TEXT="$(extract_result "$ACK_MSG_RESP" 50)"
-ACK_MSG_ID="$(parse_json_field "$ACK_MSG_TEXT" "message_id")"
-ACK_MSG_CREATED="$(parse_json_field "$ACK_MSG_TEXT" "created_ts")"
+ACK_MSG_ID="$(parse_json_field "$ACK_MSG_TEXT" "deliveries.0.payload.id")"
+ACK_MSG_CREATED="$(parse_json_field "$ACK_MSG_TEXT" "deliveries.0.payload.created_ts")"
 
 e2e_save_artifact "case_05_ack_msg.txt" "id=$ACK_MSG_ID created=$ACK_MSG_CREATED"
 
@@ -445,7 +414,7 @@ if [ -n "$ACK_MSG_ID" ] && [ "$ACK_MSG_ID" != "" ]; then
 
     ACK_RESP="$(send_jsonrpc_session "$TS_DB" \
         "$INIT_REQ" \
-        "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/call\",\"params\":{\"name\":\"acknowledge_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"Timer\",\"message_id\":${ACK_MSG_ID}}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/call\",\"params\":{\"name\":\"acknowledge_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${TIMER_AGENT}\",\"message_id\":${ACK_MSG_ID}}}}" \
     )"
     e2e_save_artifact "case_05_acknowledge.txt" "$ACK_RESP"
 
@@ -601,7 +570,7 @@ e2e_case_banner "Persistence: verify timestamps survive DB round-trip"
 # Re-fetch inbox and compare timestamps
 REFETCH_RESP="$(send_jsonrpc_session "$TS_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"Timer\",\"include_bodies\":true}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${TIMER_AGENT}\",\"include_bodies\":true}}}" \
 )"
 e2e_save_artifact "case_08_refetch.txt" "$REFETCH_RESP"
 

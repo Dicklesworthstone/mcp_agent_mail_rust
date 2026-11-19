@@ -83,36 +83,15 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 send_jsonrpc_session() {
     local db_path="$1"
     shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
     local stderr_file="${WORK}/session_stderr_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "${fifo}"
+    local status=0
+    E2E_STDIO_BINARY="${AM_BIN}" E2E_STDIO_STDERR_PATH="${stderr_file}" \
+        STORAGE_ROOT="${STORAGE_ROOT}" RUST_LOG=error WORKTREES_ENABLED=true \
+        e2e_stdio_session "${db_path}" "$@" || status=$?
 
-    DATABASE_URL="sqlite:///${db_path}" STORAGE_ROOT="${STORAGE_ROOT}" RUST_LOG=error WORKTREES_ENABLED=true \
-        "${AM_BIN}" serve-stdio < "${fifo}" > "${output_file}" 2>"${stderr_file}" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        local req
-        for req in "${requests[@]}"; do
-            echo "${req}"
-            sleep 0.08
-        done
-        sleep 0.2
-    } > "${fifo}"
-
-    wait "${srv_pid}" 2>/dev/null || true
-
-    e2e_save_artifact "session/request.jsonl" "$(printf '%s\n' "${requests[@]}")"
+    e2e_save_artifact "session/request.jsonl" "$(printf '%s\n' "$@")"
     [ -f "${stderr_file}" ] && e2e_save_artifact "session/server_stderr.txt" "$(cat "${stderr_file}")"
-
-    if [ -f "${output_file}" ]; then
-        cat "${output_file}"
-    fi
+    return "${status}"
 }
 
 extract_result() {

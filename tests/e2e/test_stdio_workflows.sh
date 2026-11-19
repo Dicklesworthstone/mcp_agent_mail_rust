@@ -32,6 +32,7 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 
 # Temp workspace
 WORK="$(e2e_mktemp "e2e_stdio_wf")"
+STORAGE_ROOT="${WORK}/storage"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-workflows","version":"1.0"}}}'
 
@@ -41,46 +42,9 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 send_session() {
     local db_path="$1"
     shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_${RANDOM}.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    local storage_root="${SESSION_STORAGE_ROOT:-${WORK}/storage}"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="$storage_root" RUST_LOG=error WORKTREES_ENABLED=true \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.5
-        done
-        # Keep FIFO open briefly so server processes the last request
-        sleep 1
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=20
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
-    fi
+    local storage_root="${SESSION_STORAGE_ROOT:-$STORAGE_ROOT}"
+    E2E_STDIO_TIMEOUT_SECONDS=10 STORAGE_ROOT="$storage_root" RUST_LOG=error WORKTREES_ENABLED=true \
+        e2e_stdio_session "$db_path" "$@"
 }
 
 # Extract JSON text from a tools/call response for a given request id.
@@ -587,7 +551,10 @@ REQS8=(
     "{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"tools/call\",\"params\":{\"name\":\"products_link\",\"arguments\":{\"product_key\":\"E2E Product\",\"project_key\":\"/tmp/e2e_wf_product_b\"}}}"
     '{"jsonrpc":"2.0","id":85,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_wf_product_a","program":"e2e","model":"test","name":"CoralBay"}}}'
     '{"jsonrpc":"2.0","id":86,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_wf_product_b","program":"e2e","model":"test","name":"MistyCove"}}}'
-    '{"jsonrpc":"2.0","id":87,"method":"tools/call","params":{"name":"send_message","arguments":{"project_key":"/tmp/e2e_wf_product_a","sender_name":"CoralBay","to":["MistyCove"],"subject":"Cross-project ping","body_md":"Testing product bus routing.","thread_id":"e2e-product-thread"}}}'
+    '{"jsonrpc":"2.0","id":861,"method":"tools/call","params":{"name":"request_contact","arguments":{"project_key":"/tmp/e2e_wf_product_a","from_agent":"CoralBay","to_agent":"MistyCove","to_project":"/tmp/e2e_wf_product_b","reason":"product bus workflow"}}}'
+    '{"jsonrpc":"2.0","id":862,"method":"tools/call","params":{"name":"respond_contact","arguments":{"project_key":"/tmp/e2e_wf_product_b","to_agent":"MistyCove","from_agent":"CoralBay","from_project":"/tmp/e2e_wf_product_a","accept":true}}}'
+    '{"jsonrpc":"2.0","id":87,"method":"tools/call","params":{"name":"send_message","arguments":{"project_key":"/tmp/e2e_wf_product_a","sender_name":"CoralBay","to":["MistyCove@/tmp/e2e_wf_product_b"],"subject":"Cross-project ping","body_md":"Testing product bus routing.","thread_id":"e2e-product-thread"}}}'
+    '{"jsonrpc":"2.0","id":871,"method":"tools/call","params":{"name":"send_message","arguments":{"project_key":"/tmp/e2e_wf_product_a","sender_name":"CoralBay","to":["CoralBay"],"subject":"Cross-project ping","body_md":"Healthy project record retained when the linked peer becomes unavailable.","thread_id":"e2e-product-thread"}}}'
     "{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox_product\",\"arguments\":{\"product_key\":\"E2E Product\",\"agent_name\":\"MistyCove\",\"limit\":5}}}"
     "{\"jsonrpc\":\"2.0\",\"id\":89,\"method\":\"tools/call\",\"params\":{\"name\":\"search_messages_product\",\"arguments\":{\"product_key\":\"E2E Product\",\"query\":\"cross-project\",\"limit\":10}}}"
 )
@@ -616,10 +583,24 @@ else
 fi
 
 # 8c: cross-project message sent
+if [ "$(is_error "$RESP8" 861)" = "OK" ] && [ "$(is_error "$RESP8" 862)" = "OK" ]; then
+    e2e_pass "product: cross-project contact approved"
+else
+    e2e_fail "product: cross-project contact approval failed"
+fi
+
 if [ "$(is_error "$RESP8" 87)" = "OK" ]; then
     e2e_pass "product: cross-project message sent"
 else
     e2e_fail "product: cross-project message send failed"
+fi
+
+# Qualified delivery lives in project B; the partial-failure drill also needs
+# an independent message in the healthy project A.
+if [ "$(is_error "$RESP8" 871)" = "OK" ]; then
+    e2e_pass "product partial: healthy project message seeded"
+else
+    e2e_fail "product partial: healthy project message seeding failed"
 fi
 
 # 8d: product-wide inbox
@@ -629,6 +610,7 @@ if [ -n "$INBOX8_TEXT" ] && [ "$INBOX8_TEXT" != "" ]; then
 else
     e2e_fail "product: fetch_inbox_product returned empty"
 fi
+e2e_assert_contains "product: peer inbox contains cross-project delivery" "$INBOX8_TEXT" "Cross-project ping"
 
 # 8e: product-wide search
 SEARCH8_TEXT="$(extract_tool_result "$RESP8" 89)"

@@ -540,9 +540,9 @@ e2e_mktemp() {
             return 2
             ;;
     esac
-    td="$(mktemp -d "${E2E_REAL_TMPDIR%/}/${prefix}.XXXXXX")"
+    td="$(mktemp -d "${E2E_REAL_TMPDIR%/}/${prefix}.XXXXXX")" || return 1
     _E2E_TMP_DIRS+=("$td")
-    printf '%s\n' "$td" >> "$_E2E_TMP_REGISTRY"
+    printf '%s\n' "$td" >> "$_E2E_TMP_REGISTRY" || return 1
     echo "$td"
 }
 
@@ -584,6 +584,11 @@ _e2e_cleanup() {
 }
 
 trap _e2e_cleanup EXIT
+
+# Each suite starts with its own archive even when invoked from an operator
+# shell. A fixture can still select a different archive after sourcing this file.
+_E2E_SUITE_STORAGE_ROOT="$(e2e_mktemp e2e_archive)" || return 1
+export STORAGE_ROOT="$_E2E_SUITE_STORAGE_ROOT"
 
 # ---------------------------------------------------------------------------
 # Artifact management
@@ -928,7 +933,9 @@ e2e_write_suite_manifest_json() {
     fi
 
     local rust_version binary_version os_name arch_name rerun_command
-    rust_version="$(rustc --version 2>/dev/null || echo "")"
+    # Reporting an installed binary must not download a toolchain into a
+    # fresh test home just to fill in an optional manifest field.
+    rust_version="$(RUSTUP_AUTO_INSTALL=0 rustc --version 2>/dev/null || echo "")"
     binary_version="$(_e2e_binary_version)"
     os_name="$(uname -s 2>/dev/null || echo "")"
     arch_name="$(uname -m 2>/dev/null || echo "")"
@@ -2873,6 +2880,100 @@ e2e_ensure_binary() {
 }
 
 # ---------------------------------------------------------------------------
+# Run an initialized MCP stdio session against a real server. By default each
+# response precedes the next request. --pipeline submits the remaining batch
+# together after the handshake, retaining every response for the caller.
+e2e_stdio_session() {
+    local mode=ordered
+    if [ "${1:-}" = "--pipeline" ]; then
+        mode=pipeline
+        shift
+    fi
+    python3 - "$mode" "$E2E_ARTIFACT_DIR/logs" "$@" <<'PY'
+import json
+import os
+from pathlib import Path
+import queue
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+mode, log_dir, db_path, *frames = sys.argv[1:]
+first, *requests = [json.loads(frame) for frame in frames]
+if first.get("method") != "initialize" or "id" not in first:
+    sys.exit("The first stdio request must be initialize with an id")
+deadline = time.monotonic() + float(os.environ.get("E2E_STDIO_TIMEOUT_SECONDS", "15"))
+env = dict(os.environ, DATABASE_URL="sqlite:///" + Path(db_path).absolute().as_posix())
+env.setdefault("RUST_LOG", "error")
+stderr_path = env.get("E2E_STDIO_STDERR_PATH")
+with (open(stderr_path, "wb") if stderr_path else
+      tempfile.NamedTemporaryFile(dir=log_dir, prefix="stdio-", suffix=".log", delete=False)) as log:
+    server = subprocess.Popen([env.get("E2E_STDIO_BINARY", "am"), "serve-stdio"],
+                              env=env, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=log, text=True, encoding="utf-8")
+lines = queue.Queue()
+
+def read_stdout():
+    try:
+        for line in server.stdout:
+            lines.put(line)
+    finally:
+        lines.put(None)
+
+def send(request):
+    server.stdin.write(json.dumps(request) + "\n")
+    server.stdin.flush()
+
+def receive(pending):
+    while pending:
+        try:
+            line = lines.get(timeout=max(0, deadline - time.monotonic()))
+        except queue.Empty:
+            print(f"Timed out waiting for stdio response ids {sorted(pending, key=str)}. See {log.name}", file=sys.stderr)
+            sys.exit(124)
+        if line is None:
+            sys.exit(f"Server exited before stdio response ids {sorted(pending, key=str)}. See {log.name}")
+        response = json.loads(line)
+        print(line, end="", flush=True)
+        if "result" in response or "error" in response:
+            pending.remove(response["id"])
+    return response
+
+try:
+    threading.Thread(target=read_stdout, daemon=True).start()
+    send(first)
+    if "error" in receive({first["id"]}):
+        sys.exit("MCP initialize failed")
+    if not requests or requests[0].get("method") != "notifications/initialized":
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    pending = set()
+    for request in requests:
+        send(request)
+        if "id" in request:
+            pending.add(request["id"])
+            if mode == "ordered":
+                receive(pending)
+    if pending:
+        receive(pending)
+    server.stdin.close()
+    # The request budget ends at the last reply. EOF also needs to drain
+    # acknowledged archive work before the next session opens this mailbox.
+    try:
+        exit_code = server.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        sys.exit(f"stdio server did not exit within five seconds after EOF. See {log.name}")
+    if exit_code:
+        sys.exit(f"stdio server exited with status {exit_code}. See {log.name}")
+finally:
+    if server.poll() is None:
+        server.kill()
+    server.wait()
+PY
+}
+
+# ---------------------------------------------------------------------------
 # Server Log Capture (br-3h13.12.2)
 # ---------------------------------------------------------------------------
 #
@@ -3877,7 +3978,10 @@ e2e_capture_final_state() {
     fi
 
     # 2. Storage tree
-    local storage_root="${STORAGE_ROOT:-${_E2E_SERVER_STORAGE_ROOT:-}}"
+    local storage_root="${STORAGE_ROOT:-}"
+    if [ -z "$storage_root" ] || [ "$storage_root" = "${_E2E_SUITE_STORAGE_ROOT:-}" ]; then
+        storage_root="${_E2E_SERVER_STORAGE_ROOT:-$storage_root}"
+    fi
     if [ -n "$storage_root" ] && [ -d "$storage_root" ]; then
         e2e_snapshot_storage_tree "$storage_root" "final"
     fi

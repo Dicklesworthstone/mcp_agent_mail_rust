@@ -39,40 +39,7 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # ---------------------------------------------------------------------------
 
 send_jsonrpc_session() {
-    local db_path="$1"; shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.3
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=25
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+    E2E_STDIO_TIMEOUT_SECONDS=12.5 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 extract_result() {
@@ -151,6 +118,8 @@ SETUP_RESP="$(send_jsonrpc_session "$MSG_DB" \
     "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_PATH}\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"RedFox\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"SilverWolf\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RedFox\",\"policy\":\"open\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"SilverWolf\",\"policy\":\"open\"}}}" \
 )"
 e2e_save_artifact "setup.txt" "$SETUP_RESP"
 
@@ -161,6 +130,12 @@ if [ "$RF_ERR" = "false" ] && [ "$SW_ERR" = "false" ]; then
 else
     e2e_fail "setup failed"
 fi
+
+# Keep this messaging corpus free of automatic contact-approval notices.
+RF_POLICY_TEXT="$(extract_result "$SETUP_RESP" 13)"
+SW_POLICY_TEXT="$(extract_result "$SETUP_RESP" 14)"
+e2e_assert_eq "RedFox fixture policy is open" "open" "$(parse_json_field "$RF_POLICY_TEXT" "policy")"
+e2e_assert_eq "SilverWolf fixture policy is open" "open" "$(parse_json_field "$SW_POLICY_TEXT" "policy")"
 
 # ===========================================================================
 # Case 1: send_message with thread + ack_required

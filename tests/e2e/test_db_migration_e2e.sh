@@ -8,7 +8,7 @@
 #   1. Fresh DB creation: start with no DB, create it, verify schema tables exist
 #   2. Schema version check: verify migration tracking table has applied entries
 #   3. Data roundtrip: create data, stop server, restart, verify data intact
-#   4. FTS integrity: after DB creation, verify FTS table exists and search works
+#   4. Search V3 integrity: persisted data is searchable with retired FTS absent
 #   5. Multiple restarts: create data, restart 3 times, verify data survives
 #   6. Concurrent access after migration: multiple sessions against same DB
 
@@ -38,39 +38,10 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 
 send_jsonrpc_session() {
     local db_path="$1"; shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.3
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=25
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+    local archive_root="${db_path}.archive"
+    mkdir -p "$archive_root"
+    E2E_STDIO_TIMEOUT_SECONDS=12.5 STORAGE_ROOT="$archive_root" RUST_LOG=error \
+        e2e_stdio_session "$db_path" "$@"
 }
 
 extract_result() {
@@ -150,9 +121,7 @@ e2e_log "Migration DB: $MIGRATION_DB"
 
 # ---------------------------------------------------------------------------
 # Smoke check: verify the am binary can successfully run ensure_project.
-# If FrankenSQLite (pure-Rust SQLite) lacks CREATE TRIGGER / CREATE VIRTUAL
-# TABLE support, the pool initialiser fails and every tool call returns
-# "not implemented".  In that case we skip the entire suite gracefully.
+# Initialization must succeed before this suite can establish persistence.
 # ---------------------------------------------------------------------------
 SMOKE_DB="${WORK}/smoke_check.sqlite3"
 SMOKE_RESP="$(send_jsonrpc_session "$SMOKE_DB" \
@@ -161,17 +130,16 @@ SMOKE_RESP="$(send_jsonrpc_session "$SMOKE_DB" \
 )"
 SMOKE_ERR="$(is_error_result "$SMOKE_RESP" 2)"
 SMOKE_TEXT="$(extract_result "$SMOKE_RESP" 2)"
-if [ "$SMOKE_ERR" = "true" ] && echo "$SMOKE_TEXT" | grep -q "not implemented"; then
-    e2e_log "SMOKE CHECK FAILED: am binary cannot run migrations (FrankenSQLite limitation)"
-    e2e_log "Error text: $SMOKE_TEXT"
-    e2e_log "Skipping entire suite -- all tests require working migrations"
-    # Register one case so summary is valid, then skip all tests
-    e2e_case_banner "Smoke check: server can create and migrate DB"
-    e2e_skip "am binary migration unsupported (FrankenSQLite lacks CREATE TRIGGER/VIRTUAL TABLE)"
+e2e_save_artifact "case_00_smoke.txt" "$SMOKE_RESP"
+e2e_case_banner "Smoke check: server can create and migrate DB"
+if [ "$SMOKE_ERR" = "true" ]; then
+    e2e_fail "am binary must initialize the mailbox: $SMOKE_TEXT"
     e2e_summary
-    exit $?
+    exit 1
+else
+    e2e_pass "server initializes a real fresh mailbox"
 fi
-rm -f "$SMOKE_DB" "${SMOKE_DB}-wal" "${SMOKE_DB}-shm" 2>/dev/null
+# Retain the independent smoke database and its sidecars as startup evidence.
 
 # ===========================================================================
 # Case 1: Fresh DB creation -- no DB file exists, server creates it
@@ -180,7 +148,9 @@ e2e_case_banner "Fresh DB creation: verify schema tables are created"
 
 # Ensure DB does not yet exist
 if [ -f "$MIGRATION_DB" ]; then
-    rm -f "$MIGRATION_DB"
+    e2e_fail "fresh migration fixture unexpectedly already exists"
+    e2e_summary
+    exit 1
 fi
 
 FRESH_RESP="$(send_jsonrpc_session "$MIGRATION_DB" \
@@ -223,13 +193,14 @@ if [ "$HAS_SQLITE3" = "true" ]; then
     TABLE_LIST="$(sqlite3 "$MIGRATION_DB" ".tables" 2>/dev/null || echo "")"
     e2e_save_artifact "case_02_tables.txt" "$TABLE_LIST"
 
-    for tbl in projects agents messages message_recipients file_reservations agent_links fts_messages; do
+    for tbl in projects agents messages message_recipients file_reservations agent_links; do
         if echo "$TABLE_LIST" | grep -qw "$tbl"; then
             e2e_pass "table '$tbl' exists in schema"
         else
             e2e_fail "table '$tbl' missing from schema"
         fi
     done
+    e2e_assert_not_contains "retired message FTS table stays absent" "$TABLE_LIST" "fts_messages"
 
     # Check WAL mode is active
     JOURNAL_MODE="$(sqlite3 "$MIGRATION_DB" "PRAGMA journal_mode;" 2>/dev/null || echo "")"
@@ -252,6 +223,8 @@ SESSION_A_RESP="$(send_jsonrpc_session "$MIGRATION_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"migration-e2e\",\"model\":\"test-model\",\"name\":\"GoldFox\",\"task_description\":\"migration roundtrip testing\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"migration-e2e\",\"model\":\"test-model\",\"name\":\"SilverWolf\",\"task_description\":\"migration roundtrip peer\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":34,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"policy\":\"open\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":35,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"SilverWolf\",\"policy\":\"open\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"GoldFox\",\"to\":[\"SilverWolf\"],\"subject\":\"Migration roundtrip test\",\"body_md\":\"Verifying data survives restart.\",\"importance\":\"high\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":33,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"paths\":[\"src/migration_test.rs\"],\"ttl_seconds\":7200,\"exclusive\":true,\"reason\":\"migration e2e test\"}}}" \
 )"
@@ -262,6 +235,10 @@ GF_ERR="$(is_error_result "$SESSION_A_RESP" 30)"
 SW_ERR="$(is_error_result "$SESSION_A_RESP" 31)"
 MSG_ERR="$(is_error_result "$SESSION_A_RESP" 32)"
 RES_ERR="$(is_error_result "$SESSION_A_RESP" 33)"
+e2e_assert_eq "GoldFox contact policy is open for fixture messages" "open" \
+    "$(parse_json_field "$(extract_result "$SESSION_A_RESP" 34)" "policy")"
+e2e_assert_eq "SilverWolf contact policy is open for fixture messages" "open" \
+    "$(parse_json_field "$(extract_result "$SESSION_A_RESP" 35)" "policy")"
 
 if [ "$GF_ERR" = "false" ] && [ "$SW_ERR" = "false" ]; then
     e2e_pass "session A: both agents registered"
@@ -340,9 +317,9 @@ e2e_assert_eq "agent name persists across restart" "GoldFox" "$WHOIS_NAME"
 e2e_assert_eq "agent program persists across restart" "migration-e2e" "$WHOIS_PROGRAM"
 
 # ===========================================================================
-# Case 4: FTS integrity -- search works on data created in prior session
+# Case 4: Search V3 integrity -- persisted messages remain searchable
 # ===========================================================================
-e2e_case_banner "FTS integrity: search_messages works after restart"
+e2e_case_banner "Search V3 integrity: search_messages works after restart"
 
 FTS_RESP="$(send_jsonrpc_session "$MIGRATION_DB" \
     "$INIT_REQ" \
@@ -380,24 +357,15 @@ e2e_save_artifact "case_04_fts_parsed.txt" "$FTS_CHECK"
 e2e_assert_contains "FTS search found the message" "$FTS_CHECK" "count=1"
 e2e_assert_contains "FTS search matched correct subject" "$FTS_CHECK" "Migration roundtrip test"
 
-# Direct FTS table verification with sqlite3
+# Runtime search is independent of the retired SQLite FTS tables and triggers.
 if [ "$HAS_SQLITE3" = "true" ]; then
-    FTS_ROW_COUNT="$(sqlite3 "$MIGRATION_DB" "SELECT COUNT(*) FROM fts_messages;" 2>/dev/null || echo "ERROR")"
-    if [ "$FTS_ROW_COUNT" != "ERROR" ] && [ "$FTS_ROW_COUNT" -gt 0 ] 2>/dev/null; then
-        e2e_pass "fts_messages table has $FTS_ROW_COUNT rows"
-    else
-        e2e_fail "fts_messages table empty or inaccessible (got: $FTS_ROW_COUNT)"
-    fi
-
-    # Verify FTS match query works directly
-    FTS_DIRECT="$(sqlite3 "$MIGRATION_DB" "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'roundtrip';" 2>/dev/null || echo "ERROR")"
-    if [ "$FTS_DIRECT" != "ERROR" ] && [ "$FTS_DIRECT" -gt 0 ] 2>/dev/null; then
-        e2e_pass "direct FTS MATCH query found results"
-    else
-        e2e_fail "direct FTS MATCH query failed (got: $FTS_DIRECT)"
-    fi
+    RETIRED_FTS_TABLES="$(sqlite3 "$MIGRATION_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fts_messages';")"
+    RETIRED_FTS_TRIGGERS="$(sqlite3 "$MIGRATION_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND lower(COALESCE(sql,'')) LIKE '%fts_messages%';")"
+    e2e_save_artifact "case_04_retired_fts_cleanup.txt" "tables=${RETIRED_FTS_TABLES} triggers=${RETIRED_FTS_TRIGGERS}"
+    e2e_assert_eq "Search V3 serves persisted data without legacy FTS tables" "0" "$RETIRED_FTS_TABLES"
+    e2e_assert_eq "retired FTS triggers stay absent after restart" "0" "$RETIRED_FTS_TRIGGERS"
 else
-    e2e_skip "sqlite3 not available for direct FTS check"
+    e2e_skip "sqlite3 not available for retired FTS cleanup check"
 fi
 
 # ===========================================================================
@@ -816,7 +784,7 @@ EOF
     )"
     e2e_save_artifact "case_10_legacy_migration.txt" "$LEGACY_RESP"
 
-    # Verify whois succeeds on migrated data (optional - may fail if FTS5 unsupported)
+    # Migrated rows must remain available through the real public tools.
     WHOIS_ERR="$(is_error_result "$LEGACY_RESP" 200)"
     if [ "$WHOIS_ERR" = "false" ]; then
         WHOIS_TEXT="$(extract_result "$LEGACY_RESP" 200)"
@@ -824,14 +792,13 @@ EOF
         if [ "$WHOIS_NAME" = "LegacyFox" ]; then
             e2e_pass "post-migration: whois LegacyFox succeeded"
         else
-            e2e_skip "post-migration: whois returned wrong name (FTS5/project mismatch)"
+            e2e_fail "post-migration: whois returned the wrong legacy identity"
         fi
     else
-        # MCP tools may fail if FTS5 not fully supported - core timestamp tests still valid
-        e2e_skip "post-migration: whois skipped (FTS5/MCP transport limitation)"
+        e2e_fail "post-migration: whois must read the migrated legacy identity"
     fi
 
-    # Verify fetch_inbox succeeds (optional - may fail if FTS5 unsupported)
+    # Verify fetch_inbox reads the preserved legacy delivery.
     INBOX_ERR="$(is_error_result "$LEGACY_RESP" 201)"
     if [ "$INBOX_ERR" = "false" ]; then
         INBOX_TEXT="$(extract_result "$LEGACY_RESP" 201)"
@@ -850,13 +817,13 @@ except:
         if [ "$INBOX_CHECK" = "FOUND" ]; then
             e2e_pass "post-migration: fetch_inbox found legacy message"
         else
-            e2e_skip "post-migration: inbox check skipped (message not found)"
+            e2e_fail "post-migration: inbox must contain the legacy message"
         fi
     else
-        e2e_skip "post-migration: fetch_inbox skipped (FTS5/MCP transport limitation)"
+        e2e_fail "post-migration: fetch_inbox must succeed"
     fi
 
-    # Verify search works on migrated data (optional - may fail if FTS5 unsupported)
+    # Search V3 must index and retrieve the migrated legacy message.
     SEARCH_ERR="$(is_error_result "$LEGACY_RESP" 202)"
     if [ "$SEARCH_ERR" = "false" ]; then
         SEARCH_TEXT="$(extract_result "$LEGACY_RESP" 202)"
@@ -873,10 +840,10 @@ except:
         if [ "$SEARCH_COUNT" -ge 1 ] 2>/dev/null; then
             e2e_pass "post-migration: search found $SEARCH_COUNT result(s) for 'Legacy'"
         else
-            e2e_skip "post-migration: search skipped (no results)"
+            e2e_fail "post-migration: search must retrieve the legacy message"
         fi
     else
-        e2e_skip "post-migration: search_messages skipped (FTS5/MCP transport limitation)"
+        e2e_fail "post-migration: search_messages must succeed"
     fi
 
     # Capture post-migration snapshot and verify timestamps converted to INTEGER
@@ -948,21 +915,11 @@ except:
         e2e_fail "timestamp value not in microseconds range: $PROJ_TS_VAL"
     fi
 
-    # Verify FTS table exists and has porter stemmer (optional - FTS5 may not be supported)
+    # The legacy migration must also leave the runtime FTS-free.
     FTS_TABLE_INFO="$(sqlite3 "$LEGACY_DB" "SELECT sql FROM sqlite_master WHERE type='table' AND name='fts_messages'" 2>/dev/null)"
     e2e_save_artifact "case_10_fts_table_info.txt" "$FTS_TABLE_INFO"
-    if echo "$FTS_TABLE_INFO" | grep -qi "porter"; then
-        e2e_pass "FTS table has porter stemmer"
-    else
-        # FTS5 virtual tables may not be fully supported in FrankenSQLite
-        FTS_EXISTS="$(sqlite3 "$LEGACY_DB" "SELECT COUNT(*) FROM fts_messages" 2>/dev/null || echo "0")"
-        if [ "$FTS_EXISTS" != "0" ] && [ "$FTS_EXISTS" != "" ]; then
-            e2e_pass "FTS table exists with $FTS_EXISTS rows"
-        else
-            # FTS5 not supported - this is a known limitation, not a migration failure
-            e2e_skip "FTS table not created (FrankenSQLite FTS5 limitation)"
-        fi
-    fi
+    LEGACY_FTS_COUNT="$(sqlite3 "$LEGACY_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fts_messages';")"
+    e2e_assert_eq "legacy migration leaves the retired FTS table absent" "0" "$LEGACY_FTS_COUNT"
 fi
 
 # ===========================================================================

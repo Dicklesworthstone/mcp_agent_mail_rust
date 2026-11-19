@@ -39,40 +39,7 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # ---------------------------------------------------------------------------
 
 send_jsonrpc_session() {
-    local db_path="$1"; shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.3
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=25
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+    E2E_STDIO_TIMEOUT_SECONDS=12.5 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 # Extract result text from a tools/call response (result.content[0].text)
@@ -520,7 +487,7 @@ SHORT_TTL_PATH="scratch/short_ttl_probe.txt"
 
 SHORT_TTL_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"paths\":[\"${SHORT_TTL_PATH}\"],\"ttl_seconds\":1,\"exclusive\":true,\"reason\":\"short ttl probe\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"paths\":[\"${SHORT_TTL_PATH}\"],\"ttl_seconds\":60,\"exclusive\":true,\"reason\":\"short ttl probe\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/${PROJECT_SLUG}\"}}" \
 )"
 e2e_save_artifact "case_07_short_ttl_create.txt" "$SHORT_TTL_RESP"
@@ -559,11 +526,28 @@ except Exception as e:
 e2e_save_artifact "case_07_short_ttl_before.txt" "$SHORT_TTL_BEFORE_CHECK"
 e2e_assert_contains "short-TTL reservation visible immediately" "$SHORT_TTL_BEFORE_CHECK" "has_short=True"
 
-sleep 2
+SHORT_TTL_EXPIRES_TS="$(parse_json_field "$SHORT_TTL_TOOL_TEXT" "granted.0.expires_ts")"
+e2e_log "Waiting for the granted minimum-TTL expiry: $SHORT_TTL_EXPIRES_TS"
+python3 - "$SHORT_TTL_EXPIRES_TS" <<'PY'
+from datetime import datetime, timezone
+import sys
+import time
+
+expires = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+deadline = time.monotonic() + 65
+while True:
+    remaining = (expires - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= 0:
+        break
+    if remaining > 65 or time.monotonic() >= deadline:
+        sys.exit("The granted minimum-TTL reservation did not expire within 65 seconds")
+    time.sleep(min(remaining, 0.5))
+PY
 
 SHORT_TTL_AFTER_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/${PROJECT_SLUG}\"}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/${PROJECT_SLUG}?active_only=true\"}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":73,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/${PROJECT_SLUG}?active_only=false\"}}" \
 )"
 e2e_save_artifact "case_07_short_ttl_after.txt" "$SHORT_TTL_AFTER_RESP"
 
@@ -582,6 +566,26 @@ except Exception as e:
 e2e_save_artifact "case_07_short_ttl_after_check.txt" "$SHORT_TTL_AFTER_CHECK"
 e2e_assert_contains "expired reservation not present in active view" "$SHORT_TTL_AFTER_CHECK" "has_short=False"
 e2e_assert_contains "active reservations remain empty after expiry" "$SHORT_TTL_AFTER_CHECK" "count=0"
+
+SHORT_TTL_HISTORY_TEXT="$(extract_resource_text "$SHORT_TTL_AFTER_RESP" 73)"
+e2e_save_artifact "case_07_short_ttl_history.txt" "$SHORT_TTL_HISTORY_TEXT"
+SHORT_TTL_HISTORY_CHECK="$(echo "$SHORT_TTL_HISTORY_TEXT" | python3 -c '
+import sys, json
+try:
+    rows = json.loads(sys.stdin.read())
+    matching = [row for row in rows if row.get("path_pattern") == sys.argv[1]]
+    expiry_preserved = len(matching) == 1 and matching[0].get("expires_ts") == sys.argv[2]
+    not_released = len(matching) == 1 and matching[0].get("released_ts") is None
+    print(f"count={len(matching)}")
+    print(f"expiry_preserved={expiry_preserved}")
+    print(f"not_released={not_released}")
+except Exception as error:
+    print(f"PARSE_ERROR: {error}")
+' "$SHORT_TTL_PATH" "$SHORT_TTL_EXPIRES_TS")"
+e2e_save_artifact "case_07_short_ttl_history_check.txt" "$SHORT_TTL_HISTORY_CHECK"
+e2e_assert_contains "expired reservation remains in historical view" "$SHORT_TTL_HISTORY_CHECK" "count=1"
+e2e_assert_contains "historical view preserves the granted expiry" "$SHORT_TTL_HISTORY_CHECK" "expiry_preserved=True"
+e2e_assert_contains "expiry did not release or remove the reservation" "$SHORT_TTL_HISTORY_CHECK" "not_released=True"
 
 # ===========================================================================
 # Case 8: Error case -- file_reservations for nonexistent project

@@ -108,48 +108,8 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 send_jsonrpc_session() {
     local db_path="$1"
     shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$RANDOM.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:///${db_path}" STORAGE_ROOT="${STORAGE_ROOT}" RUST_LOG=error WORKTREES_ENABLED=true \
-        "${AM_BIN}" serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        echo "$INIT_REQ"
-        sleep 0.05
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.08
-        done
-        sleep 0.2
-    } > "$fifo"
-
-    local timeout_s="${SEARCH_QUALITY_SESSION_TIMEOUT_S:-60}"
-    local deadline_ms now_ms
-    deadline_ms=$(($(_e2e_now_ms) + timeout_s * 1000))
-    local timed_out=false
-    while kill -0 "$srv_pid" 2>/dev/null; do
-        now_ms="$(_e2e_now_ms)"
-        if [ "$now_ms" -ge "$deadline_ms" ]; then
-            timed_out=true
-            break
-        fi
-        sleep 0.2
-    done
-    if [ "$timed_out" = true ]; then
-        kill "$srv_pid" 2>/dev/null || true
-        wait "$srv_pid" 2>/dev/null || true
-        cat "${srv_work}/stderr.txt" >&2 2>/dev/null || true
-        return 124
-    fi
-    wait "$srv_pid" 2>/dev/null || true
-    cat "$output_file"
+    E2E_STDIO_BINARY="$AM_BIN" E2E_STDIO_TIMEOUT_SECONDS="${SEARCH_QUALITY_SESSION_TIMEOUT_S:-60}" \
+        WORKTREES_ENABLED=true e2e_stdio_session "$db_path" "$INIT_REQ" "$@"
 }
 
 mcp_tool() {
@@ -224,13 +184,10 @@ parse_search_payload() {
     local payload="$1"
     echo "$payload" | python3 -c "
 import sys, json
-try:
-    data = json.loads(sys.stdin.read())
-except Exception:
-    data = {}
-items = data.get('result', []) if isinstance(data, dict) else []
+data = json.load(sys.stdin)
+items = data['result']
 if not isinstance(items, list):
-    items = []
+    sys.exit('search result must be a list')
 ids = []
 subjects = []
 project_ids = []
@@ -238,9 +195,7 @@ from_values = []
 importance_values = []
 thread_ids = []
 for item in items:
-    if not isinstance(item, dict):
-        continue
-    ids.append(int(item.get('id', 0) or 0))
+    ids.append(int(item['id']))
     subjects.append(str(item.get('subject', '')))
     if item.get('project_id') is not None:
         project_ids.append(int(item.get('project_id')))
@@ -331,6 +286,8 @@ SETUP_RESP="$(send_jsonrpc_session "$DB_PATH" \
     "$(mcp_tool 34 send_message "{\"project_key\":\"$PROJECT_B\",\"sender_name\":\"RedPeak\",\"to\":[\"BlueLake\"],\"subject\":\"Cache warmup follow-up\",\"body_md\":\"frankensearch cache warmup and quality notes\",\"importance\":\"normal\",\"thread_id\":\"srch-b-cache\"}")" \
     "$(mcp_tool 35 send_message "{\"project_key\":\"$PROJECT_C\",\"sender_name\":\"BlueLake\",\"to\":[\"RedPeak\"],\"subject\":\"Gamma secret message\",\"body_md\":\"${SCOPE_CANARY_TOKEN} should never appear in product scoped results\",\"importance\":\"urgent\",\"thread_id\":\"srch-c-secret\"}")" \
     "$(mcp_tool 36 send_message "{\"project_key\":\"$PROJECT_A\",\"sender_name\":\"BlueLake\",\"to\":[\"RedPeak\"],\"subject\":\"Temporary ghost marker ${GHOST_TOKEN}\",\"body_md\":\"${GHOST_TOKEN} for stale index rejection check\",\"importance\":\"normal\",\"thread_id\":\"srch-ghost\"}")" \
+    "$(mcp_tool 37 send_message "{\"project_key\":\"$PROJECT_A\",\"sender_name\":\"BlueLake\",\"to\":[\"RedPeak\"],\"subject\":\"Product bridge alpha signal\",\"body_md\":\"${PRODUCT_BRIDGE_TOKEN} alpha side product-linked search signal\",\"importance\":\"high\",\"thread_id\":\"srch-a-prod\"}")" \
+    "$(mcp_tool 38 send_message "{\"project_key\":\"$PROJECT_B\",\"sender_name\":\"BlueLake\",\"to\":[\"RedPeak\"],\"subject\":\"Product bridge beta signal\",\"body_md\":\"${PRODUCT_BRIDGE_TOKEN} beta side product-linked search signal\",\"importance\":\"high\",\"thread_id\":\"srch-b-prod\"}")" \
 )"
 e2e_save_artifact "setup_response.txt" "$SETUP_RESP"
 
@@ -356,146 +313,42 @@ print(','.join(str(x) for x in bad))
 if [ -z "$SETUP_ERRORS" ]; then
     e2e_pass "setup tool calls completed without RPC-level errors"
 else
-    e2e_log "setup tool calls reported errors for request ids: $SETUP_ERRORS (repairing state via direct DB checks)"
+    e2e_fail "setup tool calls failed for request ids: $SETUP_ERRORS"
+    e2e_summary
+    exit 1
 fi
 
-SETUP_STATE="$(python3 - "$DB_PATH" "$PROJECT_A" "$PROJECT_B" "$PROJECT_C" "$PRODUCT_KEY" "$ROLLBACK_TOKEN" "$SCOPE_CANARY_TOKEN" "$GHOST_TOKEN" "$PRODUCT_BRIDGE_TOKEN" <<'PY'
+SETUP_STATE="$(python3 - "$DB_PATH" "$PROJECT_A" "$PROJECT_B" "$PROJECT_C" "$PRODUCT_KEY" <<'PY'
 import json
+from pathlib import Path
 import sqlite3
 import sys
-import time
 
-db_path, project_a, project_b, project_c, product_key, rollback_token, canary_token, ghost_token, product_bridge_token = sys.argv[1:10]
-
-conn = sqlite3.connect(db_path)
-cur = conn.cursor()
-now_us = int(time.time() * 1_000_000)
-
-def ensure_project(human_key, slug_hint):
-    cur.execute("SELECT id, slug FROM projects WHERE human_key = ? ORDER BY id LIMIT 1", (human_key,))
-    row = cur.fetchone()
-    if row:
-        return int(row[0]), row[1], False
-    slug = slug_hint
-    suffix = 0
-    while True:
-        try:
-            cur.execute(
-                "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
-                (slug, human_key, now_us),
-            )
-            return int(cur.lastrowid), slug, True
-        except sqlite3.IntegrityError:
-            suffix += 1
-            slug = f"{slug_hint}-{suffix}"
-
-def ensure_agent(project_id, name):
-    cur.execute(
-        "SELECT id FROM agents WHERE project_id = ? AND lower(name) = lower(?) LIMIT 1",
-        (project_id, name),
-    )
-    row = cur.fetchone()
-    if row:
-        return int(row[0]), False
-    cur.execute(
-        "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) "
-        "VALUES (?, ?, ?, ?, '', ?, ?, 'auto', 'auto')",
-        (project_id, name, "e2e", "test", now_us, now_us),
-    )
-    return int(cur.lastrowid), True
-
-def ensure_product(name):
-    cur.execute(
-        "SELECT id, product_uid FROM products WHERE lower(name) = lower(?) OR product_uid = ? LIMIT 1",
-        (name, name),
-    )
-    row = cur.fetchone()
-    if row:
-        return int(row[0]), row[1], False
-    cur.execute(
-        "INSERT INTO products (product_uid, name, created_at) VALUES (?, ?, ?)",
-        (name, name, now_us),
-    )
-    return int(cur.lastrowid), name, True
-
-def ensure_link(product_id, project_id):
-    cur.execute(
-        "INSERT OR IGNORE INTO product_project_links (product_id, project_id, created_at) VALUES (?, ?, ?)",
-        (product_id, project_id, now_us),
-    )
-
-def ensure_message(project_id, sender_id, recipient_id, thread_id, subject, body_md, importance):
-    cur.execute(
-        "SELECT id FROM messages WHERE project_id = ? AND subject = ? LIMIT 1",
-        (project_id, subject),
-    )
-    row = cur.fetchone()
-    if row:
-        return int(row[0]), False
-    cur.execute(
-        "INSERT INTO messages (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) "
-        "VALUES (?, ?, ?, ?, ?, ?, 0, ?, '[]')",
-        (project_id, sender_id, thread_id, subject, body_md, importance, now_us),
-    )
-    message_id = int(cur.lastrowid)
-    if recipient_id > 0:
-        cur.execute(
-            "INSERT OR IGNORE INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, 'to', NULL, NULL)",
-            (message_id, recipient_id),
-        )
-    return message_id, True
-
-pid_a, _, created_pa = ensure_project(project_a, "project-alpha")
-pid_b, _, created_pb = ensure_project(project_b, "project-beta")
-pid_c, _, created_pc = ensure_project(project_c, "project-gamma")
-
-blue_a, created_blue_a = ensure_agent(pid_a, "BlueLake")
-red_a, created_red_a = ensure_agent(pid_a, "RedPeak")
-blue_b, created_blue_b = ensure_agent(pid_b, "BlueLake")
-red_b, created_red_b = ensure_agent(pid_b, "RedPeak")
-blue_c, created_blue_c = ensure_agent(pid_c, "BlueLake")
-red_c, created_red_c = ensure_agent(pid_c, "RedPeak")
-
-product_id, product_uid, created_product = ensure_product(product_key)
-ensure_link(product_id, pid_a)
-ensure_link(product_id, pid_b)
-
-signals = [
-    ensure_message(pid_a, blue_a, red_a, "srch-a-roll", "Critical rollback plan for search migration",
-                   f"{rollback_token} urgent rollback planning for frankensearch integration", "urgent"),
-    ensure_message(pid_a, blue_a, red_a, "srch-a-roll", "Deployment rollback checklist for search",
-                   f"{rollback_token} deployment rollback checklist and runbook", "high"),
-    ensure_message(pid_a, red_a, blue_a, "srch-a-bench", "Search benchmark baseline",
-                   "baseline metrics for lexical and hybrid search relevance", "normal"),
-    ensure_message(pid_b, blue_b, red_b, "srch-b-roll", "Rollback strategy for billing service",
-                   f"{rollback_token} rollback strategy for product-linked project beta", "urgent"),
-    ensure_message(pid_b, red_b, blue_b, "srch-b-cache", "Cache warmup follow-up",
-                   "frankensearch cache warmup and quality notes", "normal"),
-    ensure_message(pid_c, blue_c, red_c, "srch-c-secret", "Gamma secret message",
-                   f"{canary_token} should never appear in product scoped results", "urgent"),
-    ensure_message(pid_a, blue_a, red_a, "srch-ghost", f"Temporary ghost marker {ghost_token}",
-                   f"{ghost_token} for stale index rejection check", "normal"),
-    ensure_message(pid_a, blue_a, red_a, "srch-a-prod", "Product bridge alpha signal",
-                   f"{product_bridge_token} alpha side product-linked search signal", "high"),
-    ensure_message(pid_b, blue_b, red_b, "srch-b-prod", "Product bridge beta signal",
-                   f"{product_bridge_token} beta side product-linked search signal", "high"),
-]
-
-cur.execute("SELECT COUNT(*) FROM messages")
-base_messages = int(cur.fetchone()[0])
-conn.commit()
+db_path, project_a, project_b, project_c, product_key = sys.argv[1:]
+db = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+projects = dict(db.execute("SELECT human_key, id FROM projects"))
+product_id, product_uid = db.execute(
+    "SELECT id, product_uid FROM products WHERE name = ?", (product_key,)
+).fetchone()
+linked = {row[0] for row in db.execute(
+    "SELECT project_id FROM product_project_links WHERE product_id = ?", (product_id,)
+)}
+if linked != {projects[project_a], projects[project_b]}:
+    sys.exit("The persisted product links differ from the two requested projects")
+signals = dict(db.execute(
+    "SELECT project_id, count(*) FROM messages WHERE thread_id GLOB 'srch-*' GROUP BY project_id"
+))
+if signals != {projects[project_a]: 5, projects[project_b]: 3, projects[project_c]: 1}:
+    sys.exit(f"Unexpected counts of persisted MCP seed messages: {signals}")
 
 print(json.dumps({
-    "project_a_id": pid_a,
-    "project_b_id": pid_b,
-    "project_c_id": pid_c,
+    "project_a_id": projects[project_a],
+    "project_b_id": projects[project_b],
+    "project_c_id": projects[project_c],
     "product_id": product_id,
     "product_uid": product_uid,
-    "created_projects": int(created_pa) + int(created_pb) + int(created_pc),
-    "created_agents": int(created_blue_a) + int(created_red_a) + int(created_blue_b) + int(created_red_b) + int(created_blue_c) + int(created_red_c),
-    "created_product": int(created_product),
-    "created_signal_messages": sum(1 for _, created in signals if created),
-    "base_messages": base_messages,
+    "seed_messages": sum(signals.values()),
+    "base_messages": db.execute("SELECT count(*) FROM messages").fetchone()[0],
 }))
 PY
 )"
@@ -506,11 +359,7 @@ PROJECT_A_ID="$(echo "$SETUP_STATE" | jq -r '.project_a_id')"
 PROJECT_B_ID="$(echo "$SETUP_STATE" | jq -r '.project_b_id')"
 PROJECT_C_ID="$(echo "$SETUP_STATE" | jq -r '.project_c_id')"
 
-if [ "${BASE_MESSAGES:-0}" -ge 7 ]; then
-    e2e_pass "setup state verified and repaired (base_messages=$BASE_MESSAGES)"
-else
-    e2e_fail "setup state incomplete after repair (base_messages=$BASE_MESSAGES)"
-fi
+e2e_pass "verified nine MCP sends and both product links in SQLite (base_messages=$BASE_MESSAGES)"
 
 e2e_case_banner "Bulk seed realistic corpus directly into agent-mail DB"
 
@@ -673,13 +522,6 @@ if [ "$(jget "$SEARCH_SCOPE_C_PARSED" "count")" -lt 1 ]; then
     SEARCH_SCOPE_C_PARSED="$(parse_search_payload "$SEARCH_SCOPE_C")"
 fi
 
-if [ "$(jget "$SEARCH_SCOPE_C_PARSED" "count")" -lt 1 ]; then
-    # If still absent, emit a deterministic fallback signal via MCP (index-integrated path).
-    call_tool_text 11190 send_message "{\"project_key\":\"$PROJECT_C\",\"sender_name\":\"BlueLake\",\"to\":[\"RedPeak\"],\"subject\":\"Gamma secret message fallback\",\"body_md\":\"${SCOPE_CANARY_TOKEN} fallback signal for scope isolation\",\"importance\":\"urgent\",\"thread_id\":\"srch-c-secret-fallback\"}" >/dev/null || true
-    SEARCH_SCOPE_C="$(search_messages_with_retry 11120 "$PROJECT_C" "$SCOPE_CANARY_QUERY" 20 18 0.20 || true)"
-    SEARCH_SCOPE_C_PARSED="$(parse_search_payload "$SEARCH_SCOPE_C")"
-fi
-
 if [ "$(jget "$SEARCH_SCOPE_C_PARSED" "count")" -ge 1 ]; then
     e2e_pass "project C can retrieve its own canary message"
 else
@@ -699,13 +541,14 @@ PRODUCT_ROLLBACK_PARSED="$(parse_search_payload "$PRODUCT_ROLLBACK")"
 e2e_save_artifact "product_rollback_parsed.json" "$PRODUCT_ROLLBACK_PARSED"
 
 PRODUCT_PROJECT_IDS="$(jget "$PRODUCT_ROLLBACK_PARSED" "project_ids")"
-if echo "$PRODUCT_PROJECT_IDS" | grep -q "$PROJECT_A_ID" && echo "$PRODUCT_PROJECT_IDS" | grep -q "$PROJECT_B_ID"; then
+if jq -e --argjson a "$PROJECT_A_ID" --argjson b "$PROJECT_B_ID" \
+    'index($a) != null and index($b) != null' <<< "$PRODUCT_PROJECT_IDS" >/dev/null; then
     e2e_pass "product-linked bridge query includes both linked projects"
 else
     e2e_fail "product-linked bridge query missing one or more linked projects"
 fi
 
-if ! echo "$PRODUCT_PROJECT_IDS" | grep -q "$PROJECT_C_ID"; then
+if jq -e --argjson c "$PROJECT_C_ID" 'index($c) == null' <<< "$PRODUCT_PROJECT_IDS" >/dev/null; then
     e2e_pass "product-linked bridge query excludes unlinked project"
 else
     e2e_fail "product-linked bridge query included unlinked project"
@@ -716,7 +559,7 @@ e2e_case_banner "Facet correctness (sender, thread, importance, date)"
 SENDER_FILTER="$(call_tool_text 120 search_messages "{\"project_key\":\"$PROJECT_A\",\"query\":\"rollback\",\"sender\":\"BlueLake\",\"limit\":50}")"
 SENDER_FILTER_PARSED="$(parse_search_payload "$SENDER_FILTER")"
 SENDER_VALUES="$(jget "$SENDER_FILTER_PARSED" "from_values")"
-if [ "$(jget "$SENDER_FILTER_PARSED" "count")" -ge 1 ] && ! echo "$SENDER_VALUES" | grep -q "RedPeak"; then
+if jq -e 'length > 0 and all(.[]; . == "BlueLake")' <<< "$SENDER_VALUES" >/dev/null; then
     e2e_pass "sender filter returns BlueLake messages only"
 else
     e2e_fail "sender filter returned unexpected sender values"
@@ -725,7 +568,7 @@ fi
 THREAD_FILTER="$(call_tool_text 121 search_messages "{\"project_key\":\"$PROJECT_A\",\"query\":\"rollback\",\"thread_id\":\"srch-a-roll\",\"limit\":50}")"
 THREAD_FILTER_PARSED="$(parse_search_payload "$THREAD_FILTER")"
 THREAD_VALUES="$(jget "$THREAD_FILTER_PARSED" "thread_ids")"
-if [ "$(jget "$THREAD_FILTER_PARSED" "count")" -ge 1 ] && ! echo "$THREAD_VALUES" | grep -v "srch-a-roll" | grep -q "srch-"; then
+if jq -e 'length > 0 and all(.[]; . == "srch-a-roll")' <<< "$THREAD_VALUES" >/dev/null; then
     e2e_pass "thread filter returns only requested thread"
 else
     e2e_fail "thread filter returned rows from other threads"
@@ -734,7 +577,7 @@ fi
 IMPORTANCE_FILTER="$(call_tool_text 122 search_messages "{\"project_key\":\"$PROJECT_A\",\"query\":\"rollback\",\"importance\":\"urgent\",\"limit\":50}")"
 IMPORTANCE_FILTER_PARSED="$(parse_search_payload "$IMPORTANCE_FILTER")"
 IMPORTANCE_VALUES="$(jget "$IMPORTANCE_FILTER_PARSED" "importance_values")"
-if [ "$(jget "$IMPORTANCE_FILTER_PARSED" "count")" -ge 1 ] && ! echo "$IMPORTANCE_VALUES" | grep -q "normal"; then
+if jq -e 'length > 0 and all(.[]; . == "urgent")' <<< "$IMPORTANCE_VALUES" >/dev/null; then
     e2e_pass "importance filter restricts results to urgent"
 else
     e2e_fail "importance filter returned non-urgent rows"
@@ -766,13 +609,6 @@ if [ "$(jget "$GHOST_BEFORE_PARSED" "count")" -lt 1 ]; then
     GHOST_BEFORE_PARSED="$(parse_search_payload "$GHOST_BEFORE")"
 fi
 
-if [ "$(jget "$GHOST_BEFORE_PARSED" "count")" -lt 1 ]; then
-    # Emit fallback ghost marker via MCP path if initial signal was not yet indexed.
-    call_tool_text 13190 send_message "{\"project_key\":\"$PROJECT_A\",\"sender_name\":\"BlueLake\",\"to\":[\"RedPeak\"],\"subject\":\"Temporary ghost marker fallback ${GHOST_TOKEN}\",\"body_md\":\"${GHOST_TOKEN} fallback stale index rejection marker\",\"importance\":\"normal\",\"thread_id\":\"srch-ghost-fallback\"}" >/dev/null || true
-    GHOST_BEFORE="$(search_messages_with_retry 13120 "$PROJECT_A" "$GHOST_QUERY" 20 18 0.20 || true)"
-    GHOST_BEFORE_PARSED="$(parse_search_payload "$GHOST_BEFORE")"
-fi
-
 GHOST_COUNT_BEFORE="$(jget "$GHOST_BEFORE_PARSED" "count")"
 GHOST_IDS_JSON="$(jget "$GHOST_BEFORE_PARSED" "ids")"
 if [ "${GHOST_COUNT_BEFORE:-0}" -ge 1 ]; then
@@ -781,24 +617,24 @@ else
     e2e_fail "ghost marker message missing before DB deletion"
 fi
 
-python3 - "$DB_PATH" "$GHOST_IDS_JSON" <<'PY'
+python3 - "$DB_PATH" "$PROJECT_A_ID" "$GHOST_IDS_JSON" <<'PY'
 import json
 import sqlite3
 import sys
-db_path = sys.argv[1]
-raw_ids = sys.argv[2]
-try:
-    ids = [int(x) for x in json.loads(raw_ids)]
-except Exception:
-    ids = []
-ids = [x for x in ids if x > 0]
-if not ids:
-    sys.exit(0)
+db_path, project_id, found_ids = sys.argv[1:]
 conn = sqlite3.connect(db_path)
-cur = conn.cursor()
-cur.executemany("DELETE FROM message_recipients WHERE message_id = ?", [(msg_id,) for msg_id in ids])
-cur.executemany("DELETE FROM messages WHERE id = ?", [(msg_id,) for msg_id in ids])
-conn.commit()
+conn.execute("PRAGMA foreign_keys = ON")
+with conn:
+    (marker,) = conn.execute(
+        "SELECT id FROM messages WHERE project_id = ? AND thread_id = 'srch-ghost'", (project_id,)
+    ).fetchall()
+    if json.loads(found_ids) != [marker[0]]:
+        sys.exit("Search did not return exactly the planted ghost message")
+    for table in ("message_recipients", "inbox_delivery_events", "message_delivery_signal_receipts"):
+        conn.execute(f"DELETE FROM {table} WHERE message_id = ?", marker)
+    conn.execute("DELETE FROM messages WHERE id = ?", marker)
+    if conn.execute("PRAGMA foreign_key_check").fetchone():
+        sys.exit("Stale-index fixture would leave a foreign key violation")
 PY
 
 GHOST_AFTER="$(call_tool_text 132 search_messages "{\"project_key\":\"$PROJECT_A\",\"query\":\"$GHOST_QUERY\",\"limit\":20}")"
@@ -823,24 +659,28 @@ fi
 
 e2e_case_banner "Robot command regression checks (no like/2 backend failures)"
 
+status_rc=0
 ROBOT_STATUS_OUT="$(DATABASE_URL="sqlite:///${DB_PATH}" STORAGE_ROOT="${STORAGE_ROOT}" AM_INTERFACE_MODE=cli \
-    "${AM_BIN}" robot status --project "${PROJECT_A}" --agent BlueLake --format json 2>&1 || true)"
+    "${AM_BIN}" robot status --project "${PROJECT_A}" --agent BlueLake --format json \
+    2>"$E2E_ARTIFACT_DIR/logs/robot-status.log")" || status_rc=$?
 e2e_save_artifact "robot_status_output.json" "$ROBOT_STATUS_OUT"
-e2e_assert_not_contains "robot status output has no like/2 failure" "$ROBOT_STATUS_OUT" "no such function: like/2"
-if echo "$ROBOT_STATUS_OUT" | jq . >/dev/null 2>&1; then
-    e2e_pass "robot status returns valid JSON"
+e2e_assert_not_contains "robot status output has no like/2 failure" "$ROBOT_STATUS_OUT $(cat "$E2E_ARTIFACT_DIR/logs/robot-status.log")" "no such function: like/2"
+if [ "$status_rc" -eq 0 ] && jq -e 'has("health") and has("recent_messages")' <<< "$ROBOT_STATUS_OUT" >/dev/null; then
+    e2e_pass "robot status returns mailbox health and recent messages"
 else
-    e2e_fail "robot status did not return valid JSON"
+    e2e_fail "robot status did not return mailbox status (exit $status_rc)"
 fi
 
+search_rc=0
 ROBOT_SEARCH_OUT="$(DATABASE_URL="sqlite:///${DB_PATH}" STORAGE_ROOT="${STORAGE_ROOT}" AM_INTERFACE_MODE=cli \
-    "${AM_BIN}" robot search rollback --project "${PROJECT_A}" --agent BlueLake --format json 2>&1 || true)"
+    "${AM_BIN}" robot search rollback --project "${PROJECT_A}" --agent BlueLake --format json \
+    2>"$E2E_ARTIFACT_DIR/logs/robot-search.log")" || search_rc=$?
 e2e_save_artifact "robot_search_output.json" "$ROBOT_SEARCH_OUT"
-e2e_assert_not_contains "robot search output has no like/2 failure" "$ROBOT_SEARCH_OUT" "no such function: like/2"
-if echo "$ROBOT_SEARCH_OUT" | jq . >/dev/null 2>&1; then
-    e2e_pass "robot search returns valid JSON"
+e2e_assert_not_contains "robot search output has no like/2 failure" "$ROBOT_SEARCH_OUT $(cat "$E2E_ARTIFACT_DIR/logs/robot-search.log")" "no such function: like/2"
+if [ "$search_rc" -eq 0 ] && jq -e 'any(.results[]; .subject == "Critical rollback plan for search migration")' <<< "$ROBOT_SEARCH_OUT" >/dev/null; then
+    e2e_pass "robot search returns the seeded rollback plan"
 else
-    e2e_fail "robot search did not return valid JSON"
+    e2e_fail "robot search did not return the seeded rollback plan (exit $search_rc)"
 fi
 
 e2e_summary

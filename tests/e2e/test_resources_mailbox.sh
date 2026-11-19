@@ -5,13 +5,13 @@
 # reading lifecycle through the MCP stdio transport.
 #
 # Tests:
-#   1. Setup: ensure_project + register 2 agents (GoldFox, SilverWolf)
+#   1. Setup: register GoldFox, SilverWolf, and uninvolved GreenCastle
 #   2. Send a message from GoldFox to SilverWolf
 #   3. Read resource://mailbox/SilverWolf - verify message appears in inbox
 #   4. Read resource://outbox/GoldFox - verify message appears in outbox
 #   5. Read resource://mailbox-with-commits/SilverWolf - verify commit metadata
 #   6. Read resource://inbox/SilverWolf - verify alternative inbox resource
-#   7. Verify empty mailbox for GoldFox (no inbound messages)
+#   7. Verify empty GreenCastle mailbox and GoldFox's sent-mail view
 #   8. Send second message + verify outbox count increases
 #   9. Read mailbox without project param returns error
 
@@ -40,40 +40,7 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # ---------------------------------------------------------------------------
 
 send_jsonrpc_session() {
-    local db_path="$1"; shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.3
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=25
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+    E2E_STDIO_TIMEOUT_SECONDS=12.5 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 # Extract result text from a tools/call response (result.content[0].text)
@@ -193,15 +160,18 @@ e2e_log "Project path: $PROJECT_PATH"
 e2e_log "Project slug: $PROJECT_SLUG"
 
 # ===========================================================================
-# Case 1: Setup -- ensure_project + register 2 agents (GoldFox, SilverWolf)
+# Case 1: Setup -- communicating agents plus an uninvolved mailbox
 # ===========================================================================
-e2e_case_banner "Setup: project + two agents (GoldFox, SilverWolf)"
+e2e_case_banner "Setup: project + GoldFox, SilverWolf, and GreenCastle"
 
 SETUP_RESP="$(send_jsonrpc_session "$MBOX_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_PATH}\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"GoldFox\",\"task_description\":\"mailbox resource E2E testing\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"SilverWolf\",\"task_description\":\"mailbox resource E2E testing\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"GreenCastle\",\"task_description\":\"uninvolved empty mailbox witness\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"policy\":\"open\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"SilverWolf\",\"policy\":\"open\"}}}" \
 )"
 e2e_save_artifact "case_01_setup.txt" "$SETUP_RESP"
 
@@ -229,6 +199,13 @@ SW_NAME="$(parse_json_field "$SW_TEXT" "name")"
 
 e2e_assert_eq "GoldFox name in response" "GoldFox" "$GF_NAME"
 e2e_assert_eq "SilverWolf name in response" "SilverWolf" "$SW_NAME"
+e2e_assert_eq "uninvolved GreenCastle registered" "GreenCastle" \
+    "$(parse_json_field "$(extract_result "$SETUP_RESP" 13)" "name")"
+# Exact mailbox counts concern the fixture messages, without contact notices.
+e2e_assert_eq "GoldFox contact policy is open" "open" \
+    "$(parse_json_field "$(extract_result "$SETUP_RESP" 14)" "policy")"
+e2e_assert_eq "SilverWolf contact policy is open" "open" \
+    "$(parse_json_field "$(extract_result "$SETUP_RESP" 15)" "policy")"
 
 # ===========================================================================
 # Case 2: Send a message from GoldFox to SilverWolf
@@ -469,21 +446,22 @@ e2e_assert_contains "inbox subject correct" "$INBOX_CHECK" "subject=Architecture
 e2e_assert_contains "inbox sender is GoldFox" "$INBOX_CHECK" "sender=GoldFox"
 
 # ===========================================================================
-# Case 7: Verify empty mailbox for GoldFox (no inbound messages)
+# Case 7: Uninvolved mailbox stays empty; sender mailbox includes its outbox
 # ===========================================================================
-e2e_case_banner "Empty mailbox: GoldFox has no inbound messages"
+e2e_case_banner "Empty GreenCastle mailbox and GoldFox sent mail"
 
 EMPTY_RESP="$(send_jsonrpc_session "$MBOX_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://mailbox/GoldFox?project=${PROJECT_SLUG}\"}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://mailbox/GreenCastle?project=${PROJECT_SLUG}\"}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://mailbox/GoldFox?project=${PROJECT_SLUG}\"}}" \
 )"
 e2e_save_artifact "case_07_empty_mailbox.txt" "$EMPTY_RESP"
 
 EMPTY_ERR="$(is_error_result "$EMPTY_RESP" 70)"
 if [ "$EMPTY_ERR" = "true" ]; then
-    e2e_fail "resource://mailbox/GoldFox returned error"
+    e2e_fail "resource://mailbox/GreenCastle returned error"
 else
-    e2e_pass "resource://mailbox/GoldFox succeeded (empty)"
+    e2e_pass "resource://mailbox/GreenCastle succeeded (empty)"
 fi
 
 EMPTY_TEXT="$(extract_resource_text "$EMPTY_RESP" 70)"
@@ -505,9 +483,30 @@ except Exception as e:
 " 2>/dev/null)"
 e2e_save_artifact "case_07_parsed.txt" "$EMPTY_CHECK"
 
-e2e_assert_contains "GoldFox mailbox count is 0" "$EMPTY_CHECK" "count=0"
-e2e_assert_contains "GoldFox mailbox agent correct" "$EMPTY_CHECK" "agent=GoldFox"
-e2e_assert_contains "GoldFox mailbox has 0 messages" "$EMPTY_CHECK" "msg_count=0"
+e2e_assert_contains "GreenCastle mailbox count is 0" "$EMPTY_CHECK" "count=0"
+e2e_assert_contains "GreenCastle mailbox agent correct" "$EMPTY_CHECK" "agent=GreenCastle"
+e2e_assert_contains "GreenCastle mailbox has 0 messages" "$EMPTY_CHECK" "msg_count=0"
+
+SENDER_MAILBOX_TEXT="$(extract_resource_text "$EMPTY_RESP" 71)"
+e2e_save_artifact "case_07_sender_mailbox_text.txt" "$SENDER_MAILBOX_TEXT"
+SENDER_MAILBOX_CHECK="$(echo "$SENDER_MAILBOX_TEXT" | python3 -c '
+import sys, json
+try:
+    data = json.loads(sys.stdin.read())
+    messages = data.get("messages", [])
+    count = data.get("count", -1)
+    only_outbox = bool(messages) and all(message.get("kind") == "outbox" for message in messages)
+    has_subject = any(message.get("subject") == "Architecture review" for message in messages)
+    print(f"count={count}")
+    print(f"only_outbox={only_outbox}")
+    print(f"has_subject={has_subject}")
+except Exception as error:
+    print(f"PARSE_ERROR: {error}")
+')"
+e2e_save_artifact "case_07_sender_mailbox_parsed.txt" "$SENDER_MAILBOX_CHECK"
+e2e_assert_contains "sender mailbox has its one sent message" "$SENDER_MAILBOX_CHECK" "count=1"
+e2e_assert_contains "sender mailbox identifies the outbox direction" "$SENDER_MAILBOX_CHECK" "only_outbox=True"
+e2e_assert_contains "sender mailbox preserves the sent subject" "$SENDER_MAILBOX_CHECK" "has_subject=True"
 
 # ===========================================================================
 # Case 8: Send second message + verify outbox count increases

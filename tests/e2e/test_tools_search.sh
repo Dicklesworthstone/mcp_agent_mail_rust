@@ -82,29 +82,9 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 
 send_jsonrpc_session() {
     local db_path="$1"; shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:///${db_path}" STORAGE_ROOT="${STORAGE_ROOT}" RUST_LOG=error \
-        "${AM_BIN}" serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.1
-        done
-        sleep 0.2
-    } > "$fifo"
-
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+    E2E_STDIO_BINARY="${AM_BIN}" E2E_STDIO_TIMEOUT_SECONDS=15 \
+        STORAGE_ROOT="${STORAGE_ROOT}" RUST_LOG=error \
+        e2e_stdio_session "$db_path" "$@"
 }
 
 extract_result() {

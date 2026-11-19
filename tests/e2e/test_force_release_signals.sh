@@ -2,16 +2,14 @@
 # test_force_release_signals.sh - E2E: Force-release multi-signal heuristic aggregation
 #
 # Verifies (br-3h13.10.4):
-# 1. Recent activity on all 4 signals: should NOT force-release
-# 2. Stale on all 4 signals: should force-release successfully
-# 3. Stale on agent_last_seen only: borderline threshold behavior
-# 4. Recent git but no mail activity: mixed signals
-# 5. Recent mail but no git activity: mixed signals
-# 6. Force-release triggers notification to reservation holder
-# 7. Force-release of already-released reservation: no-op
-# 8. Force-release with notify_previous=true/false
-# 9. Force-release by different agents
-# 10. Force-release with note field
+# 1. Recent agent/mail activity prevents release and preserves the lease
+# 2. Four stale signals authorize exactly one real release by another agent
+# 3. Force-release of an already-released reservation is an idempotent no-op
+# 4. A nonexistent reservation returns NOT_FOUND
+# 5. notify_previous=true creates a real holder notification
+# 6. notify_previous=false releases without sending holder mail
+# 7. The holder can force-release its actually expired lease
+# 8. Detailed note text survives in the notification body
 #
 # Target: 10+ assertions
 
@@ -32,8 +30,23 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 WORK="$(e2e_mktemp "e2e_force_release")"
 FR_DB="${WORK}/force_release_test.sqlite3"
 TEST_STORAGE_ROOT="${WORK}/storage"
-PROJECT_PATH="/tmp/e2e_force_release_$$"
+PROJECT_PATH="${WORK}/project"
 mkdir -p "$TEST_STORAGE_ROOT"
+mkdir -p "$PROJECT_PATH"/{stale_files,active_files,notify_test,self_release,note_test}
+# Real tracked paths provide complete filesystem/Git evidence. Old commit and
+# file timestamps represent inactivity without weakening production thresholds.
+for directory in stale_files active_files notify_test self_release note_test; do
+    printf 'reservation activity fixture\n' >> "$PROJECT_PATH/$directory/lease.rs"
+done
+git -C "$PROJECT_PATH" init --quiet
+git -C "$PROJECT_PATH" config user.name "Force Release E2E"
+git -C "$PROJECT_PATH" config user.email "force-release@example.invalid"
+git -C "$PROJECT_PATH" add .
+GIT_AUTHOR_DATE="2000-01-01T00:00:00Z" GIT_COMMITTER_DATE="2000-01-01T00:00:00Z" \
+    git -C "$PROJECT_PATH" commit --quiet -m "Seed inactive reservation paths"
+for directory in stale_files active_files notify_test self_release note_test; do
+    touch -t 200001010000.00 "$PROJECT_PATH/$directory/lease.rs"
+done
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-force-release","version":"1.0"}}}'
 
@@ -42,47 +55,17 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # ---------------------------------------------------------------------------
 
 send_jsonrpc_session() {
-    local db_path="$1"; shift
-    local requests=("$@")
-    local output_file
-    output_file="$(mktemp "${WORK}/session_response.XXXXXX")"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
+    E2E_STDIO_TIMEOUT_SECONDS=100 STORAGE_ROOT="$TEST_STORAGE_ROOT" RUST_LOG=error \
+        e2e_stdio_session "$@"
+}
 
-    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="$TEST_STORAGE_ROOT" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.3
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local max_ticks=200
-    local elapsed=0
-    local expected_responses="${#requests[@]}"
-    local response_count=0
-    while [ "$elapsed" -lt "$max_ticks" ]; do
-        response_count="$(grep -c '^{' "$output_file" 2>/dev/null || true)"
-        if [ "$response_count" -ge "$expected_responses" ]; then
-            break
-        fi
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+seed_inactive_holder() {
+    local holder="$1"
+    local changed
+    changed="$(sqlite3 "$FR_DB" "UPDATE agents SET inception_ts=946684800000000, last_active_ts=946684800000000 WHERE name='${holder}'; SELECT changes();")"
+    e2e_assert_eq "one private $holder heartbeat aged" "1" "$changed"
+    e2e_save_artifact "seed_${holder}_activity.txt" \
+        "$(sqlite3 "$FR_DB" "SELECT id, name, inception_ts, last_active_ts FROM agents WHERE name='${holder}';")"
 }
 
 extract_result() {
@@ -190,6 +173,8 @@ print('NO_MATCH')
 STALE_AGENT="SilverPine"
 ACTIVE_AGENT="BlueLake"
 RELEASER_AGENT="RedStone"
+NOTIFY_AGENT="GoldLake"
+NOTE_AGENT="GreenCastle"
 
 e2e_case_banner "Setup: project + agents (${STALE_AGENT}, ${ACTIVE_AGENT}, ${RELEASER_AGENT})"
 
@@ -199,6 +184,8 @@ SETUP_RESP="$(send_jsonrpc_session "$FR_DB" \
     "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${STALE_AGENT}\",\"task_description\":\"force-release E2E (will become stale)\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${ACTIVE_AGENT}\",\"task_description\":\"force-release E2E (stays active)\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${RELEASER_AGENT}\",\"task_description\":\"force-release E2E (requests force-release)\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${NOTIFY_AGENT}\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${NOTE_AGENT}\"}}}" \
 )"
 e2e_save_artifact "case_00_setup.txt" "$SETUP_RESP"
 
@@ -206,6 +193,8 @@ assert_ok "ensure_project" "$SETUP_RESP" 10
 assert_ok "register ${STALE_AGENT}" "$SETUP_RESP" 11
 assert_ok "register ${ACTIVE_AGENT}" "$SETUP_RESP" 12
 assert_ok "register ${RELEASER_AGENT}" "$SETUP_RESP" 13
+assert_ok "register ${NOTIFY_AGENT}" "$SETUP_RESP" 14
+assert_ok "register ${NOTE_AGENT}" "$SETUP_RESP" 15
 
 # ===========================================================================
 # Case 1: stale agent creates a reservation
@@ -298,20 +287,16 @@ if [ -n "$ACTIVE_RES_ID" ] && [ "$ACTIVE_RES_ID" != "" ]; then
     FORCE_ACTIVE_ERR="$(is_error_result "$FORCE_ACTIVE_RESP" 40)"
     FORCE_ACTIVE_TEXT="$(extract_result "$FORCE_ACTIVE_RESP" 40)"
 
-    # Should either error or indicate the agent is still active
     if [ "$FORCE_ACTIVE_ERR" = "true" ]; then
         e2e_pass "force-release rejected: ${ACTIVE_AGENT} has recent activity"
+        e2e_assert_contains "active reservation refusal names the activity policy" "$FORCE_ACTIVE_RESP" "RESERVATION_ACTIVE"
     else
-        # Check if released anyway (implementation may allow force-release regardless)
-        RELEASED="$(parse_json_field "$FORCE_ACTIVE_TEXT" "released")"
-        if [ "$RELEASED" = "True" ] || [ "$RELEASED" = "true" ]; then
-            e2e_pass "force-release succeeded (implementation allows force-release regardless of activity)"
-        else
-            e2e_pass "force-release response: $FORCE_ACTIVE_TEXT"
-        fi
+        e2e_fail "force-release must refuse an active reservation"
     fi
+    e2e_assert_eq "active reservation remains unreleased" "1" \
+        "$(sqlite3 "$FR_DB" "SELECT COUNT(*) FROM file_reservations WHERE id=${ACTIVE_RES_ID} AND released_ts IS NULL;")"
 else
-    e2e_skip "${ACTIVE_AGENT} reservation ID not available for force-release test"
+    e2e_fail "${ACTIVE_AGENT} reservation ID not available for force-release test"
 fi
 
 # ===========================================================================
@@ -320,6 +305,7 @@ fi
 e2e_case_banner "Force-release ${STALE_AGENT} reservation (expect success)"
 
 if [ -n "$STALE_RES_ID" ] && [ "$STALE_RES_ID" != "" ]; then
+    seed_inactive_holder "$STALE_AGENT"
     FORCE_STALE_RESP="$(send_jsonrpc_session "$FR_DB" \
         "$INIT_REQ" \
         "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${RELEASER_AGENT}\",\"file_reservation_id\":${STALE_RES_ID},\"note\":\"Force releasing stale reservation\",\"notify_previous\":true}}}" \
@@ -332,27 +318,35 @@ if [ -n "$STALE_RES_ID" ] && [ "$STALE_RES_ID" != "" ]; then
     if [ "$FORCE_STALE_ERR" = "false" ]; then
         e2e_pass "force-release ${STALE_AGENT} succeeded"
 
-        # Check response fields
         RELEASED="$(parse_json_field "$FORCE_STALE_TEXT" "released")"
-        PREV_HOLDER="$(parse_json_field "$FORCE_STALE_TEXT" "previous_holder")"
-
-        if [ "$RELEASED" = "True" ] || [ "$RELEASED" = "true" ]; then
-            e2e_pass "released field is true"
-        else
-            e2e_pass "force-release completed (released field: $RELEASED)"
-        fi
-
-        if [ -n "$PREV_HOLDER" ] && [ "$PREV_HOLDER" != "" ]; then
-            e2e_pass "previous_holder returned: $PREV_HOLDER"
-        else
-            e2e_pass "force-release completed (previous_holder may not be in response)"
-        fi
+        e2e_assert_eq "one stale reservation was released" "1" "$RELEASED"
+        e2e_assert_eq "released reservation retains its holder" "$STALE_AGENT" \
+            "$(parse_json_field "$FORCE_STALE_TEXT" "reservation.agent")"
+        e2e_assert_eq "previous holder was notified" "True" \
+            "$(parse_json_field "$FORCE_STALE_TEXT" "reservation.notified")"
+        FORCE_SIGNALS_CHECK="$(echo "$FORCE_STALE_TEXT" | python3 -c '
+from datetime import datetime, timezone
+import json, sys
+reservation = json.load(sys.stdin)["reservation"]
+now = datetime.now(timezone.utc)
+for field in ["last_agent_activity_ts", "last_filesystem_activity_ts", "last_git_activity_ts"]:
+    value = reservation.get(field)
+    old = value is not None and (now - datetime.fromisoformat(value.replace("Z", "+00:00"))).total_seconds() > 1800
+    print(f"{field}_old={old}")
+value = reservation.get("last_mail_activity_ts")
+mail_stale = value is None or (now - datetime.fromisoformat(value.replace("Z", "+00:00"))).total_seconds() > 1800
+print(f"mail_stale={mail_stale}")
+')"
+        e2e_save_artifact "case_04_stale_signals.txt" "$FORCE_SIGNALS_CHECK"
+        for field in last_agent_activity_ts last_filesystem_activity_ts last_git_activity_ts; do
+            e2e_assert_contains "stale release observed old $field" "$FORCE_SIGNALS_CHECK" "${field}_old=True"
+        done
+        e2e_assert_contains "stale release observed no recent mail" "$FORCE_SIGNALS_CHECK" "mail_stale=True"
     else
-        # Some implementations may require staleness heuristics to pass
-        e2e_pass "force-release returned error (may require staleness heuristics): $FORCE_STALE_TEXT"
+        e2e_fail "force-release must release a reservation with four stale signals: $FORCE_STALE_TEXT"
     fi
 else
-    e2e_skip "${STALE_AGENT} reservation ID not available for force-release test"
+    e2e_fail "${STALE_AGENT} reservation ID not available for force-release test"
 fi
 
 # ===========================================================================
@@ -370,19 +364,16 @@ if [ -n "$STALE_RES_ID" ] && [ "$STALE_RES_ID" != "" ]; then
     FORCE_AGAIN_ERR="$(is_error_result "$FORCE_AGAIN_RESP" 60)"
     FORCE_AGAIN_TEXT="$(extract_result "$FORCE_AGAIN_RESP" 60)"
 
-    # Should either error or indicate already released
     if [ "$FORCE_AGAIN_ERR" = "true" ]; then
-        e2e_pass "force-release on already-released correctly returned error"
+        e2e_fail "already-released reservation must return an idempotent no-op"
     else
-        # May return success with "already released" or "not found"
-        if echo "$FORCE_AGAIN_TEXT" | grep -qiE "already|not found|no.*reservation"; then
-            e2e_pass "force-release on already-released handled gracefully"
-        else
-            e2e_pass "force-release on already-released: $FORCE_AGAIN_TEXT"
-        fi
+        e2e_assert_eq "already-released reservation releases no second row" "0" \
+            "$(parse_json_field "$FORCE_AGAIN_TEXT" "released")"
+        e2e_assert_eq "already-released reservation is identified" "True" \
+            "$(parse_json_field "$FORCE_AGAIN_TEXT" "already_released")"
     fi
 else
-    e2e_skip "${STALE_AGENT} reservation ID not available for no-op test"
+    e2e_fail "${STALE_AGENT} reservation ID not available for no-op test"
 fi
 
 # ===========================================================================
@@ -401,12 +392,9 @@ FORCE_NONEXIST_TEXT="$(extract_result "$FORCE_NONEXIST_RESP" 70)"
 
 if [ "$FORCE_NONEXIST_ERR" = "true" ]; then
     e2e_pass "force-release on nonexistent ID correctly returned error"
+    e2e_assert_contains "nonexistent reservation names NOT_FOUND" "$FORCE_NONEXIST_RESP" "NOT_FOUND"
 else
-    if echo "$FORCE_NONEXIST_TEXT" | grep -qiE "not found|no.*reservation|invalid"; then
-        e2e_pass "force-release on nonexistent ID returned not-found response"
-    else
-        e2e_pass "force-release on nonexistent ID: $FORCE_NONEXIST_TEXT"
-    fi
+    e2e_fail "nonexistent reservation must return NOT_FOUND"
 fi
 
 # ===========================================================================
@@ -417,7 +405,7 @@ e2e_case_banner "Force-release with notify_previous=false"
 # Create another reservation for this test
 NOTIFY_RES_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":75,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${STALE_AGENT}\",\"paths\":[\"notify_test/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"Notify test\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":75,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${NOTIFY_AGENT}\",\"paths\":[\"notify_test/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"Notify test\"}}}" \
 )"
 e2e_save_artifact "case_07_notify_reserve.txt" "$NOTIFY_RES_RESP"
 
@@ -434,9 +422,11 @@ except Exception:
 " <<< "$NOTIFY_RES_TEXT" 2>/dev/null)"
 
 if [ -n "$NOTIFY_RES_ID" ] && [ "$NOTIFY_RES_ID" != "" ]; then
+    seed_inactive_holder "$NOTIFY_AGENT"
     FORCE_NONOTIFY_RESP="$(send_jsonrpc_session "$FR_DB" \
         "$INIT_REQ" \
         "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${RELEASER_AGENT}\",\"file_reservation_id\":${NOTIFY_RES_ID},\"note\":\"Silent force release\",\"notify_previous\":false}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${NOTIFY_AGENT}\",\"include_bodies\":true}}}" \
     )"
     e2e_save_artifact "case_07_force_nonotify.txt" "$FORCE_NONOTIFY_RESP"
 
@@ -444,11 +434,19 @@ if [ -n "$NOTIFY_RES_ID" ] && [ "$NOTIFY_RES_ID" != "" ]; then
 
     if [ "$FORCE_NONOTIFY_ERR" = "false" ]; then
         e2e_pass "force-release with notify_previous=false succeeded"
+        FORCE_NONOTIFY_TEXT="$(extract_result "$FORCE_NONOTIFY_RESP" 80)"
+        e2e_assert_eq "silent force release releases one row" "1" \
+            "$(parse_json_field "$FORCE_NONOTIFY_TEXT" "released")"
+        e2e_assert_eq "silent force release reports no notification" "False" \
+            "$(parse_json_field "$FORCE_NONOTIFY_TEXT" "reservation.notified")"
+        assert_ok "silent previous holder inbox remains readable" "$FORCE_NONOTIFY_RESP" 81
+        e2e_assert_eq "silent previous holder receives no mail" "[]" \
+            "$(extract_result "$FORCE_NONOTIFY_RESP" 81)"
     else
-        e2e_pass "force-release with notify_previous=false: handled (may require staleness)"
+        e2e_fail "silent force release must release the inactive holder's lease"
     fi
 else
-    e2e_skip "Notify test reservation ID not available"
+    e2e_fail "Notify test reservation ID not available"
 fi
 
 # ===========================================================================
@@ -483,17 +481,16 @@ except Exception:
 
 e2e_save_artifact "case_08_notification_check.txt" "$NOTIFICATION_CHECK"
 
-# Notifications may or may not be present depending on implementation
 if echo "$NOTIFICATION_CHECK" | grep -q "force_release=[1-9]"; then
     e2e_pass "force-release notification found in ${STALE_AGENT} inbox"
 else
-    e2e_pass "${STALE_AGENT} inbox checked (notification may be sent via different channel)"
+    e2e_fail "force-release notification must appear in ${STALE_AGENT} inbox"
 fi
 
 # ===========================================================================
 # Case 9: Force-release as the reservation holder (self-release)
 # ===========================================================================
-e2e_case_banner "Force-release as reservation holder (self-release)"
+e2e_case_banner "Force-release an expired lease as its reservation holder"
 
 # Create a reservation for the active agent.
 SELF_RES_RESP="$(send_jsonrpc_session "$FR_DB" \
@@ -515,7 +512,10 @@ except Exception:
 " <<< "$SELF_RES_TEXT" 2>/dev/null)"
 
 if [ -n "$SELF_RES_ID" ] && [ "$SELF_RES_ID" != "" ]; then
-    # Try to force-release own reservation.
+    # Seed an actually expired private lease; expiry authorizes release even
+    # while this holder is active. This does not claim inactivity authorization.
+    SELF_SEEDED="$(sqlite3 "$FR_DB" "UPDATE file_reservations SET created_ts=946684800000000, expires_ts=946684860000000 WHERE id=${SELF_RES_ID}; SELECT changes();")"
+    e2e_assert_eq "one private own lease expired" "1" "$SELF_SEEDED"
     SELF_FORCE_RESP="$(send_jsonrpc_session "$FR_DB" \
         "$INIT_REQ" \
         "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${ACTIVE_AGENT}\",\"file_reservation_id\":${SELF_RES_ID},\"note\":\"Self force-release\"}}}" \
@@ -526,11 +526,13 @@ if [ -n "$SELF_RES_ID" ] && [ "$SELF_RES_ID" != "" ]; then
 
     if [ "$SELF_FORCE_ERR" = "false" ]; then
         e2e_pass "force-release as reservation holder succeeded"
+        e2e_assert_eq "expired own lease releases one row" "1" \
+            "$(parse_json_field "$(extract_result "$SELF_FORCE_RESP" 100)" "released")"
     else
-        e2e_pass "force-release as holder: handled (may require using release_file_reservations instead)"
+        e2e_fail "force-release must release the holder's expired lease"
     fi
 else
-    e2e_skip "Self-release reservation ID not available"
+    e2e_fail "Self-release reservation ID not available"
 fi
 
 # ===========================================================================
@@ -541,7 +543,7 @@ e2e_case_banner "Force-release with detailed note field"
 # Create another reservation
 NOTE_RES_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":105,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${STALE_AGENT}\",\"paths\":[\"note_test/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"Note test\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":105,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${NOTE_AGENT}\",\"paths\":[\"note_test/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"Note test\"}}}" \
 )"
 e2e_save_artifact "case_10_note_reserve.txt" "$NOTE_RES_RESP"
 
@@ -558,7 +560,8 @@ except Exception:
 " <<< "$NOTE_RES_TEXT" 2>/dev/null)"
 
 if [ -n "$NOTE_RES_ID" ] && [ "$NOTE_RES_ID" != "" ]; then
-    DETAILED_NOTE="Agent ${STALE_AGENT} has been unresponsive for 2 hours. Last seen: 2026-02-12T03:00:00Z. No git commits. No mail activity. Force-releasing to unblock br-1234."
+    seed_inactive_holder "$NOTE_AGENT"
+    DETAILED_NOTE="Agent ${NOTE_AGENT} has been unresponsive for 2 hours. Last seen: 2026-02-12T03:00:00Z. No git commits. No mail activity. Force-releasing to unblock br-1234."
 
     # URL-encode the note for JSON
     ENCODED_NOTE="$(python3 -c "import json; print(json.dumps('$DETAILED_NOTE'))" 2>/dev/null | tr -d '"')"
@@ -566,6 +569,7 @@ if [ -n "$NOTE_RES_ID" ] && [ "$NOTE_RES_ID" != "" ]; then
     NOTE_FORCE_RESP="$(send_jsonrpc_session "$FR_DB" \
         "$INIT_REQ" \
         "{\"jsonrpc\":\"2.0\",\"id\":110,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${RELEASER_AGENT}\",\"file_reservation_id\":${NOTE_RES_ID},\"note\":\"${ENCODED_NOTE}\",\"notify_previous\":true}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":111,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${NOTE_AGENT}\",\"include_bodies\":true}}}" \
     )"
     e2e_save_artifact "case_10_note_force.txt" "$NOTE_FORCE_RESP"
 
@@ -573,11 +577,16 @@ if [ -n "$NOTE_RES_ID" ] && [ "$NOTE_RES_ID" != "" ]; then
 
     if [ "$NOTE_FORCE_ERR" = "false" ]; then
         e2e_pass "force-release with detailed note succeeded"
+        e2e_assert_eq "detailed-note force release releases one row" "1" \
+            "$(parse_json_field "$(extract_result "$NOTE_FORCE_RESP" 110)" "released")"
+        assert_ok "detailed-note holder inbox is readable" "$NOTE_FORCE_RESP" 111
+        e2e_assert_contains "notification preserves the detailed note" \
+            "$(extract_result "$NOTE_FORCE_RESP" 111)" "$DETAILED_NOTE"
     else
-        e2e_pass "force-release with detailed note: handled"
+        e2e_fail "detailed-note force release must release its inactive holder's lease"
     fi
 else
-    e2e_skip "Note test reservation ID not available"
+    e2e_fail "Note test reservation ID not available"
 fi
 
 # ===========================================================================

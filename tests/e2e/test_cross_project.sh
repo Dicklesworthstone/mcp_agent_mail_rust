@@ -25,45 +25,7 @@ CP_DB="${WORK}/cross_project.sqlite3"
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-cross-project","version":"1.0"}}}'
 
 send_jsonrpc_session() {
-    local db_path="$1"
-    shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.2
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=15
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
-    fi
+    E2E_STDIO_TIMEOUT_SECONDS=4.5 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 assert_ok() {
@@ -112,6 +74,8 @@ RESP="$(send_jsonrpc_session "$CP_DB" \
     '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_proj_alpha","program":"test","model":"test","name":"RedFox"}}}' \
     '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_proj_beta","program":"test","model":"test","name":"BlueLake"}}}' \
     '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_proj_alpha","program":"test","model":"test","name":"GoldPeak"}}}' \
+    '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"set_contact_policy","arguments":{"project_key":"/tmp/e2e_proj_alpha","agent_name":"RedFox","policy":"open"}}}' \
+    '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"set_contact_policy","arguments":{"project_key":"/tmp/e2e_proj_alpha","agent_name":"GoldPeak","policy":"open"}}}' \
 )"
 e2e_save_artifact "setup.txt" "$RESP"
 
@@ -120,6 +84,8 @@ assert_ok "ensure project beta" "$RESP" 11
 assert_ok "register RedFox in alpha" "$RESP" 12
 assert_ok "register BlueLake in beta" "$RESP" 13
 assert_ok "register GoldPeak in alpha" "$RESP" 14
+assert_ok "RedFox accepts fixture messages without contact notices" "$RESP" 15
+assert_ok "GoldPeak accepts fixture messages without contact notices" "$RESP" 16
 
 # ===========================================================================
 # Case 1: Messaging within project alpha

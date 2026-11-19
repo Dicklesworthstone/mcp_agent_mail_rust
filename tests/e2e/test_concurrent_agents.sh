@@ -21,50 +21,10 @@ export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
 
 WORK="$(e2e_mktemp "e2e_concurrent")"
 CA_DB="${WORK}/concurrent.sqlite3"
+# The previous runner polled fifteen times at 300 ms intervals.
+export E2E_STDIO_TIMEOUT_SECONDS=4.5
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-concurrent","version":"1.0"}}}'
-
-send_jsonrpc_session() {
-    local db_path="$1"
-    shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.15
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=15
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
-    fi
-}
 
 assert_ok() {
     local label="$1"
@@ -103,7 +63,7 @@ print('NO_MATCH')
 # ===========================================================================
 e2e_case_banner "Setup project + agents"
 
-RESP="$(send_jsonrpc_session "$CA_DB" \
+RESP="$(e2e_stdio_session "$CA_DB" \
     "$INIT_REQ" \
     '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"ensure_project","arguments":{"human_key":"/tmp/e2e_concurrent"}}}' \
     '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_concurrent","program":"test","model":"test","name":"RedFox"}}}' \
@@ -121,7 +81,7 @@ assert_ok "register GoldPeak" "$RESP" 13
 # ===========================================================================
 e2e_case_banner "File reservation conflict"
 
-RESP="$(send_jsonrpc_session "$CA_DB" \
+RESP="$(e2e_stdio_session "$CA_DB" \
     "$INIT_REQ" \
     '{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"file_reservation_paths","arguments":{"project_key":"/tmp/e2e_concurrent","agent_name":"RedFox","paths":["src/shared.rs"],"ttl_seconds":3600,"exclusive":true,"reason":"editing"}}}' \
     '{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"file_reservation_paths","arguments":{"project_key":"/tmp/e2e_concurrent","agent_name":"BlueLake","paths":["src/shared.rs"],"ttl_seconds":3600,"exclusive":true,"reason":"also editing"}}}' \
@@ -157,7 +117,7 @@ e2e_assert_contains "BlueLake gets conflict" "$CONFLICT" "CONFLICT="
 # ===========================================================================
 e2e_case_banner "Rapid multi-agent messaging"
 
-RESP="$(send_jsonrpc_session "$CA_DB" \
+RESP="$(e2e_stdio_session --pipeline "$CA_DB" \
     "$INIT_REQ" \
     '{"jsonrpc":"2.0","id":200,"method":"tools/call","params":{"name":"send_message","arguments":{"project_key":"/tmp/e2e_concurrent","sender_name":"RedFox","to":["BlueLake","GoldPeak"],"subject":"From RedFox 1","body_md":"msg 1"}}}' \
     '{"jsonrpc":"2.0","id":201,"method":"tools/call","params":{"name":"send_message","arguments":{"project_key":"/tmp/e2e_concurrent","sender_name":"BlueLake","to":["RedFox","GoldPeak"],"subject":"From BlueLake 1","body_md":"msg 2"}}}' \
@@ -177,7 +137,7 @@ assert_ok "BlueLake sends msg 5" "$RESP" 204
 # ===========================================================================
 e2e_case_banner "Concurrent inbox fetches"
 
-RESP="$(send_jsonrpc_session "$CA_DB" \
+RESP="$(e2e_stdio_session --pipeline "$CA_DB" \
     "$INIT_REQ" \
     '{"jsonrpc":"2.0","id":300,"method":"tools/call","params":{"name":"fetch_inbox","arguments":{"project_key":"/tmp/e2e_concurrent","agent_name":"RedFox"}}}' \
     '{"jsonrpc":"2.0","id":301,"method":"tools/call","params":{"name":"fetch_inbox","arguments":{"project_key":"/tmp/e2e_concurrent","agent_name":"BlueLake"}}}' \
@@ -188,13 +148,35 @@ assert_ok "RedFox inbox fetch" "$RESP" 300
 assert_ok "BlueLake inbox fetch" "$RESP" 301
 assert_ok "GoldPeak inbox fetch" "$RESP" 302
 
+# A successful fetch can still return an empty inbox or another agent's mail.
+if python3 -c '
+import json, sys
+expected = {
+    300: ["From BlueLake 1", "From BlueLake 2", "From GoldPeak 1"],
+    301: ["From GoldPeak 1", "From RedFox 1", "From RedFox 2"],
+    302: ["From BlueLake 1", "From RedFox 1"],
+}
+for line in sys.stdin:
+    reply = json.loads(line)
+    if reply.get("id") in expected:
+        inbox = json.loads(reply["result"]["content"][0]["text"])
+        actual = sorted(m["subject"] for m in inbox if m["subject"].startswith("From "))
+        if actual != expected.pop(reply["id"]):
+            sys.exit(1)
+sys.exit(bool(expected))
+' <<< "$RESP"; then
+    e2e_pass "each agent receives exactly its addressed test messages"
+else
+    e2e_fail "per-recipient inbox contents differ from the five sends"
+fi
+
 # ===========================================================================
 # Case 4: Concurrent ack operations
 # ===========================================================================
 e2e_case_banner "Concurrent acknowledge"
 
 # First send ack_required messages
-RESP="$(send_jsonrpc_session "$CA_DB" \
+RESP="$(e2e_stdio_session "$CA_DB" \
     "$INIT_REQ" \
     '{"jsonrpc":"2.0","id":400,"method":"tools/call","params":{"name":"send_message","arguments":{"project_key":"/tmp/e2e_concurrent","sender_name":"RedFox","to":["BlueLake","GoldPeak"],"subject":"Ack needed","body_md":"Please confirm","ack_required":true}}}' \
 )"
@@ -221,7 +203,7 @@ print('0')
 
 if [ "$MSG_ID" != "0" ] && [ -n "$MSG_ID" ]; then
     # Both agents ack the same message
-    RESP="$(send_jsonrpc_session "$CA_DB" \
+    RESP="$(e2e_stdio_session --pipeline "$CA_DB" \
         "$INIT_REQ" \
         "{\"jsonrpc\":\"2.0\",\"id\":401,\"method\":\"tools/call\",\"params\":{\"name\":\"acknowledge_message\",\"arguments\":{\"project_key\":\"/tmp/e2e_concurrent\",\"agent_name\":\"BlueLake\",\"message_id\":${MSG_ID}}}}" \
         "{\"jsonrpc\":\"2.0\",\"id\":402,\"method\":\"tools/call\",\"params\":{\"name\":\"acknowledge_message\",\"arguments\":{\"project_key\":\"/tmp/e2e_concurrent\",\"agent_name\":\"GoldPeak\",\"message_id\":${MSG_ID}}}}" \
@@ -238,7 +220,7 @@ fi
 # ===========================================================================
 e2e_case_banner "Release and re-acquire reservation"
 
-RESP="$(send_jsonrpc_session "$CA_DB" \
+RESP="$(e2e_stdio_session "$CA_DB" \
     "$INIT_REQ" \
     '{"jsonrpc":"2.0","id":500,"method":"tools/call","params":{"name":"release_file_reservations","arguments":{"project_key":"/tmp/e2e_concurrent","agent_name":"RedFox","paths":["src/shared.rs"]}}}' \
     '{"jsonrpc":"2.0","id":501,"method":"tools/call","params":{"name":"file_reservation_paths","arguments":{"project_key":"/tmp/e2e_concurrent","agent_name":"BlueLake","paths":["src/shared.rs"],"ttl_seconds":3600,"exclusive":true,"reason":"now available"}}}' \
@@ -267,6 +249,16 @@ print('PARSE_FAIL')
 
 e2e_assert_contains "BlueLake acquires after release" "$REACQ" "granted=1"
 e2e_assert_contains "no conflicts after release" "$REACQ" "conflicts=0"
+
+# Each server session has exited and flushed its archive by this point.
+for mailbox in messages agents/RedFox/outbox agents/BlueLake/inbox agents/GoldPeak/inbox; do
+    if git -C "$STORAGE_ROOT" grep -q -F 'Please confirm' HEAD -- \
+        ":(glob)projects/*/${mailbox}/**/*__ack-needed__${MSG_ID}.md"; then
+        e2e_pass "ack-required message committed in $mailbox"
+    else
+        e2e_fail "suite archive is missing message $MSG_ID in $mailbox"
+    fi
+done
 
 # ===========================================================================
 # Summary

@@ -33,44 +33,8 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 send_jsonrpc_session() {
     local db_path="$1"
     shift
-    local requests=("$@")
-    local output_file
-    output_file="$(mktemp "${WORK}/session_response.XXXXXX.txt")"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.25
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=20
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
-    fi
+    E2E_STDIO_TIMEOUT_SECONDS=6 RUST_LOG=error \
+        e2e_stdio_session "$db_path" "$@"
 }
 
 is_error_result() {
@@ -410,6 +374,7 @@ assert_resource_shape_matches_fixture \
 METRICS_CHECK="$(
     RESP="$RESP" REQ_ID="300" python3 - <<'PY'
 import json
+import math
 import os
 
 resp = os.environ["RESP"]
@@ -441,14 +406,28 @@ if not isinstance(tools, list) or not tools:
     print("FAIL:tools array empty")
     raise SystemExit(0)
 
-required_tool_keys = {"name", "calls", "errors", "cluster", "capabilities", "complexity"}
+required_tool_keys = {"name", "calls", "errors", "rejections", "cluster", "capabilities", "complexity"}
+latency_timing_keys = {"avg_ms", "min_ms", "max_ms", "p50_ms", "p95_ms", "p99_ms"}
 for idx, tool in enumerate(tools):
     if not isinstance(tool, dict):
         print(f"FAIL:tool entry {idx} is not object")
         raise SystemExit(0)
-    if set(tool.keys()) != required_tool_keys:
+    if set(tool.keys()) not in (required_tool_keys, required_tool_keys | {"latency"}):
         print(f"FAIL:tool entry keys mismatch at idx={idx}: {sorted(tool.keys())}")
         raise SystemExit(0)
+    if "latency" in tool:
+        latency = tool["latency"]
+        if not isinstance(latency, dict) or set(latency) != latency_timing_keys | {"is_slow"}:
+            print(f"FAIL:latency keys mismatch at idx={idx}")
+            raise SystemExit(0)
+        if not isinstance(latency["is_slow"], bool):
+            print(f"FAIL:latency is_slow is not boolean at idx={idx}")
+            raise SystemExit(0)
+        for key in latency_timing_keys:
+            value = latency[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                print(f"FAIL:invalid latency {key} at idx={idx}")
+                raise SystemExit(0)
 
 if max(int(t.get("calls", 0)) for t in tools) <= 0:
     print("FAIL:expected at least one tool calls>0 after prep calls")
