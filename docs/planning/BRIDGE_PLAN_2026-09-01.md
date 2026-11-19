@@ -16,6 +16,32 @@ large backup-rotation workloads also exceeded 240 seconds on Apple Silicon.
 Publication and downstream installer checksum verification have separate
 open Beads. The scope and outcomes of individual checks follow below.
 
+### Doctor and the serving search index
+
+- [x] Trace lexical startup and doctor dispatch. Startup opens the flat
+  Tantivy index in `STORAGE_ROOT/search_index`. The corrupt-index detector
+  inspected only the optional scoped layout in `SEARCH_V3_INDEX_DIR`.
+- [x] Run the original doctor against a real, healthy serving index and
+  again after preserving and damaging its manifest in a private mailbox.
+  The HTTP server found the seeded message. With the optional index root
+  unset, doctor exited 64. With it set to the serving directory, doctor
+  returned zero findings for both manifests.
+- [x] Exercise a missing directory, an empty directory, a valid native
+  index, a missing manifest with retained state and a malformed manifest.
+  All 13 focused detector tests passed, including the scoped-layout cases.
+- [x] Repeat the actual doctor CLI on both private indexes with the optional
+  root set and unset. The final macOS binary (`01659df83f7e`) reported zero
+  findings for each healthy case and one P2 finding naming the serving
+  directory for each damaged case. The index and mailbox hashes matched
+  before and after all four invocations. Doctor recorded zero actions.
+- [x] Verify the 675 final build inputs on Apple Silicon, run both workspace
+  compiler graphs, strict Clippy and formatting. All passed.
+- [ ] Land the doctor patch and close `br-gvnw2`. The default four-file UBS
+  scan exits 1 on both the baseline and the patch. Its four critical findings
+  flag comparisons of public diagnostic identifiers in unchanged dispatch
+  branches. The strict six-file scan also exits 1 (4 critical, 5,787 warnings).
+  The patch is in the working tree pending the repository's precommit gate.
+
 ## November 18 agent health on a quiet mailbox
 
 - [x] Reproduce a stale TUI count after a sidecar-only write and a robot count
@@ -218,8 +244,14 @@ open Beads. The scope and outcomes of individual checks follow below.
   place, the quarantine directory was absent and all bytes survived. After
   releasing the lock, restart that same mailbox. Exactly its two oldest
   files moved and all three NTFS file identities and bodies matched.
-- [ ] On NTFS, run the server's boundary tests with a competing publisher
-  during the move and verify that the selected snapshot remains pinned.
+- [x] Run eight server tests on NTFS. A competing publisher stayed excluded
+  through the final move, the selected snapshot stayed pinned, and normal
+  rotation still staged older backups. All eight ran individually and passed.
+- [x] Compile and run the three existing startup cache link tests on
+  native Windows. The original build failed at three Unix imports.
+  With Windows file and directory link constructors all three passed with
+  the same assertions. The producer and Windows host agreed on executable
+  SHA-256 `4c65062b5d41` (prefix) for all eleven tests.
 - [x] On NTFS, verify that the selected snapshot resists writes and renames
   until release, that a pending receipt parks retention, and that a complete
   scan resumes. All 41 snapshot tests, the receipt scan, and promotion of a
@@ -238,9 +270,11 @@ open Beads. The scope and outcomes of individual checks follow below.
   host's 0002 creation mask, three of 64 cases stopped at the private
   namespace check. The same binary passed all 64 with mask 0077. A trace
   confirmed that the failed fixture's parent was group-writable (0775).
-- [ ] Create the three retention fixtures with explicit private permissions
+- [x] Create the three retention fixtures with explicit private permissions
   and repeat all 64 under the ordinary user's original 0002 mask. Include
-  the separate shared-directory refusal control.
+  the separate shared-directory refusal control. The same executable
+  (`a8d7b784d0b1`) passed all 64 cases and the refusal control on both
+  Linux hosts, including the one that originally failed.
 - [x] Give each of the 12 refusal, seven competing-write and five revision
   fixtures its own 60-second child deadline in `br-kw4yv`. Preserve each
   test's existing assertions and the timeout diagnostic.
