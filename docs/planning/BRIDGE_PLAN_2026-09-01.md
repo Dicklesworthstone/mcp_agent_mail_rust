@@ -102,11 +102,17 @@
   quarantined the two oldest backups. All three files retained their bytes.
 - [ ] On NTFS, exercise a competing publisher during each real move, a
   busy reader before quarantine creation, and resumption after release.
-- [ ] Verify that the pinned file resists writes and renames, that an
-  unfinished recovery receipt parks rotation, and that a complete scan
-  resumes after the owner releases its lock.
-- [ ] Run both workspace compiler checks, Clippy, formatting and the
-  existing Unix rotation and snapshot tests on these source bytes.
+- [x] On NTFS, verify that the selected snapshot resists writes and renames
+  until release, that a pending receipt parks retention, and that a complete
+  scan resumes. All 41 snapshot tests, the receipt scan, and promotion of a
+  read-only recovery candidate passed. The producer and Windows host measured
+  the same database executable SHA-256, `73a0e4be0a03` (prefix).
+- [x] On the same 675 inputs, run both workspace compiler checks, Clippy
+  with warnings denied, formatting, all 62 snapshot tests and four rotation
+  coordination tests on Apple Silicon. All passed.
+- [ ] Run the wider Unix rotation suite. On Apple Silicon the existing
+  16,641-directory backlog test exceeded its original 240-second deadline
+  (`br-h6k9b`).
 - [x] Give each of the 12 refusal, seven competing-write and five revision
   fixtures its own 60-second child deadline in `br-kw4yv`. Preserve each
   test's existing assertions and the timeout diagnostic.
