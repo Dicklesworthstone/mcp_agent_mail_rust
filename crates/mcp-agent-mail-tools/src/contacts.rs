@@ -130,6 +130,26 @@ fn require_active_contact_participant(
     Ok(())
 }
 
+fn require_distinct_contact_participants(
+    requester: &mcp_agent_mail_db::AgentRow,
+    target: &mcp_agent_mail_db::AgentRow,
+    requester_project_key: &str,
+) -> McpResult<()> {
+    let same_agent = match (requester.id, target.id) {
+        (Some(from), Some(to)) => from == to,
+        _ => requester.name.eq_ignore_ascii_case(&target.name),
+    };
+    if requester.project_id == target.project_id && same_agent {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Self-contact within the same project is unnecessary. You can message yourself without contact approval.",
+            true,
+            serde_json::json!({ "project_key": requester_project_key, "agent_name": requester.name }),
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize a contact policy string.
 ///
 /// Trims whitespace and lowercases without changing semantic intent.
@@ -464,6 +484,7 @@ pub(crate) async fn request_contact_with_intro(
     .await?;
     require_active_contact_participant(&from_row, "requester")?;
     require_active_contact_participant(&to_row, "target")?;
+    require_distinct_contact_participants(&from_row, &to_row, &project.human_key)?;
     let from_agent_name = from_row.name.clone();
     let target_agent_name = to_row.name.clone();
 
@@ -809,6 +830,7 @@ async fn respond_contact_with_mode(
     // valid binding.
     require_active_contact_participant(&to_row, "recipient")?;
     require_active_contact_participant(&from_row, "requester")?;
+    require_distinct_contact_participants(&from_row, &to_row, &source_project_row.human_key)?;
     // Mirror request_contact: clamp caller-supplied TTL to [60s, 1 year] so the DB's
     // expires_ts = now + ttl*1_000_000 cannot be driven past a reasonable horizon.
     let ttl = match ttl_seconds {

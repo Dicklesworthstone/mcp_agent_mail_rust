@@ -6,7 +6,7 @@
 # 2. Self-contact request: agent requests contact with self (verify error)
 # 3. block_all policy: contact request to agent with block_all policy (verify rejection)
 # 4. Orphaned response: contact request → agent deregisters → respond to orphaned request
-# 5. TTL expiry: contact with short TTL → verify expired state
+# 5. Contact TTL: verify the 60s floor and loss of send authorization at expiry
 # 6. Already-approved duplicate: re-request contact that's already approved
 # 7. Mutual approve: both agents accept each other's contact requests
 # 8. Simultaneous accept/reject: race condition with concurrent responses
@@ -30,6 +30,11 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 WORK="$(e2e_mktemp "e2e_circular_contacts")"
 CIRC_DB="${WORK}/circular_contacts.sqlite3"
 PROJECT_PATH="/tmp/e2e_circular_$$"
+# Keep the scenario's role names while registering valid agent identities.
+ALPHA_AGENT="RedFox"
+BETA_AGENT="BlueLake"
+GAMMA_AGENT="GoldPeak"
+DELTA_AGENT="SilverWolf"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-circular","version":"1.0"}}}'
 
@@ -38,40 +43,7 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # ---------------------------------------------------------------------------
 
 send_jsonrpc_session() {
-    local db_path="$1"; shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.3
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=25
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+    E2E_STDIO_TIMEOUT_SECONDS=12.5 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 extract_result() {
@@ -142,15 +114,15 @@ except Exception:
 # ===========================================================================
 # Setup: Create project and register test agents (Alpha, Beta, Gamma, Delta)
 # ===========================================================================
-e2e_case_banner "Setup: project + four agents (Alpha, Beta, Gamma, Delta)"
+e2e_case_banner "Setup: Alpha=$ALPHA_AGENT, Beta=$BETA_AGENT, Gamma=$GAMMA_AGENT, Delta=$DELTA_AGENT"
 
 SETUP_RESP="$(send_jsonrpc_session "$CIRC_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_PATH}\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"Alpha\",\"task_description\":\"circular contact testing\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"Beta\",\"task_description\":\"circular contact testing\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"Gamma\",\"task_description\":\"circular contact testing\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"Delta\",\"task_description\":\"circular contact testing\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${ALPHA_AGENT}\",\"task_description\":\"circular contact testing\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${BETA_AGENT}\",\"task_description\":\"circular contact testing\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${GAMMA_AGENT}\",\"task_description\":\"circular contact testing\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${DELTA_AGENT}\",\"task_description\":\"circular contact testing\"}}}" \
 )"
 e2e_save_artifact "case_00_setup.txt" "$SETUP_RESP"
 
@@ -179,23 +151,15 @@ e2e_case_banner "Self-contact request: Alpha -> Alpha (expect error)"
 
 SELF_RESP="$(send_jsonrpc_session "$CIRC_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"Alpha\",\"to_agent\":\"Alpha\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"${ALPHA_AGENT}\",\"to_agent\":\"${ALPHA_AGENT}\"}}}" \
 )"
 e2e_save_artifact "case_01_self_contact.txt" "$SELF_RESP"
 
 SELF_ERR="$(is_error_result "$SELF_RESP" 20)"
 SELF_TEXT="$(extract_result "$SELF_RESP" 20)"
 
-if [ "$SELF_ERR" = "true" ]; then
-    e2e_pass "self-contact correctly returned error"
-else
-    # Some implementations may allow self-contact; mark as info, not fail
-    if echo "$SELF_TEXT" | grep -qi "self\|same\|identical"; then
-        e2e_pass "self-contact returned error or warning about self"
-    else
-        e2e_fail "self-contact should have returned error (got: $SELF_TEXT)"
-    fi
-fi
+e2e_assert_eq "self-contact returns a tool error" "true" "$SELF_ERR"
+e2e_assert_eq "self-contact returns typed INVALID_ARGUMENT" "INVALID_ARGUMENT" "$(parse_json_field "$SELF_TEXT" "error.type")"
 
 # ===========================================================================
 # Case 2: Set block_all policy on Gamma
@@ -204,7 +168,7 @@ e2e_case_banner "Set block_all policy on Gamma"
 
 BLOCK_RESP="$(send_jsonrpc_session "$CIRC_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"Gamma\",\"policy\":\"block_all\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${GAMMA_AGENT}\",\"policy\":\"block_all\"}}}" \
 )"
 e2e_save_artifact "case_02_block_all_policy.txt" "$BLOCK_RESP"
 
@@ -227,7 +191,7 @@ e2e_case_banner "Contact request to block_all agent: Alpha -> Gamma"
 
 BLOCKED_REQ_RESP="$(send_jsonrpc_session "$CIRC_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"Alpha\",\"to_agent\":\"Gamma\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"${ALPHA_AGENT}\",\"to_agent\":\"${GAMMA_AGENT}\"}}}" \
 )"
 e2e_save_artifact "case_03_contact_to_blocked.txt" "$BLOCKED_REQ_RESP"
 
@@ -252,10 +216,10 @@ fi
 # ===========================================================================
 e2e_case_banner "Mutual contact requests: Alpha <-> Beta"
 
-MUTUAL_RESP="$(send_jsonrpc_session "$CIRC_DB" \
+MUTUAL_RESP="$(send_jsonrpc_session --pipeline "$CIRC_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"Alpha\",\"to_agent\":\"Beta\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"Beta\",\"to_agent\":\"Alpha\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"${ALPHA_AGENT}\",\"to_agent\":\"${BETA_AGENT}\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"${BETA_AGENT}\",\"to_agent\":\"${ALPHA_AGENT}\"}}}" \
 )"
 e2e_save_artifact "case_04_mutual_requests.txt" "$MUTUAL_RESP"
 
@@ -301,10 +265,10 @@ fi
 # ===========================================================================
 e2e_case_banner "Accept mutual requests: both sides approve"
 
-ACCEPT_RESP="$(send_jsonrpc_session "$CIRC_DB" \
+ACCEPT_RESP="$(send_jsonrpc_session --pipeline "$CIRC_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"respond_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"to_agent\":\"Beta\",\"from_agent\":\"Alpha\",\"accept\":true}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/call\",\"params\":{\"name\":\"respond_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"to_agent\":\"Alpha\",\"from_agent\":\"Beta\",\"accept\":true}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"respond_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"to_agent\":\"${BETA_AGENT}\",\"from_agent\":\"${ALPHA_AGENT}\",\"accept\":true}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/call\",\"params\":{\"name\":\"respond_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"to_agent\":\"${ALPHA_AGENT}\",\"from_agent\":\"${BETA_AGENT}\",\"accept\":true}}}" \
 )"
 e2e_save_artifact "case_05_accept_mutual.txt" "$ACCEPT_RESP"
 
@@ -341,7 +305,7 @@ e2e_case_banner "Verify mutual contacts are approved"
 
 LIST_RESP="$(send_jsonrpc_session "$CIRC_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"list_contacts\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"Alpha\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"list_contacts\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${ALPHA_AGENT}\"}}}" \
 )"
 e2e_save_artifact "case_06_list_contacts.txt" "$LIST_RESP"
 
@@ -355,7 +319,7 @@ else
 fi
 
 # Check if Beta is in Alpha's contact list
-if echo "$LIST_TEXT" | grep -q "Beta"; then
+if echo "$LIST_TEXT" | grep -q "$BETA_AGENT"; then
     e2e_pass "Alpha's contacts include Beta"
 else
     e2e_pass "Alpha's contacts (may include Beta in different format)"
@@ -368,7 +332,7 @@ e2e_case_banner "Duplicate request for already-approved contact: Alpha -> Beta a
 
 DUP_RESP="$(send_jsonrpc_session "$CIRC_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"Alpha\",\"to_agent\":\"Beta\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"${ALPHA_AGENT}\",\"to_agent\":\"${BETA_AGENT}\"}}}" \
 )"
 e2e_save_artifact "case_07_duplicate_request.txt" "$DUP_RESP"
 
@@ -390,14 +354,16 @@ else
 fi
 
 # ===========================================================================
-# Case 8: Contact request with short TTL (Delta -> Alpha with ttl_seconds=1)
+# Case 8: Sub-minimum contact TTL is clamped and authorization expires
 # ===========================================================================
-e2e_case_banner "Contact request with short TTL: Delta -> Alpha (ttl=1s)"
+e2e_case_banner "Contact TTL: Delta -> Alpha uses the 60s floor and expires"
 
+TTL_REQUEST_BEFORE="$(python3 -c 'import time; print(time.time())')"
 TTL_RESP="$(send_jsonrpc_session "$CIRC_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"Delta\",\"to_agent\":\"Alpha\",\"ttl_seconds\":1}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"request_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"from_agent\":\"${DELTA_AGENT}\",\"to_agent\":\"${ALPHA_AGENT}\",\"ttl_seconds\":1}}}" \
 )"
+TTL_REQUEST_AFTER="$(python3 -c 'import time; print(time.time())')"
 e2e_save_artifact "case_08_short_ttl_request.txt" "$TTL_RESP"
 
 TTL_ERR="$(is_error_result "$TTL_RESP" 80)"
@@ -409,30 +375,74 @@ else
     e2e_fail "short TTL request failed"
 fi
 
-# Wait for TTL to expire
-e2e_log "Waiting 2s for TTL to expire..."
-sleep 2
+TTL_REQUEST_EXPIRES="$(parse_json_field "$TTL_TEXT" "expires_ts")"
+if python3 - "$TTL_REQUEST_EXPIRES" "$TTL_REQUEST_BEFORE" "$TTL_REQUEST_AFTER" <<'PY'
+from datetime import datetime
+import sys
+expires = datetime.fromisoformat(sys.argv[1].replace('Z', '+00:00')).timestamp()
+sys.exit(0 if float(sys.argv[2]) + 60 <= expires <= float(sys.argv[3]) + 60 else 1)
+PY
+then
+    e2e_pass "sub-minimum request TTL is clamped to 60 seconds"
+else
+    e2e_fail "sub-minimum request TTL did not match the 60-second floor"
+fi
 
-# Try to respond after TTL expiry
+# A recipient's explicit approval starts a fresh approval lifetime. Test that
+# lifetime through send_message, where expired links must not grant access.
+TTL_APPROVAL_BEFORE="$(python3 -c 'import time; print(time.time())')"
 TTL_ACCEPT_RESP="$(send_jsonrpc_session "$CIRC_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\",\"params\":{\"name\":\"respond_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"to_agent\":\"Alpha\",\"from_agent\":\"Delta\",\"accept\":true}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\",\"params\":{\"name\":\"respond_contact\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"to_agent\":\"${ALPHA_AGENT}\",\"from_agent\":\"${DELTA_AGENT}\",\"accept\":true,\"ttl_seconds\":1}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${ALPHA_AGENT}\",\"policy\":\"contacts_only\"}}}" \
 )"
-e2e_save_artifact "case_08_ttl_expired_accept.txt" "$TTL_ACCEPT_RESP"
+TTL_APPROVAL_AFTER="$(python3 -c 'import time; print(time.time())')"
+e2e_save_artifact "case_08_ttl_approval.txt" "$TTL_ACCEPT_RESP"
 
-TTL_ACCEPT_ERR="$(is_error_result "$TTL_ACCEPT_RESP" 81)"
 TTL_ACCEPT_TEXT="$(extract_result "$TTL_ACCEPT_RESP" 81)"
-
-# Should either error (expired) or find no pending request
-if [ "$TTL_ACCEPT_ERR" = "true" ]; then
-    e2e_pass "expired TTL request correctly rejected"
+TTL_APPROVED_EXPIRES="$(parse_json_field "$TTL_ACCEPT_TEXT" "expires_ts")"
+e2e_assert_eq "short-lived contact approval succeeds" "True" "$(parse_json_field "$TTL_ACCEPT_TEXT" "approved")"
+e2e_assert_eq "expiry target requires contacts" "contacts_only" "$(parse_json_field "$(extract_result "$TTL_ACCEPT_RESP" 82)" "policy")"
+if python3 - "$TTL_APPROVED_EXPIRES" "$TTL_APPROVAL_BEFORE" "$TTL_APPROVAL_AFTER" <<'PY'
+from datetime import datetime
+import sys
+expires = datetime.fromisoformat(sys.argv[1].replace('Z', '+00:00')).timestamp()
+sys.exit(0 if float(sys.argv[2]) + 60 <= expires <= float(sys.argv[3]) + 60 else 1)
+PY
+then
+    e2e_pass "sub-minimum approval TTL is clamped to 60 seconds"
 else
-    if echo "$TTL_ACCEPT_TEXT" | grep -qiE "expired|no.*pending|not found|already"; then
-        e2e_pass "expired TTL request handled (may have auto-cleaned)"
-    else
-        e2e_pass "TTL response: implementation may handle expiry lazily"
-    fi
+    e2e_fail "sub-minimum approval TTL did not match the 60-second floor"
 fi
+
+TTL_LIVE_RESP="$(CONTACT_ENFORCEMENT_ENABLED=true MESSAGING_AUTO_HANDSHAKE_ON_BLOCK=false \
+    send_jsonrpc_session "$CIRC_DB" "$INIT_REQ" \
+    "{\"jsonrpc\":\"2.0\",\"id\":83,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${DELTA_AGENT}\",\"to\":[\"${ALPHA_AGENT}\"],\"subject\":\"Live contact approval\",\"body_md\":\"Approved link still permits delivery.\"}}}")"
+e2e_save_artifact "case_08_before_expiry_send.txt" "$TTL_LIVE_RESP"
+e2e_assert_eq "live contact approval permits delivery" "false" "$(is_error_result "$TTL_LIVE_RESP" 83)"
+e2e_assert_eq "live approval delivers exactly one message" "1" "$(parse_json_field "$(extract_result "$TTL_LIVE_RESP" 83)" "count")"
+
+e2e_log "Waiting until the real contact approval expires: $TTL_APPROVED_EXPIRES"
+python3 - "$TTL_APPROVED_EXPIRES" <<'PY'
+from datetime import datetime
+import sys
+import time
+expires = datetime.fromisoformat(sys.argv[1].replace('Z', '+00:00')).timestamp()
+if expires - time.time() > 65:
+    sys.exit('Contact expiry exceeds the bounded 65-second wait')
+deadline = time.monotonic() + 65
+while (remaining := expires - time.time()) > 0:
+    if time.monotonic() >= deadline:
+        sys.exit('Contact expiry wait exceeded 65 seconds')
+    time.sleep(min(remaining, 0.25))
+PY
+
+TTL_EXPIRED_RESP="$(CONTACT_ENFORCEMENT_ENABLED=true MESSAGING_AUTO_HANDSHAKE_ON_BLOCK=false \
+    send_jsonrpc_session "$CIRC_DB" "$INIT_REQ" \
+    "{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${DELTA_AGENT}\",\"to\":[\"${ALPHA_AGENT}\"],\"subject\":\"Expired contact approval\",\"body_md\":\"Expired link must refuse delivery.\"}}}")"
+e2e_save_artifact "case_08_after_expiry_send.txt" "$TTL_EXPIRED_RESP"
+e2e_assert_eq "expired approval returns a tool error" "true" "$(is_error_result "$TTL_EXPIRED_RESP" 84)"
+e2e_assert_eq "expired contact approval no longer authorizes delivery" "CONTACT_REQUIRED" "$(parse_json_field "$(extract_result "$TTL_EXPIRED_RESP" 84)" "error.type")"
 
 # ===========================================================================
 # Summary

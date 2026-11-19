@@ -2695,6 +2695,292 @@ fn run_rust_native_fixtures_against_rust_server_router() {
     }
 }
 
+fn assert_self_contact_router_rejection(tool_name: &str) {
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let env = setup_fixture_env();
+    let project_path = env.tmp.path().join("self-contact-project");
+    std::fs::create_dir_all(&project_path).expect("create self-contact fixture project");
+    let project_key = project_path.to_string_lossy().into_owned();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id = 20_000;
+    let invoke = |tool: &str, input: Value, req_id: &mut u64| {
+        execute_tool(
+            &env.router,
+            &cx,
+            &budget,
+            req_id,
+            tool,
+            args_from_value(&input),
+        )
+        .unwrap_or_else(|error| panic!("{tool} router failure: {error}"))
+    };
+    let project = invoke(
+        "ensure_project",
+        serde_json::json!({ "human_key": &project_key }),
+        &mut req_id,
+    )
+    .expect("create self-contact project through router");
+    let slug = project["slug"].as_str().expect("project slug");
+    let canonical_key = project["human_key"].as_str().expect("project human key");
+    let agent = invoke(
+        "register_agent",
+        serde_json::json!({
+            "project_key": &project_key,
+            "program": "conformance",
+            "model": "contact-contract",
+            "name": "BlueLake"
+        }),
+        &mut req_id,
+    )
+    .expect("register real self-contact participant");
+    assert_eq!(agent["name"], "BlueLake");
+
+    // Project aliases and name normalization must resolve identity before the
+    // refusal. Literal input equality would miss these same-identity calls.
+    let mut inputs = vec![match tool_name {
+        "request_contact" => serde_json::json!({
+            "project_key": &project_key,
+            "from_agent": "bluelake",
+            "to_agent": "BlueLake",
+            "to_project": slug
+        }),
+        "respond_contact" => serde_json::json!({
+            "project_key": slug,
+            "from_project": &project_key,
+            "from_agent": "BlueLake",
+            "to_agent": "bluelake",
+            "accept": true
+        }),
+        "macro_contact_handshake" => serde_json::json!({
+            "project_key": &project_key,
+            "requester": "bluelake",
+            "target": "BlueLake",
+            "to_project": slug,
+            "auto_accept": true,
+            "welcome_subject": "Must not deliver a self-contact welcome",
+            "welcome_body": "A refused handshake must have no durable side effects."
+        }),
+        _ => panic!("unexpected contact contract tool: {tool_name}"),
+    }];
+    if tool_name == "macro_contact_handshake" {
+        inputs.push(serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": "BlueLake",
+            "to_agent": format!("project:{slug}#BlueLake"),
+            "auto_accept": true,
+            "welcome_subject": "Must not deliver an aliased self-contact welcome",
+            "welcome_body": "Alias parameters preserve the same refusal contract."
+        }));
+    }
+
+    for input in inputs {
+        let error_text = invoke(tool_name, input, &mut req_id)
+            .expect_err("same-project self-contact must be a tool error");
+        let error: Value = serde_json::from_str(&error_text)
+            .unwrap_or_else(|error| panic!("structured contact error: {error}: {error_text}"));
+        assert_eq!(error["error"]["type"], "INVALID_ARGUMENT", "{error}");
+        assert_eq!(error["error"]["recoverable"], true, "{error}");
+        assert_eq!(
+            error["error"]["data"],
+            serde_json::json!({ "project_key": canonical_key, "agent_name": "BlueLake" }),
+            "{error}"
+        );
+        let contacts = invoke(
+            "list_contacts",
+            serde_json::json!({ "project_key": &project_key, "agent_name": "BlueLake" }),
+            &mut req_id,
+        )
+        .expect("read real contact links after refusal");
+        assert_eq!(
+            contacts,
+            serde_json::json!([]),
+            "{tool_name} created a link"
+        );
+        let inbox = invoke(
+            "fetch_inbox",
+            serde_json::json!({
+                "project_key": &project_key,
+                "agent_name": "BlueLake",
+                "include_bodies": true
+            }),
+            &mut req_id,
+        )
+        .expect("read real inbox after refusal");
+        assert_eq!(inbox, serde_json::json!([]), "{tool_name} emitted a notice");
+    }
+    crate::drain_shared_storage();
+    let archive_files = collect_archive_files(&env.tmp.path().join("archive"));
+    assert!(
+        archive_files
+            .iter()
+            .any(|path| path.ends_with("/profile.json")),
+        "real registration must produce an archive profile: {archive_files:?}"
+    );
+    assert!(
+        archive_files.iter().all(|path| {
+            !path.contains("/messages/") && !path.contains("/inbox/") && !path.contains("/outbox/")
+        }),
+        "{tool_name} archived a notice despite refusing self-contact: {archive_files:?}"
+    );
+}
+
+#[test]
+fn self_contact_request_is_typed_and_side_effect_free() {
+    assert_self_contact_router_rejection("request_contact");
+}
+
+#[test]
+fn self_contact_response_is_typed_and_side_effect_free() {
+    assert_self_contact_router_rejection("respond_contact");
+}
+
+#[test]
+fn self_contact_macro_and_aliases_are_typed_and_side_effect_free() {
+    assert_self_contact_router_rejection("macro_contact_handshake");
+}
+
+#[test]
+fn self_contact_guard_preserves_same_name_cross_project_contacts_and_self_messaging() {
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let env = setup_fixture_env();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id = 30_000;
+    let invoke = |tool: &str, input: Value, req_id: &mut u64| {
+        execute_tool(
+            &env.router,
+            &cx,
+            &budget,
+            req_id,
+            tool,
+            args_from_value(&input),
+        )
+        .unwrap_or_else(|error| panic!("{tool} router failure: {error}"))
+        .unwrap_or_else(|error| panic!("{tool} tool failure: {error}"))
+    };
+    let mut projects = Vec::new();
+    let mut agent_ids = Vec::new();
+    for directory in ["contact-source", "contact-target"] {
+        let path = env.tmp.path().join(directory);
+        std::fs::create_dir_all(&path).expect("create cross-project contact fixture");
+        let project = invoke(
+            "ensure_project",
+            serde_json::json!({ "human_key": path.to_string_lossy() }),
+            &mut req_id,
+        );
+        let agent = invoke(
+            "register_agent",
+            serde_json::json!({
+                "project_key": &project["human_key"],
+                "program": "conformance",
+                "model": "contact-contract",
+                "name": "BlueLake"
+            }),
+            &mut req_id,
+        );
+        assert_eq!(agent["name"], "BlueLake");
+        agent_ids.push(agent["id"].as_i64().expect("real registered agent id"));
+        projects.push(project);
+    }
+    assert_ne!(
+        agent_ids[0], agent_ids[1],
+        "same names are distinct identities"
+    );
+    let source = &projects[0];
+    let target = &projects[1];
+    let requested = invoke(
+        "request_contact",
+        serde_json::json!({
+            "project_key": &source["human_key"],
+            "from_agent": "BlueLake",
+            "to_agent": "BlueLake",
+            "to_project": &target["slug"]
+        }),
+        &mut req_id,
+    );
+    assert_eq!(requested["from_project"], source["human_key"]);
+    assert_eq!(requested["to_project"], target["human_key"]);
+    assert_eq!(requested["status"], "pending");
+    let approved = invoke(
+        "respond_contact",
+        serde_json::json!({
+            "project_key": &target["human_key"],
+            "from_project": &source["slug"],
+            "from_agent": "BlueLake",
+            "to_agent": "BlueLake",
+            "accept": true
+        }),
+        &mut req_id,
+    );
+    assert_eq!(approved["approved"], true);
+    let handshake = invoke(
+        "macro_contact_handshake",
+        serde_json::json!({
+            "project_key": &target["human_key"],
+            "requester": "BlueLake",
+            "target": "BlueLake",
+            "to_project": &source["slug"],
+            "auto_accept": true,
+            "welcome_subject": "Same-name cross-project welcome",
+            "welcome_body": "The project distinguishes these two identities."
+        }),
+        &mut req_id,
+    );
+    assert_eq!(handshake["response"]["approved"], true);
+    assert_eq!(
+        handshake["welcome_message"]["deliveries"][0]["payload"]["project_id"],
+        source["id"]
+    );
+    let self_message = invoke(
+        "send_message",
+        serde_json::json!({
+            "project_key": &source["human_key"],
+            "sender_name": "BlueLake",
+            "to": ["BlueLake"],
+            "subject": "Ordinary self-message",
+            "body_md": "Self-messaging needs no self-contact link."
+        }),
+        &mut req_id,
+    );
+    assert_eq!(self_message["count"], 1);
+    let self_message_id = self_message["deliveries"][0]["payload"]["id"]
+        .as_i64()
+        .expect("real self-message id");
+    let inbox = invoke(
+        "fetch_inbox",
+        serde_json::json!({
+            "project_key": &source["human_key"],
+            "agent_name": "BlueLake",
+            "include_bodies": true
+        }),
+        &mut req_id,
+    );
+    assert!(
+        inbox
+            .as_array()
+            .expect("real source inbox")
+            .iter()
+            .any(|message| {
+                message["id"].as_i64() == Some(self_message_id)
+                    && message["subject"] == "Ordinary self-message"
+                    && message["body_md"] == "Self-messaging needs no self-contact link."
+            }),
+        "self-message must reach its own inbox: {inbox}"
+    );
+    crate::drain_shared_storage();
+    assert!(
+        collect_archive_files(&env.tmp.path().join("archive"))
+            .iter()
+            .any(|path| path.contains("/messages/") && path.ends_with(".md")),
+        "positive contact and message paths must write real archive messages"
+    );
+}
+
 #[test]
 fn lifecycle_tools_preserve_authorization_roster_and_permanent_deregistration_contract() {
     let _lock = env_lock()
