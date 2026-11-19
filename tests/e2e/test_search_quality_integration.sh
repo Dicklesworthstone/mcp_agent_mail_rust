@@ -659,6 +659,9 @@ fi
 
 e2e_case_banner "Robot command regression checks (no like/2 backend failures)"
 
+# Both commands must read this private mailbox even when an operator server
+# is listening on the default port.
+export HTTP_HOST=127.0.0.1 HTTP_PORT=0 AGENT_MAIL_URL=http://127.0.0.1:0/mcp/
 status_rc=0
 ROBOT_STATUS_OUT="$(DATABASE_URL="sqlite:///${DB_PATH}" STORAGE_ROOT="${STORAGE_ROOT}" AM_INTERFACE_MODE=cli \
     "${AM_BIN}" robot status --project "${PROJECT_A}" --agent BlueLake --format json \

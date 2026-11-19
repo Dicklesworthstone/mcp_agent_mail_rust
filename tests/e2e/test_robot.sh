@@ -64,6 +64,9 @@ printf "case_id\tcommand\telapsed_ms\n" > "${TIMINGS_FILE}"
 export DATABASE_URL="sqlite:///${DB_PATH}"
 export STORAGE_ROOT
 export AM_INTERFACE_MODE=cli
+# Port zero cannot have a listener; keep robot reads on this private mailbox.
+export HTTP_HOST=127.0.0.1 HTTP_PORT=0 HTTP_PATH=/mcp/
+export AGENT_MAIL_URL=http://127.0.0.1:0/mcp/
 ROBOT_AGENT="RedFox"
 
 e2e_log "Work directory: ${WORK}"
@@ -81,60 +84,17 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 seed_data() {
     local db_path="$1"
     local project="$2"
-    local output_file="${WORK}/seed_response.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:///${db_path}" RUST_LOG=error WORKTREES_ENABLED=true \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        echo "$INIT_REQ"
-        sleep 0.5
-        # Ensure project
-        echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${project}\"}}}"
-        sleep 0.5
-        # Register agents
-        echo "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${project}\",\"program\":\"claude-code\",\"model\":\"opus-4.6\",\"name\":\"BlueLake\",\"task_description\":\"E2E testing\"}}}"
-        sleep 0.5
-        echo "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${project}\",\"program\":\"codex-cli\",\"model\":\"gpt-5.2\",\"name\":\"RedFox\",\"task_description\":\"E2E testing\"}}}"
-        sleep 0.5
-        # Set RedFox's contact policy to "open" so anyone can message them
-        echo "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"RedFox\",\"policy\":\"open\"}}}"
-        sleep 0.5
-        # Send two messages in the same thread for thread/message command coverage.
-        echo "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message 1\",\"body_md\":\"This is test message 1 for robot E2E validation.\",\"importance\":\"high\",\"thread_id\":\"robot-e2e-thread\"}}}"
-        sleep 0.5
-        echo "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message 2\",\"body_md\":\"This is test message 2 for robot E2E validation.\",\"importance\":\"normal\",\"thread_id\":\"robot-e2e-thread\"}}}"
-        sleep 0.5
-        # Create a file reservation
-        echo "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"paths\":[\"src/test.rs\"],\"ttl_seconds\":7200,\"exclusive\":true,\"reason\":\"E2E test\"}}}"
-        sleep 0.5
-        # Create a build slot lease for robot analytics topology coverage.
-        echo "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"acquire_build_slot\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"slot\":\"cargo-build\",\"ttl_seconds\":7200,\"exclusive\":true}}}"
-        sleep 0.5
-        # Keep stdin open briefly so the server can flush all responses.
-        sleep 1
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=15
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    cat "$output_file"
+    E2E_STDIO_TIMEOUT_SECONDS=7.5 RUST_LOG=error WORKTREES_ENABLED=true \
+        e2e_stdio_session "$db_path" \
+        "$INIT_REQ" \
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${project}\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${project}\",\"program\":\"claude-code\",\"model\":\"opus-4.6\",\"name\":\"BlueLake\",\"task_description\":\"E2E testing\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${project}\",\"program\":\"codex-cli\",\"model\":\"gpt-5.2\",\"name\":\"RedFox\",\"task_description\":\"E2E testing\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"RedFox\",\"policy\":\"open\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message 1\",\"body_md\":\"This is test message 1 for robot E2E validation.\",\"importance\":\"high\",\"thread_id\":\"robot-e2e-thread\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Robot E2E Test Message 2\",\"body_md\":\"This is test message 2 for robot E2E validation.\",\"importance\":\"normal\",\"thread_id\":\"robot-e2e-thread\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"paths\":[\"src/test.rs\"],\"ttl_seconds\":7200,\"exclusive\":true,\"reason\":\"E2E test\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"acquire_build_slot\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"slot\":\"cargo-build\",\"ttl_seconds\":7200,\"exclusive\":true}}}"
 }
 
 SEED_RESP="$(seed_data "$DB_PATH" "$PROJECT_PATH")"
@@ -159,6 +119,33 @@ if ! echo "$SEED_RESP" | grep -q '"id":10'; then
     e2e_summary
     exit 1
 fi
+RESP="$SEED_RESP" python3 - "$DB_PATH" "$PROJECT_PATH" <<'PY'
+import json
+import os
+import sqlite3
+import sys
+
+responses = [json.loads(line) for line in os.environ["RESP"].splitlines() if line.strip()]
+by_id = {item["id"]: item for item in responses if "id" in item}
+for request_id in (1, 2, 3, 4, 5, 6, 8, 9, 10):
+    response = by_id[request_id]
+    assert "result" in response and "error" not in response, response
+    assert not response["result"].get("isError", False), response
+
+def payload(request_id):
+    return json.loads(by_id[request_id]["result"]["content"][0]["text"])
+
+project_id = payload(2)["id"]
+with sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True) as conn:
+    assert conn.execute("SELECT id FROM projects WHERE human_key = ?", (sys.argv[2],)).fetchall() == [(project_id,)]
+    assert conn.execute("SELECT name FROM agents WHERE project_id = ? ORDER BY name", (project_id,)).fetchall() == [("BlueLake",), ("RedFox",)]
+    for request_id, number, importance in ((6, 1, "high"), (8, 2, "normal")):
+        message_id = payload(request_id)["deliveries"][0]["payload"]["id"]
+        assert conn.execute("SELECT m.subject, m.body_md, m.thread_id, m.importance, a.name FROM messages m JOIN agents a ON a.id = m.sender_id WHERE m.id = ? AND m.project_id = ?", (message_id, project_id)).fetchall() == [(f"Robot E2E Test Message {number}", f"This is test message {number} for robot E2E validation.", "robot-e2e-thread", importance, "BlueLake")]
+        assert conn.execute("SELECT a.name FROM message_recipients mr JOIN agents a ON a.id = mr.agent_id WHERE mr.message_id = ? AND mr.kind = 'to'", (message_id,)).fetchall() == [("RedFox",)]
+    assert conn.execute("SELECT fr.path_pattern, a.name FROM file_reservations fr JOIN agents a ON a.id = fr.agent_id WHERE fr.project_id = ? AND fr.released_ts IS NULL", (project_id,)).fetchall() == [("src/test.rs", "BlueLake")]
+print("Seed project, agents, messages, recipients, and reservation persisted")
+PY
 e2e_pass "Test data seeded successfully"
 
 # Workaround: frankensqlite doesn't update indexes properly, so we REINDEX
@@ -178,9 +165,11 @@ run_robot() {
         agent_args=(--agent "${ROBOT_AGENT}")
     fi
     local output
+    local exit_code=0
     output=$(DATABASE_URL="sqlite:///${DB_PATH}" STORAGE_ROOT="${STORAGE_ROOT}" \
-        AM_INTERFACE_MODE=cli am robot --project "${PROJECT_PATH}" "${agent_args[@]}" "$subcommand" "$@" 2>&1) || true
+        AM_INTERFACE_MODE=cli am robot --project "${PROJECT_PATH}" "${agent_args[@]}" "$subcommand" "$@" 2>&1) || exit_code=$?
     echo "$output"
+    return "$exit_code"
 }
 
 run_robot_with_mailbox() {
@@ -203,14 +192,16 @@ run_robot_timed() {
     local case_id="$1"
     shift
     local t0 t1 elapsed output
+    local exit_code=0
     t0="$(date +%s%3N 2>/dev/null || echo 0)"
-    output="$(run_robot "$@")"
+    output="$(run_robot "$@")" || exit_code=$?
     t1="$(date +%s%3N 2>/dev/null || echo 0)"
     if [ "$t0" -gt 0 ] && [ "$t1" -ge "$t0" ]; then
         elapsed=$((t1 - t0))
         printf "%s\t%s\t%s\n" "$case_id" "am robot $*" "$elapsed" >> "${TIMINGS_FILE}"
     fi
     printf '%s' "$output"
+    return "$exit_code"
 }
 
 # Validate JSON output

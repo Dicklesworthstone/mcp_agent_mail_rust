@@ -5,11 +5,13 @@
 #   1. 10KB+ message body
 #   2. 100KB+ message body
 #   3. Maximum subject length (200 chars)
-#   4. Many recipients (20+)
-#   5. Long file reservation paths
-#   6. Large search query
-#   7. Many concurrent messages in one session
+#   4. Subject truncation (250 to 200 chars)
+#   5. Many recipients (20)
+#   6. Long file reservation paths
+#   7. Large search query
 #   8. Message with many newlines
+#   9. Inbox containing the large messages
+#  10. Fifty file reservations in one call
 
 E2E_SUITE="large_inputs"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,45 +30,7 @@ LI_DB="${WORK}/large_inputs.sqlite3"
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-large-inputs","version":"1.0"}}}'
 
 send_jsonrpc_session() {
-    local db_path="$1"
-    shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.2
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=20
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
-    fi
+    E2E_STDIO_TIMEOUT_SECONDS=6 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 assert_ok() {
@@ -94,7 +58,7 @@ for line in sys.stdin:
                 sys.exit(0)
     except Exception: pass
 print('NO_MATCH')
-" 2>/dev/null)"
+")"
 
     case "$check" in
         OK) e2e_pass "$label" ;;
@@ -142,7 +106,10 @@ RESP="$(send_jsonrpc_session "$LI_DB" \
 e2e_save_artifact "setup.txt" "$RESP"
 assert_ok "ensure_project" "$RESP" 10
 assert_ok "register first agent (RedFox)" "$RESP" 11
-assert_ok "register 25th agent (DryCreek)" "$RESP" 35
+for i in $(seq 2 24); do
+    assert_ok "register agent $i (${NAMES[$((i-1))]})" "$RESP" "$((10+i))"
+done
+assert_ok "register 25th agent (CobaltElk)" "$RESP" 35
 
 # ===========================================================================
 # Case 1: 10KB message body
@@ -225,7 +192,7 @@ for line in sys.stdin:
     except Exception as e:
         pass
 print('PARSE_FAIL')
-" 2>/dev/null)"
+")"
 
 e2e_assert_contains "subject truncated to 200" "$TRUNC_CHECK" "LEN=200"
 
@@ -300,7 +267,8 @@ RESP="$(send_jsonrpc_session "$LI_DB" \
 e2e_save_artifact "case_09_fetch_large_inbox.txt" "$RESP"
 assert_ok "fetch inbox with large messages" "$RESP" 900
 
-# Verify inbox has multiple messages
+# Verify all six independently expected message payloads survived persistence.
+# Automatic contact-approval notices may also be present in this inbox.
 MSG_COUNT="$(echo "$RESP" | python3 -c "
 import sys, json
 for line in sys.stdin:
@@ -312,12 +280,29 @@ for line in sys.stdin:
             text = d['result']['content'][0]['text']
             msgs = json.loads(text)
             print(f'COUNT={len(msgs)}')
+            pattern = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '
+            expected = {
+                '10KB body test': (pattern * ((10 * 1024 // len(pattern)) + 1))[:10 * 1024] + '\\n',
+                '100KB body test': (pattern * ((100 * 1024 // len(pattern)) + 1))[:100 * 1024] + '\\n',
+                'A' * 200: 'body',
+                'B' * 200: 'body',
+                'Broadcast to 20 agents': 'Hello everyone',
+                '1000 lines': '\\n'.join(f'Line {i}: Some content here' for i in range(1000)),
+            }
+            for subject, body in expected.items():
+                matches = [msg for msg in msgs if msg['subject'] == subject]
+                assert len(matches) == 1, f'Expected one {subject!r}, got {len(matches)}'
+                assert matches[0]['body_md'] == body, f'Body mismatch for {subject!r}'
+                assert matches[0]['from'] == 'RedFox', f'Sender mismatch for {subject!r}'
+            print(f'PAYLOADS={len(expected)}')
             sys.exit(0)
-    except Exception: pass
+    except Exception as error:
+        print(f'Invalid persisted message: {error}', file=sys.stderr)
 print('PARSE_FAIL')
-" 2>/dev/null)"
+")"
 
 e2e_assert_contains "inbox has multiple messages" "$MSG_COUNT" "COUNT="
+e2e_assert_contains "all six subjects and bodies round-trip exactly" "$MSG_COUNT" "PAYLOADS=6"
 
 # ===========================================================================
 # Case 10: Many file reservations in one call
@@ -336,6 +321,26 @@ RESP="$(send_jsonrpc_session "$LI_DB" \
 )"
 e2e_save_artifact "case_10_many_reservations.txt" "$RESP"
 assert_ok "reserve 50 file paths" "$RESP" 1000
+RESERVATION_CHECK="$(echo "$RESP" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        response = json.loads(line)
+        if response.get('id') != 1000:
+            continue
+        result = json.loads(response['result']['content'][0]['text'])
+        granted = result['granted']
+        expected = {f'src/module_{i}/file_{j}.rs' for i in range(5) for j in range(10)}
+        assert len(granted) == 50
+        assert {row['path_pattern'] for row in granted} == expected
+        assert result['conflicts'] == []
+        print('ALL_50_GRANTED')
+        sys.exit(0)
+    except (json.JSONDecodeError, KeyError, TypeError, AssertionError):
+        pass
+print('MISMATCH')
+")"
+e2e_assert_eq "all 50 distinct reservation paths granted without conflicts" "ALL_50_GRANTED" "$RESERVATION_CHECK"
 
 # ===========================================================================
 # Summary

@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # test_concurrent_conflicts_e2e.sh - E2E: Write conflicts and concurrent operations
 #
-# Tests concurrent DB access patterns via separate MCP server sessions sharing
-# a single SQLite database. Each send_jsonrpc_session call spins up a fresh
-# server process, so overlapping reservations and messaging exercise real
-# cross-session conflict detection.
+# Tests ordered reservation contention across separate MCP server sessions
+# sharing one SQLite database, plus three pipelined independent message sends.
+# Inbox, ACK and idempotency checks run after those sends have completed.
 #
 # Tests:
-#   1. Setup: ensure_project + register 3 agents (GoldFox, SilverWolf, RedHawk)
-#   2. GoldFox reserves "app/*.py" exclusively
-#   3. SilverWolf reserves "app/api/*.py" (overlaps GoldFox) — conflict detected
-#   4. RedHawk sends messages to GoldFox and SilverWolf concurrently
+#   1. Setup: ensure_project + register 3 agents, open both recipient policies
+#   2. GoldFox reserves "app/**/*.py" and "shallow/*.py" exclusively
+#   3. SilverWolf sees an app/api/*.py conflict; shallow/api/*.py stays disjoint
+#   4. RedHawk pipelines three sends to GoldFox and SilverWolf
 #   5. fetch_inbox for each agent verifies all messages received
 #   6. Multiple agents acknowledge the same messages
 #   7. Idempotent operations: ensure_project twice returns same ID, register_agent upserts
@@ -40,40 +39,7 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # ---------------------------------------------------------------------------
 
 send_jsonrpc_session() {
-    local db_path="$1"; shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.3
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=30
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+    E2E_STDIO_TIMEOUT_SECONDS=15 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 extract_result() {
@@ -152,6 +118,8 @@ SETUP_RESP="$(send_jsonrpc_session "$CC_DB" \
     "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"GoldFox\",\"task_description\":\"reservation holder\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"SilverWolf\",\"task_description\":\"reservation contender\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"RedHawk\",\"task_description\":\"message sender\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"policy\":\"open\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"SilverWolf\",\"policy\":\"open\"}}}" \
 )"
 e2e_save_artifact "case_01_setup.txt" "$SETUP_RESP"
 
@@ -172,6 +140,12 @@ else
     e2e_fail "agent registration failed (GoldFox=$GF_ERR, SilverWolf=$SW_ERR, RedHawk=$RH_ERR)"
 fi
 
+# Keep contact approval notices out of the exact message-delivery counts.
+GF_POLICY_TEXT="$(extract_result "$SETUP_RESP" 14)"
+SW_POLICY_TEXT="$(extract_result "$SETUP_RESP" 15)"
+e2e_assert_eq "GoldFox messaging fixture policy is open" "open" "$(parse_json_field "$GF_POLICY_TEXT" "policy")"
+e2e_assert_eq "SilverWolf messaging fixture policy is open" "open" "$(parse_json_field "$SW_POLICY_TEXT" "policy")"
+
 # Save project id for idempotency test later
 PROJ_TEXT="$(extract_result "$SETUP_RESP" 10)"
 PROJ_ID="$(parse_json_field "$PROJ_TEXT" "id")"
@@ -185,13 +159,14 @@ else
 fi
 
 # ===========================================================================
-# Case 2: GoldFox reserves "app/*.py" exclusively (separate session)
+# Case 2: GoldFox reserves recursive and single-level patterns (separate session)
 # ===========================================================================
-e2e_case_banner "GoldFox reserves app/*.py exclusively"
+e2e_case_banner "GoldFox reserves app/**/*.py and shallow/*.py exclusively"
 
 GF_RESERVE_RESP="$(send_jsonrpc_session "$CC_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"paths\":[\"app/*.py\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"concurrent conflict E2E\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"paths\":[\"app/**/*.py\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"concurrent conflict E2E\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"GoldFox\",\"paths\":[\"shallow/*.py\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"single-level non-overlap control\"}}}" \
 )"
 e2e_save_artifact "case_02_goldfox_reserve.txt" "$GF_RESERVE_RESP"
 
@@ -218,6 +193,9 @@ except Exception as e:
 
 e2e_assert_contains "GoldFox granted 1 reservation" "$GF_RES_CHECK" "granted=1"
 e2e_assert_contains "GoldFox no conflicts" "$GF_RES_CHECK" "conflicts=0"
+GF_SHALLOW_TEXT="$(extract_result "$GF_RESERVE_RESP" 21)"
+e2e_assert_eq "single-level control holder granted" "shallow/*.py" "$(parse_json_field "$GF_SHALLOW_TEXT" "granted.0.path_pattern")"
+e2e_assert_eq "single-level control holder has no conflicts" "[]" "$(parse_json_field "$GF_SHALLOW_TEXT" "conflicts")"
 
 # ===========================================================================
 # Case 3: SilverWolf reserves "app/api/*.py" — conflict with GoldFox
@@ -227,6 +205,7 @@ e2e_case_banner "SilverWolf reserves app/api/*.py (overlaps GoldFox) — conflic
 SW_RESERVE_RESP="$(send_jsonrpc_session "$CC_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"SilverWolf\",\"paths\":[\"app/api/*.py\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"concurrent conflict E2E\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"SilverWolf\",\"paths\":[\"shallow/api/*.py\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"single-level non-overlap control\"}}}" \
 )"
 e2e_save_artifact "case_03_silverwolf_reserve.txt" "$SW_RESERVE_RESP"
 
@@ -255,13 +234,16 @@ e2e_save_artifact "case_03_parsed.txt" "$SW_RES_CHECK"
 
 e2e_assert_contains "SilverWolf sees conflict" "$SW_RES_CHECK" "conflicts=1"
 e2e_assert_contains "conflict holder is GoldFox" "$SW_RES_CHECK" "has_goldfox_holder=True"
+SW_SHALLOW_TEXT="$(extract_result "$SW_RESERVE_RESP" 31)"
+e2e_assert_eq "deeper control requester granted" "shallow/api/*.py" "$(parse_json_field "$SW_SHALLOW_TEXT" "granted.0.path_pattern")"
+e2e_assert_eq "single-level star does not conflict across a directory" "[]" "$(parse_json_field "$SW_SHALLOW_TEXT" "conflicts")"
 
 # ===========================================================================
 # Case 4: RedHawk sends messages to GoldFox and SilverWolf (separate session)
 # ===========================================================================
 e2e_case_banner "RedHawk sends messages to GoldFox and SilverWolf"
 
-MSG_RESP="$(send_jsonrpc_session "$CC_DB" \
+MSG_RESP="$(send_jsonrpc_session --pipeline "$CC_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"RedHawk\",\"to\":[\"GoldFox\"],\"subject\":\"Build plan alpha\",\"body_md\":\"Starting the build now.\",\"thread_id\":\"CONC-1\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"RedHawk\",\"to\":[\"SilverWolf\"],\"subject\":\"Build plan beta\",\"body_md\":\"Please review the PR.\",\"thread_id\":\"CONC-2\"}}}" \

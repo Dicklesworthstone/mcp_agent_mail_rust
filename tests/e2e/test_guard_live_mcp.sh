@@ -187,6 +187,7 @@ send_jsonrpc_session() {
             if [ "$MCP_INITIALIZED" = "0" ]; then
                 echo "$req" >&3
                 wait_for_jsonrpc_response "1" "initialize" || return 1
+                printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}' >&3
                 MCP_INITIALIZED=1
             fi
             continue

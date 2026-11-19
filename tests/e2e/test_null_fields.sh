@@ -34,54 +34,18 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # Helper: send a tool call via stdio and check for proper error/result.
 # Returns the parsed response text.
 send_jsonrpc_session() {
-    local db_path="$1"
-    shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.2
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=10
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
-    fi
+    E2E_STDIO_TIMEOUT_SECONDS=3 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 # Helper: check that a tool call returned an error response.
 # Accepts response text and the JSON-RPC id to look for.
-# Checks both MCP-style isError=true and JSON-RPC-level error.
+# Checks product errors after initialization. Empty search has an explicit
+# successful empty-result expectation; other successful responses fail.
 assert_tool_error() {
     local label="$1"
     local resp="$2"
     local id="$3"
+    local expected="${4:-ERROR}"
 
     local check
     check="$(echo "$resp" | python3 -c "
@@ -95,29 +59,26 @@ for line in sys.stdin:
             continue
         # JSON-RPC level error
         if 'error' in d:
-            print('ERROR')
+            code = d['error'].get('code')
+            print('TRANSPORT_OR_INTERNAL_ERROR' if code in (-32700, -32600, -32603) else 'ERROR')
             sys.exit(0)
         # MCP tool error (isError=true in result)
         if 'result' in d:
             if d['result'].get('isError', False):
                 print('ERROR')
                 sys.exit(0)
-            # Some tools may return valid result for null inputs (e.g., empty arrays)
-            print('RESULT')
+            payload = json.loads(d['result']['content'][0]['text'])
+            print('EMPTY_RESULT' if isinstance(payload, dict) and payload.get('result') == [] else 'RESULT')
             sys.exit(0)
     except (json.JSONDecodeError, KeyError, IndexError, TypeError):
         pass
 print('NO_MATCH')
-" 2>/dev/null)"
+")"
 
-    if [ "$check" = "ERROR" ]; then
-        e2e_pass "$label → returned error"
-    elif [ "$check" = "RESULT" ]; then
-        # Some cases may legitimately succeed (e.g., empty list for release)
-        e2e_pass "$label → returned result (acceptable)"
-    elif [ "$check" = "NO_MATCH" ]; then
-        # Server didn't crash but no response matched - still not a crash
-        e2e_fail "$label → no matching response for id=$id"
+    if [ "$check" = "$expected" ]; then
+        e2e_pass "$label → $expected"
+    else
+        e2e_fail "$label → expected $expected, got $check for id=$id"
         echo "    response: $(echo "$resp" | tail -3)"
     fi
 }
@@ -141,7 +102,7 @@ e2e_save_artifact "setup_response.txt" "$SETUP_RESP"
 # Verify setup succeeded
 if echo "$SETUP_RESP" | python3 -c "
 import sys, json
-found = 0
+responses = {}
 for line in sys.stdin:
     line = line.strip()
     if not line: continue
@@ -149,11 +110,21 @@ for line in sys.stdin:
         d = json.loads(line)
         if d.get('id') in (10, 11, 12, 13) and 'result' in d:
             if not d['result'].get('isError', False):
-                found += 1
+                responses[d['id']] = json.loads(d['result']['content'][0]['text'])
     except: pass
-print(found)
-sys.exit(0 if found >= 3 else 1)
-" 2>/dev/null; then
+try:
+    assert set(responses) == {10, 11, 12, 13}
+    assert responses[10]['human_key'] == '/tmp/e2e_fuzz_project'
+    assert responses[11]['name'] == 'RedLake'
+    assert responses[12]['name'] == 'BluePeak'
+    deliveries = responses[13]['deliveries']
+    assert len(deliveries) == 1
+    payload = deliveries[0]['payload']
+    assert payload['from'] == 'RedLake' and payload['to'] == ['BluePeak']
+    assert payload['subject'] == 'test' and payload['body_md'] == 'hello'
+except (AssertionError, KeyError, IndexError, TypeError):
+    sys.exit(1)
+"; then
     e2e_pass "setup: project + 2 agents + message created"
 else
     e2e_fail "setup: could not create test fixtures"
@@ -280,7 +251,7 @@ e2e_save_artifact "tool_06_search_messages.txt" "$RESP"
 assert_tool_error "search_messages(empty args)" "$RESP" 600
 assert_tool_error "search_messages(null project_key)" "$RESP" 601
 assert_tool_error "search_messages(null query)" "$RESP" 602
-assert_tool_error "search_messages(empty query)" "$RESP" 603
+assert_tool_error "search_messages(empty query)" "$RESP" 603 EMPTY_RESULT
 
 # ===========================================================================
 # Tool 7: file_reservation_paths - null/missing fields

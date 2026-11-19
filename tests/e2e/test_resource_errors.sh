@@ -32,45 +32,7 @@ RES_DB="${WORK}/resource_errors.sqlite3"
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-resource-errors","version":"1.0"}}}'
 
 send_jsonrpc_session() {
-    local db_path="$1"
-    shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.2
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=12
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
-    fi
+    E2E_STDIO_TIMEOUT_SECONDS=3.6 RUST_LOG=error e2e_stdio_session "$@"
 }
 
 # Helper: check tool/resource call succeeded (id match, no isError)
@@ -99,7 +61,7 @@ for line in sys.stdin:
                 sys.exit(0)
     except Exception: pass
 print('NO_MATCH')
-" 2>/dev/null)"
+")"
 
     case "$check" in
         OK) e2e_pass "$label" ;;
@@ -113,6 +75,7 @@ assert_error() {
     local label="$1"
     local resp="$2"
     local id="$3"
+    local expected_detail="${4:-}"
 
     local check
     check="$(echo "$resp" | python3 -c "
@@ -123,8 +86,12 @@ for line in sys.stdin:
     try:
         d = json.loads(line)
         if d.get('id') == $id:
+            if '$expected_detail'.lower() not in json.dumps(d).lower():
+                print('WRONG_ERROR')
+                sys.exit(0)
             if 'error' in d:
-                print('ERROR')
+                code = d['error'].get('code')
+                print('TRANSPORT_OR_INTERNAL_ERROR' if code in (-32700, -32600, -32603) else 'ERROR')
                 sys.exit(0)
             r = d.get('result', {})
             if isinstance(r, dict) and r.get('isError', False):
@@ -134,10 +101,12 @@ for line in sys.stdin:
             sys.exit(0)
     except Exception: pass
 print('NO_MATCH')
-" 2>/dev/null)"
+")"
 
     case "$check" in
         ERROR) e2e_pass "$label" ;;
+        WRONG_ERROR) e2e_fail "$label → missing expected error detail: $expected_detail" ;;
+        TRANSPORT_OR_INTERNAL_ERROR) e2e_fail "$label → transport or internal failure" ;;
         OK) e2e_fail "$label → expected error but got success" ;;
         NO_MATCH) e2e_fail "$label → no response for id=$id" ;;
     esac
@@ -148,6 +117,7 @@ assert_has_contents() {
     local label="$1"
     local resp="$2"
     local id="$3"
+    local fixture="${4:-}"
 
     local check
     check="$(echo "$resp" | python3 -c "
@@ -162,19 +132,34 @@ for line in sys.stdin:
                 print('ERROR')
                 sys.exit(0)
             r = d.get('result', {})
-            if isinstance(r, dict) and 'contents' in r:
+            if isinstance(r, dict) and r.get('contents'):
+                payload = json.loads(r['contents'][0]['text']) if '$fixture' else None
+                if '$fixture' == 'projects':
+                    assert any(p['human_key'] == '/tmp/e2e_res_test' for p in payload)
+                elif '$fixture' == 'message':
+                    assert payload['id'] == 1 and payload['from'] == 'RedPeak'
+                    assert payload['subject'] == 'Test msg' and payload['body_md'] == 'Hello'
+                elif '$fixture' == 'inbox':
+                    assert payload['agent'] == 'RedPeak' and payload['count'] == 1
+                    assert payload['messages'][0]['subject'] == 'Test msg'
+                elif '$fixture' == 'empty_thread':
+                    assert payload['thread_id'] == 'TKT-99999' and payload['messages'] == []
                 print('HAS_CONTENTS')
                 sys.exit(0)
             print('NO_CONTENTS')
             sys.exit(0)
-    except Exception: pass
+    except Exception as error:
+        print(f'Invalid resource contents: {error}', file=sys.stderr)
+        print('INVALID_CONTENTS')
+        sys.exit(0)
 print('NO_MATCH')
-" 2>/dev/null)"
+")"
 
     case "$check" in
         HAS_CONTENTS) e2e_pass "$label" ;;
         ERROR) e2e_fail "$label → got error" ;;
         NO_CONTENTS) e2e_fail "$label → no contents in result" ;;
+        INVALID_CONTENTS) e2e_fail "$label → contents did not match the fixture" ;;
         NO_MATCH) e2e_fail "$label → no response for id=$id" ;;
     esac
 }
@@ -224,7 +209,7 @@ for line in sys.stdin:
             sys.exit(0)
     except Exception: pass
 print('NO_MATCH')
-" 2>/dev/null)"
+")"
 
 e2e_assert_contains "resources/list returns resources" "$LIST_CHECK" "COUNT="
 
@@ -235,10 +220,10 @@ e2e_case_banner "Valid resource read (projects)"
 
 RESP="$(send_jsonrpc_session "$RES_DB" \
     "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":200,"method":"resources/read","params":{"uri":"resource://projects"}}' \
+    '{"jsonrpc":"2.0","id":200,"method":"resources/read","params":{"uri":"resource://projects?format=json"}}' \
 )"
 e2e_save_artifact "case_02_valid_projects.txt" "$RESP"
-assert_has_contents "resources/read projects" "$RESP" 200
+assert_has_contents "resources/read projects contains fixture" "$RESP" 200 projects
 
 # ===========================================================================
 # Case 3: resources/read with unknown URI scheme
@@ -262,7 +247,7 @@ RESP="$(send_jsonrpc_session "$RES_DB" \
     '{"jsonrpc":"2.0","id":400,"method":"resources/read","params":{"uri":"resource://project/nonexistent-slug-xyz"}}' \
 )"
 e2e_save_artifact "case_04_nonexistent_project.txt" "$RESP"
-assert_error "nonexistent project slug returns error" "$RESP" 400
+assert_error "nonexistent project slug returns error" "$RESP" 400 "Project not found"
 
 # ===========================================================================
 # Case 5: resources/read with nonexistent agent
@@ -274,33 +259,7 @@ RESP="$(send_jsonrpc_session "$RES_DB" \
     '{"jsonrpc":"2.0","id":500,"method":"resources/read","params":{"uri":"resource://agents/nonexistent-slug-xyz"}}' \
 )"
 e2e_save_artifact "case_05_nonexistent_agent_agents.txt" "$RESP"
-# agents/{project_key} with nonexistent project - may return empty or error
-# Accept either: error, or result with empty contents
-AGENT_CHECK="$(echo "$RESP" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        if d.get('id') == 500:
-            if 'error' in d:
-                print('ERROR')
-                sys.exit(0)
-            r = d.get('result', {})
-            if isinstance(r, dict) and r.get('isError', False):
-                print('ERROR')
-                sys.exit(0)
-            print('RESULT')
-            sys.exit(0)
-    except Exception: pass
-print('NO_MATCH')
-" 2>/dev/null)"
-
-case "$AGENT_CHECK" in
-    ERROR|RESULT) e2e_pass "nonexistent project in agents handled" ;;
-    NO_MATCH) e2e_fail "nonexistent project in agents → no response" ;;
-esac
+assert_error "nonexistent project in agents returns error" "$RESP" 500 "Project not found"
 
 # ===========================================================================
 # Case 6: resources/read with non-numeric message ID
@@ -309,10 +268,10 @@ e2e_case_banner "Non-numeric message ID"
 
 RESP="$(send_jsonrpc_session "$RES_DB" \
     "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":600,"method":"resources/read","params":{"uri":"resource://message/not-a-number"}}' \
+    '{"jsonrpc":"2.0","id":600,"method":"resources/read","params":{"uri":"resource://message/not-a-number?project=tmp-e2e-res-test"}}' \
 )"
 e2e_save_artifact "case_06_nonnumeric_message_id.txt" "$RESP"
-assert_error "non-numeric message ID returns error" "$RESP" 600
+assert_error "non-numeric message ID returns error" "$RESP" 600 "Invalid message ID"
 
 # ===========================================================================
 # Case 7: resources/read with nonexistent message ID
@@ -321,10 +280,10 @@ e2e_case_banner "Nonexistent message ID"
 
 RESP="$(send_jsonrpc_session "$RES_DB" \
     "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":700,"method":"resources/read","params":{"uri":"resource://message/999999"}}' \
+    '{"jsonrpc":"2.0","id":700,"method":"resources/read","params":{"uri":"resource://message/999999?project=tmp-e2e-res-test"}}' \
 )"
 e2e_save_artifact "case_07_nonexistent_message.txt" "$RESP"
-assert_error "nonexistent message ID returns error" "$RESP" 700
+assert_error "nonexistent message ID returns error" "$RESP" 700 "not found"
 
 # ===========================================================================
 # Case 8: resources/read with empty URI
@@ -357,35 +316,10 @@ e2e_case_banner "Inbox for nonexistent agent"
 
 RESP="$(send_jsonrpc_session "$RES_DB" \
     "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":1000,"method":"resources/read","params":{"uri":"resource://inbox/GhostAgent"}}' \
+    '{"jsonrpc":"2.0","id":1000,"method":"resources/read","params":{"uri":"resource://inbox/GhostAgent?project=tmp-e2e-res-test"}}' \
 )"
 e2e_save_artifact "case_10_inbox_ghost_agent.txt" "$RESP"
-# May return empty or error
-INBOX_CHECK="$(echo "$RESP" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        if d.get('id') == 1000:
-            if 'error' in d:
-                print('ERROR')
-                sys.exit(0)
-            r = d.get('result', {})
-            if isinstance(r, dict) and r.get('isError', False):
-                print('ERROR')
-                sys.exit(0)
-            print('RESULT')
-            sys.exit(0)
-    except Exception: pass
-print('NO_MATCH')
-" 2>/dev/null)"
-
-case "$INBOX_CHECK" in
-    ERROR|RESULT) e2e_pass "inbox for nonexistent agent handled" ;;
-    NO_MATCH) e2e_fail "inbox for nonexistent agent → no response" ;;
-esac
+assert_error "inbox for nonexistent agent returns error" "$RESP" 1000 "Agent not found"
 
 # ===========================================================================
 # Case 11: resources/read for thread with nonexistent ID
@@ -394,35 +328,10 @@ e2e_case_banner "Nonexistent thread ID"
 
 RESP="$(send_jsonrpc_session "$RES_DB" \
     "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":1100,"method":"resources/read","params":{"uri":"resource://thread/TKT-99999"}}' \
+    '{"jsonrpc":"2.0","id":1100,"method":"resources/read","params":{"uri":"resource://thread/TKT-99999?project=tmp-e2e-res-test&format=json"}}' \
 )"
 e2e_save_artifact "case_11_nonexistent_thread.txt" "$RESP"
-# Thread with no messages may return empty or error
-THREAD_CHECK="$(echo "$RESP" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        if d.get('id') == 1100:
-            if 'error' in d:
-                print('ERROR')
-                sys.exit(0)
-            r = d.get('result', {})
-            if isinstance(r, dict) and r.get('isError', False):
-                print('ERROR')
-                sys.exit(0)
-            print('RESULT')
-            sys.exit(0)
-    except Exception: pass
-print('NO_MATCH')
-" 2>/dev/null)"
-
-case "$THREAD_CHECK" in
-    ERROR|RESULT) e2e_pass "nonexistent thread handled" ;;
-    NO_MATCH) e2e_fail "nonexistent thread → no response" ;;
-esac
+assert_has_contents "nonexistent thread returns an empty message list" "$RESP" 1100 empty_thread
 
 # ===========================================================================
 # Case 12: resources/read message without project param (expect error)
@@ -434,7 +343,7 @@ RESP="$(send_jsonrpc_session "$RES_DB" \
     '{"jsonrpc":"2.0","id":1200,"method":"resources/read","params":{"uri":"resource://message/1"}}' \
 )"
 e2e_save_artifact "case_12_message_no_project.txt" "$RESP"
-assert_error "message/1 without project param returns error" "$RESP" 1200
+assert_error "message/1 without project param returns error" "$RESP" 1200 "project query parameter is required"
 
 # ===========================================================================
 # Case 12b: resources/read valid message with project param
@@ -443,10 +352,10 @@ e2e_case_banner "Valid message with project param"
 
 RESP="$(send_jsonrpc_session "$RES_DB" \
     "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":1201,"method":"resources/read","params":{"uri":"resource://message/1?project=tmp-e2e-res-test"}}' \
+    '{"jsonrpc":"2.0","id":1201,"method":"resources/read","params":{"uri":"resource://message/1?project=tmp-e2e-res-test&format=json"}}' \
 )"
 e2e_save_artifact "case_12b_valid_message.txt" "$RESP"
-assert_has_contents "resources/read message/1 with project" "$RESP" 1201
+assert_has_contents "resources/read message/1 matches fixture" "$RESP" 1201 message
 
 # ===========================================================================
 # Case 13: resources/read with missing uri param
@@ -470,7 +379,7 @@ RESP="$(send_jsonrpc_session "$RES_DB" \
     '{"jsonrpc":"2.0","id":1400,"method":"resources/read","params":{"uri":"resource://inbox/RedPeak"}}' \
 )"
 e2e_save_artifact "case_14_inbox_no_project.txt" "$RESP"
-assert_error "inbox without project param returns error" "$RESP" 1400
+assert_error "inbox without project param returns error" "$RESP" 1400 "project query parameter is required"
 
 # ===========================================================================
 # Case 14b: resources/read valid inbox with project param
@@ -479,10 +388,10 @@ e2e_case_banner "Valid inbox with project param"
 
 RESP="$(send_jsonrpc_session "$RES_DB" \
     "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":1401,"method":"resources/read","params":{"uri":"resource://inbox/RedPeak?project=tmp-e2e-res-test"}}' \
+    '{"jsonrpc":"2.0","id":1401,"method":"resources/read","params":{"uri":"resource://inbox/RedPeak?project=tmp-e2e-res-test&format=json"}}' \
 )"
 e2e_save_artifact "case_14b_valid_inbox.txt" "$RESP"
-assert_has_contents "resources/read inbox/RedPeak with project" "$RESP" 1401
+assert_has_contents "resources/read inbox/RedPeak matches fixture" "$RESP" 1401 inbox
 
 # ===========================================================================
 # Case 15: resources/read tooling/directory (no project needed)

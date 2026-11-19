@@ -198,8 +198,8 @@ STDIO_STDERR="${SRV_WORK}/stderr.txt"
 mkfifo "$STDIO_FIFO"
 
 set +e
-# Start server in background, reading from FIFO
-DATABASE_URL="sqlite:////${FAKE_HOME}/fresh_test.sqlite3" RUST_LOG=error \
+# Select the supported CLI surface for this binary's stdio command.
+AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${FAKE_HOME}/fresh_test.sqlite3" RUST_LOG=error \
   "$FAKE_DEST/mcp-agent-mail" serve-stdio < "$STDIO_FIFO" > "$STDIO_RESPONSE" 2>"$STDIO_STDERR" &
 SRV_PID=$!
 
@@ -210,7 +210,7 @@ sleep 0.3
 echo "$MCP_INIT_REQ" > "$STDIO_FIFO" &
 WRITE_PID=$!
 
-# Wait for response with timeout (up to 5 seconds)
+# Wait for response through the original five 0.3-second polling intervals.
 ELAPSED=0
 while [ "$ELAPSED" -lt 5 ]; do
   if [ -s "$STDIO_RESPONSE" ]; then
@@ -234,21 +234,34 @@ fi
 e2e_save_artifact "case_08_mcp_init_response.txt" "$MCP_INIT_OUT"
 e2e_save_artifact "case_08_mcp_init_stderr.txt" "$(cat "$STDIO_STDERR" 2>/dev/null || true)"
 
-# Response should contain "result" and protocol version
-if [ -n "$MCP_INIT_OUT" ]; then
-  e2e_assert_contains "MCP response has result" "$MCP_INIT_OUT" "result"
-  e2e_assert_contains "MCP response has protocolVersion" "$MCP_INIT_OUT" "protocolVersion"
+# Require the successful response to this request, not unrelated output.
+if MCP_INIT_VALIDATION="$(python3 - "$STDIO_RESPONSE" 2>&1 <<'PY'
+import json
+import pathlib
+import sys
+
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    try:
+        response = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(response, dict) or type(response.get("id")) is not int or response["id"] != 1:
+        continue
+    result = response.get("result")
+    if response.get("jsonrpc") != "2.0" or "error" in response or not isinstance(result, dict):
+        sys.exit("initialize ID1 did not return a successful JSON-RPC result")
+    if result.get("protocolVersion") != "2024-11-05":
+        sys.exit("initialize ID1 did not negotiate the supported protocol 2024-11-05")
+    print("valid")
+    sys.exit(0)
+sys.exit("missing initialize response ID1")
+PY
+)"; then
+  e2e_pass "MCP initialize ID1 succeeds with the supported protocol"
 else
-  # If empty, server may not support bare stdio without initialization
-  # At minimum, verify it didn't crash (check stderr for panics)
-  STDERR_CONTENT="$(cat "$STDIO_STDERR" 2>/dev/null || true)"
-  if echo "$STDERR_CONTENT" | command grep -qi "panic" 2>/dev/null; then
-    e2e_assert_eq "serve-stdio did not panic" "no panic" "panicked"
-  else
-    # No output and no panic = acceptable (server may need different framing)
-    e2e_assert_eq "serve-stdio did not panic" "no panic" "no panic"
-  fi
+  e2e_fail "MCP initialize ID1 succeeds with the supported protocol" "valid" "$MCP_INIT_VALIDATION"
 fi
+e2e_save_artifact "case_08_mcp_init_validation.txt" "$MCP_INIT_VALIDATION"
 
 if [ "$AM_E2E_KEEP_TMP" = "1" ] || [ "$AM_E2E_KEEP_TMP" = "true" ]; then
   printf 'Preserved stdio sandbox: %s\n' "$SRV_WORK" >&2

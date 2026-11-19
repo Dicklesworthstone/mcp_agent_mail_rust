@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# test_robot_format_md.sh — E2E: --format md output for all 16 robot subcommands
+# test_robot_format_md.sh — E2E: strict markdown support across 16 robot subcommands
 #
 # Verifies (br-3h13.18.6):
-# - Every robot subcommand produces valid markdown with --format md
-# - Output contains markdown structure (headers), not raw JSON
+# - Thread/message produce actual markdown with the seeded bodies
+# - Other commands reject --format md and produce structured --format toon
 # - No 'undefined' in output
 #
 # Uses a seeded database (project + agent + messages) for rich output.
@@ -47,6 +47,9 @@ mkdir -p "${STORAGE_ROOT}" "${PROJECT_PATH}"
 export DATABASE_URL="sqlite:///${DB_PATH}"
 export STORAGE_ROOT
 export AM_INTERFACE_MODE=cli
+# Port zero cannot have a listener; keep robot reads on this private mailbox.
+export HTTP_HOST=127.0.0.1 HTTP_PORT=0 HTTP_PATH=/mcp/
+export AGENT_MAIL_URL=http://127.0.0.1:0/mcp/
 ROBOT_AGENT="RedFox"
 
 e2e_log "Work directory: ${WORK}"
@@ -62,59 +65,55 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 seed_data() {
     local db_path="$1"
     local project="$2"
-    local output_file="${WORK}/seed_response.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:///${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        echo "$INIT_REQ"
-        sleep 0.5
-        # Ensure project
-        echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${project}\"}}}"
-        sleep 0.5
-        # Register agents
-        echo "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"RedFox\",\"project_key\":\"${project}\",\"program\":\"claude-code\",\"model\":\"test\"}}}"
-        sleep 0.5
-        echo "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"BlueLake\",\"project_key\":\"${project}\",\"program\":\"codex-cli\",\"model\":\"test\"}}}"
-        sleep 0.5
-        # Send messages to create inbox + threads
-        echo "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"from_agent\":\"BlueLake\",\"to\":\"RedFox\",\"subject\":\"Build review needed\",\"body\":\"Please review PR #42 for the auth module.\"}}}"
-        sleep 0.5
-        echo "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"from_agent\":\"RedFox\",\"to\":\"BlueLake\",\"subject\":\"Status update\",\"body\":\"Completed the migration task. All tests passing.\"}}}"
-        sleep 0.5
-        # Contact policy
-        echo "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${project}\",\"from_agent\":\"RedFox\",\"to_agent\":\"BlueLake\",\"status\":\"allow\",\"reason\":\"teammate\"}}}"
-        sleep 0.3
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=20
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+    E2E_STDIO_TIMEOUT_SECONDS=10 RUST_LOG=error \
+        e2e_stdio_session "$db_path" \
+        "$INIT_REQ" \
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${project}\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"RedFox\",\"project_key\":\"${project}\",\"program\":\"claude-code\",\"model\":\"test\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"BlueLake\",\"project_key\":\"${project}\",\"program\":\"codex-cli\",\"model\":\"test\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"Build review needed\",\"body_md\":\"Please review PR #42 for the auth module.\",\"thread_id\":\"robot-md-thread\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${project}\",\"sender_name\":\"RedFox\",\"to\":[\"BlueLake\"],\"subject\":\"Status update\",\"body_md\":\"Completed the migration task. All tests passing.\",\"thread_id\":\"robot-md-thread\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"set_contact_policy\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"RedFox\",\"policy\":\"open\"}}}"
 }
 
 SEED_OUT="$(seed_data "${DB_PATH}" "${PROJECT_PATH}")"
 e2e_save_artifact "seed_output.txt" "$SEED_OUT"
 
 if [ -f "${DB_PATH}" ]; then
-    e2e_pass "seed: database created with data"
+    SEED_METADATA="$(RESP="$SEED_OUT" python3 - "$DB_PATH" "$PROJECT_PATH" <<'PY'
+import json
+import os
+import sqlite3
+import sys
+
+responses = [json.loads(line) for line in os.environ["RESP"].splitlines() if line.strip()]
+by_id = {item["id"]: item for item in responses if "id" in item}
+for request_id in range(1, 8):
+    response = by_id[request_id]
+    assert "result" in response and "error" not in response, response
+    assert not response["result"].get("isError", False), response
+
+def payload(request_id):
+    return json.loads(by_id[request_id]["result"]["content"][0]["text"])
+
+project_id = payload(2)["id"]
+messages = [payload(request_id)["deliveries"][0]["payload"] for request_id in (5, 6)]
+with sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True) as conn:
+    assert conn.execute("SELECT id FROM projects WHERE human_key = ?", (sys.argv[2],)).fetchall() == [(project_id,)]
+    assert conn.execute("SELECT name FROM agents WHERE project_id = ? ORDER BY name", (project_id,)).fetchall() == [("BlueLake",), ("RedFox",)]
+    for message, subject, body, recipient in zip(messages,
+            ("Build review needed", "Status update"),
+            ("Please review PR #42 for the auth module.", "Completed the migration task. All tests passing."),
+            ("RedFox", "BlueLake")):
+        message_id = message["id"]
+        assert isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0
+        assert conn.execute("SELECT subject, body_md, thread_id FROM messages WHERE id = ? AND project_id = ?", (message_id, project_id)).fetchall() == [(subject, body, "robot-md-thread")]
+        assert conn.execute("SELECT a.name FROM message_recipients mr JOIN agents a ON a.id = mr.agent_id WHERE mr.message_id = ? AND mr.kind = 'to'", (message_id,)).fetchall() == [(recipient,)]
+print(f'{messages[0]["id"]}\t{messages[0]["thread_id"]}')
+PY
+)"
+    IFS=$'\t' read -r MESSAGE_ID THREAD_ID <<< "$SEED_METADATA"
+    e2e_pass "seed: project, agents, messages, thread, and recipients persisted"
 else
     e2e_fail "seed: database not created"
     e2e_summary
@@ -132,15 +131,15 @@ run_robot() {
     if [ -n "${ROBOT_AGENT:-}" ]; then
         agent_args=(--agent "${ROBOT_AGENT}")
     fi
-    local output
-    output=$(DATABASE_URL="sqlite:///${DB_PATH}" STORAGE_ROOT="${STORAGE_ROOT}" \
-        AM_INTERFACE_MODE=cli am robot --project "${PROJECT_PATH}" "${agent_args[@]}" "$subcommand" "$@" 2>&1) || true
-    echo "$output"
+    ROBOT_EXIT_STATUS=0
+    ROBOT_OUTPUT=$(DATABASE_URL="sqlite:///${DB_PATH}" STORAGE_ROOT="${STORAGE_ROOT}" \
+        AM_INTERFACE_MODE=cli am robot --project "${PROJECT_PATH}" "${agent_args[@]}" "$subcommand" "$@" 2>&1) || ROBOT_EXIT_STATUS=$?
 }
 
-assert_is_markdown() {
+assert_structured_output() {
     local case_id="$1"
     local output="$2"
+    local format="$3"
     # Non-empty
     if [ -z "$output" ]; then
         e2e_fail "${case_id}: output is empty"
@@ -148,12 +147,12 @@ assert_is_markdown() {
     fi
     e2e_pass "${case_id}: output is non-empty"
 
-    # --format md produces either:
-    # (a) true markdown with # headers (e.g., thread), or
-    # (b) toon format with _meta:, key: value pairs, indented sections
-    # Both are valid; check for either pattern
-    if echo "$output" | grep -qE '^#{1,3} |^\*\*|\| .+ \||^- |^_meta:|^[a-z_]+:' 2>/dev/null; then
-        e2e_pass "${case_id}: contains structured output"
+    local structure='^_meta:'
+    if [ "$format" = md ]; then
+        structure='^#{1,3} '
+    fi
+    if echo "$output" | grep -qE "$structure"; then
+        e2e_pass "${case_id}: contains ${format} structure"
     else
         e2e_fail "${case_id}: no structured output found"
         e2e_save_artifact "${case_id}_no_structure.txt" "$output"
@@ -176,108 +175,112 @@ assert_is_markdown() {
     fi
 }
 
+assert_supported_status() {
+    local case_id="$1"
+    if [ "$ROBOT_EXIT_STATUS" -eq 0 ]; then
+        e2e_pass "${case_id}: supported format succeeded (exit ${ROBOT_EXIT_STATUS})"
+    else
+        e2e_fail "${case_id}: supported format exited ${ROBOT_EXIT_STATUS}"
+    fi
+}
+
+check_unsupported_markdown() {
+    local case_id="$1"
+    local subcommand="$2"
+    shift 2
+    run_robot "$subcommand" --format md "$@"
+    e2e_save_artifact "robot_${case_id}/output.md" "$ROBOT_OUTPUT"
+    if [ "$ROBOT_EXIT_STATUS" -ne 0 ]; then
+        e2e_pass "${case_id}: unsupported markdown rejected (exit ${ROBOT_EXIT_STATUS})"
+    else
+        e2e_fail "${case_id}: unsupported markdown returned success"
+    fi
+    e2e_assert_contains "${case_id}: documented format refusal" "$ROBOT_OUTPUT" \
+        '--format md is only supported for `am robot thread` and `am robot message`'
+
+    run_robot "$subcommand" --format toon "$@"
+    e2e_save_artifact "robot_${case_id}/output.toon" "$ROBOT_OUTPUT"
+    assert_supported_status "${case_id} toon"
+    assert_structured_output "${case_id} toon" "$ROBOT_OUTPUT" toon
+}
+
 # ---------------------------------------------------------------------------
 # Track 2: Situational Awareness
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "robot_status_md"
-OUT="$(run_robot status --format md)"
-e2e_save_artifact "robot_status_md/output.md" "$OUT"
-assert_is_markdown "status_md" "$OUT"
+check_unsupported_markdown status_md status
 
 e2e_case_banner "robot_inbox_md"
-OUT="$(run_robot inbox --format md)"
-e2e_save_artifact "robot_inbox_md/output.md" "$OUT"
-assert_is_markdown "inbox_md" "$OUT"
+check_unsupported_markdown inbox_md inbox
 
 e2e_case_banner "robot_timeline_md"
-OUT="$(run_robot timeline --format md)"
-e2e_save_artifact "robot_timeline_md/output.md" "$OUT"
-assert_is_markdown "timeline_md" "$OUT"
+check_unsupported_markdown timeline_md timeline
 
 e2e_case_banner "robot_overview_md"
-OUT="$(run_robot overview --format md)"
-e2e_save_artifact "robot_overview_md/output.md" "$OUT"
-assert_is_markdown "overview_md" "$OUT"
+check_unsupported_markdown overview_md overview
 
 # ---------------------------------------------------------------------------
 # Track 3: Context & Discovery
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "robot_thread_md"
-OUT="$(run_robot thread --format md -- 1)"
+run_robot thread --format md -- "$THREAD_ID"
+OUT="$ROBOT_OUTPUT"
 e2e_save_artifact "robot_thread_md/output.md" "$OUT"
-assert_is_markdown "thread_md" "$OUT"
+assert_supported_status thread_md
+assert_structured_output thread_md "$OUT" md
+e2e_assert_contains "thread_md: first seeded subject" "$OUT" "Build review needed"
+e2e_assert_contains "thread_md: second seeded subject" "$OUT" "Status update"
+e2e_assert_contains "thread_md: first seeded body" "$OUT" "Please review PR #42 for the auth module."
+e2e_assert_contains "thread_md: second seeded body" "$OUT" "Completed the migration task. All tests passing."
 
 e2e_case_banner "robot_search_md"
-OUT="$(run_robot search --format md -- "review")"
-e2e_save_artifact "robot_search_md/output.md" "$OUT"
-assert_is_markdown "search_md" "$OUT"
+check_unsupported_markdown search_md search -- "review"
 
 e2e_case_banner "robot_message_md"
-OUT="$(run_robot message --format md -- 1)"
+run_robot message --format md -- "$MESSAGE_ID"
+OUT="$ROBOT_OUTPUT"
 e2e_save_artifact "robot_message_md/output.md" "$OUT"
-# Message may not exist if seeding didn't create messages — verify graceful error
-if echo "$OUT" | grep -q "not found" 2>/dev/null; then
-    e2e_pass "message_md: graceful error for missing message"
-    e2e_pass "message_md: not raw JSON"
-    e2e_pass "message_md: no undefined values"
-else
-    assert_is_markdown "message_md" "$OUT"
-fi
+assert_supported_status message_md
+assert_structured_output message_md "$OUT" md
+e2e_assert_contains "message_md: seeded subject" "$OUT" "Build review needed"
+e2e_assert_contains "message_md: seeded body" "$OUT" "Please review PR #42 for the auth module."
 
 e2e_case_banner "robot_navigate_md"
-OUT="$(run_robot navigate --format md -- "resource://projects")"
-e2e_save_artifact "robot_navigate_md/output.md" "$OUT"
-assert_is_markdown "navigate_md" "$OUT"
+check_unsupported_markdown navigate_md navigate -- "resource://projects"
 
 # ---------------------------------------------------------------------------
 # Track 4: Monitoring & Analytics
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "robot_reservations_md"
-OUT="$(run_robot reservations --format md)"
-e2e_save_artifact "robot_reservations_md/output.md" "$OUT"
-assert_is_markdown "reservations_md" "$OUT"
+check_unsupported_markdown reservations_md reservations
 
 e2e_case_banner "robot_metrics_md"
-OUT="$(run_robot metrics --format md)"
-e2e_save_artifact "robot_metrics_md/output.md" "$OUT"
-assert_is_markdown "metrics_md" "$OUT"
+check_unsupported_markdown metrics_md metrics
 
 e2e_case_banner "robot_health_md"
-OUT="$(run_robot health --format md)"
-e2e_save_artifact "robot_health_md/output.md" "$OUT"
-assert_is_markdown "health_md" "$OUT"
+check_unsupported_markdown health_md health
 
 e2e_case_banner "robot_analytics_md"
-OUT="$(run_robot analytics --format md)"
-e2e_save_artifact "robot_analytics_md/output.md" "$OUT"
-assert_is_markdown "analytics_md" "$OUT"
+check_unsupported_markdown analytics_md analytics
 
 # ---------------------------------------------------------------------------
 # Track 5: Entity Views
 # ---------------------------------------------------------------------------
 
 e2e_case_banner "robot_agents_md"
-OUT="$(run_robot agents --format md)"
-e2e_save_artifact "robot_agents_md/output.md" "$OUT"
-assert_is_markdown "agents_md" "$OUT"
+check_unsupported_markdown agents_md agents
 
 e2e_case_banner "robot_contacts_md"
-OUT="$(run_robot contacts --format md)"
-e2e_save_artifact "robot_contacts_md/output.md" "$OUT"
-assert_is_markdown "contacts_md" "$OUT"
+check_unsupported_markdown contacts_md contacts
 
 e2e_case_banner "robot_projects_md"
-OUT="$(run_robot projects --format md)"
-e2e_save_artifact "robot_projects_md/output.md" "$OUT"
-assert_is_markdown "projects_md" "$OUT"
+check_unsupported_markdown projects_md projects
 
 e2e_case_banner "robot_attachments_md"
-OUT="$(run_robot attachments --format md)"
-e2e_save_artifact "robot_attachments_md/output.md" "$OUT"
-assert_is_markdown "attachments_md" "$OUT"
+check_unsupported_markdown attachments_md attachments
 
 # ---------------------------------------------------------------------------
 # Summary
