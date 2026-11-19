@@ -22357,7 +22357,10 @@ mod tests {
 
     #[test]
     fn startup_integrity_cache_is_not_fresh_when_cache_file_is_symlinked() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_root = temp.path().join("storage");
@@ -22404,7 +22407,10 @@ mod tests {
 
     #[test]
     fn write_startup_integrity_cache_ignores_symlinked_cache_file() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_root = temp.path().join("storage");
@@ -22438,7 +22444,10 @@ mod tests {
 
     #[test]
     fn write_startup_integrity_cache_ignores_symlinked_diagnostics_directory() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_dir as symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_root = temp.path().join("storage");
