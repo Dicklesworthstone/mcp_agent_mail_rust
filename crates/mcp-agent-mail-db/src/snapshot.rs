@@ -1279,6 +1279,18 @@ pub fn restore_from_verified_snapshot(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn private_retention_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // With an unreadable process, retention requires a non-shared parent.
+        // The runner's creation mask can otherwise turn a TempDir into mode 0775.
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("create private retention fixture")
+    }
+
     fn make_db(path: &Path) {
         let conn = crate::DbConn::open_file(path.display().to_string()).expect("open db");
         conn.execute_raw("PRAGMA journal_mode = WAL;").expect("wal");
@@ -1924,7 +1936,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn retention_preserves_failed_verification_and_the_last_valid_generation() {
-        let dir = tempfile::tempdir().unwrap();
+        use std::io::Write as _;
+
+        let dir = private_retention_dir();
         let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
         make_restorable_mailbox_db(&primary);
         let backup = snapshot_bak_path(&primary);
@@ -1937,7 +1951,10 @@ mod tests {
         std::fs::rename(&backup, &last_valid).unwrap();
         std::fs::write(&backup, b"interrupted newer backup").unwrap();
         let invalid = primary.with_file_name("storage.sqlite3.bak.20260901_000000");
-        std::fs::write(&invalid, b"unresolved old forensic evidence").unwrap();
+        mcp_agent_mail_core::disk::create_new_private_file_no_follow(&invalid)
+            .unwrap()
+            .write_all(b"unresolved old forensic evidence")
+            .unwrap();
         assert!(record_snapshot_metadata(&primary, created_us + 1).is_err());
         assert_eq!(read_snapshot_metadata(&primary), Some(metadata));
 
@@ -1973,7 +1990,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn retention_reclaims_a_verified_superseded_generation_after_its_reader_closes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_retention_dir();
         let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
         make_restorable_mailbox_db(&primary);
         {
@@ -2023,13 +2040,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn reclamation_requires_matching_lineage_or_exact_duplicate_bytes() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
         for scenario in [
             "matching_lineage",
             "foreign_lineage",
             "unseeded_duplicate",
             "unseeded_changed",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = private_retention_dir();
             let root = dir.path().canonicalize().unwrap();
             let primary = root.join("storage.sqlite3");
             make_restorable_mailbox_db(&primary);
@@ -2043,7 +2062,11 @@ mod tests {
                     .unwrap();
             }
             let history = root.join("doctor/reclaimable/rotation-20261001T000000Z");
-            std::fs::create_dir_all(&history).unwrap();
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&history)
+                .unwrap();
             let old = history.join("storage.sqlite3.bak.20261001_000000");
             std::fs::copy(&primary, &old).unwrap();
             if scenario == "foreign_lineage" {
