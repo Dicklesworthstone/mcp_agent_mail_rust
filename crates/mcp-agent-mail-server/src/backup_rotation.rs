@@ -1317,8 +1317,9 @@ fn acquire_snapshot_retention(
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn record_snapshot_admission_error(report: &mut RotateReport, path: &Path, error: &std::io::Error) {
+    #[cfg(unix)]
     if let Some(reason) =
         mcp_agent_mail_db::snapshot::SnapshotRetentionDeferred::from_io_error(error)
     {
@@ -1333,12 +1334,12 @@ fn record_snapshot_admission_error(report: &mut RotateReport, path: &Path, error
                 .failures
                 .push(RotationFailure::from_error(path, error));
         }
-    } else {
-        report.admission_refused = true;
-        report
-            .failures
-            .push(RotationFailure::from_error(path, error));
+        return;
     }
+    report.admission_refused = true;
+    report
+        .failures
+        .push(RotationFailure::from_error(path, error));
 }
 
 // Preserve the existing non-Unix move contract. The stronger descriptor and
@@ -1886,7 +1887,7 @@ where
     #[cfg(unix)]
     let pin_admitted_at = first_unit_admitted_at.take();
     #[cfg(unix)]
-    let (_retained_parent, snapshot_guard) = match parent_admission.and_then(|parent| {
+    let snapshot_admission = parent_admission.and_then(|parent| {
         early_snapshot_guard
             .map_or_else(
                 || {
@@ -1900,7 +1901,13 @@ where
                 Ok,
             )
             .map(|guard| (parent, guard))
-    }) {
+    });
+    #[cfg(windows)]
+    let snapshot_admission =
+        mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(snapshot_primary)
+            .map(|guard| ((), guard));
+    #[cfg(any(unix, windows))]
+    let (_retained_parent, snapshot_guard) = match snapshot_admission {
         Ok(guard) => guard,
         Err(error) => {
             // Refusal is observable even when no bytes can be reclaimed. Do
@@ -1923,7 +1930,7 @@ where
             return Ok(report);
         }
     };
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let (snapshot_authority_occupied, pinned_verified_snapshot) = (
         snapshot_guard.metadata_occupied(),
         snapshot_guard.verified_source_path().map(Path::to_path_buf),
@@ -1932,12 +1939,12 @@ where
     {
         report.completed_pin_search_without_match = snapshot_guard.completed_search_without_pin();
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let snapshot_authority_occupied = match fs::symlink_metadata(&snapshot_metadata) {
         Ok(_) => true,
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     };
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let pinned_verified_snapshot = snapshot_authority_occupied
         .then(|| mcp_agent_mail_db::snapshot::verified_snapshot_source_path(snapshot_primary))
         .flatten();
@@ -2080,15 +2087,16 @@ where
                     summary.bytes_kept = summary.bytes_kept.saturating_add(size);
                     continue;
                 }
-                // Only admitted work pays for repeated authority validation.
-                // Periodic deletion has the same check inside its boundary.
-                if let Err(error) = snapshot_guard.revalidate() {
-                    report.admission_refused = true;
-                    let failure = RotationFailure::from_error(path, &error);
-                    summary.record_failure(&failure, size);
-                    report.record_failure(failure);
-                    continue;
-                }
+            }
+            // Only admitted work pays for repeated authority validation.
+            // Periodic deletion has the same check inside its boundary.
+            #[cfg(any(unix, windows))]
+            if let Err(error) = snapshot_guard.revalidate() {
+                report.admission_refused = true;
+                let failure = RotationFailure::from_error(path, &error);
+                summary.record_failure(&failure, size);
+                report.record_failure(failure);
+                continue;
             }
             if delete_opted_in {
                 #[cfg(unix)]
@@ -2157,7 +2165,7 @@ where
             };
             match stage(path, directory, metadata) {
                 Ok(dest) => {
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     if let Err(error) = snapshot_guard.revalidate() {
                         let failure = RotationFailure {
                             source: path.clone(),
@@ -2243,7 +2251,7 @@ where
             &error,
         ));
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if !report.admission_refused
         && let Err(error) = snapshot_guard.revalidate()
     {
@@ -4548,7 +4556,7 @@ mod tests {
         assert_eq!(fs::read(root.join("unrelated.txt")).unwrap(), b"untouched");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn rotation_coordination_excludes_metadata_refresh_through_final_move() {
         let tmp = TempDir::new().unwrap();
@@ -4608,10 +4616,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn rotation_coordination_refuses_live_snapshot_owners_before_eviction() {
         use fs2::FileExt as _;
+        #[cfg(unix)]
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
         for shared in [false, true] {
             let tmp = TempDir::new().unwrap();
@@ -4622,14 +4631,17 @@ mod tests {
             fs::write(&older, b"old backup evidence").unwrap();
             fs::write(&newer, b"new backup evidence").unwrap();
             let lock_path = root.join("storage.sqlite3.bak.authority.lock");
-            let owner = fs::OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .mode(0o600)
-                .open(&lock_path)
-                .unwrap();
-            let inode = owner.metadata().unwrap().ino();
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).read(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let owner = options.open(&lock_path).unwrap();
+            #[cfg(unix)]
+            let identity = |file: &fs::File| file.metadata().unwrap().ino();
+            #[cfg(windows)]
+            let identity =
+                |file: &fs::File| mcp_agent_mail_core::disk::windows_file_identity(file).unwrap();
+            let original_identity = identity(&owner);
             if shared {
                 fs2::FileExt::lock_shared(&owner).unwrap();
             } else {
@@ -4653,10 +4665,16 @@ mod tests {
                 !root.join("doctor").exists(),
                 "busy admission created quarantine"
             );
-            assert_eq!(fs::metadata(&lock_path).unwrap().ino(), inode);
+            assert_eq!(
+                identity(&fs::File::open(&lock_path).unwrap()),
+                original_identity
+            );
             let resumed = rotate_with_delete_off(&root, 1);
             assert_eq!((resumed.staged, resumed.kept), (1, 1));
-            assert_eq!(fs::metadata(&lock_path).unwrap().ino(), inode);
+            assert_eq!(
+                identity(&fs::File::open(&lock_path).unwrap()),
+                original_identity
+            );
         }
     }
 
