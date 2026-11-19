@@ -128,19 +128,18 @@ e2e_save_artifact "case_01_10kb_body.txt" "$RESP"
 assert_ok "send 10KB body" "$RESP" 100
 
 # ===========================================================================
-# Case 2: 100KB message body
+# Case 2: Large message bodies, including one larger than an OS argument
 # ===========================================================================
-e2e_case_banner "100KB message body"
-
-BODY_100K="$(gen_body 100)"
-BODY_100K_JSON="$(python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" <<< "$BODY_100K")"
-
-RESP="$(send_jsonrpc_session "$LI_DB" \
-    "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":200,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"/tmp/e2e_large\",\"sender_name\":\"RedFox\",\"to\":[\"BlueLake\"],\"subject\":\"100KB body test\",\"body_md\":${BODY_100K_JSON}}}}" \
-)"
-e2e_save_artifact "case_02_100kb_body.txt" "$RESP"
-assert_ok "send 100KB body" "$RESP" 200
+for size_kib in 100 192; do
+    e2e_case_banner "${size_kib} KiB message body"
+    body_json="$(gen_body "$size_kib" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read() + "\n"))')"
+    RESP="$(send_jsonrpc_session "$LI_DB" \
+        "$INIT_REQ" \
+        "{\"jsonrpc\":\"2.0\",\"id\":200,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"/tmp/e2e_large\",\"sender_name\":\"RedFox\",\"to\":[\"BlueLake\"],\"subject\":\"${size_kib}KB body test\",\"body_md\":${body_json}}}}" \
+    )"
+    e2e_save_artifact "case_02_${size_kib}kb_body.txt" "$RESP"
+    assert_ok "send ${size_kib} KiB body" "$RESP" 200
+done
 
 # ===========================================================================
 # Case 3: Maximum subject length (exactly 200 chars)
@@ -267,7 +266,7 @@ RESP="$(send_jsonrpc_session "$LI_DB" \
 e2e_save_artifact "case_09_fetch_large_inbox.txt" "$RESP"
 assert_ok "fetch inbox with large messages" "$RESP" 900
 
-# Verify all six independently expected message payloads survived persistence.
+# Verify all independently expected message payloads survived persistence.
 # Automatic contact-approval notices may also be present in this inbox.
 MSG_COUNT="$(echo "$RESP" | python3 -c "
 import sys, json
@@ -284,6 +283,7 @@ for line in sys.stdin:
             expected = {
                 '10KB body test': (pattern * ((10 * 1024 // len(pattern)) + 1))[:10 * 1024] + '\\n',
                 '100KB body test': (pattern * ((100 * 1024 // len(pattern)) + 1))[:100 * 1024] + '\\n',
+                '192KB body test': (pattern * ((192 * 1024 // len(pattern)) + 1))[:192 * 1024] + '\\n',
                 'A' * 200: 'body',
                 'B' * 200: 'body',
                 'Broadcast to 20 agents': 'Hello everyone',
@@ -302,7 +302,7 @@ print('PARSE_FAIL')
 ")"
 
 e2e_assert_contains "inbox has multiple messages" "$MSG_COUNT" "COUNT="
-e2e_assert_contains "all six subjects and bodies round-trip exactly" "$MSG_COUNT" "PAYLOADS=6"
+e2e_assert_contains "all seven subjects and bodies round-trip exactly" "$MSG_COUNT" "PAYLOADS=7"
 
 # ===========================================================================
 # Case 10: Many file reservations in one call

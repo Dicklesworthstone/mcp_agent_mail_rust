@@ -2889,7 +2889,10 @@ e2e_stdio_session() {
         mode=pipeline
         shift
     fi
-    python3 - "$mode" "$E2E_ARTIFACT_DIR/logs" "$@" <<'PY'
+    local db_path="$1"
+    shift
+    local client_program
+    client_program="$(cat <<'PY'
 import json
 import os
 from pathlib import Path
@@ -2900,7 +2903,10 @@ import tempfile
 import threading
 import time
 
-mode, log_dir, db_path, *frames = sys.argv[1:]
+mode, log_dir, db_path = sys.argv[1:]
+frames = sys.stdin.buffer.read().split(b"\0")
+if frames.pop() != b"":
+    sys.exit("Incomplete stdio fixture input")
 first, *requests = [json.loads(frame) for frame in frames]
 if first.get("method") != "initialize" or "id" not in first:
     sys.exit("The first stdio request must be initialize with an id")
@@ -2996,6 +3002,10 @@ finally:
     # A child of the server may have inherited the pipe's read end.
     writer.join(timeout=0.25)
 PY
+)"
+    # Large bodies fit the MCP transport but can exceed the OS argument
+    # limit. NUL separates frames even when their JSON spans multiple lines.
+    printf '%s\0' "$@" | python3 -c "$client_program" "$mode" "$E2E_ARTIFACT_DIR/logs" "$db_path"
 }
 
 # ---------------------------------------------------------------------------
