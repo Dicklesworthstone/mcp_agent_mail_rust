@@ -1,5 +1,21 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
+## November 19 coordination and recovery assessment
+
+Two agents on a signed Windows installation exchanged and acknowledged a
+message over MCP. The installed Linux CLI exercised identities, cross-project
+delivery, search and reservations against private SQLite and Git mailboxes.
+The rebuilt macOS and Windows CLIs each delivered and persisted the same
+192 KiB message. The Windows server preserved backups during a competing
+snapshot lock.
+
+The highest-priority unresolved claims concern durability under a swarm.
+The mixed HTTP archive-drain stall (`br-kp1in.13`) and the eight-sender
+SIGBUS (`br-kp1in.33`) each need their original workloads to pass. Three
+large backup-rotation workloads also exceeded 240 seconds on Apple Silicon.
+Publication and downstream installer checksum verification have separate
+open Beads. The scope and outcomes of individual checks follow below.
+
 ## November 18 agent health on a quiet mailbox
 
 - [x] Reproduce a stale TUI count after a sidecar-only write and a robot count
@@ -63,6 +79,102 @@
   (`br-8tszv`) and the downstream raw installer checksum at the committed,
   pushed ACFS revision (`br-quq4r`).
 
+### Real stdio workflows and mailbox isolation
+
+- [x] Run the original concurrent-agent suite against a disposable caller
+  archive. It created a mailbox activity lock there. The client omitted
+  `notifications/initialized`; all 19 operating assertions failed.
+- [x] Allocate a private archive for each suite, fail on allocation errors,
+  and collect the archive actually used by the test. Check explicit storage
+  overrides and the path taken when artifact initialization is skipped.
+- [x] On Linux with installed `am 0.3.38` (`171713fa43e8`), check that the
+  caller retains only its original sentinel. The concurrent suite passed 25
+  checks, including addressed inbox contents and all four Git copies of the
+  acknowledged message. Stock SQLite and Git HEAD agreed on nine canonical
+  messages. Both recipients had recorded acknowledgements (`br-mzr9l`).
+- [x] Keep requesting the installed compiler version for the run manifest
+  without downloading a Rust toolchain into an empty fixture home.
+- [x] Enforce the stdio deadline during a blocked write. With a one-second
+  budget and a peer that stopped reading, the original client raised a
+  broken-pipe error after 4.17 seconds. The fixed client returned 124 in
+  1.08 seconds, and in 1.33 seconds when a child inherited the pipe.
+  Recheck ordered and pipelined calls, EOF and persistence on the real
+  binary. Four suites passed 127 assertions with unchanged caller archives.
+- [x] Send a 192 KiB body through the real stdio client. The original Linux
+  client exited 126 before starting the server because the request exceeded
+  the argument limit. Native Windows and macOS each returned all 196,608
+  bytes in the addressed inbox. A separate read-only SQLite query on each
+  host matched the original SHA-256, `3a0a5abd4f2c` (prefix). Keep the
+  100 KiB and larger cases in the regular suite. All 41 assertions passed
+  on macOS. The four Linux coordination suites passed all 127 assertions
+  again with unchanged caller archives. The blocked writer still exited
+  124 in 1.07 seconds with its one-second budget.
+- [x] Exercise identity, messaging, contacts, reservations and infrastructure
+  through initialized sessions at their original response deadlines. All 105
+  assertions passed on the installed binary.
+- [x] Exercise resource reads, cross-project routing and orphan threading.
+  Six suites passed 177 assertions across selected runs. Concurrent cold
+  initialization exceeded the 4.5-second cross-project limit; the same
+  source and deadline passed all 20 assertions in isolation.
+- [x] Check search, enabled and disabled build slots, and tooling resources.
+  All 72 assertions passed. The metrics check covers rejections and the
+  optional latency fields returned for a tool that actually ran.
+- [x] Run 19 frozen suites in sequence against the installed Linux binary,
+  checking the caller archive after every suite. All 480 assertions passed.
+  All 19 caller directories retained only the original sentinel and its
+  contents and metadata. Logs and source hashes are in
+  `/data/tmp/am-stdio-final.FlkkVlIn`.
+- [x] Verify all three send timestamps and the acknowledged message ID against
+  the delivery payload. All 21 timestamp assertions passed without skips.
+  At the actual 60-second contact TTL, a send succeeded before expiry and
+  returned `CONTACT_REQUIRED` after expiry. A separate self-contact request
+  incorrectly created a pending link on the installed release.
+- [x] Reproduce the search fixture creating setup rows directly after all 19
+  tool calls failed. Require nine successful MCP sends and independently read
+  their project counts and both product links. Removing the ghost message
+  originally left an orphan delivery event that triggered mailbox repair.
+  The fixture now keeps foreign keys valid. With 1,300 background messages,
+  all 22 integration checks passed, including robot search and status.
+- [x] Exercise the workflow, adaptive, screen and Unicode suites. Their 106
+  assertions passed in isolated installed-binary runs. The Unicode reply now
+  addresses the emoji message, and the product message reaches its recipient
+  in the other project. A 3.6-second cold start also timed out under load.
+- [x] Check the self-contact fix through request, response and macro calls.
+  Three baseline router regressions failed. All four fixed tests passed,
+  including no link, inbox notice or archived message on refusal, ordinary
+  self-mail and same-name contacts across distinct projects. The rebuilt
+  CLI passed all 24 circular-contact checks. Both workspace compiler graphs,
+  strict Clippy and formatting passed on Apple Silicon. UBS on the three
+  reviewed Rust files reported 29 conformance-test panic sites and 1,145
+  warnings. See `08a93431` and `br-oe7po`.
+- [x] On installed Linux 0.3.38, run the complete set of 29 selected suites.
+  All 771 assertions passed. Each caller's archive retained only its original
+  sentinel. These runs include cache flush, database migration, force-release
+  notices, product routing and searches against a populated mailbox.
+- [x] With separate private mailboxes, run the robot CLI (83 checks), its
+  Markdown and TOON contracts (115), search cockpit (55), reservation
+  contention (30), stress correctness (10), resource errors (20) and the
+  live pre-commit guard (19). All passed. Two robot commands returned
+  Markdown bodies. The other 14 rejected Markdown and returned data as TOON.
+- [x] Require the fresh-install stdio probe to negotiate protocol 2024-11-05
+  with the requested response ID. The isolated install probe passed and
+  four invalid controls failed. The full service installer was not exercised
+  by this probe.
+- [x] Compare the large-input suite on the installed Linux release and the
+  rebuilt Apple Silicon CLI. The installed binary rejected a 100 KiB body
+  and its inbox lacked the expected message (38 passed, two failed). On
+  the rebuilt binary all 40 checks passed, including the returned body.
+  The installed null-field suite passed 51 checks and exposed self-contact.
+  A concurrent cold start on the rebuilt binary exceeded the three-second
+  deadline. Its isolated repeat passed all 52 checks at that same deadline.
+- [ ] Check the remaining ordinary stdio suites against a real server.
+  The current direct clients include `fault_injection`, `path_safety`,
+  `search_v3_resilience`, `search_v3_security_matrix`, `search_v3_stdio`
+  and `security_privacy`. Preserve deliberately malformed protocol cases.
+- [ ] Resolve what the `search_v3_shadow_parity` comparison can establish.
+  The old engine names select the same lexical implementation. Its two
+  result sets cannot establish agreement between independent engines.
+
 ### Storage recovery and concurrent writes
 
 - [x] For `br-cdsge`, run the three existing Windows snapshot-lock tests on
@@ -100,8 +212,14 @@
   Each cold start saw three incident backups with one retention slot. Both
   the unlocked control and the run with another process holding the lock
   quarantined the two oldest backups. All three files retained their bytes.
-- [ ] On NTFS, exercise a competing publisher during each real move, a
-  busy reader before quarantine creation, and resumption after release.
+- [x] Repeat the two cold starts with the rebuilt Windows CLI
+  (`39adb120cab74`). An unlocked mailbox quarantined its two oldest incident
+  backups. With a separate process holding the lock all three stayed in
+  place, the quarantine directory was absent and all bytes survived. After
+  releasing the lock, restart that same mailbox. Exactly its two oldest
+  files moved and all three NTFS file identities and bodies matched.
+- [ ] On NTFS, run the server's boundary tests with a competing publisher
+  during the move and verify that the selected snapshot remains pinned.
 - [x] On NTFS, verify that the selected snapshot resists writes and renames
   until release, that a pending receipt parks retention, and that a complete
   scan resumes. All 41 snapshot tests, the receipt scan, and promotion of a
@@ -110,9 +228,19 @@
 - [x] On the same 675 inputs, run both workspace compiler checks, Clippy
   with warnings denied, formatting, all 62 snapshot tests and four rotation
   coordination tests on Apple Silicon. All passed.
-- [ ] Run the wider Unix rotation suite. On Apple Silicon the existing
-  16,641-directory backlog test exceeded its original 240-second deadline
-  (`br-h6k9b`).
+- [x] Run all 87 backup-rotation tests on Apple Silicon at their original
+  deadlines. 84 passed. Three exceeded 240 seconds on the native system
+  APFS volume: the 16,641-directory backlog, 720 hourly generations, and
+  the 212-image mixed backlog. The full command exited 100.
+- [ ] Resolve the three rotation timeouts at their existing workloads and
+  deadlines (`br-h6k9b`, `br-kp1in.63`).
+- [x] Re-run the snapshot suite as an ordinary Linux user on hz3. With the
+  host's 0002 creation mask, three of 64 cases stopped at the private
+  namespace check. The same binary passed all 64 with mask 0077. A trace
+  confirmed that the failed fixture's parent was group-writable (0775).
+- [ ] Create the three retention fixtures with explicit private permissions
+  and repeat all 64 under the ordinary user's original 0002 mask. Include
+  the separate shared-directory refusal control.
 - [x] Give each of the 12 refusal, seven competing-write and five revision
   fixtures its own 60-second child deadline in `br-kw4yv`. Preserve each
   test's existing assertions and the timeout diagnostic.
