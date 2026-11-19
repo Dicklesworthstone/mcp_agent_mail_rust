@@ -2496,9 +2496,13 @@ mod tests {
         // Keep the `.` inside the parent: `Path::parent` trims a trailing one,
         // so this spelling survives into the record's own `.bak` spelling.
         // `Path` equality ignores `.` components, so compare the strings.
+        // A Windows verbatim path does not interpret slash or dot components
+        // like an ordinary configured path.
+        let parent =
+            mcp_agent_mail_core::disk::simplify_verbatim_path(canonical_dir.parent().unwrap());
         let spelled = PathBuf::from(format!(
             "{}/./{}/storage.sqlite3",
-            canonical_dir.parent().unwrap().display(),
+            parent.display(),
             canonical_dir.file_name().unwrap().to_str().unwrap()
         ));
         assert_ne!(spelled.to_str(), primary.to_str());

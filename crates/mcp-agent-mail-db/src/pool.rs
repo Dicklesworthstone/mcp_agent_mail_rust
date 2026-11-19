@@ -19659,14 +19659,21 @@ where
     candidate_anchor
         .verify_unchanged("recovery candidate promotion")
         .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
-    let candidate_file = candidate_anchor
-        .open_regular_read_only("recovery candidate promotion")
-        .map_err(|error| {
-            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
-                "failed to open recovery candidate {} for secure permission normalization: {error}",
-                candidate_path.display()
-            )))
-        })?;
+    // Windows needs FILE_WRITE_ATTRIBUTES even to clear an already-clear
+    // read-only flag. The candidate may itself be read-only before this step.
+    #[cfg(windows)]
+    let candidate_file =
+        mcp_agent_mail_core::disk::open_regular_file_for_permission_change_no_follow(
+            candidate_path,
+        );
+    #[cfg(not(windows))]
+    let candidate_file = candidate_anchor.open_regular_read_only("recovery candidate promotion");
+    let candidate_file = candidate_file.map_err(|error| {
+        ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+            "failed to open recovery candidate {} for secure permission normalization: {error}",
+            candidate_path.display()
+        )))
+    })?;
     if source_existed {
         let primary_file = primary_anchor
             .open_regular_read_only("recovery candidate promotion")
@@ -30617,6 +30624,29 @@ mod tests {
             quarantined_certs >= 2,
             "cert sidecars must be quarantined aside, not deleted"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_promotion_clears_readonly_attribute_on_the_verified_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let candidate = dir.path().join("storage.sqlite3.candidate");
+        write_marker_db(&primary, "old-generation");
+        write_marker_db(&candidate, "restored-generation");
+        let mut permissions = candidate.metadata().unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&candidate, permissions).unwrap();
+        assert!(candidate.metadata().unwrap().permissions().readonly());
+
+        promote_recovery_candidate(&primary, &candidate, dir.path()).expect("promote candidate");
+
+        assert!(!primary.metadata().unwrap().permissions().readonly());
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("restored-generation")
+        );
+        crate::forensics::verify_recovery_receipt_state(dir.path(), &primary).unwrap();
     }
 
     #[test]
