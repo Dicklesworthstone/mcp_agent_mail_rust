@@ -1700,18 +1700,20 @@ function Verify-Install {
     Write-Ok "VERIFY mcp-agent-mail.exe -> mcp-agent-mail $ExpectedVersion"
 }
 
-$requestedRelease = Resolve-Version -RequestedVersion $Version
-$releaseContract = Get-ReleaseContract -RawVersion $requestedRelease
-$resolvedVersion = $releaseContract.Tag
-$requestedNormalized = $releaseContract.Version
-$CosignIdentity = $releaseContract.CertificateIdentity
-Write-Info "Installing mcp-agent-mail $resolvedVersion for target $Target"
-
-$Dest = Assert-SafeInstallDirectory -InstallDir $Dest
-$installerMutex = Enter-InstallerMutex -InstallDir $Dest
+$installerMutex = $null
 $workDir = $null
+$interrupted = $true
 
 try {
+    $requestedRelease = Resolve-Version -RequestedVersion $Version
+    $releaseContract = Get-ReleaseContract -RawVersion $requestedRelease
+    $resolvedVersion = $releaseContract.Tag
+    $requestedNormalized = $releaseContract.Version
+    $CosignIdentity = $releaseContract.CertificateIdentity
+    Write-Info "Installing mcp-agent-mail $resolvedVersion for target $Target"
+
+    $Dest = Assert-SafeInstallDirectory -InstallDir $Dest
+    $installerMutex = Enter-InstallerMutex -InstallDir $Dest
     # Only the fixed active path is authoritative. Unique `.preparing.*`
     # directories and phase siblings from a pre-publication interruption are
     # retained evidence but are deliberately ignored by recovery.
@@ -1811,6 +1813,10 @@ try {
         }
     }
 
+    $interrupted = $false
+} catch {
+    $interrupted = $false
+    throw
 } finally {
     $transactionRecoveryError = $null
     if ($null -ne $script:ActiveBinaryTransactionInstallDir -and
@@ -1833,6 +1839,11 @@ try {
     Exit-InstallerMutex -Mutex $installerMutex
     if ($null -ne $transactionRecoveryError) {
         throw $transactionRecoveryError
+    }
+    # Ctrl+C skips catch and goes directly to finally. Report cancellation
+    # after recovery and mutex release so a caller cannot mistake it for an install.
+    if ($interrupted) {
+        throw [System.OperationCanceledException]::new("Installation was interrupted. Re-run the installer to finish.")
     }
 }
 
