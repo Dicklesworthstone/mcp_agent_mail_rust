@@ -81,9 +81,18 @@
   A corrupt primary could not be restored because permission normalization
   received a read-only handle. The legacy-path fixture collapsed its two
   spellings into one. Nine separate recovery-receipt tests passed.
-- [ ] Rerun the original 40 cases with the permission-change handle and the
-  corrected Windows path fixture. Exercise a read-only recovery candidate
-  and check both the promoted data and its receipt.
+- [x] Restore the corrupt primary on Windows and query its three recovered
+  messages. All 40 snapshot tests passed at `69d180fa`, including the original
+  38 controls and both previously failing tests. A separate read-only candidate
+  became writable and its data and recovery receipt verified.
+- [x] Run the two receipt-boundary rollbacks on both Windows binaries.
+  Both failed before the fix and passed afterward. Nine receipt tests and
+  four additional invalid-stage, stale-sidecar, alias and rotation controls
+  passed on the fixed binary. The Windows run covered 56 distinct tests.
+- [x] On Apple Silicon, verify the same 675 input hashes, both workspace
+  compiler checks, Clippy with warnings denied, formatting, and all 62
+  snapshot tests. UBS scanned both Rust files and reported 0 critical
+  findings and 6,105 warnings.
 - [ ] Hold snapshot authority through the Windows backup rotation decision
   and move. The non-Unix path currently obtains a verified source pathname
   and releases selection admission before it stages older backups.
