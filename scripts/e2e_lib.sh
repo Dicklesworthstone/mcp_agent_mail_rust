@@ -2914,6 +2914,8 @@ with (open(stderr_path, "wb") if stderr_path else
                               env=env, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=log, text=True, encoding="utf-8")
 lines = queue.Queue()
+writes = queue.SimpleQueue()
+written = queue.SimpleQueue()
 
 def read_stdout():
     try:
@@ -2922,9 +2924,27 @@ def read_stdout():
     finally:
         lines.put(None)
 
+def write_stdin():
+    try:
+        with server.stdin:
+            for frame in iter(writes.get, None):
+                server.stdin.write(frame)
+                server.stdin.flush()
+                written.put(None)
+    except OSError as error:
+        written.put(error)
+
 def send(request):
-    server.stdin.write(json.dumps(request) + "\n")
-    server.stdin.flush()
+    # A peer can stop reading after initialize. A body larger than the pipe
+    # buffer must still observe the same deadline as its response.
+    writes.put(json.dumps(request) + "\n")
+    try:
+        error = written.get(timeout=max(0, deadline - time.monotonic()))
+    except queue.Empty:
+        print(f"Timed out writing stdio {request['method']} (id={request.get('id')}). See {log.name}", file=sys.stderr)
+        sys.exit(124)
+    if error is not None:
+        sys.exit(f"Could not write stdio {request['method']}: {error}. See {log.name}")
 
 def receive(pending):
     while pending:
@@ -2941,6 +2961,8 @@ def receive(pending):
             pending.remove(response["id"])
     return response
 
+writer = threading.Thread(target=write_stdin, daemon=True)
+writer.start()
 try:
     threading.Thread(target=read_stdout, daemon=True).start()
     send(first)
@@ -2957,7 +2979,7 @@ try:
                 receive(pending)
     if pending:
         receive(pending)
-    server.stdin.close()
+    writes.put(None)
     # The request budget ends at the last reply. EOF also needs to drain
     # acknowledged archive work before the next session opens this mailbox.
     try:
@@ -2967,9 +2989,12 @@ try:
     if exit_code:
         sys.exit(f"stdio server exited with status {exit_code}. See {log.name}")
 finally:
+    writes.put(None)
     if server.poll() is None:
         server.kill()
     server.wait()
+    # A child of the server may have inherited the pipe's read end.
+    writer.join(timeout=0.25)
 PY
 }
 
