@@ -30,7 +30,7 @@ run_pwsh_case() {
     local body="$3"
     local ps_file="${WORK}/${case_id}.ps1"
     local out_file="${WORK}/${case_id}.out"
-    local out rc
+    local out rc last_line
 
     cat > "${ps_file}" <<'PS_SCRIPT'
 param([string]$InstallPath)
@@ -38,6 +38,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 PS_SCRIPT
     printf '%s\n' "$body" >> "${ps_file}"
+    # pwsh -File can exit zero on Ctrl+C before the assertions finish.
+    printf '%s\n' 'Write-Output "AM_INSTALL_PS1_CASE_COMPLETED"' >> "${ps_file}"
 
     set +e
     pwsh -NoLogo -NoProfile -File "${ps_file}" "${INSTALL_PS1}" >"${out_file}" 2>&1
@@ -47,13 +49,16 @@ PS_SCRIPT
     out="$(cat "${out_file}" 2>/dev/null || true)"
     e2e_save_artifact "${case_id}.out.txt" "${out}"
 
-    if [ "$rc" -eq 0 ]; then
-        e2e_pass "${case_title}"
-    else
+    last_line="${out##*$'\n'}"
+    if [ "$rc" -ne 0 ]; then
         e2e_fail "${case_title}" "pwsh exit 0" "pwsh exit ${rc}"
         if [ -n "$out" ]; then
             printf '%s\n' "$out"
         fi
+    elif [ "${last_line%$'\r'}" != AM_INSTALL_PS1_CASE_COMPLETED ]; then
+        e2e_fail "${case_title}" "completed PowerShell case" "exit 0 without completion marker"
+    else
+        e2e_pass "${case_title}"
     fi
 }
 

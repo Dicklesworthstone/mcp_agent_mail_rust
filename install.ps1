@@ -1702,7 +1702,6 @@ function Verify-Install {
 
 $installerMutex = $null
 $workDir = $null
-$interrupted = $true
 
 try {
     $requestedRelease = Resolve-Version -RequestedVersion $Version
@@ -1813,10 +1812,6 @@ try {
         }
     }
 
-    $interrupted = $false
-} catch {
-    $interrupted = $false
-    throw
 } finally {
     $transactionRecoveryError = $null
     if ($null -ne $script:ActiveBinaryTransactionInstallDir -and
@@ -1839,11 +1834,6 @@ try {
     Exit-InstallerMutex -Mutex $installerMutex
     if ($null -ne $transactionRecoveryError) {
         throw $transactionRecoveryError
-    }
-    # Ctrl+C skips catch and goes directly to finally. Report cancellation
-    # after recovery and mutex release so a caller cannot mistake it for an install.
-    if ($interrupted) {
-        throw [System.OperationCanceledException]::new("Installation was interrupted. Re-run the installer to finish.")
     }
 }
 

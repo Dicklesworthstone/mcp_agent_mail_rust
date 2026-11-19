@@ -40,10 +40,28 @@
 - [x] Repeat all seven Windows cases, including diagnostic export, with
   PowerShell 7.6.4, Minisign 0.12 and the installed Python 3.13 interpreter.
   Seven passed with zero skips. The Unix installer passed scenarios A–L.
-- [ ] Exercise a Windows console Ctrl+C during binary replacement for
-  `br-r1say`. The Windows fixture uses terminating function faults.
-- [ ] Complete a full Windows installer invocation and the publisher
-  acceptance in `br-8tszv`. The Windows version probes used a private directory.
+- [x] Install signed v0.3.39 and v0.3.40 from the public assets into a private
+  Windows destination. Reinstall v0.3.40 with a space in the destination path
+  and a separate Python-style launcher first on PATH. Both executable hashes,
+  the launcher, user PATH and process PATH survived the reinstall.
+- [x] Send real console Ctrl+C during a v0.3.39 → v0.3.40 upgrade after both
+  old binaries moved. Compare both restored SHA-256 hashes to the originals.
+  Retry the upgrade, open the installed MCP server over stdio, enumerate 45
+  tools, deliver a message between two agents, fetch its body and acknowledge it.
+- [x] Interrupt the reverse upgrade after the replacement server was visible
+  and before the CLI was published. The installer restored both v0.3.40 files
+  and archived the rollback journal. A clean retry installed v0.3.39.
+- [x] Compare launcher exit codes at that same interruption. The parent saw
+  0 with `pwsh -File` and 1 with `pwsh -Command`. The README gives the
+  automation invocation. The PowerShell test runner now checks that each case
+  completed. A zero-exit stand-in that ran no assertions failed all nine cases.
+- [x] Run the final signed Windows suite, including all 20 fresh/upgrade
+  transaction interruptions. All nine cases passed with zero skips. The Unix
+  installer passed A–L. Both Cargo workspace checks, Clippy and formatting
+  passed on Apple Silicon.
+- [ ] Verify complete asset coverage during the next authorized DSR publication
+  (`br-8tszv`) and the downstream raw installer checksum at the committed,
+  pushed ACFS revision (`br-quq4r`).
 
 ### Storage recovery and concurrent writes
 

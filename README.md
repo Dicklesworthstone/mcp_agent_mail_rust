@@ -327,6 +327,15 @@ For a side-by-side installation, pass `-Portable` to the downloaded script to op
 & "C:\Tools\Agent Mail\am.exe" --version
 ```
 
+For automation that checks the installer's exit code, launch the downloaded
+script with `pwsh -Command`. During binary replacement, Ctrl+C triggers
+recovery. PowerShell reports that interruption as exit 1 with `-Command`
+and exit 0 with `-File`. [PowerShell exit codes](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_pwsh?view=powershell-7.6#-file--f)
+
+```powershell
+pwsh -NoProfile -Command "& '.\install.ps1' -Version v0.3.40 -Dest 'C:\Tools\Agent Mail' -Portable"
+```
+
 ### Container (Docker or Podman)
 
 Each release also publishes a `linux/amd64` + `linux/arm64` image to GHCR, tagged `vX.Y.Z`, `X.Y.Z`, `0.3` and `latest`:
