@@ -65,6 +65,28 @@
 
 ### Storage recovery and concurrent writes
 
+- [x] For `br-cdsge`, run the three existing Windows snapshot-lock tests on
+  NTFS with the pinned MSVC toolchain. Shared readers coexisted, publishers
+  excluded one another, held handles pinned ancestors, and malformed lock
+  files kept their original contents and link counts.
+- [x] Repeat contention across two native processes. A child held the
+  publication lock. The parent could lock a different mailbox, was refused
+  for the held mailbox, and acquired the same file identity after the child
+  exited without dropping its guard.
+- [x] Place real NTFS symbolic links in the lock slot, pointing at an empty
+  file and a file with known contents. Both readers and publishers refused
+  them. The links, target identities and target bytes survived.
+- [x] Run the full database test binary on Windows. All five contention
+  and verification-error cases passed. Two of 40 snapshot tests failed.
+  A corrupt primary could not be restored because permission normalization
+  received a read-only handle. The legacy-path fixture collapsed its two
+  spellings into one. Nine separate recovery-receipt tests passed.
+- [ ] Rerun the original 40 cases with the permission-change handle and the
+  corrected Windows path fixture. Exercise a read-only recovery candidate
+  and check both the promoted data and its receipt.
+- [ ] Hold snapshot authority through the Windows backup rotation decision
+  and move. The non-Unix path currently obtains a verified source pathname
+  and releases selection admission before it stages older backups.
 - [x] Give each of the 12 refusal, seven competing-write and five revision
   fixtures its own 60-second child deadline in `br-kw4yv`. Preserve each
   test's existing assertions and the timeout diagnostic.
