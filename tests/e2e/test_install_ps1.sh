@@ -10,7 +10,7 @@ e2e_init_artifacts
 e2e_banner "PowerShell Installer Helper Suite"
 
 if ! command -v pwsh >/dev/null 2>&1; then
-    if [ "${AM_E2E_INSTALL_PS1_REQUIRE_PWSH:-0}" = "1" ]; then
+    if [ "${AM_E2E_INSTALL_PS1_REQUIRE_PWSH:-0}" = "1" ] || [ -n "${AM_E2E_INSTALL_PS1_PORTABLE_VERSION:-}" ]; then
         e2e_case_banner "0) PowerShell runtime is available"
         e2e_fail "pwsh is required for the strict install.ps1 lane"
         e2e_summary
@@ -753,5 +753,75 @@ foreach ($case in $cases) {
 }
 Write-Host "All eight archive cases passed; retained $root"
 '
+
+e2e_case_banner "8) PATH updates preserve shell-local tools and deduplicate the destination"
+run_pwsh_case \
+    "case_08_install_path" \
+    "installer PATH prioritization preserves existing entries in order" \
+'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($InstallPath, [ref]$tokens, [ref]$errors)
+$fn = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Get-PrioritizedInstallPath"
+}, $false)
+$prioritize = $fn.Body.GetScriptBlock()
+$dest = "C:\Tools\Agent Mail"
+$path = "C:\venv\Scripts;c:\tools\agent mail\;D:\utilities;C:\Tools\Agent Mail"
+$expected = "C:\Tools\Agent Mail;C:\venv\Scripts;D:\utilities"
+if ((& $prioritize $dest $path) -cne $expected) { throw "lost or reordered session PATH entries" }
+if ((& $prioritize $dest $expected) -cne $expected) { throw "unstable repeated PATH update" }
+if ((& $prioritize $dest "") -cne $dest) { throw "empty PATH contains a spurious entry" }
+'
+
+# Opt in on a Windows release worker with minisign and access to GitHub assets.
+if [ -n "${AM_E2E_INSTALL_PS1_PORTABLE_VERSION:-}" ]; then
+    e2e_case_banner "9) Signed portable install and reinstall"
+    run_pwsh_case \
+        "case_09_portable_install" \
+        "portable install verifies both executables and preserves the user environment" \
+'
+$root = Join-Path $PSScriptRoot "portable"
+$null = New-Item -ItemType Directory -Path $root
+$dest = Join-Path $root "Agent Mail"
+$scripts = New-Item -ItemType Directory -Path (Join-Path $root "other-env\Scripts") -Force
+$launcher = Join-Path $scripts.FullName "am.exe"
+[IO.File]::WriteAllText($launcher, "existing launcher")
+$env:Path = "$($scripts.FullName);$env:Path"
+if ((Get-Command am.exe -CommandType Application | Select-Object -First 1).Source -cne $launcher) {
+    throw "The fixture launcher must be first on the session PATH"
+}
+$sessionPath = $env:Path
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$release = $env:AM_E2E_INSTALL_PS1_PORTABLE_VERSION
+$expectedVersion = $release.TrimStart("v")
+$firstHashes = @{}
+foreach ($attempt in 1..2) {
+    & $InstallPath -Version $release -Dest $dest -Portable
+    foreach ($name in @("am", "mcp-agent-mail")) {
+        $exe = Join-Path $dest "$name.exe"
+        $actualVersion = & $exe --version
+        if ($LASTEXITCODE -ne 0 -or $actualVersion -cne "$name $expectedVersion") {
+            throw "Unexpected installed version for $exe"
+        }
+        $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+        if ($attempt -eq 1) {
+            $firstHashes[$name] = $hash
+        } elseif ($hash -cne $firstHashes[$name]) {
+            throw "Reinstall changed authenticated bytes for $exe"
+        }
+    }
+    if ($sessionPath -cne $env:Path -or $userPath -cne [Environment]::GetEnvironmentVariable("Path", "User")) {
+        throw "Portable install modified PATH"
+    }
+    if ([IO.File]::ReadAllText($launcher) -cne "existing launcher" -or @(Get-ChildItem -LiteralPath $scripts.FullName -Force).Count -ne 1) {
+        throw "Portable install disturbed the surrounding launcher"
+    }
+}
+$serverHash = $firstHashes["mcp-agent-mail"]
+Write-Host "Verified installed SHA-256 am=$($firstHashes.am) server=$serverHash; retained $dest"
+'
+fi
 
 e2e_summary

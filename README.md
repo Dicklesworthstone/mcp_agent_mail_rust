@@ -320,6 +320,13 @@ iwr -useb "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_ru
 
 PowerShell enforces the same per-release trust contract before `Expand-Archive`: for releases v0.3.31 and later it verifies the minisign-signed `SHA256SUMS` manifest with the same pinned maintainer key (a `minisign` executable on `PATH` is required; `cosign` is not consulted), and for older releases it requires the same stable `cosign` v3.1.3-or-newer-in-v3 verifier, forces modern-bundle parsing, and isolates verification from the three custom Sigstore trust environment variables named above. The ZIP must contain `am.exe` and `mcp-agent-mail.exe`, with optional `README.md` and `LICENSE` entries. Every member must be a flat, non-empty regular file; duplicate or other members are rejected. The binaries' staged and post-install version lines must exactly match the requested release. Both executables are replaced under one per-destination installer mutex and rollback domain; backups remain until byte-for-byte installed-digest and version checks pass. Options: `-Version vX.Y.Z`, `-Dest PATH`, `-Force`, `-Verify` (explicitly request the already-default cryptographic checks), and `-NoVerify` (the **unsafe** escape that skips only those checksum and signature checks). Archive-member and exact-version checks still run with `-NoVerify`, which means unauthenticated downloaded executables run during version probes and may execute arbitrary code as the installer user.
 
+For a side-by-side installation, pass `-Portable` to the downloaded script to opt out of PATH registration and Python launcher migration.
+
+```powershell
+.\install.ps1 -Version v0.3.40 -Dest "C:\Tools\Agent Mail" -Portable
+& "C:\Tools\Agent Mail\am.exe" --version
+```
+
 ### Container (Docker or Podman)
 
 Each release also publishes a `linux/amd64` + `linux/arm64` image to GHCR, tagged `vX.Y.Z`, `X.Y.Z`, `0.3` and `latest`:

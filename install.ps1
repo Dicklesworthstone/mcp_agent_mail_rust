@@ -7,6 +7,7 @@
   Options:
     -Version vX.Y.Z   Install a specific release tag (default: latest)
     -Dest PATH        Install directory (default: %LOCALAPPDATA%\Programs\mcp-agent-mail)
+    -Portable         Install both binaries without changing PATH or moving Python launchers
     -Force            Reinstall without probing the already-installed version
     -NoVerify         UNSAFE: skip checksum + signature checks (minisign for releases
                       >= v0.3.31, Sigstore/cosign for older); downloaded code still executes
@@ -17,6 +18,7 @@
 param(
     [string]$Version = "",
     [string]$Dest = "",
+    [switch]$Portable,
     [switch]$Force,
     [switch]$NoVerify,
     [switch]$Verify
@@ -251,40 +253,31 @@ function Resolve-Version {
     return [string]$response.tag_name
 }
 
+function Get-PrioritizedInstallPath {
+    param([string]$InstallDir, [string]$CurrentPath)
+    $normalized = $InstallDir.TrimEnd("\")
+    $parts = @(
+        $InstallDir
+        foreach ($entry in ($CurrentPath -split ";")) {
+            if (-not [string]::IsNullOrWhiteSpace($entry) -and
+                -not [string]::Equals($entry.TrimEnd("\"), $normalized, [StringComparison]::OrdinalIgnoreCase)) {
+                $entry
+            }
+        }
+    )
+    return ($parts -join ";")
+}
+
 function Ensure-UserPathEntry {
     param([string]$InstallDir)
     $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if ($null -eq $currentPath) {
-        $currentPath = ""
-    }
-
-    $parts = if ($currentPath.Length -gt 0) {
-        $currentPath.Split(";") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    } else {
-        @()
-    }
-
-    $normalizedInstallDir = $InstallDir.TrimEnd("\").ToLowerInvariant()
-    $filtered = @()
-    foreach ($entry in $parts) {
-        if ($entry.TrimEnd("\").ToLowerInvariant() -eq $normalizedInstallDir) {
-            continue
-        }
-        $filtered += $entry
-    }
-
-    $newParts = @($InstallDir) + $filtered
-    $newPath = ($newParts -join ";")
+    $newPath = Get-PrioritizedInstallPath -InstallDir $InstallDir -CurrentPath $currentPath
     $changed = ($newPath -ne $currentPath)
-    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-
-    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-    $processParts = @($InstallDir)
-    if (-not [string]::IsNullOrWhiteSpace($machinePath)) {
-        $processParts += ($machinePath.Split(";") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($changed) {
+        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
     }
-    $processParts += $filtered
-    $env:Path = ($processParts -join ";")
+    # The caller can have an activated venv or toolchain present only in this shell.
+    $env:Path = Get-PrioritizedInstallPath -InstallDir $InstallDir -CurrentPath $env:Path
     return $changed
 }
 
@@ -1794,26 +1787,28 @@ try {
         -PostInstallVerifier $postInstallVerifier
     Write-Ok "Installed binaries to $Dest (atomic replace)"
 
-    $pythonModulePresent = Test-PythonModuleAvailable
-    $pythonAmExecutables = @(Get-PythonAmExecutables -InstallDir $Dest)
-    if ($pythonModulePresent -or $pythonAmExecutables.Count -gt 0) {
-        Write-Info "Detected existing Python mcp-agent-mail footprint"
-    }
-    if ($pythonAmExecutables.Count -gt 0) {
-        $displaced = @(Displace-PythonAmExecutables -Paths $pythonAmExecutables)
-        foreach ($entry in $displaced) {
-            Write-Ok "Displaced Python am.exe: $entry"
-        }
-    } elseif ($pythonModulePresent) {
-        Write-WarnText "python -m mcp_agent_mail is importable, but no Python am.exe script was found to displace."
-    }
-
     Ensure-SqliteDll -ExtractDir $extractDir -InstallDir $Dest -ResolvedVersion $resolvedVersion
 
-    if (Ensure-UserPathEntry -InstallDir $Dest) {
-        Write-Ok "Updated user PATH with $Dest at highest precedence"
-    } else {
-        Write-Info "User PATH already prioritizes $Dest"
+    if (-not $Portable) {
+        $pythonModulePresent = Test-PythonModuleAvailable
+        $pythonAmExecutables = @(Get-PythonAmExecutables -InstallDir $Dest)
+        if ($pythonModulePresent -or $pythonAmExecutables.Count -gt 0) {
+            Write-Info "Detected existing Python mcp-agent-mail footprint"
+        }
+        if ($pythonAmExecutables.Count -gt 0) {
+            $displaced = @(Displace-PythonAmExecutables -Paths $pythonAmExecutables)
+            foreach ($entry in $displaced) {
+                Write-Ok "Displaced Python am.exe: $entry"
+            }
+        } elseif ($pythonModulePresent) {
+            Write-WarnText "python -m mcp_agent_mail is importable, but no Python am.exe script was found to displace."
+        }
+
+        if (Ensure-UserPathEntry -InstallDir $Dest) {
+            Write-Ok "Updated user PATH with $Dest at highest precedence"
+        } else {
+            Write-Info "User PATH already prioritizes $Dest"
+        }
     }
 
 } finally {
@@ -1843,6 +1838,11 @@ try {
 
 Write-Host ""
 Write-Ok "mcp-agent-mail is installed."
+if ($Portable) {
+    Write-Host "CLI executable: $(Join-Path $Dest 'am.exe')"
+    Write-Host "Server executable: $(Join-Path $Dest 'mcp-agent-mail.exe')"
+    return
+}
 Write-Host "Quick start:"
 Write-Host "  am"
 Write-Host "  am serve-http"
