@@ -93,9 +93,20 @@
   compiler checks, Clippy with warnings denied, formatting, and all 62
   snapshot tests. UBS scanned both Rust files and reported 0 critical
   findings and 6,105 warnings.
-- [ ] Hold snapshot authority through the Windows backup rotation decision
-  and move. The non-Unix path currently obtains a verified source pathname
-  and releases selection admission before it stages older backups.
+- [x] Trace Windows backup rotation from verified selection to quarantine.
+  The selector dropped its read lock when it returned the path. Wire the
+  recovery election and exclusive snapshot lock through the final move.
+- [x] Reproduce the effect through the signed v0.3.40 HTTP server on NTFS.
+  Each cold start saw three incident backups with one retention slot. Both
+  the unlocked control and the run with another process holding the lock
+  quarantined the two oldest backups. All three files retained their bytes.
+- [ ] On NTFS, exercise a competing publisher during each real move, a
+  busy reader before quarantine creation, and resumption after release.
+- [ ] Verify that the pinned file resists writes and renames, that an
+  unfinished recovery receipt parks rotation, and that a complete scan
+  resumes after the owner releases its lock.
+- [ ] Run both workspace compiler checks, Clippy, formatting and the
+  existing Unix rotation and snapshot tests on these source bytes.
 - [x] Give each of the 12 refusal, seven competing-write and five revision
   fixtures its own 60-second child deadline in `br-kw4yv`. Preserve each
   test's existing assertions and the timeout diagnostic.
