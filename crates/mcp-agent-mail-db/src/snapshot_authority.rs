@@ -197,22 +197,25 @@ pub(super) struct SnapshotAuthority {
 /// the durable recovery election. Holding the election excludes candidate
 /// selection/staging without recording a recovery attempt or opening the live
 /// database. The caller must still validate each inventoried file before moving it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[must_use]
 pub struct SnapshotRetentionGuard {
     authority: SnapshotAuthority,
+    #[cfg(unix)]
     expected_parent: Option<File>,
     primary: PathBuf,
     metadata_path: PathBuf,
     metadata: RetentionMetadata,
     selected: Option<super::SelectedVerifiedSnapshot>,
+    #[cfg(unix)]
     selected_identity: Option<std::fs::Metadata>,
+    #[cfg(unix)]
     completed_search_without_pin: bool,
     // Drop recovery last, after releasing the snapshot authority and source.
     recovery: crate::recovery_breaker::RecoveryBreakerFileLock,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(PartialEq, Eq)]
 enum RetentionMetadata {
     Absent,
@@ -220,7 +223,7 @@ enum RetentionMetadata {
     Unavailable,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn retention_metadata(path: &Path) -> RetentionMetadata {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => RetentionMetadata::Absent,
@@ -237,7 +240,7 @@ fn retention_metadata(path: &Path) -> RetentionMetadata {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl SnapshotRetentionGuard {
     /// Acquire without waiting, then select the exact verified generation.
     /// An unreadable or malformed sidecar stays occupied, never absent.
@@ -245,10 +248,67 @@ impl SnapshotRetentionGuard {
     /// # Errors
     /// Refuses recovery, live readers/publishers, pending recovery intents,
     /// unsafe lock paths, or changed authority.
+    #[cfg(unix)]
     pub fn acquire(primary: &Path) -> io::Result<Self> {
         Self::acquire_with_parent(primary, None, None)
     }
 
+    /// Hold the recovery election and exclusive snapshot lock through the
+    /// last Windows quarantine move, including when there is no metadata yet.
+    ///
+    /// # Errors
+    /// Refuses competing owners, unresolved recovery intents and changed pins.
+    #[cfg(windows)]
+    pub fn acquire(primary: &Path) -> io::Result<Self> {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let primary = super::normalized_snapshot_primary(primary).map_err(io::Error::other)?;
+        let recovery = crate::recovery_breaker::try_acquire_file_lock(&primary)?;
+        let authority = SnapshotAuthority::acquire(&primary, true)?;
+        recovery.revalidate()?;
+        ensure_no_recovery_references(&primary)?;
+        let metadata_path = super::snapshot_meta_path(&primary);
+        let metadata = retention_metadata(&metadata_path);
+        let selected = if matches!(metadata, RetentionMetadata::Bytes(_)) {
+            super::select_verified_snapshot_with_work_admission(
+                &primary,
+                |_| Ok(()),
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+                |path| {
+                    // Deny writes and renames from the first hash read through
+                    // the final move. A nonmatching candidate releases its handle.
+                    const FILE_SHARE_READ: u32 = 1;
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(FILE_SHARE_READ)
+                        .custom_flags(WINDOWS_OPEN_REPARSE_POINT)
+                        .open(path)?;
+                    let info = file.metadata()?;
+                    if !info.is_file() || info.file_attributes() & WINDOWS_REPARSE_POINT != 0 {
+                        return Err(invalid("verified snapshot pin must be a regular file"));
+                    }
+                    Ok(file)
+                },
+            )?
+        } else {
+            None
+        };
+        let guard = Self {
+            authority,
+            primary,
+            metadata_path,
+            metadata,
+            selected,
+            recovery,
+        };
+        guard.revalidate()?;
+        Ok(guard)
+    }
+}
+
+#[cfg(unix)]
+impl SnapshotRetentionGuard {
     /// Bind retention to the directory already held by an exporter admission.
     /// The retained directory identity, rather than its reusable pathname,
     /// determines which snapshot authority may authorize cleanup.
@@ -402,6 +462,7 @@ impl SnapshotRetentionGuard {
                     }
                     Ok(())
                 },
+                mcp_agent_mail_core::disk::open_regular_file_no_follow,
             );
             if bounded && inventoried && matches!(selected, Ok(None)) {
                 // A completed search is not an authority to delete anything.
@@ -527,7 +588,10 @@ impl SnapshotRetentionGuard {
         guard.revalidate()?;
         Ok(guard)
     }
+}
 
+#[cfg(any(unix, windows))]
+impl SnapshotRetentionGuard {
     /// Whether a sidecar exists or its absence could not be established.
     #[must_use]
     pub fn metadata_occupied(&self) -> bool {
@@ -541,7 +605,10 @@ impl SnapshotRetentionGuard {
             .as_ref()
             .map(|selected| selected.actual_path.as_path())
     }
+}
 
+#[cfg(unix)]
+impl SnapshotRetentionGuard {
     /// Verified pin length for charging repeated verification work, never a
     /// substitute for revalidating its identity or contents before an unlink.
     #[must_use]
@@ -719,11 +786,15 @@ impl SnapshotRetentionGuard {
             None => crate::recovery_retention::delete_inventoried_file(path, inventoried),
         }
     }
+}
 
+#[cfg(any(unix, windows))]
+impl SnapshotRetentionGuard {
     /// Recheck ownership and metadata before another destructive operation.
     /// Participating writers are excluded; changed external evidence refuses
     /// further work rather than allowing a stale pin to authorize eviction.
     pub fn revalidate(&self) -> io::Result<()> {
+        #[cfg(unix)]
         if let Some(expected) = &self.expected_parent {
             self.authority.ensure_parent(expected)?;
         }
@@ -735,6 +806,7 @@ impl SnapshotRetentionGuard {
                 "snapshot metadata changed during retention; rescan required",
             ));
         }
+        #[cfg(unix)]
         if let (Some(selected), Some(expected)) = (&self.selected, &self.selected_identity) {
             let retained = selected.source.metadata()?;
             let current = std::fs::symlink_metadata(&selected.actual_path)?;
@@ -752,11 +824,19 @@ impl SnapshotRetentionGuard {
                     return Err(invalid("verified snapshot pin changed during retention"));
                 }
             }
-            if !crate::pool::sqlite_recovery_candidate_is_standalone(&selected.actual_path) {
-                return Err(invalid(
-                    "verified snapshot pin gained companion recovery state",
-                ));
-            }
+        }
+        #[cfg(windows)]
+        if let Some(selected) = &self.selected
+            && mcp_agent_mail_core::disk::windows_file_link_count(&selected.source)? != 1
+        {
+            return Err(invalid("verified snapshot pin gained another link"));
+        }
+        if let Some(selected) = &self.selected
+            && !crate::pool::sqlite_recovery_candidate_is_standalone(&selected.actual_path)
+        {
+            return Err(invalid(
+                "verified snapshot pin gained companion recovery state",
+            ));
         }
         Ok(())
     }
@@ -810,7 +890,7 @@ fn retention_generation_created(
     Err(invalid("not an eligible superseded backup generation"))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ensure_no_recovery_references(primary: &Path) -> io::Result<()> {
     let legacy_lock = crate::pool::sqlite_path_with_suffix(primary, ".recovery.lock");
     match std::fs::symlink_metadata(&legacy_lock) {

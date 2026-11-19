@@ -822,10 +822,52 @@ fn recovery_receipts_dir(_storage_root: &Path, db_path: &Path) -> Result<PathBuf
 /// still references recovery generations. Retention must preserve those bytes
 /// until recovery resolves the intent; verifying the entire receipt chain or
 /// opening the live database is unnecessary for this admission check.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn ensure_no_pending_recovery_receipts(db_path: &Path) -> std::io::Result<()> {
     let directory = recovery_receipts_dir(Path::new(""), db_path).map_err(std::io::Error::other)?;
     ensure_no_pending_recovery_receipts_in(&directory, 16_384)
+}
+
+#[cfg(windows)]
+fn ensure_no_pending_recovery_receipts_in(path: &Path, entry_limit: usize) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::windows::fs::MetadataExt as _;
+
+    // Hold every ancestor against rename and reject reparse points before
+    // enumerating. Recovery and retention share the same per-mailbox election.
+    let parents = match crate::snapshot::pin_windows_parents(path) {
+        Ok(parents) => parents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let (_, directory) = parents
+        .last()
+        .ok_or_else(|| Error::other("missing receipt directory"))?;
+    let before = directory.metadata()?.last_write_time();
+    for (index, entry) in std::fs::read_dir(path)?.enumerate() {
+        let name = entry?.file_name();
+        if index >= entry_limit {
+            return Err(Error::other(
+                "recovery receipt inventory is incomplete; preserving recovery evidence",
+            ));
+        }
+        if name
+            .as_encoded_bytes()
+            .last_chunk::<8>()
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".pending"))
+        {
+            return Err(Error::new(
+                ErrorKind::WouldBlock,
+                "unfinalized recovery intent remains; preserving recovery evidence",
+            ));
+        }
+    }
+    if directory.metadata()?.last_write_time() != before {
+        return Err(Error::other(
+            "recovery receipt authority changed during retention",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -4875,6 +4917,33 @@ mod tests {
             );
             assert!(std::fs::symlink_metadata(&pending).is_ok(), "{shape}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retention_parks_for_pending_receipts_and_incomplete_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let receipts = super::recovery_receipts_dir(&root, &primary).unwrap();
+        super::ensure_no_pending_recovery_receipts(&primary).unwrap();
+        assert!(!receipts.exists());
+        std::fs::create_dir_all(&receipts).unwrap();
+        let settled = receipts.join("old.receipt.json");
+        std::fs::write(&settled, b"retained receipt").unwrap();
+        assert!(super::ensure_no_pending_recovery_receipts_in(&receipts, 0).is_err());
+        super::ensure_no_pending_recovery_receipts_in(&receipts, 1).unwrap();
+        let pending = receipts.join("crash.receipt.PENDING");
+        std::fs::create_dir(&pending).unwrap();
+        assert_eq!(
+            super::ensure_no_pending_recovery_receipts(&primary)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock,
+        );
+        assert!(crate::snapshot::SnapshotRetentionGuard::acquire(&primary).is_err());
+        assert!(pending.is_dir());
+        assert_eq!(std::fs::read(&settled).unwrap(), b"retained receipt");
     }
 
     #[cfg(unix)]

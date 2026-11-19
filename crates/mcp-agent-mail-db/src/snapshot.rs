@@ -18,10 +18,12 @@
 #[path = "snapshot_authority.rs"]
 mod authority;
 use authority::SnapshotAuthority;
+#[cfg(unix)]
+pub use authority::SnapshotRetentionDeferred;
+#[cfg(any(unix, windows))]
+pub use authority::SnapshotRetentionGuard;
 #[cfg(windows)]
 pub(crate) use authority::pin_windows_parents;
-#[cfg(unix)]
-pub use authority::{SnapshotRetentionDeferred, SnapshotRetentionGuard};
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _};
@@ -1004,9 +1006,15 @@ fn select_verified_snapshot_inner(
     primary: &Path,
     before_open: impl FnMut(&Path, &std::fs::Metadata) -> std::io::Result<()>,
 ) -> Option<SelectedVerifiedSnapshot> {
-    select_verified_snapshot_with_work_admission(primary, |_| Ok(()), before_open, |_, _| Ok(()))
-        .ok()
-        .flatten()
+    select_verified_snapshot_with_work_admission(
+        primary,
+        |_| Ok(()),
+        before_open,
+        |_, _| Ok(()),
+        mcp_agent_mail_core::disk::open_regular_file_no_follow,
+    )
+    .ok()
+    .flatten()
 }
 
 /// Work admission can stop a retention search without converting an unfinished
@@ -1017,6 +1025,7 @@ fn select_verified_snapshot_with_work_admission(
     order: impl FnOnce(&mut Vec<PathBuf>) -> std::io::Result<()>,
     mut before_open: impl FnMut(&Path, &std::fs::Metadata) -> std::io::Result<()>,
     mut admit: impl FnMut(&Path, &std::fs::Metadata) -> std::io::Result<()>,
+    open_source: impl Fn(&Path) -> std::io::Result<std::fs::File>,
 ) -> std::io::Result<Option<SelectedVerifiedSnapshot>> {
     let Ok(primary) = normalized_snapshot_primary(primary) else {
         return Ok(None);
@@ -1060,7 +1069,7 @@ fn select_verified_snapshot_with_work_admission(
         if before_open(&candidate, &inventoried).is_err() {
             continue;
         }
-        let mut source = match mcp_agent_mail_core::disk::open_regular_file_no_follow(&candidate) {
+        let mut source = match open_source(&candidate) {
             Ok(source) => source,
             Err(_) => continue,
         };
@@ -1875,6 +1884,41 @@ mod tests {
         assert_eq!(read_snapshot_metadata(&primary), Some(metadata));
         drop(reader);
         SnapshotPublicationGuard::acquire(&primary).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retention_holds_the_election_and_verified_bytes_until_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        let metadata = record_snapshot_metadata(&primary, 41).unwrap();
+        let rotated = primary.with_file_name("storage.sqlite3.bak.20261001_000000");
+        std::fs::rename(&backup, &rotated).unwrap();
+        let bytes = std::fs::read(&rotated).unwrap();
+
+        let reader = select_verified_snapshot(&primary).unwrap();
+        assert!(SnapshotRetentionGuard::acquire(&primary).is_err());
+        drop(reader);
+        let guard = SnapshotRetentionGuard::acquire(&primary).unwrap();
+        assert_eq!(guard.verified_source_path(), Some(rotated.as_path()));
+        assert!(crate::recovery_breaker::try_acquire_file_lock(&primary).is_err());
+        assert!(SnapshotPublicationGuard::acquire(&primary).is_err());
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&rotated)
+                .is_err()
+        );
+        assert!(std::fs::rename(&rotated, &backup).is_err());
+        assert_eq!(std::fs::read(&rotated).unwrap(), bytes);
+        guard.revalidate().unwrap();
+        drop(guard);
+        std::fs::rename(&rotated, &backup).unwrap();
+        assert_eq!(latest_verified_snapshot(&primary), Some(metadata));
+        drop(crate::recovery_breaker::try_acquire_file_lock(&primary).unwrap());
     }
 
     #[cfg(unix)]
