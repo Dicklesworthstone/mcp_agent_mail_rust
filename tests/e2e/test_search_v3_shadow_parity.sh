@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# test_search_v3_shadow_parity.sh - E2E: Shadow parity between legacy and Search V3
+# Exercise search through the legacy, lexical, and shadow configuration paths.
+# Legacy and lexical select the same serving engine. Planted message IDs are
+# the independent reference for membership in this corpus.
 #
 # br-2tnl.7.10: Add shadow-parity E2E script comparing legacy and Search V3 outputs
 #
@@ -16,7 +18,7 @@
 #   - Filter behavior deltas (sender/thread/importance facet checks)
 #   - Classification under explicit divergence policy
 #
-# Cutover readiness is then evaluated with objective thresholds:
+# The fixture passes with these thresholds:
 #   - unacceptable cases == 0
 #   - acceptance rate == 100%
 #   - mean overlap >= 70%
@@ -25,7 +27,7 @@
 
 set -euo pipefail
 
-E2E_SUITE="search_v3_shadow_parity"
+export E2E_SUITE="search_v3_shadow_parity"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../scripts/e2e_search_v3_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_search_v3_lib.sh"
@@ -35,14 +37,17 @@ search_v3_init
 
 search_v3_banner "Search V3 Shadow Parity E2E (br-2tnl.7.10)"
 
-e2e_ensure_binary "am" >/dev/null
-export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
-search_v3_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
+AM_BIN="$(e2e_ensure_binary am | tail -n 1)"
+search_v3_log "am binary: ${AM_BIN}"
 
 WORK="$(e2e_mktemp "e2e_search_v3_shadow_parity")"
 SEARCH_DB="${WORK}/search_v3_shadow_parity.sqlite3"
-PROJECT_ALPHA="/tmp/e2e_search_v3_shadow_alpha_${E2E_TIMESTAMP}_$$"
-PROJECT_BETA="/tmp/e2e_search_v3_shadow_beta_${E2E_TIMESTAMP}_$$"
+PROJECT_ALPHA="${WORK}/alpha"
+PROJECT_BETA="${WORK}/beta"
+PROJECT_OTHER="${WORK}/unlinked"
+export STORAGE_ROOT="${WORK}/archive"
+export SEARCH_V3_INDEX_DIR="${WORK}/tantivy"
+mkdir -p "${PROJECT_ALPHA}" "${PROJECT_BETA}" "${PROJECT_OTHER}" "${STORAGE_ROOT}"
 PRODUCT_KEY="test-search-v3-shadow-product-${E2E_TIMESTAMP}-$$"
 
 PARITY_DIR="${SEARCH_V3_RUN_DIR}/shadow_parity"
@@ -58,44 +63,14 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 
 send_jsonrpc_session() {
     local db_path="$1"
-    shift
-
-    local env_vars=()
-    while [ $# -gt 0 ] && [ "${1:-}" != "--" ]; do
-        env_vars+=("$1")
-        shift
-    done
-    if [ "${1:-}" = "--" ]; then
-        shift
-    fi
-    local requests=("$@")
-
-    local output_file="${WORK}/session_response_$RANDOM.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    env "${env_vars[@]}" \
-        DATABASE_URL="sqlite:////${db_path}" \
-        RUST_LOG=error \
-        WORKTREES_ENABLED=true \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        echo "$INIT_REQ"
-        sleep 0.1
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.05
-        done
-        sleep 0.2
-    } > "$fifo"
-
-    wait "$srv_pid" 2>/dev/null || true
-    cat "$output_file"
+    local engine="$2" shadow_mode=off
+    shift 2
+    if [[ "$engine" == shadow ]]; then shadow_mode=log_only; fi
+    AM_SEARCH_ENGINE="$engine" AM_SEARCH_SHADOW_MODE="$shadow_mode" \
+        AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES="$engine" \
+        AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES_PRODUCT="$engine" \
+        E2E_STDIO_BINARY="$AM_BIN" WORKTREES_ENABLED=true \
+        e2e_stdio_session "$db_path" "$INIT_REQ" "$@"
 }
 
 extract_content_text() {
@@ -122,25 +97,13 @@ for line in sys.stdin:
 is_error_result() {
     local response="$1"
     local req_id="$2"
-    echo "$response" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        d = json.loads(line)
-        if d.get('id') == ${req_id}:
-            if 'error' in d:
-                print('true')
-                sys.exit(0)
-            if 'result' in d and d['result'].get('isError', False):
-                print('true')
-                sys.exit(0)
-    except Exception:
-        pass
-print('false')
-" 2>/dev/null
+    python3 -c '
+import json, sys
+messages = [json.loads(line) for line in sys.stdin if line.strip()]
+matches = [m for m in messages if m.get("id") == int(sys.argv[1])]
+result = matches[0].get("result") if len(matches) == 1 and "error" not in matches[0] else None
+print("false" if isinstance(result, dict) and result.get("content") and not result.get("isError") else "true")
+' "$req_id" <<< "$response"
 }
 
 mcp_tool() {
@@ -212,11 +175,12 @@ build_parity_report() {
     local v3_call_error="${10}"
     local shadow_call_error="${11}"
 
-    python3 - "$case_id" "$tool_name" "$policy" "$args_file" "$legacy_file" "$v3_file" "$shadow_file" "$report_file" "$legacy_call_error" "$v3_call_error" "$shadow_call_error" <<'PY'
+    python3 - "$case_id" "$tool_name" "$policy" "$args_file" "$legacy_file" "$v3_file" "$shadow_file" "$report_file" "$legacy_call_error" "$v3_call_error" "$shadow_call_error" "$SEARCH_DB" "${E2E_ARTIFACT_DIR}/shadow_parity/setup_rpc.jsonl" <<'PY'
 import json
-import math
+import sqlite3
 import statistics
 import sys
+from datetime import datetime
 from pathlib import Path
 
 (
@@ -231,6 +195,8 @@ from pathlib import Path
     legacy_call_error,
     v3_call_error,
     shadow_call_error,
+    db_path,
+    setup_path,
 ) = sys.argv[1:]
 
 
@@ -245,15 +211,15 @@ def load_json(path: str):
 
 
 def get_rows(data):
-    if isinstance(data, dict):
-        rows = data.get("result", [])
-    elif isinstance(data, list):
-        rows = data
-    else:
-        rows = []
+    rows = data.get("result") if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        return []
-    return rows
+        return [], "missing_result_list"
+    ids = [row.get("id") for row in rows if isinstance(row, dict)]
+    if len(ids) != len(rows) or any(type(i) is not int or i <= 0 for i in ids):
+        return [], "invalid_message_id"
+    if len(ids) != len(set(ids)):
+        return [], "duplicate_message_id"
+    return rows, None
 
 
 def score_of(item):
@@ -274,10 +240,8 @@ def score_of(item):
 
 def normalize_rows(rows):
     normalized = []
-    for idx, row in enumerate(rows):
-        if not isinstance(row, dict):
-            continue
-        raw_id = row.get("id", row.get("message_id", f"idx-{idx}"))
+    for row in rows:
+        raw_id = row["id"]
         id_key = str(raw_id)
         normalized.append(
             {
@@ -370,9 +334,15 @@ legacy_data, legacy_parse_err = load_json(legacy_path)
 v3_data, v3_parse_err = load_json(v3_path)
 shadow_data, shadow_parse_err = load_json(shadow_path)
 
-legacy_rows = normalize_rows(get_rows(legacy_data))
-v3_rows = normalize_rows(get_rows(v3_data))
-shadow_rows = normalize_rows(get_rows(shadow_data))
+legacy_rows, legacy_shape_err = get_rows(legacy_data)
+v3_rows, v3_shape_err = get_rows(v3_data)
+shadow_rows, shadow_shape_err = get_rows(shadow_data)
+legacy_parse_err = legacy_parse_err or legacy_shape_err
+v3_parse_err = v3_parse_err or v3_shape_err
+shadow_parse_err = shadow_parse_err or shadow_shape_err
+legacy_rows = normalize_rows(legacy_rows)
+v3_rows = normalize_rows(v3_rows)
+shadow_rows = normalize_rows(shadow_rows)
 
 legacy_ids = [row["id_key"] for row in legacy_rows]
 v3_ids = [row["id_key"] for row in v3_rows]
@@ -434,6 +404,58 @@ policy_cfg = make_policy(policy)
 reasons = []
 acceptable = True
 
+# The send receipts identify the intended hits even when every search route
+# makes the same mistake. A separate SQLite FTS5 index over persisted rows
+# checks the same request using another implementation of text matching.
+expected_sends = {
+    "basic_deployment": [10, 17, 21], "phrase_migration": [11],
+    "sender_filter": [16], "thread_filter": [12, 13], "importance_filter": [19],
+    "not_operator": [10, 21], "unicode_query": [14], "unicode_accent": [14],
+    "date_window": [10, 17, 21],
+    "date_excluded": [], "zero_result": [], "product_cross_project": [10, 17, 21, 22],
+}
+replies = {r["id"]: r for r in map(json.loads, Path(setup_path).read_text().splitlines())}
+expected_ids = set()
+for req_id in expected_sends[case_id]:
+    reply = json.loads(replies[req_id]["result"]["content"][0]["text"])
+    delivery, = reply["deliveries"]
+    expected_ids.add(str(delivery["payload"]["id"]))
+
+source = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+if tool_name == "search_messages_product":
+    scope = {r[0] for r in source.execute(
+        "SELECT l.project_id FROM product_project_links l JOIN products p ON p.id=l.product_id "
+        "WHERE p.name=?", (query_args["product_key"],))}
+else:
+    scope = {r[0] for r in source.execute(
+        "SELECT id FROM projects WHERE human_key=?", (query_args["project_key"],))}
+index = sqlite3.connect(":memory:")
+index.execute("CREATE VIRTUAL TABLE corpus USING fts5(subject, body_md)")
+def timestamp_us(value):
+    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1_000_000)
+for mid, pid, subject, body, sender, thread, importance, created in source.execute(
+    "SELECT m.id,m.project_id,m.subject,m.body_md,a.name,m.thread_id,m.importance,m.created_ts "
+    "FROM messages m JOIN agents a ON a.id=m.sender_id"
+):
+    if pid not in scope or any(key in query_args and query_args[key] != actual for key, actual in
+                               (("sender", sender), ("importance", importance), ("thread_id", thread))):
+        continue
+    if "date_start" in query_args and created < timestamp_us(query_args["date_start"]):
+        continue
+    if "date_end" in query_args and created > timestamp_us(query_args["date_end"]):
+        continue
+    index.execute("INSERT INTO corpus(rowid,subject,body_md) VALUES (?,?,?)", (mid, subject, body))
+reference_ids = {str(r[0]) for r in index.execute(
+    "SELECT rowid FROM corpus WHERE corpus MATCH ? ORDER BY rank LIMIT ?",
+    (query_args["query"], query_args["limit"]))}
+if reference_ids != expected_ids:
+    acceptable = False
+    reasons.append("fts5_fixture_mismatch")
+for name, actual in (("legacy", legacy_set), ("v3", v3_set), ("shadow", shadow_set)):
+    if actual != expected_ids:
+        acceptable = False
+        reasons.append(f"{name}_fixture_mismatch")
+
 legacy_call_failed = legacy_call_error == "true"
 v3_call_failed = v3_call_error == "true"
 shadow_call_failed = shadow_call_error == "true"
@@ -479,6 +501,9 @@ if v3_mismatch["total_mismatch"] > 0:
 if legacy_mismatch["total_mismatch"] > 0:
     acceptable = False
     reasons.append("legacy_filter_behavior_mismatch")
+if shadow_mismatch["total_mismatch"] > 0:
+    acceptable = False
+    reasons.append("shadow_filter_behavior_mismatch")
 
 classification = "unacceptable"
 if acceptable:
@@ -503,6 +528,9 @@ report = {
     "classification": classification,
     "acceptable": acceptable,
     "reasons": reasons,
+    "expected_ids": sorted(expected_ids),
+    "sqlite_fts5_ids": sorted(reference_ids),
+    "shadow_order": shadow_ids,
     "counts": {
         "legacy": len(legacy_ids),
         "v3": len(v3_ids),
@@ -659,30 +687,9 @@ print(f'{query}\t{limit if limit is not None else \"\"}\t{project}')
     request="$(mcp_tool 2 "${tool_name}" "${args_json}")"
 
     local legacy_resp v3_resp shadow_resp
-    legacy_resp="$(
-        send_jsonrpc_session "$SEARCH_DB" \
-            AM_SEARCH_ENGINE=legacy \
-            AM_SEARCH_SHADOW_MODE=off \
-            AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES=legacy \
-            AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES_PRODUCT=legacy \
-            -- "$request"
-    )"
-    v3_resp="$(
-        send_jsonrpc_session "$SEARCH_DB" \
-            AM_SEARCH_ENGINE=lexical \
-            AM_SEARCH_SHADOW_MODE=off \
-            AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES=lexical \
-            AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES_PRODUCT=lexical \
-            -- "$request"
-    )"
-    shadow_resp="$(
-        send_jsonrpc_session "$SEARCH_DB" \
-            AM_SEARCH_ENGINE=shadow \
-            AM_SEARCH_SHADOW_MODE=log_only \
-            AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES=shadow \
-            AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES_PRODUCT=shadow \
-            -- "$request"
-    )"
+    legacy_resp="$(send_jsonrpc_session "$SEARCH_DB" legacy "$request")"
+    v3_resp="$(send_jsonrpc_session "$SEARCH_DB" lexical "$request")"
+    shadow_resp="$(send_jsonrpc_session "$SEARCH_DB" shadow "$request")"
 
     printf '%s\n' "$legacy_resp" > "${case_dir}/legacy_rpc.jsonl"
     printf '%s\n' "$v3_resp" > "${case_dir}/v3_rpc.jsonl"
@@ -831,7 +838,7 @@ build_cutover_readiness_report() {
     local reports_jsonl="$1"
     local output_file="$2"
 
-    python3 - "$reports_jsonl" "$output_file" <<'PY'
+    python3 - "$reports_jsonl" "$output_file" "$EXPECTED_CASE_COUNT" <<'PY'
 import json
 import statistics
 import sys
@@ -884,6 +891,7 @@ thresholds = {
 }
 
 gates = {
+    "complete_matrix": len({r["case_id"] for r in reports}) == total_cases == int(sys.argv[3]),
     "unacceptable_cases_ok": len(unacceptable_cases) <= thresholds["max_unacceptable_cases"],
     "acceptance_rate_ok": acceptance_rate >= thresholds["min_acceptance_rate"],
     "mean_overlap_ok": mean_overlap >= thresholds["min_mean_overlap"],
@@ -891,10 +899,10 @@ gates = {
     "call_errors_ok": call_error_total <= thresholds["max_call_error_total"],
 }
 
-cutover_ready = all(gates.values()) and total_cases > 0
+fixture_passed = all(gates.values()) and total_cases > 0
 
 report = {
-    "schema_version": 1,
+    "schema_version": 2,
     "suite": "search_v3_shadow_parity",
     "total_cases": total_cases,
     "acceptable_cases": len(acceptable_cases),
@@ -907,7 +915,10 @@ report = {
     "call_error_total": call_error_total,
     "thresholds": thresholds,
     "gates": gates,
-    "cutover_ready": cutover_ready,
+    "fixture_passed": fixture_passed,
+    "reference": "SQLite FTS5 over persisted messages and planted MCP delivery IDs",
+    "cutover_ready": False,
+    "cutover_assessment": "Historical server cutover unassessed. The legacy setting selects lexical search.",
     "unacceptable_case_ids": [r.get("case_id") for r in unacceptable_cases],
 }
 
@@ -915,7 +926,7 @@ output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 print(
     "|".join(
         [
-            str(int(cutover_ready)),
+            str(int(fixture_passed)),
             str(len(unacceptable_cases)),
             str(int(round(acceptance_rate * 10000))),
             str(int(round(mean_overlap * 10000))),
@@ -934,7 +945,7 @@ PY
 e2e_case_banner "Setup: seed deterministic corpus for shadow parity"
 search_v3_log "Seeding alpha/beta projects, agents, threads, product links"
 
-SETUP_RESP="$(send_jsonrpc_session "$SEARCH_DB" -- \
+SETUP_RESP="$(send_jsonrpc_session "$SEARCH_DB" lexical \
     "$(mcp_tool 2 ensure_project "{\"human_key\":\"$PROJECT_ALPHA\"}")" \
     "$(mcp_tool 3 ensure_project "{\"human_key\":\"$PROJECT_BETA\"}")" \
     "$(mcp_tool 4 register_agent "{\"project_key\":\"$PROJECT_ALPHA\",\"program\":\"e2e\",\"model\":\"test\",\"name\":\"GoldFox\"}")" \
@@ -948,12 +959,12 @@ SETUP_RESP="$(send_jsonrpc_session "$SEARCH_DB" -- \
     "$(mcp_tool 12 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"SilverWolf\",\"to\":[\"GoldFox\"],\"subject\":\"API redesign proposal\",\"body_md\":\"Propose REST + GraphQL dual endpoint strategy.\",\"thread_id\":\"thread-api-redesign\"}")" \
     "$(mcp_tool 13 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"GoldFox\",\"to\":[\"SilverWolf\"],\"subject\":\"Re: API redesign proposal\",\"body_md\":\"GraphQL schema follow-up for API redesign.\",\"thread_id\":\"thread-api-redesign\"}")" \
     "$(mcp_tool 14 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"RedPeak\",\"to\":[\"GoldFox\",\"SilverWolf\"],\"subject\":\"Internationales Datenupdate\",\"body_md\":\"Lokalisierungsdaten bereit. Unicode: Straße, café, élève.\"}")" \
-    "$(mcp_tool 15 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"GoldFox\",\"to\":[\"RedPeak\"],\"subject\":\"Quantum entanglement research\",\"body_md\":\"Quantum entanglement experiment results are ready.\"}")" \
+    "$(mcp_tool 15 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"GoldFox\",\"to\":[\"RedPeak\"],\"subject\":\"Quantum entanglement research\",\"body_md\":\"Quantum entanglement experiment results are ready for consensus review.\"}")" \
     "$(mcp_tool 16 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"SilverWolf\",\"to\":[\"GoldFox\"],\"subject\":\"Blockchain consensus protocol\",\"body_md\":\"Consensus mechanism update for distributed ledger.\",\"thread_id\":\"thread-blockchain\"}")" \
     "$(mcp_tool 17 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"RedPeak\",\"to\":[\"GoldFox\"],\"subject\":\"Deployment checklist complete\",\"body_md\":\"Deployment prerequisites verified for production rollout.\"}")" \
-    "$(mcp_tool 18 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"GoldFox\",\"to\":[\"SilverWolf\"],\"subject\":\"Performance benchmarking results\",\"body_md\":\"Query latency improved by 3x after optimization.\"}")" \
+    "$(mcp_tool 18 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"GoldFox\",\"to\":[\"SilverWolf\"],\"subject\":\"Performance benchmarking results\",\"body_md\":\"GraphQL query latency improved by 3x after optimization.\",\"thread_id\":\"thread-release\"}")" \
     "$(mcp_tool 19 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"SilverWolf\",\"to\":[\"GoldFox\",\"RedPeak\"],\"subject\":\"Security audit findings\",\"body_md\":\"High severity security issue requires immediate remediation.\",\"importance\":\"urgent\",\"ack_required\":true}")" \
-    "$(mcp_tool 20 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"GoldFox\",\"to\":[\"RedPeak\"],\"subject\":\"Rollout postmortem notes\",\"body_md\":\"Postmortem for rollout issue with mitigation tasks.\",\"importance\":\"low\"}")" \
+    "$(mcp_tool 20 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"GoldFox\",\"to\":[\"RedPeak\"],\"subject\":\"Rollout postmortem notes\",\"body_md\":\"Postmortem for rollout issue with security checklist and mitigation tasks.\",\"importance\":\"low\"}")" \
     "$(mcp_tool 21 send_message "{\"project_key\":\"$PROJECT_ALPHA\",\"sender_name\":\"RedPeak\",\"to\":[\"GoldFox\"],\"subject\":\"Deployment rollback plan\",\"body_md\":\"Rollback strategy for deployment incident.\",\"importance\":\"high\"}")" \
     "$(mcp_tool 22 send_message "{\"project_key\":\"$PROJECT_BETA\",\"sender_name\":\"GoldFox\",\"to\":[\"SilverWolf\"],\"subject\":\"Beta deployment notes\",\"body_md\":\"Deployment notes for beta staging environment.\"}")" \
     "$(mcp_tool 23 send_message "{\"project_key\":\"$PROJECT_BETA\",\"sender_name\":\"SilverWolf\",\"to\":[\"GoldFox\"],\"subject\":\"Beta search integration\",\"body_md\":\"Cross-project search integration checks for beta.\"}")" \
@@ -962,13 +973,17 @@ SETUP_RESP="$(send_jsonrpc_session "$SEARCH_DB" -- \
     "$(mcp_tool 26 ensure_product "{\"product_key\":\"$PRODUCT_KEY\"}")" \
     "$(mcp_tool 27 products_link "{\"product_key\":\"$PRODUCT_KEY\",\"project_key\":\"$PROJECT_ALPHA\"}")" \
     "$(mcp_tool 28 products_link "{\"product_key\":\"$PRODUCT_KEY\",\"project_key\":\"$PROJECT_BETA\"}")" \
+    "$(mcp_tool 29 ensure_project "{\"human_key\":\"$PROJECT_OTHER\"}")" \
+    "$(mcp_tool 30 register_agent "{\"project_key\":\"$PROJECT_OTHER\",\"program\":\"e2e\",\"model\":\"test\",\"name\":\"GoldFox\"}")" \
+    "$(mcp_tool 31 register_agent "{\"project_key\":\"$PROJECT_OTHER\",\"program\":\"e2e\",\"model\":\"test\",\"name\":\"RedPeak\"}")" \
+    "$(mcp_tool 32 send_message "{\"project_key\":\"$PROJECT_OTHER\",\"sender_name\":\"GoldFox\",\"to\":[\"RedPeak\"],\"subject\":\"Unlinked deployment notes\",\"body_md\":\"Deployment outside the product.\"}")" \
 )"
 
 e2e_save_artifact "shadow_parity/setup_rpc.jsonl" "$SETUP_RESP"
 
 SETUP_OK=0
 SETUP_FAIL=0
-for i in $(seq 2 28); do
+for i in $(seq 2 32); do
     ERR_FLAG="$(is_error_result "$SETUP_RESP" "$i")"
     if [ "$ERR_FLAG" = "false" ]; then
         SETUP_OK=$((SETUP_OK + 1))
@@ -978,17 +993,44 @@ for i in $(seq 2 28); do
 done
 
 if [ "$SETUP_FAIL" -eq 0 ]; then
-    e2e_pass "setup: all 27 setup requests succeeded"
+    e2e_pass "setup: all ${SETUP_OK} setup requests succeeded"
     search_v3_case_summary "setup" "pass" --message "ok=${SETUP_OK}"
 else
     e2e_fail "setup: ${SETUP_FAIL} setup requests failed"
     search_v3_case_summary "setup" "fail" --message "failed=${SETUP_FAIL}"
+    e2e_summary
+    exit 1
 fi
 
-search_v3_capture_index_meta "initial_shadow_parity_index" \
-    --doc-count 16 \
-    --last-commit "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-    --consistency "ok"
+python3 - "$SEARCH_DB" "${E2E_ARTIFACT_DIR}/shadow_parity/setup_rpc.jsonl" <<'PY'
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+db = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True)
+replies = {r["id"]: json.loads(r["result"]["content"][0]["text"])
+           for r in map(json.loads, Path(sys.argv[2]).read_text().splitlines()) if r["id"] != 1}
+project_ids = {replies[2]["id"], replies[3]["id"]}
+links = {r[0] for r in db.execute("SELECT project_id FROM product_project_links WHERE product_id=?",
+                                  (replies[26]["id"],))}
+if len(project_ids) != 2 or links != project_ids or replies[29]["id"] in links:
+    sys.exit("Unexpected persisted product links")
+sent = []
+for request in [*range(10, 26), 32]:
+    delivery, = replies[request]["deliveries"]
+    message = delivery["payload"]
+    project_request = 2 if request < 22 else 3
+    if request == 32:
+        project_request = 29
+    project = replies[project_request]["id"]
+    row = db.execute("SELECT project_id, subject FROM messages WHERE id=?", (message["id"],)).fetchone()
+    if row != (project, message["subject"]):
+        sys.exit(f"Send request {request} differs from the persisted message")
+    sent.append(message["id"])
+if len(set(sent)) != len(sent):
+    sys.exit("Duplicate message IDs in seed receipts")
+PY
 
 # ---------------------------------------------------------------------------
 # Parity matrix
@@ -1001,9 +1043,11 @@ sender_filter|search_messages|strict_set|Sender filter parity|{"project_key":"__
 thread_filter|search_messages|strict_set|Thread filter parity|{"project_key":"__ALPHA__","query":"GraphQL","thread_id":"thread-api-redesign","limit":10,"explain":true}
 importance_filter|search_messages|strict_set|Importance filter parity|{"project_key":"__ALPHA__","query":"security","importance":"urgent","limit":10,"explain":true}
 not_operator|search_messages|rank_relaxed|NOT-operator parity|{"project_key":"__ALPHA__","query":"deployment NOT checklist","limit":10,"explain":true}
-unicode_query|search_messages|strict_set|Unicode query parity|{"project_key":"__ALPHA__","query":"Lokalisierungsdaten","limit":10,"explain":true}
+unicode_query|search_messages|strict_set|Localized body text parity|{"project_key":"__ALPHA__","query":"Lokalisierungsdaten","limit":10,"explain":true}
+unicode_accent|search_messages|strict_set|Accented query across project boundaries|{"project_key":"__ALPHA__","query":"café","limit":10,"explain":true}
 date_window|search_messages|rank_relaxed|Date-filter parity|{"project_key":"__ALPHA__","query":"deployment","date_start":"2020-01-01T00:00:00Z","limit":12,"explain":true}
 zero_result|search_messages|zero_exact|Zero-result parity|{"project_key":"__ALPHA__","query":"xyznonexistentterm123","limit":10,"explain":true}
+date_excluded|search_messages|zero_exact|Date filter excludes otherwise matching messages|{"project_key":"__ALPHA__","query":"deployment","date_end":"2000-01-01T00:00:00Z","limit":12,"explain":true}
 product_cross_project|search_messages_product|product_relaxed|Cross-project product search parity|{"product_key":"__PRODUCT__","query":"deployment","limit":20}
 EOF
 
@@ -1023,13 +1067,13 @@ done
 # Cutover gating + artifact contract
 # ---------------------------------------------------------------------------
 
-e2e_case_banner "Cutover readiness gate"
+e2e_case_banner "Lexical fixture and configuration parity"
 
 CUTOVER_REPORT="${PARITY_DIR}/cutover_readiness.json"
 cutover_line="$(build_cutover_readiness_report "${PARITY_REPORTS_JSONL}" "${CUTOVER_REPORT}")"
 
 IFS='|' read -r \
-    cutover_ready_flag \
+    fixture_passed \
     unacceptable_cases \
     acceptance_bps \
     mean_overlap_bps \
@@ -1037,21 +1081,21 @@ IFS='|' read -r \
     call_error_total \
     <<< "$cutover_line"
 
-e2e_assert_eq "cutover: unacceptable cases" "0" "$unacceptable_cases"
-e2e_assert_eq "cutover: acceptance rate == 100%" "10000" "$acceptance_bps"
-assert_numeric_ge "cutover: mean overlap >= 70%" "$mean_overlap_bps" "7000"
-e2e_assert_eq "cutover: v3 filter mismatch total" "0" "$v3_filter_mismatch_total"
-e2e_assert_eq "cutover: call error total" "0" "$call_error_total"
-e2e_assert_eq "cutover: readiness flag" "1" "$cutover_ready_flag"
+e2e_assert_eq "fixture: unacceptable cases" "0" "$unacceptable_cases"
+e2e_assert_eq "fixture: acceptance rate == 100%" "10000" "$acceptance_bps"
+assert_numeric_ge "fixture: mean overlap >= 70%" "$mean_overlap_bps" "7000"
+e2e_assert_eq "fixture: v3 filter mismatch total" "0" "$v3_filter_mismatch_total"
+e2e_assert_eq "fixture: call error total" "0" "$call_error_total"
+e2e_assert_eq "fixture passed" "1" "$fixture_passed"
 
-if [ "$cutover_ready_flag" = "1" ]; then
-    search_v3_case_summary "cutover_gate" "pass" --message "ready=true overlap_bps=${mean_overlap_bps}"
+if [ "$fixture_passed" = "1" ]; then
+    search_v3_case_summary "fixture_gate" "pass" --message "overlap_bps=${mean_overlap_bps}"
 else
-    search_v3_case_summary "cutover_gate" "fail" --message "ready=false overlap_bps=${mean_overlap_bps}"
+    search_v3_case_summary "fixture_gate" "fail" --message "overlap_bps=${mean_overlap_bps}"
 fi
 
-# Generate suite-level Search V3 summary artifacts before contract checks.
-search_v3_suite_summary || true
+# These transports do not disclose the index document count.
+SEARCH_V3_INDEX_DOC_COUNT=null search_v3_suite_summary || true
 
 e2e_case_banner "Artifact contract"
 
