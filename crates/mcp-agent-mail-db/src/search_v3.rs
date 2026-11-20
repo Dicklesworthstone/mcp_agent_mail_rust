@@ -71,6 +71,14 @@ pub struct TantivyBridge {
 }
 
 impl TantivyBridge {
+    /// Inspect existing index metadata without creating an index, writer or backfill.
+    ///
+    /// # Errors
+    /// Returns an error when Tantivy cannot open the index metadata.
+    pub fn check_metadata(index_dir: &Path) -> tantivy::Result<()> {
+        Index::open_in_dir(index_dir).map(drop)
+    }
+
     /// Open or create a Tantivy index at the given directory.
     ///
     /// If the directory doesn't exist, it will be created.

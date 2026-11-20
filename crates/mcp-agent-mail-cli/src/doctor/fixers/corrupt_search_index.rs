@@ -5,12 +5,10 @@
 //!
 //! ## What's broken
 //!
-//! The Search V3 (frankensearch / Tantivy) on-disk index under
-//! `$SEARCH_V3_INDEX_DIR` is corrupt, incomplete, or unopenable. Unlike a
-//! corrupt `storage.sqlite3`, this is **low-risk**: the index is a *derived
-//! artifact* — SQLite remains the source of truth and the index is rebuilt
-//! from it. But until the index is rebuilt, lexical search silently returns
-//! wrong or empty results, so an operator should know.
+//! The server opens its Tantivy index at `$STORAGE_ROOT/search_index`.
+//! Doctor also checks the scoped layout under `$SEARCH_V3_INDEX_DIR` when
+//! configured. Damaged metadata can make search unavailable or incomplete.
+//! SQLite holds the message records used to rebuild the serving index.
 //!
 //! `legacy_fts_residue` (db_state_files) only cleans *old* SQLite FTS5
 //! artifacts; nothing detected a corrupt frankensearch index. This FM fills
@@ -18,7 +16,11 @@
 //!
 //! ## Detection (pure over a filesystem path)
 //!
-//! The index layout (see `mcp_agent_mail_db::search_index_layout`) is:
+//! For the serving directory, open the existing Tantivy metadata read-only.
+//! A missing manifest is actionable when managed-file or backfill state
+//! survives. A mailbox that has never created an index needs no finding.
+//!
+//! The optional scoped layout (see `mcp_agent_mail_db::search_index_layout`) is:
 //!
 //! ```text
 //! $SEARCH_V3_INDEX_DIR/indexes/{scope}/          # global | project-N | product-N
@@ -42,19 +44,14 @@
 //!    parse (metadata corruption).
 //!
 //! A scope/engine with no `active-{engine}` link is simply *not built* —
-//! that is not corruption, so it is skipped. If `{root}/indexes/` does not
-//! exist (no search has ever run), the detector emits nothing.
+//! that is not corruption, so it is skipped. If `{root}/indexes/` is absent,
+//! the scoped layout contributes no findings.
 //!
 //! ## Fix — detect-only
 //!
-//! The index is rebuildable, and quarantining it while a live server holds
-//! it open would race the writer (owner coordination needed — the same
-//! constraint as the WAL/reservation FMs). There is also no dedicated `am`
-//! reindex verb today: a missing/corrupt index is rebuilt from SQLite when
-//! the server restarts and the next search runs. So the finding carries the
-//! restart-to-rebuild remediation and `fix()` is a no-op. (A future
-//! enhancement could Op::Rename the corrupt active dir to quarantine after a
-//! live-owner check.)
+//! Moving an index while the server holds it open would race the writer.
+//! Report the affected directory so the operator can stop the owner and
+//! preserve damaged files before restarting with a fresh serving index.
 
 #![forbid(unsafe_code)]
 
@@ -74,6 +71,8 @@ pub enum CorruptionReason {
     DanglingActiveLink,
     /// Active lexical dir is missing Tantivy's `meta.json` manifest.
     MissingTantivyManifest,
+    /// The serving index metadata cannot be opened for inspection.
+    UnreadableTantivyIndex,
     /// `checkpoint.json` marks the build not-successful or never-completed.
     IncompleteBuild,
     /// `checkpoint.json` present but unparseable (metadata corruption).
@@ -86,6 +85,7 @@ impl CorruptionReason {
         match self {
             Self::DanglingActiveLink => "dangling_active_link",
             Self::MissingTantivyManifest => "missing_tantivy_manifest",
+            Self::UnreadableTantivyIndex => "unreadable_tantivy_index",
             Self::IncompleteBuild => "incomplete_build",
             Self::UnreadableCheckpoint => "unreadable_checkpoint",
         }
@@ -96,7 +96,9 @@ impl CorruptionReason {
         match self {
             // A dangling link or a missing Tantivy manifest is a hard
             // "this index cannot be opened" signal.
-            Self::DanglingActiveLink | Self::MissingTantivyManifest => 0.9,
+            Self::DanglingActiveLink
+            | Self::MissingTantivyManifest
+            | Self::UnreadableTantivyIndex => 0.9,
             Self::IncompleteBuild => 0.85,
             Self::UnreadableCheckpoint => 0.8,
         }
@@ -138,11 +140,9 @@ impl CorruptSearchIndexFinding {
                 "active_dir": self.active_dir,
                 "reason": self.reason.as_str(),
                 "detail": self.detail,
-                "impact": "the Search V3 index is a derived artifact (SQLite is the source of truth); message data is safe, but lexical search returns wrong/empty results until the index is rebuilt",
+                "impact": "Search results may be incomplete or unavailable. The serving index is derived from message records in SQLite.",
                 "remediation_steps": [
-                    "Restart the server (`am serve-http` / `mcp-agent-mail serve`): a missing/corrupt Search V3 index is rebuilt from SQLite on the next search. No data loss — the index is derived.",
-                    format!("To force a clean rebuild, stop the server and move the corrupt active index dir aside (do NOT delete): mv {} {}.corrupt — then restart.", self.active_dir, self.active_dir),
-                    "There is no dedicated `am` reindex command today; rebuild is restart-driven.",
+                    "Check the reported directory and read permissions. If its metadata is damaged, stop the mailbox owner, preserve the index directory by moving it aside, then restart the server. The serving index is rebuilt from SQLite.",
                 ],
             }),
             remediation: FindingRemediation {
@@ -155,6 +155,78 @@ impl CorruptSearchIndexFinding {
             },
         }
     }
+}
+
+pub(super) fn detect_configured(
+    inputs: &super::DispatchInputs,
+) -> Result<Vec<CorruptSearchIndexFinding>, super::DispatchError> {
+    if inputs.storage_root.is_none() && inputs.search_index_root.is_none() {
+        return Err(super::DispatchError::MissingInput {
+            fm_id: FM_ID,
+            field: "storage_root",
+        });
+    }
+    let mut findings = Vec::new();
+    if let Some(root) = &inputs.storage_root
+        && let Some(finding) = probe_serving_index(&root.join("search_index"))
+    {
+        findings.push(finding);
+    }
+    if let Some(root) = &inputs.search_index_root {
+        findings.extend(detect(root));
+    }
+    Ok(findings)
+}
+
+fn probe_serving_index(index: &Path) -> Option<CorruptSearchIndexFinding> {
+    use std::io::ErrorKind;
+    let manifest = index.join("meta.json");
+    let (reason, detail) = match std::fs::symlink_metadata(&manifest) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            // Startup creates the directory before the first commit. Only a
+            // footprint from an existing index makes a missing manifest actionable.
+            if ![".managed.json", "backfill_state.json"]
+                .iter()
+                .any(|name| index.join(name).exists())
+            {
+                return None;
+            }
+            (
+                CorruptionReason::MissingTantivyManifest,
+                "serving lexical index has state but no meta.json",
+            )
+        }
+        Ok(meta) if meta.is_file() => {
+            // Tantivy also opens its optional managed-file list. Never hand
+            // a pipe or another special file to its metadata reader.
+            let managed = std::fs::symlink_metadata(index.join(".managed.json"));
+            let managed_regular = match managed {
+                Ok(meta) => meta.is_file(),
+                Err(error) => error.kind() == ErrorKind::NotFound,
+            };
+            if managed_regular
+                && mcp_agent_mail_db::search_v3::TantivyBridge::check_metadata(index).is_ok()
+            {
+                return None;
+            }
+            (
+                CorruptionReason::UnreadableTantivyIndex,
+                "Tantivy could not open the serving index metadata",
+            )
+        }
+        _ => (
+            CorruptionReason::UnreadableTantivyIndex,
+            "serving index meta.json is inaccessible or is not a regular file",
+        ),
+    };
+    Some(CorruptSearchIndexFinding {
+        index_root: index.display().to_string(),
+        scope: "global".into(),
+        engine: "lexical".into(),
+        active_dir: index.display().to_string(),
+        reason,
+        detail: detail.into(),
+    })
 }
 
 /// Detector. PURE over the supplied index-root path (reads the filesystem
@@ -289,11 +361,7 @@ pub fn fix(
     })
 }
 
-/// Resolve the production Search V3 index root from the environment.
-///
-/// `SEARCH_V3_INDEX_DIR` is the single source (see
-/// `mcp_agent_mail_db::search_tantivy::init_tantivy_backend`). `None` (unset
-/// or empty) means no Tantivy index is configured, so the FM is skipped.
+/// Resolve the optional scoped-layout root, in addition to the serving index.
 #[must_use]
 pub fn index_root_from_env() -> Option<PathBuf> {
     std::env::var("SEARCH_V3_INDEX_DIR")
@@ -307,6 +375,35 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn serving_index_detection_checks_the_real_manifest_without_reinitializing_it() {
+        let root = TempDir::new().unwrap();
+        let index = root.path().join("search_index");
+        assert!(probe_serving_index(&index).is_none());
+        assert!(!index.exists());
+        fs::create_dir(&index).unwrap();
+        assert!(probe_serving_index(&index).is_none());
+        drop(mcp_agent_mail_db::search_v3::TantivyBridge::open(&index).unwrap());
+        let manifest = index.join("meta.json");
+        let original = fs::read(&manifest).unwrap();
+        assert!(probe_serving_index(&index).is_none());
+        assert_eq!(fs::read(&manifest).unwrap(), original);
+
+        fs::rename(&manifest, index.join("original-meta.json")).unwrap();
+        // A backfill record identifies the directory as an existing index.
+        fs::write(index.join("backfill_state.json"), "{}").unwrap();
+        assert_eq!(
+            probe_serving_index(&index).unwrap().reason,
+            CorruptionReason::MissingTantivyManifest
+        );
+        assert!(!manifest.exists());
+        fs::write(&manifest, "{}").unwrap();
+        let finding = probe_serving_index(&index).unwrap();
+        assert_eq!(finding.reason, CorruptionReason::UnreadableTantivyIndex);
+        assert_eq!(Path::new(&finding.active_dir), index);
+        assert_eq!(fs::read(&manifest).unwrap(), b"{}");
+    }
 
     /// Build `{root}/indexes/{scope}/` and an `active-{engine}` symlink (unix)
     /// or file-fallback pointing at `{engine}/{short}`. Returns the active dir.

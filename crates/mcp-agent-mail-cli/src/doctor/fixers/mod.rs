@@ -1249,7 +1249,7 @@ pub fn registry() -> Vec<FixerSpec> {
             subsystem: "search_index_state",
             op_pattern: "detect-only",
             auto_fixable: false,
-            one_line_description: "Search V3 (frankensearch/Tantivy) index under $SEARCH_V3_INDEX_DIR is corrupt/incomplete (dangling active link, missing meta.json, or failed checkpoint) — derived artifact, rebuilt from SQLite on restart (detect-only)",
+            one_line_description: "Inspect the serving Tantivy index under STORAGE_ROOT/search_index and any configured scoped Search V3 indexes for unreadable or incomplete metadata",
             source_module: "doctor::fixers::corrupt_search_index",
         },
         FixerSpec {
@@ -1422,10 +1422,8 @@ pub struct DispatchInputs {
     /// [`crate::doctor::process_owner::ProcessOwnerModel`] so the pure
     /// classifiers can be round-tripped without a live host.
     pub process_owner: Option<crate::doctor::process_owner::ProcessOwnerModel>,
-    /// Resolved Search V3 index root (`SEARCH_V3_INDEX_DIR`) for the
-    /// `corrupt_search_index` FM. `None` (env unset/empty → no Tantivy
-    /// index configured) skips the FM. Production callers resolve it via
-    /// `corrupt_search_index::index_root_from_env()`; tests inject a tempdir.
+    /// Optional scoped-layout root (`SEARCH_V3_INDEX_DIR`). The serving
+    /// lexical index is checked independently under `storage_root`.
     pub search_index_root: Option<std::path::PathBuf>,
 }
 
@@ -1795,14 +1793,7 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == corrupt_search_index::FM_ID {
-        let index_root = inputs
-            .search_index_root
-            .as_ref()
-            .ok_or(DispatchError::MissingInput {
-                fm_id: corrupt_search_index::FM_ID,
-                field: "search_index_root",
-            })?;
-        let findings = corrupt_search_index::detect(index_root);
+        let findings = corrupt_search_index::detect_configured(inputs)?;
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -2608,14 +2599,7 @@ fn detect_only_with_db_reads(
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == corrupt_search_index::FM_ID {
-        let index_root = inputs
-            .search_index_root
-            .as_ref()
-            .ok_or(DispatchError::MissingInput {
-                fm_id: corrupt_search_index::FM_ID,
-                field: "search_index_root",
-            })?;
-        corrupt_search_index::detect(index_root)
+        corrupt_search_index::detect_configured(inputs)?
             .iter()
             .map(|f| f.to_finding())
             .collect()

@@ -51,9 +51,9 @@ The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
     lock) — the root cause, caught before it corrupts.
   - `search-v3-index-corrupt` → **RESOLVED** (`br-2vdg9`):
     `fm-search-index-state-corrupt-index` (P2, detect-only) probes the
-    on-disk frankensearch/Tantivy index for a dangling active link, a
-    missing Tantivy `meta.json`, or a failed/incomplete/unparseable
-    `checkpoint.json`, and points at the restart-driven rebuild.
+    serving Tantivy metadata under `STORAGE_ROOT/search_index`. For
+    configured scoped indexes it also checks the active link, lexical
+    manifest and build checkpoint.
   - `busy-timeout-missing` → **PREVENT** (no bead — set in `schema.rs` init SQL,
     test-guarded).
   - `tui-foreground-cpu-spin`, `commit-coalescer-thread-died`,
@@ -78,7 +78,7 @@ The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
 | inbox-stats-divergence | AUTO-FIX | `fm-db-state-files-inbox-stats-divergence` (Op::DbExec). |
 | sqlite-sidecar-symlink | DETECT-ONLY | `fm-db-state-files-sqlite-sidecar-symlink`. |
 | **busy-timeout-missing** | **PREVENT** | Set in canonical init SQL `crates/mcp-agent-mail-db/src/schema.rs` (`PRAGMA_SETTINGS_SQL`: `PRAGMA busy_timeout = 20000;`, kept below the 30s ecosystem client deadline per br-ovy6e) and guarded by `pragma_busy_timeout_matches_runtime_constant`. The pass-35V doctor detector was correctly reverted: `busy_timeout` is connection-local, so a separate doctor-process connection always reads SQLite defaults — detection from doctor is unsound. |
-| **search-v3-index-corrupt** | **DETECT-ONLY (`br-2vdg9` resolved)** | `fm-search-index-state-corrupt-index` (P2, search_index_state). Pure over `$SEARCH_V3_INDEX_DIR`: flags a dangling `active-{engine}` link, a missing Tantivy `meta.json` (lexical), or a failed/incomplete/unparseable `checkpoint.json`. Low-risk (the index is a derived artifact — SQLite is the source of truth; rebuilt from it on restart). `legacy-fts-residue` only cleans old SQLite FTS5 artifacts; this is the live frankensearch-index surface. |
+| **search-v3-index-corrupt** | **DETECT-ONLY** | `fm-search-index-state-corrupt-index` (P2, search_index_state) opens the metadata of the serving Tantivy index read-only. It reports unreadable metadata and a missing manifest alongside retained index state. With `SEARCH_V3_INDEX_DIR` configured, it also checks scoped active links, lexical manifests and checkpoints. SQLite holds the messages used to rebuild the index. |
 | **python-server-coresident-write** | **DETECT-ONLY (`br-j3e9m` resolved)** | `fm-runtime-processes-coresident-db-writer` (P0, runtime_processes). Pure over the I4 `ProcessOwnerModel`: flags a live Python `mcp_agent_mail` holder of `storage.sqlite3` (open fd → confidence 1.0; advisory lock → 0.9) before it corrupts. Detect-only by design — doctor never kills a foreign process. Sibling FMs cover the *symptom* (`fm-db-state-files-integrity-page-malformed`) and the PID-hint *stale* case (`fm-runtime-processes-stale-python-server-shadow`). **`br-epoqj` resolved:** the earlier scope limit (a truly foreign holder — neither the Rust binary nor a Python shadow, e.g. an ad-hoc `sqlite3` shell or migration script — was filtered out by `inspect_mailbox_ownership` upstream) is now covered. `gather_process_owner_model` also runs the unfiltered `pool::foreign_db_file_holders` scan and threads it into `ProcessOwnerModel::foreign_db_holders`; the detector emits a lower-confidence (0.6) `unclassified_foreign` finding per holder, still detect-only and explicitly asking the operator to confirm whether the holder writes before acting. |
 
 ### Runtime-process FMs
