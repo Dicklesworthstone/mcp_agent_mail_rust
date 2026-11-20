@@ -23,6 +23,29 @@ large backup-rotation workloads also exceeded 240 seconds on Apple Silicon.
 Publication and downstream installer checksum verification have separate
 open Beads. The scope and outcomes of individual checks follow below.
 
+### Inbox windows and document attachments
+
+- [x] Run both GH#399 regressions from `d10c0e8a` on Apple Silicon.
+  Sparse unread and acknowledgment windows returned the expected deliveries.
+  Imported timestamps and dense recent reads also passed.
+- [x] Verify the follow-up at `5a08954c`. All 56 active database tests,
+  the separate opt-in scaling test and the tool-level peek/consume test
+  passed. With 257 deliveries and 10,000 messages the indexed reader
+  needed one speculative header page and three delivery pages. The
+  original reader traversed 79 header pages for the same result.
+- [x] Run the six release benchmarks on a second Mac. With 50,000 unrelated
+  messages and 256 shared deliveries, the five-unread and all-read estimates
+  were 5.93 and 6.37 ms. The reporter's production latency remains unmeasured.
+- [x] Close `br-gh399-delivery` after both locked workspace compiler checks,
+  strict Clippy and formatting passed at `5a08954c`. All 3,940 source files
+  matched their hashes after verification. The [inbox verification record](../evidence/gh399/indexed_delivery_validation.json)
+  includes the test commands, benchmark measurements and earlier build failures.
+- [x] Run all seven new attachment regressions from `89fd710c`.
+  Documents retained their bytes alongside converted images and counted
+  toward the message limit. The storage tests also covered extensionless
+  images and refusals for damaged images, empty or oversized files, symlinks
+  and nonregular sources. All seven passed.
+
 ### Doctor and the serving search index
 
 - [x] Trace lexical startup and doctor dispatch. Startup opens the flat

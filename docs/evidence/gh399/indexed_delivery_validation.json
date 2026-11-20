@@ -8,13 +8,13 @@
     "reporter_latency_seconds": 28.73,
     "latency_provenance": "Issue reporter's 0.3.40 deployment; not reproduced or measured in this validation environment"
   },
-  "status": "implementation_complete_validation_blocked",
+  "status": "native_verification_passed",
   "provenance": {
     "source_hashes_recorded_at_utc": "2026-11-20T21:36:18Z",
     "branch": "main",
     "initial_base_commit": "4e83ee583dcb39bad6dc8bbcdd8157c31820b2ab",
     "current_base_commit": "6801933049d28ce840e2bee822976deb497ba2a2",
-    "patch_commit_reference": "The Git commit containing this report",
+    "patch_commit_reference": "5a08954cd2c3b35c16f66ecf2f73bd95348ba8d3",
     "base_refresh": "Integrated the concurrent indexed-delivery fix and the subsequent upstream formatting/Beads updates. Their production behavior, tests, and unrelated records are retained; this follow-up adds complementary coverage and an exact SQL constant.",
     "rust_toolchain": "nightly-2026-08-31",
     "rustc_version": "1.100.0-nightly",
@@ -24,7 +24,7 @@
     "lockfile_changed": false,
     "dependency_fetch_note": "-Zgit=shallow-deps affected dependency cache transport only; it did not substitute dependencies or change their pinned revisions",
     "upstream_implementation_commit": "d10c0e8aa82f6b818052ecf3f7e9fbaeaa416e93",
-    "validation_attempts_scope": "All Cargo compilation/test/Clippy attempts recorded below ran on the earlier independent candidate based on 4e83ee5 or 386c5d2, before the concurrent d10c0e8 fix was incorporated. They failed in unchanged dependencies or the execution service before any changed crate was reached. They are blocker evidence, not validation of the final integrated source hashes.",
+    "validation_attempts_scope": "The earlier candidate attempts on 4e83ee5 or 386c5d2 stopped in dependencies or in the execution service. The later Apple Silicon runs identify the tested commit and source manifest separately.",
     "prior_candidate_source_files": [
       {
         "path": "crates/mcp-agent-mail-db/src/sync/inbox.rs",
@@ -107,8 +107,8 @@
       "status": "passed",
       "command": "cargo fmt --all --check",
       "exit_code": 0,
-      "base_commit_at_execution": "6801933049d28ce840e2bee822976deb497ba2a2",
-      "note": "Final integrated tree; upstream attachment-test formatting fixes are retained"
+      "source_commit": "5a08954cd2c3b35c16f66ecf2f73bd95348ba8d3",
+      "note": "Passed on the follow-up tree and the earlier 68019330 base."
     },
     "changed_file_format": {
       "status": "passed",
@@ -122,6 +122,13 @@
     "source_review": {
       "status": "completed",
       "note": "Independent comparisons found no blocking correctness issue in the concurrent upstream implementation. Its production behavior and tests were preserved; the additive tests were adapted to its one-page budget and reviewed. Static review does not establish compilation or runtime correctness."
+    },
+    "ubs": {
+      "scope": "Four Rust files in source_files",
+      "critical": 0,
+      "warnings": 874,
+      "info": 122,
+      "log": "/data/tmp/am-health-nov20.BGSDAZYc/gh399-ubs.json"
     },
     "native_db_test_build_attempts": [
       {
@@ -178,30 +185,54 @@
       }
     ],
     "workspace_check_all_targets": {
-      "status": "interrupted_by_execution_service",
-      "command": "cargo check --workspace --all-targets",
-      "exit_code": null,
-      "failure": "exec-server transport disconnected; executor key changed during session recovery. Dependency compilation was still in progress and no final compiler result was available."
+      "status": "passed",
+      "command": "cargo check --locked --workspace --all-targets",
+      "exit_code": 0,
+      "prior_candidate": {
+        "status": "interrupted_by_execution_service",
+        "exit_code": null,
+        "failure": "The executor disconnected during dependency compilation."
+      }
     },
     "workspace_check_production_graph": {
-      "status": "blocked_before_changed_crate",
-      "command": "cargo check --workspace --lib --bins",
-      "exit_code": 101,
-      "failure": "rustc compiling asupersync was terminated by SIGKILL (signal 9) even with --emit=dep-info,metadata, before checking the changed crate"
+      "status": "passed",
+      "command": "cargo check --locked --workspace --lib --bins",
+      "exit_code": 0,
+      "prior_candidate": {
+        "status": "blocked_before_changed_crate",
+        "exit_code": 101,
+        "failure": "Asupersync compilation received SIGKILL even with metadata-only output."
+      }
     },
     "workspace_clippy": {
-      "status": "blocked_during_dependency_checkout",
-      "command": "cargo clippy --workspace --all-targets -- -D warnings",
-      "exit_code": 101,
-      "failure": "Failed to make the Asupersync dependency checkout directory: No space left on device. No patched crate was linted."
+      "status": "passed",
+      "command": "cargo clippy --locked --workspace --all-targets -- -D warnings",
+      "exit_code": 0,
+      "prior_candidate": {
+        "status": "blocked_during_dependency_checkout",
+        "exit_code": 101,
+        "failure": "The Asupersync dependency checkout ran out of disk space before any changed crate was linted."
+      }
     },
     "runtime_tests": {
-      "status": "not_executed",
-      "reason": "Native test executable builds stopped in asupersync before reaching the changed crate"
+      "source_commit": "5a08954cd2c3b35c16f66ecf2f73bd95348ba8d3",
+      "source_manifest_sha256": "3c3a82431e61ee32a989cdaac087a861fd5a520d7e9187a0cc674966cf433171",
+      "db_test_executable_sha256": "583a058e47364afcd703e2894bfaf9e1a150371cb28f67a5ba68a3b5e3fb8306",
+      "status": "passed",
+      "database": "The no-default-features project_mailbox and sync::inbox groups passed all 56 active tests in 72.73 s. Their opt-in shared inbox comparison passed separately. A second Mac repeated all six GH399 tests with the same executable.",
+      "physical_work": "At 257 shared deliveries, growing the mailbox from 2,000 to 10,000 messages raised the original header walk from 16 to 79 pages. The indexed reader used one speculative header page and three delivery pages at both sizes. It probed four headers for the sparse unread result and zero for the all-read result.",
+      "tool": "The no-default-features project_mailbox_unread_metadata_preserves_order_and_recipient_state integration test passed in 1.17 s. Its real tool calls cover peek, consuming fetch, direct precedence, ACK state and per-agent isolation behind 300 unrelated headers.",
+      "logs": ["gh399-db.log", "gh399-db-paired.log", "gh399-tool.log"],
+      "evidence_directory": "/data/tmp/am-health-nov20.BGSDAZYc"
     },
     "criterion_benchmark": {
-      "status": "not_executed",
+      "status": "passed",
       "group": "inbox_sparse_shared_unread",
+      "source_commit": "5a08954cd2c3b35c16f66ecf2f73bd95348ba8d3",
+      "executable_sha256": "dc11810bae5c13fdc0a38926f567aadb0e69df6ea4b0de6a3779320bd143afd6",
+      "host": "mac-mini-old, Mac16,10, arm64, 10 cores, 32 GiB",
+      "scope": "In-memory FrankenSQLite mailbox on a separate host from the build. The six candidate workloads each collected 20 samples. No production mailbox timing or release-to-release speedup was measured.",
+      "raw_samples": "/data/tmp/am-health-nov20.BGSDAZYc/gh399-criterion-samples/inbox_sparse_shared_unread",
       "shared_deliveries": 256,
       "unrelated_project_message_counts": [
         0,
@@ -215,7 +246,14 @@
       "limit": 20,
       "include_bodies": false,
       "fixture_setup_timed": false,
-      "samples": []
+      "samples": [
+        {"unrelated": 0, "unread": 5, "criterion_estimate_ms": 9.4591},
+        {"unrelated": 0, "unread": 0, "criterion_estimate_ms": 8.5660},
+        {"unrelated": 10000, "unread": 5, "criterion_estimate_ms": 5.9807},
+        {"unrelated": 10000, "unread": 0, "criterion_estimate_ms": 5.7873},
+        {"unrelated": 50000, "unread": 5, "criterion_estimate_ms": 5.9313},
+        {"unrelated": 50000, "unread": 0, "criterion_estimate_ms": 6.3668}
+      ]
     },
     "prior_candidate_workspace_format": {
       "status": "passed",
@@ -225,8 +263,13 @@
       "note": "Passed both before and after the unrelated fast-forward"
     },
     "final_integrated_candidate_build": {
-      "status": "not_executed",
-      "reason": "The prior candidate could not get through the same pinned Asupersync dependency even in metadata-only mode. Clippy also exhausted checkout storage. No further compilation is claimed for the integrated tree."
+      "status": "passed",
+      "source_commit": "5a08954cd2c3b35c16f66ecf2f73bd95348ba8d3",
+      "target": "aarch64-apple-darwin",
+      "verified_files": 3940,
+      "source_manifest_sha256": "3c3a82431e61ee32a989cdaac087a861fd5a520d7e9187a0cc674966cf433171",
+      "log": "/data/tmp/am-health-nov20.BGSDAZYc/gh399-workspace.log",
+      "note": "Both locked workspace checks, strict Clippy and formatting passed. The source manifest matched again after verification. Cargo emitted a future-incompatibility notice for proc-macro-error2 2.0.1."
     }
   },
   "added_regressions": [
@@ -274,6 +317,7 @@
     "cargo test --locked -p mcp-agent-mail-db --no-default-features --lib gh399 -- --nocapture",
     "cargo test --locked -p mcp-agent-mail-db --no-default-features --lib project_mailbox::tests -- --nocapture",
     "cargo test --locked -p mcp-agent-mail-db --no-default-features --lib sync::inbox::tests -- --nocapture",
+    "cargo test --locked -p mcp-agent-mail-db --no-default-features --lib -- --ignored --exact project_mailbox::tests::shared_inbox_scaling_compares_live_join_at_both_history_sizes --nocapture",
     "cargo test --locked -p mcp-agent-mail-tools --no-default-features --test it project_mailbox_unread_metadata_preserves_order_and_recipient_state -- --nocapture",
     "cargo bench --locked -p mcp-agent-mail-db --no-default-features --bench inbox_bench -- inbox_sparse_shared_unread",
     "cargo check --locked --workspace --all-targets",
@@ -282,12 +326,12 @@
     "cargo fmt --all --check"
   ],
   "claims": {
-    "compilation_verified": false,
-    "lint_verified": false,
-    "runtime_correctness_verified": false,
+    "compilation_verified": true,
+    "lint_verified": true,
+    "runtime_correctness_verified": true,
     "production_latency_measured": false,
     "speedup_measured": false,
     "issue_closed": false,
-    "note": "Regression code and benchmark fixtures have been added. Unexecuted assertions are coverage plans, not passing evidence; no speedup or issue-closure claim is made."
+    "note": "The runtime result applies to the named native inbox fixtures. The release benchmark measures the candidate on a seeded mailbox. The paired database tests compare work with the original reader. The reporter's production latency remains unmeasured here."
   }
 }
