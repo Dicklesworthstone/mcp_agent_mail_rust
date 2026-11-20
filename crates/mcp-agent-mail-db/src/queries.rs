@@ -12809,16 +12809,19 @@ fn quote_hyphenated_tokens(query: &str) -> String {
 pub fn extract_like_terms(query: &str, max_terms: usize) -> Vec<String> {
     const STOPWORDS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
     let mut terms: Vec<String> = Vec::new();
-    for token in query
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '_' && c != '/' && c != '-')
+    if max_terms == 0 {
+        return terms;
+    }
+    for token in
+        query.split(|c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '/' && c != '-')
     {
-        if token.len() < 2 {
+        if token.chars().nth(1).is_none() {
             continue;
         }
         if STOPWORDS.iter().any(|&sw| sw.eq_ignore_ascii_case(token)) {
             continue;
         }
-        if !terms.iter().any(|t| t.eq_ignore_ascii_case(token)) {
+        if !terms.iter().any(|t| same_like_term(t, token)) {
             terms.push(token.to_string());
         }
         if terms.len() >= max_terms {
@@ -12826,6 +12829,32 @@ pub fn extract_like_terms(query: &str, max_terms: usize) -> Vec<String> {
         }
     }
     terms
+}
+
+pub(crate) fn same_like_term(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+        || (!left.is_ascii()
+            && !right.is_ascii()
+            && left
+                .chars()
+                .map(like_case_variants)
+                .eq(right.chars().map(like_case_variants)))
+}
+
+/// Simple case variants emitted by the non-ASCII substring predicate. Keep a
+/// distinct source spelling (e.g. titlecase) when neither mapping includes it.
+pub(crate) fn like_case_variants(c: char) -> (char, char, Option<char>) {
+    fn single(mut mapping: impl Iterator<Item = char>, fallback: char) -> char {
+        let first = mapping.next().unwrap_or(fallback);
+        if mapping.next().is_none() {
+            first
+        } else {
+            fallback
+        }
+    }
+    let lower = single(c.to_lowercase(), c);
+    let upper = single(c.to_uppercase(), c);
+    (lower, upper, (c != lower && c != upper).then_some(c))
 }
 
 /// Escape LIKE wildcards for literal substring matching.
@@ -12836,28 +12865,23 @@ pub fn like_escape(term: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// LIKE fallback when FTS5 fails (e.g. malformed query syntax).
-/// Builds `subject LIKE '%term%' OR body_md LIKE '%term%'` for each term.
+fn message_candidate_predicate(query: &str) -> crate::DbResult<Option<(String, Vec<String>)>> {
+    if sanitize_fts_query(query).is_none() {
+        return Ok(None);
+    }
+    crate::search_planner::legacy_candidate_like_clause(query, 5)
+}
+
+/// Search one project's messages with the bound SQL candidate predicate.
 async fn run_like_fallback(
     cx: &Cx,
     conn: &TrackedConnection<'_>,
     project_id: i64,
-    terms: &[String],
+    (where_clause, patterns): (String, Vec<String>),
     limit: i64,
 ) -> Outcome<Vec<sqlmodel_core::Row>, DbError> {
-    // params layout: [project_id, term1_like, term1_like, term2_like, term2_like, ..., limit]
-    let mut params: Vec<Value> = Vec::with_capacity(2 + terms.len() * 2);
-    params.push(Value::BigInt(project_id));
-
-    let mut where_parts: Vec<&str> = Vec::with_capacity(terms.len());
-    for term in terms {
-        let escaped = format!("%{}%", like_escape(term));
-        params.push(Value::Text(escaped.clone()));
-        params.push(Value::Text(escaped));
-        where_parts.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
-    }
-    // Fallback should stay permissive: match when any extracted term appears.
-    let where_clause = where_parts.join(" OR ");
+    let mut params = vec![Value::BigInt(project_id)];
+    params.extend(patterns.into_iter().map(Value::Text));
     params.push(Value::BigInt(limit));
 
     let sql = format!(
@@ -12872,27 +12896,16 @@ async fn run_like_fallback(
     map_sql_outcome(traw_query(cx, conn, &sql, &params).await)
 }
 
-/// LIKE fallback for cross-project/product search when FTS5 fails (e.g. malformed query syntax).
+/// Search messages from linked projects with the same candidate predicate.
 async fn run_like_fallback_product(
     cx: &Cx,
     conn: &TrackedConnection<'_>,
     product_id: i64,
-    terms: &[String],
+    (where_clause, patterns): (String, Vec<String>),
     limit: i64,
 ) -> Outcome<Vec<sqlmodel_core::Row>, DbError> {
-    // params layout: [product_id, term1_like, term1_like, term2_like, term2_like, ..., limit]
-    let mut params: Vec<Value> = Vec::with_capacity(2 + terms.len() * 2);
-    params.push(Value::BigInt(product_id));
-
-    let mut where_parts: Vec<&str> = Vec::with_capacity(terms.len());
-    for term in terms {
-        let escaped = format!("%{}%", like_escape(term));
-        params.push(Value::Text(escaped.clone()));
-        params.push(Value::Text(escaped));
-        where_parts.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
-    }
-    // Fallback should stay permissive: match when any extracted term appears.
-    let where_clause = where_parts.join(" OR ");
+    let mut params = vec![Value::BigInt(product_id)];
+    params.extend(patterns.into_iter().map(Value::Text));
     params.push(Value::BigInt(limit));
 
     let sql = format!(
@@ -12928,21 +12941,12 @@ pub async fn search_messages(
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
 
-    // Sanitize the FTS query; None means "no meaningful results possible"
-    let sanitized = sanitize_fts_query(query);
-
-    let rows_out = if sanitized.is_some() {
-        // FTS5-backed search was decommissioned (br-2tnl.8.4).
-        // Fall back directly to LIKE with extracted terms for legacy/fallback path.
-        let terms = extract_like_terms(query, 5);
-        if terms.is_empty() {
-            Outcome::Ok(Vec::new())
-        } else {
-            run_like_fallback(cx, &tracked, project_id, &terms, limit_i64).await
+    let rows_out = match message_candidate_predicate(query) {
+        Ok(Some(predicate)) => {
+            run_like_fallback(cx, &tracked, project_id, predicate, limit_i64).await
         }
-    } else {
-        // Empty/unsearchable query: return empty results
-        Outcome::Ok(Vec::new())
+        Ok(None) => Outcome::Ok(Vec::new()),
+        Err(error) => return Outcome::Err(error),
     };
     match rows_out {
         Outcome::Ok(rows) => {
@@ -13029,18 +13033,12 @@ pub async fn search_messages_for_product(
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
 
-    let sanitized = sanitize_fts_query(query);
-    let rows_out = if sanitized.is_some() {
-        // FTS5-backed search was decommissioned (br-2tnl.8.4).
-        // Fall back directly to LIKE with extracted terms for legacy/fallback path.
-        let terms = extract_like_terms(query, 5);
-        if terms.is_empty() {
-            Outcome::Ok(Vec::new())
-        } else {
-            run_like_fallback_product(cx, &tracked, product_id, &terms, limit_i64).await
+    let rows_out = match message_candidate_predicate(query) {
+        Ok(Some(predicate)) => {
+            run_like_fallback_product(cx, &tracked, product_id, predicate, limit_i64).await
         }
-    } else {
-        Outcome::Ok(Vec::new())
+        Ok(None) => Outcome::Ok(Vec::new()),
+        Err(error) => return Outcome::Err(error),
     };
 
     match rows_out {
@@ -13362,18 +13360,10 @@ pub async fn search_messages_global(
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
 
-    let sanitized = sanitize_fts_query(query);
-    let rows_out = if sanitized.is_some() {
-        // FTS5-backed search was decommissioned (br-2tnl.8.4).
-        // Fall back directly to LIKE with extracted terms for legacy/fallback path.
-        let terms = extract_like_terms(query, 5);
-        if terms.is_empty() {
-            Outcome::Ok(Vec::new())
-        } else {
-            run_like_fallback_global(cx, &tracked, &terms, limit_i64).await
-        }
-    } else {
-        Outcome::Ok(Vec::new())
+    let rows_out = match message_candidate_predicate(query) {
+        Ok(Some(predicate)) => run_like_fallback_global(cx, &tracked, predicate, limit_i64).await,
+        Ok(None) => Outcome::Ok(Vec::new()),
+        Err(error) => return Outcome::Err(error),
     };
     match rows_out {
         Outcome::Ok(rows) => {
@@ -13419,22 +13409,10 @@ pub async fn search_messages_global(
 async fn run_like_fallback_global(
     cx: &Cx,
     conn: &TrackedConnection<'_>,
-    terms: &[String],
+    (where_clause, patterns): (String, Vec<String>),
     limit: i64,
 ) -> Outcome<Vec<sqlmodel_core::Row>, DbError> {
-    if terms.is_empty() {
-        return Outcome::Ok(Vec::new());
-    }
-
-    let mut conditions = Vec::with_capacity(terms.len());
-    let mut params: Vec<Value> = Vec::with_capacity(terms.len() * 2 + 1);
-
-    for term in terms {
-        conditions.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
-        let pattern = format!("%{}%", like_escape(term));
-        params.push(Value::Text(pattern.clone()));
-        params.push(Value::Text(pattern));
-    }
+    let mut params: Vec<Value> = patterns.into_iter().map(Value::Text).collect();
 
     let sql = format!(
         "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, \
@@ -13444,10 +13422,9 @@ async fn run_like_fallback_global(
          FROM messages m \
          LEFT JOIN agents a ON a.id = m.sender_id \
          LEFT JOIN projects p ON p.id = m.project_id \
-         WHERE {} \
+         WHERE {where_clause} \
          ORDER BY m.created_ts DESC \
-         LIMIT ?",
-        conditions.join(" OR ")
+         LIMIT ?"
     );
     params.push(Value::BigInt(limit));
 
@@ -41408,13 +41385,15 @@ mod tests {
                 .expect("acquire conn");
             let search_tracked = tracked(&*conn);
 
-            let mut terms = Vec::new();
-            for _ in 0..120 {
-                terms.push("needle".to_string());
-            }
+            let mut terms: Vec<_> = (0..120).map(|i| format!("missing{i}")).collect();
+            terms.push("needle".to_string());
             assert!(terms.len() > 100, "test must use >100 terms");
-
-            let rows = run_like_fallback(&cx, &search_tracked, project_id, &terms, 25)
+            let predicate =
+                crate::search_planner::legacy_candidate_like_clause(&terms.join(" "), terms.len())
+                    .expect("valid query")
+                    .expect("searchable terms");
+            assert_eq!(predicate.1.len(), 2 * terms.len());
+            let rows = run_like_fallback(&cx, &search_tracked, project_id, predicate, 25)
                 .await
                 .into_result()
                 .expect("run like fallback");
@@ -41431,32 +41410,11 @@ mod tests {
     #[test]
     fn run_like_fallback_uses_term_union_semantics() {
         use asupersync::runtime::RuntimeBuilder;
-        use tempfile::tempdir;
 
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("like_fallback_union.db");
-        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
-            .expect("open base schema connection");
-        init_conn
-            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
-            .expect("apply init PRAGMAs");
-        let init_sql = crate::schema::init_schema_sql_base();
-        init_conn
-            .execute_raw(&init_sql)
-            .expect("initialize base schema");
-        drop(init_conn);
-        let cfg = crate::pool::DbPoolConfig {
-            database_url: format!("sqlite:///{}", db_path.display()),
-            min_connections: 1,
-            max_connections: 1,
-            run_migrations: false,
-            warmup_connections: 0,
-            ..Default::default()
-        };
-        let pool = crate::create_pool(&cfg).expect("create pool");
+        let (_dir, pool) = create_file_pool_with_schema_for_test("like-fallback-union");
 
         rt.block_on(async {
             let cx = Cx::current().expect("runtime installs message test context");
@@ -41481,13 +41439,13 @@ mod tests {
             .expect("create sender");
             let sender_id = sender.id.expect("sender id");
 
-            create_message(
+            let keep = create_message(
                 &cx,
                 &pool,
                 project_id,
                 sender_id,
                 "needle only",
-                "contains needle token",
+                "contains needle token and café with database\nmigration, Kilo, Kelvin and ǅfoo",
                 Some("THREAD-LIKE-UNION"),
                 "normal",
                 false,
@@ -41497,22 +41455,62 @@ mod tests {
             .into_result()
             .expect("create message");
 
-            let conn = acquire_conn(&cx, &pool)
+            for (subject, body) in [
+                ("needle in checklist", "café"),
+                ("body exclusion", "needle and checklist"),
+                ("checklist only", "no positive hit"),
+                ("cafeteria", "different Unicode token"),
+            ] {
+                create_message(
+                    &cx, &pool, project_id, sender_id, subject, body, None, "normal", false, "[]",
+                )
                 .await
                 .into_result()
-                .expect("acquire conn");
-            let search_tracked = tracked(&*conn);
-            let terms = vec!["needle".to_string(), "missing".to_string()];
-
-            let rows = run_like_fallback(&cx, &search_tracked, project_id, &terms, 25)
+                .expect("create distractor");
+            }
+            let product = ensure_product(&cx, &pool, None, Some("fallback search"))
                 .await
                 .into_result()
-                .expect("run like fallback");
-            assert_eq!(
-                rows.len(),
-                1,
-                "fallback should match when any extracted term appears"
-            );
+                .expect("ensure product");
+            let product_id = product.id.expect("product id");
+            link_product_to_projects(&cx, &pool, product_id, &[project_id])
+                .await
+                .into_result()
+                .expect("link project");
+            for query in [
+                "migration missing",
+                "needle NOT checklist",
+                "needle -checklist",
+                "miss1 miss2 miss3 miss4 needle NOT checklist",
+                "café NOT checklist",
+                "CAFÉ NOT checklist",
+                "ÉÉÉÉ éÉÉÉ ÉéÉÉ ÉÉéÉ ÉÉÉé needle NOT checklist",
+                "kilo Kilo",
+                "Kelvin kelvin",
+                "Ǆfoo ǅfoo",
+                "\"database migration\"",
+            ] {
+                let project = search_messages(&cx, &pool, project_id, query, 25)
+                    .await
+                    .into_result()
+                    .expect("project search");
+                let product = search_messages_for_product(&cx, &pool, product_id, query, 25)
+                    .await
+                    .into_result()
+                    .expect("product search");
+                let global = search_messages_global(&cx, &pool, query, 25)
+                    .await
+                    .into_result()
+                    .expect("global search");
+                let expected = [keep.id.expect("message id")];
+                assert_eq!(project.iter().map(|r| r.id).collect::<Vec<_>>(), expected);
+                assert_eq!(product.iter().map(|r| r.id).collect::<Vec<_>>(), expected);
+                assert_eq!(global.iter().map(|r| r.id).collect::<Vec<_>>(), expected);
+            }
+            assert!(matches!(
+                search_messages(&cx, &pool, project_id, "needle -aa -bb -cc -dd -ee -ff", 25).await,
+                Outcome::Err(DbError::InvalidArgument { .. })
+            ));
         });
     }
 

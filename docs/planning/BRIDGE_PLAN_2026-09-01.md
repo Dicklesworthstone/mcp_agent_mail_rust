@@ -1,6 +1,6 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
-## November 19 coordination and recovery assessment
+## November 20 coordination and recovery assessment
 
 Two agents on a signed Windows installation exchanged and acknowledged a
 message over MCP. The installed Linux CLI exercised identities, cross-project
@@ -8,6 +8,10 @@ delivery, search and reservations against private SQLite and Git mailboxes.
 The rebuilt macOS and Windows CLIs each delivered and persisted the same
 192 KiB message. The Windows server preserved backups during a competing
 snapshot lock.
+
+On November 20 the installed Linux 0.3.38 server advertised 45 tools,
+eight concrete resources and 25 resource templates in a fresh MCP session.
+The shadow search comparison below uncovered two incorrect search hits.
 
 The highest-priority unresolved claims concern durability under a swarm.
 The mixed HTTP archive-drain stall (`br-kp1in.13`) and the eight-sender
@@ -36,11 +40,12 @@ open Beads. The scope and outcomes of individual checks follow below.
   before and after all four invocations. Doctor recorded zero actions.
 - [x] Verify the 675 final build inputs on Apple Silicon, run both workspace
   compiler graphs, strict Clippy and formatting. All passed.
-- [ ] Land the doctor patch and close `br-gvnw2`. The default four-file UBS
-  scan exits 1 on both the baseline and the patch. Its four critical findings
-  flag comparisons of public diagnostic identifiers in unchanged dispatch
-  branches. The strict six-file scan also exits 1 (4 critical, 5,787 warnings).
-  The patch is in the working tree pending the repository's precommit gate.
+- [x] Verify the published doctor fix at `359a78b2`. On November 20 an
+  independent verifier matched all 675 build inputs and repeated the four
+  native CLI probes. Both healthy runs produced zero findings. Both damaged
+  runs identified the serving path. All four preserved the index and database
+  files and recorded zero actions. Closed `br-gvnw2`. The default UBS scan
+  still flags four pre-existing comparisons of public diagnostic identifiers.
 
 ## November 18 agent health on a quiet mailbox
 
@@ -197,9 +202,29 @@ open Beads. The scope and outcomes of individual checks follow below.
   The current direct clients include `fault_injection`, `path_safety`,
   `search_v3_resilience`, `search_v3_security_matrix`, `search_v3_stdio`
   and `security_privacy`. Preserve deliberately malformed protocol cases.
-- [ ] Resolve what the `search_v3_shadow_parity` comparison can establish.
-  The old engine names select the same lexical implementation. Its two
-  result sets cannot establish agreement between independent engines.
+- [x] Replace the timed FIFO in `search_v3_shadow_parity` with initialized
+  MCP sessions. Verify all 17 seeded message IDs and both product links
+  against the private database. Compare each route with SQLite FTS5 and
+  the planted delivery IDs. Cover a matching message in an unlinked
+  project, excluded dates and competing sender, thread and importance
+  values. The fixture report explicitly leaves historical cutover unassessed.
+- [x] Reproduce the shadow-route exclusion defect on Linux 0.3.38 and the
+  November 19 Apple Silicon build. For `deployment NOT checklist` the
+  shadow route returned four messages. Two should have been excluded.
+  The lexical settings and independent reference returned the intended two.
+- [x] Correct the project, product and global SQL candidate predicates.
+  Keep the positive keyword union and apply exclusions across both subject
+  and body. Preserve distinct Unicode spellings when SQLite matches them
+  differently. Seven deliberately incorrect result sets failed the fixture.
+- [x] Run the rebuilt Apple Silicon CLI (`e37e97c9ee17`) on two Macs.
+  Both passed all 169 assertions with zero skips on local system storage.
+  All 12 scenarios matched the planted and FTS5 IDs in each setting.
+  Shadow returned IDs 2 and 15 for the exclusion query and both caller
+  directories retained their sentinel. An earlier run exceeded the
+  five-second shutdown deadline. The second Mac also timed out during
+  setup on an external volume. Both failures are retained.
+- [ ] Run the database regression and neighboring search tests on the final
+  source. Verify both workspace compiler graphs, strict Clippy and formatting.
 
 ### Storage recovery and concurrent writes
 

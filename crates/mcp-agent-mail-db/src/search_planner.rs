@@ -714,6 +714,109 @@ struct LikeCondition {
     negated: bool,
 }
 
+impl LikeCondition {
+    fn sql(&self, mut bind: impl FnMut(String)) -> String {
+        // SQLite LIKE folds ASCII only. For non-ASCII text, use literal GLOB
+        // character classes for single-code-point case variants. Escape the
+        // query's glob metacharacters before adding the substring wildcards.
+        let (operator, pattern) = if self.needle.is_ascii() {
+            (
+                "LIKE ? ESCAPE '\\'",
+                format!("%{}%", crate::queries::like_escape(&self.needle)),
+            )
+        } else {
+            let mut pattern = String::from("*");
+            for ch in self.needle.chars() {
+                match ch {
+                    '*' => pattern.push_str("[*]"),
+                    '?' => pattern.push_str("[?]"),
+                    '[' => pattern.push_str("[[]"),
+                    c => {
+                        let (lo, hi, original) = crate::queries::like_case_variants(c);
+                        if lo == hi && original.is_none() {
+                            pattern.push(c);
+                        } else {
+                            pattern.push('[');
+                            pattern.extend([lo, hi]);
+                            pattern.extend(original);
+                            pattern.push(']');
+                        }
+                    }
+                }
+            }
+            pattern.push('*');
+            ("GLOB ?", pattern)
+        };
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| {
+                bind(pattern.clone());
+                format!("{column} {operator}")
+            })
+            .collect::<Vec<_>>();
+        format!("({})", columns.join(" OR "))
+    }
+}
+
+/// The legacy candidate scan matches any positive keyword, but an excluded
+/// term disqualifies a message even when it also matches a positive keyword.
+pub(crate) fn legacy_candidate_like_clause(
+    text: &str,
+    max_terms: usize,
+) -> crate::DbResult<Option<(String, Vec<String>)>> {
+    // Preserve the positive keyword cap, but keep scanning for an exclusion
+    // after it. Reject excess exclusions explicitly instead of broadening the
+    // query or constructing an unbounded SQL expression.
+    let mut positive = Vec::new();
+    let mut negative = Vec::new();
+    let within_budget = visit_like_conditions(text, SUBJECT_AND_BODY_COLUMNS, max_terms, |c| {
+        if c.negated {
+            push_distinct_condition(&mut negative, c);
+            return negative.len() <= max_terms;
+        }
+        // The legacy API has always admitted any positive keyword, including
+        // words inside quotes. A phrase split across lines must stay eligible.
+        for needle in extract_like_terms(&c.needle, max_terms) {
+            if positive.len() >= max_terms {
+                break;
+            }
+            push_distinct_condition(&mut positive, LikeCondition { needle, ..c });
+        }
+        true
+    });
+    if !within_budget {
+        return Err(crate::DbError::invalid(
+            "query",
+            format!("at most {max_terms} excluded terms are supported by SQL search"),
+        ));
+    }
+    if positive.is_empty() {
+        return Ok(None);
+    }
+    let mut patterns = Vec::new();
+    let mut bind = |value| patterns.push(value);
+    let positives = positive
+        .iter()
+        .map(|c| c.sql(&mut bind))
+        .collect::<Vec<_>>();
+    let mut clauses = vec![format!("({})", positives.join(" OR "))];
+    for excluded in negative {
+        clauses.push(format!("NOT {}", excluded.sql(&mut bind)));
+    }
+    Ok(Some((clauses.join(" AND "), patterns)))
+}
+
+fn push_distinct_condition(terms: &mut Vec<LikeCondition>, condition: LikeCondition) {
+    if !terms.iter().any(|seen| {
+        seen.columns == condition.columns
+            && seen.negated == condition.negated
+            && crate::queries::same_like_term(&seen.needle, &condition.needle)
+    }) {
+        terms.push(condition);
+    }
+}
+
 /// The Query Help syntax the index honours, for the LIKE plan: `subject:` and
 /// `body:` prefixes, `"quoted phrases"`, `NOT x` / `-x`, `AND` (implicit) and
 /// a trailing `*` (a substring match already covers a prefix). Other words
@@ -724,10 +827,25 @@ fn like_conditions(
     default_columns: &'static [&'static str],
     max_terms: usize,
 ) -> Vec<LikeCondition> {
-    let mut conditions: Vec<LikeCondition> = Vec::new();
+    let mut conditions = Vec::new();
+    if max_terms > 0 {
+        visit_like_conditions(text, default_columns, max_terms, |c| {
+            push_distinct_condition(&mut conditions, c);
+            conditions.len() < max_terms
+        });
+    }
+    conditions
+}
+
+fn visit_like_conditions(
+    text: &str,
+    default_columns: &'static [&'static str],
+    max_terms: usize,
+    mut visit: impl FnMut(LikeCondition) -> bool,
+) -> bool {
     let mut chars = text.chars().peekable();
     let mut negate_next = false;
-    while conditions.len() < max_terms {
+    while chars.peek().is_some() {
         while chars.peek().is_some_and(|c| c.is_whitespace()) {
             chars.next();
         }
@@ -779,27 +897,25 @@ fn like_conditions(
                 .join(" ");
             vec![phrase]
         } else {
-            extract_like_terms(value.trim_end_matches('*'), max_terms)
+            extract_like_terms(
+                value.trim_end_matches('*'),
+                max_terms.saturating_add(usize::from(negated)),
+            )
         };
         for needle in needles {
-            if needle.chars().count() < 2 || conditions.len() >= max_terms {
+            if needle.chars().count() < 2 {
                 continue;
             }
-            let condition = LikeCondition {
+            if !visit(LikeCondition {
                 needle,
                 columns,
                 negated,
-            };
-            if !conditions.iter().any(|seen| {
-                seen.needle.eq_ignore_ascii_case(&condition.needle)
-                    && seen.columns == condition.columns
-                    && seen.negated == condition.negated
             }) {
-                conditions.push(condition);
+                return false;
             }
         }
     }
-    conditions
+    true
 }
 
 /// Plan a search query into SQL + params.
@@ -921,18 +1037,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
             };
             let mut like_parts = Vec::new();
             for condition in like_conditions(&query.text, default_columns, 5) {
-                let escaped = condition
-                    .needle
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_");
-                let pattern = format!("%{escaped}%");
-                let mut alternatives = Vec::with_capacity(condition.columns.len());
-                for column in condition.columns {
-                    alternatives.push(format!("{column} LIKE ? ESCAPE '\\'"));
-                    params.push(PlanParam::Text(pattern.clone()));
-                }
-                let any_column = format!("({})", alternatives.join(" OR "));
+                let any_column = condition.sql(|value| params.push(PlanParam::Text(value)));
                 like_parts.push(if condition.negated {
                     format!("NOT {any_column}")
                 } else {
