@@ -11,7 +11,10 @@ snapshot lock.
 
 On November 20 the installed Linux 0.3.38 server advertised 45 tools,
 eight concrete resources and 25 resource templates in a fresh MCP session.
-The shadow search comparison below uncovered two incorrect search hits.
+It returned two extra messages for `deployment NOT checklist` in shadow
+mode. The corrected server returned the expected two IDs on both Macs.
+Doctor also identified a damaged serving index with its optional index
+directory unset.
 
 The highest-priority unresolved claims concern durability under a swarm.
 The mixed HTTP archive-drain stall (`br-kp1in.13`) and the eight-sender

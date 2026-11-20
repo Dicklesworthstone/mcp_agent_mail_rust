@@ -1834,6 +1834,7 @@ Search V3 is not an afterthought bolted onto mailbox rows. It is a dedicated que
 - Candidate budgeting and fusion keep broad natural-language queries from exploding while preserving exact-match strength for identifiers and short phrases.
 - The same search path serves MCP tools, `am mail search`, `am robot search`, TUI search, and web UI search routes.
 - Empty or non-searchable queries route through a deterministic SQL plan before Search V3 candidate retrieval. Legacy SQLite FTS artifacts still exist for migration hygiene and cleanup, but the current search architecture is Search V3 plus that deterministic SQL plan, not a hidden FTS fallback.
+- In shadow mode (`AM_SEARCH_ENGINE=shadow`), the SQL keyword scan for messages considers the first five distinct positive terms and accepts up to five distinct exclusions. For example, `deployment NOT checklist` finds messages containing “deployment” and excludes any with “checklist” in the subject or body. Exceeding the exclusion limit returns an error.
 
 The dedicated `mcp-agent-mail-search-core` crate exists specifically so search planning and backends can evolve without entangling the rest of the mailbox stack.
 
