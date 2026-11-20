@@ -270,7 +270,7 @@ pub fn project_inbox_unread_counts_from_conn(
         let mut floor = None;
         let mut skip_at_floor = 0;
         loop {
-            let ids = project_mailbox_count_ids(conn, project_id, &mut floor, &mut skip_at_floor)?;
+            let ids = project_mailbox_delivery_ids(conn, project_id, &mut floor, &mut skip_at_floor)?;
             if ids.is_empty() {
                 return Ok(counts);
             }
@@ -432,7 +432,7 @@ pub fn project_mailbox_inbox_counts_from_conn(
         let mut floor = None;
         let mut skip_at_floor = 0;
         loop {
-            let ids = project_mailbox_count_ids(conn, project_id, &mut floor, &mut skip_at_floor)?;
+            let ids = project_mailbox_delivery_ids(conn, project_id, &mut floor, &mut skip_at_floor)?;
             if ids.is_empty() {
                 return Ok(counts);
             }
@@ -461,7 +461,7 @@ pub fn project_mailbox_inbox_counts_from_conn(
 /// walk. The integer primary key is the deterministic tie break, matching the
 /// index's implicit rowid order. The offset counts only rows already consumed
 /// at the boundary timestamp.
-fn project_mailbox_count_ids(
+pub(crate) fn project_mailbox_delivery_ids(
     conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     floor: &mut Option<i64>,

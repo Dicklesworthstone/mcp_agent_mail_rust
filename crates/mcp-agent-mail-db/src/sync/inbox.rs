@@ -744,6 +744,13 @@ pub(super) fn hydrate_priority_rows(
 
 const SHARED_PAGE_SIZE: usize = 128;
 
+#[derive(Clone, Copy)]
+struct SharedViewer {
+    project_id: i64,
+    agent_id: i64,
+    inception: i64,
+}
+
 /// Page authoritative message timestamps, not the denormalized delivery time.
 /// The pinned engine's reverse composite seek needs a timestamp range and
 /// the explicit ID tie break. A typed i64 minimum includes the entire valid
@@ -864,7 +871,45 @@ pub fn fetch_shared_with_policy(
     {
         return Ok(Vec::new());
     }
-    let inception = viewer.get_named::<i64>("inception_ts").map_err(db_error)?;
+    let viewer = SharedViewer {
+        project_id,
+        agent_id,
+        inception: viewer.get_named::<i64>("inception_ts").map_err(db_error)?,
+    };
+    // Read/ACK filters may reject every recent message (GH#399). Allow one
+    // header page to satisfy a dense or recent window, then fall back to the
+    // project's actual deliveries instead of scanning unrelated mail.
+    let max_pages = (options.unread_only
+        || options.ack_required_only
+        || options.ack_overdue_before.is_some())
+    .then_some(1);
+    let newest = match shared_header_window(conn, viewer, since_ts, limit, options, max_pages)? {
+        Some(newest) => newest,
+        None => shared_delivery_window(conn, viewer, since_ts, limit, options)?,
+    };
+    hydrate(
+        conn,
+        project_id,
+        newest,
+        options.body_policy,
+        candidates_only,
+    )
+}
+
+fn shared_header_window(
+    conn: &impl SyncQuery,
+    viewer: SharedViewer,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+    max_pages: Option<usize>,
+) -> Result<Option<NewestWindow>, DbError> {
+    let SharedViewer {
+        project_id,
+        agent_id,
+        inception,
+    } = viewer;
+    let mut pages = 0_usize;
     let mut newest: BTreeMap<(i64, i64), Receipt> = BTreeMap::new();
     let mut ceiling = None;
     let mut skip_at_ceiling = 0_i64;
@@ -876,6 +921,7 @@ pub fn fetch_shared_with_policy(
                 "shared inbox page exceeded its bound".into(),
             ));
         }
+        pages += 1;
         let finished = rows.len() < SHARED_PAGE_SIZE;
         let mut last_ts = ceiling;
         let mut trailing_count = skip_at_ceiling;
@@ -1009,18 +1055,127 @@ pub fn fetch_shared_with_policy(
                 .first_key_value()
                 .is_some_and(|((oldest, _), _)| last_ts.is_some_and(|last| last < *oldest));
         if finished || lower_bound_reached || window_complete {
-            break;
+            return Ok(Some(newest));
+        }
+        if max_pages.is_some_and(|maximum| pages >= maximum) {
+            return Ok(None);
         }
         ceiling = last_ts;
         skip_at_ceiling = trailing_count;
     }
-    hydrate(
-        conn,
-        project_id,
-        newest,
-        options.body_policy,
-        candidates_only,
-    )
+}
+
+/// Read only project delivery pages and bounded primary-key lookups. Delivery
+/// timestamps and IDs are traversal keys, never message-time cutoffs: imports
+/// may preserve creation times while assigning different delivery timestamps.
+/// Exhaust those pages and retain only the newest requested message window.
+fn shared_delivery_window(
+    conn: &impl SyncQuery,
+    viewer: SharedViewer,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+) -> Result<NewestWindow, DbError> {
+    let mut newest = NewestWindow::new();
+    let mut floor = None;
+    let mut skip_at_floor = 0_i64;
+    loop {
+        let ids = crate::project_mailbox::project_mailbox_delivery_ids(
+            conn,
+            viewer.project_id,
+            &mut floor,
+            &mut skip_at_floor,
+        )?;
+        let finished = ids.len() < SHARED_PAGE_SIZE;
+        let mut candidates: HashMap<i64, Receipt> = ids
+            .iter()
+            .copied()
+            .map(|id| {
+                (
+                    id,
+                    Receipt {
+                        kind: crate::project_mailbox::PROJECT_MAILBOX_KIND.into(),
+                        read_ts: None,
+                        ack_ts: None,
+                    },
+                )
+            })
+            .collect();
+        for row in shared_receipt_rows(
+            conn,
+            "message_recipients",
+            "message_id",
+            &ids,
+            viewer.agent_id,
+        )? {
+            // Direct delivery wins even when its own read/ACK state would
+            // exclude it. A shared receipt must never resurrect that mail.
+            candidates.remove(&row.get_named::<i64>("message_id").map_err(db_error)?);
+        }
+        let ids: Vec<i64> = candidates.keys().copied().collect();
+        for row in shared_receipt_rows(
+            conn,
+            "project_mailbox_receipts",
+            "message_id, read_ts, ack_ts",
+            &ids,
+            viewer.agent_id,
+        )? {
+            let id = row.get_named::<i64>("message_id").map_err(db_error)?;
+            let receipt = candidates
+                .get_mut(&id)
+                .ok_or_else(|| DbError::Internal("unrequested shared inbox receipt".into()))?;
+            receipt.read_ts = row.get_named("read_ts").map_err(db_error)?;
+            receipt.ack_ts = row.get_named("ack_ts").map_err(db_error)?;
+        }
+        candidates.retain(|_, receipt| {
+            (!options.unread_only || receipt.read_ts.is_none())
+                && (!(options.ack_required_only || options.ack_overdue_before.is_some())
+                    || receipt.ack_ts.is_none())
+        });
+        if !candidates.is_empty() {
+            let ids: Vec<i64> = candidates.keys().copied().collect();
+            let (sql, params) = lookup_query("messages", HEADER_COLUMNS, &ids);
+            for row in query(conn, &sql, &params)? {
+                let id = row.get_named::<i64>("id").map_err(db_error)?;
+                let receipt = candidates.remove(&id).ok_or_else(|| {
+                    DbError::Internal("unrequested shared inbox message header".into())
+                })?;
+                let created = row.get_named::<i64>("created_ts").map_err(db_error)?;
+                let ack = row.get_named::<i64>("ack_required").map_err(db_error)?;
+                let importance = row.get_named::<String>("importance").map_err(db_error)?;
+                let topic = row.get_named::<Option<String>>("topic").map_err(db_error)?;
+                if row.get_named::<i64>("project_id").map_err(db_error)? != viewer.project_id
+                    || row.get_named::<i64>("sender_id").map_err(db_error)? == viewer.agent_id
+                    || created < viewer.inception
+                    || since_ts.is_some_and(|ts| created <= ts)
+                    || (options.urgent_only && !matches!(importance.as_str(), "high" | "urgent"))
+                    || (options.ack_required_only && ack != 1)
+                    || options
+                        .ack_overdue_before
+                        .is_some_and(|ts| ack != 1 || created >= ts)
+                    || options.topic.is_some_and(|wanted| {
+                        !topic
+                            .as_deref()
+                            .is_some_and(|actual| actual.eq_ignore_ascii_case(wanted))
+                    })
+                {
+                    continue;
+                }
+                let key = (created, id);
+                if newest.len() < limit
+                    || newest.first_key_value().is_some_and(|(old, _)| key > *old)
+                {
+                    newest.insert(key, receipt);
+                    if newest.len() > limit {
+                        newest.pop_first();
+                    }
+                }
+            }
+        }
+        if finished {
+            return Ok(newest);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1979,6 +2134,233 @@ mod tests {
     }
 
     #[test]
+    fn gh399_unread_and_ack_windows_skip_unrelated_project_history() {
+        let conn = walk_conn();
+        seed_walk(
+            &conn,
+            (1, 8192),
+            i64::MAX,
+            |id| 1_000_000 + id * 1000,
+            |_| "normal",
+        );
+        let deliveries = (128..=8192)
+            .step_by(128)
+            .map(|id| format!("({id},1,'to',{})", 100_000 - id))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute_raw(&format!(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             VALUES {deliveries}; \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) \
+             SELECT message_id,2,1,1 FROM project_mailbox_deliveries; \
+             UPDATE project_mailbox_receipts SET read_ts=NULL \
+             WHERE message_id IN (128,1024,4096,8064); \
+             UPDATE project_mailbox_receipts SET ack_ts=NULL \
+             WHERE message_id IN (256,1024,4096,8192); \
+             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) \
+             VALUES(1024,2,'to',1,1); PRAGMA query_only = ON"
+        ))
+        .unwrap();
+        let viewer = SharedViewer {
+            project_id: 1,
+            agent_id: 2,
+            inception: 0,
+        };
+        let metadata = InboxFetchOptions {
+            body_policy: InboxBodyPolicy::MetadataOnly,
+            ..options()
+        };
+        let cases = [
+            (
+                "unread",
+                InboxFetchOptions {
+                    unread_only: true,
+                    ..metadata
+                },
+                vec![8064, 4096, 128],
+            ),
+            (
+                "pending_ack",
+                InboxFetchOptions {
+                    ack_required_only: true,
+                    ..metadata
+                },
+                vec![8192, 4096, 256],
+            ),
+            (
+                "overdue_ack",
+                InboxFetchOptions {
+                    ack_overdue_before: Some(8_000_000),
+                    ..metadata
+                },
+                vec![4096, 256],
+            ),
+            (
+                "unread_pending_ack",
+                InboxFetchOptions {
+                    unread_only: true,
+                    ack_required_only: true,
+                    ..metadata
+                },
+                vec![4096],
+            ),
+            (
+                "unread_urgent",
+                InboxFetchOptions {
+                    unread_only: true,
+                    urgent_only: true,
+                    ..metadata
+                },
+                vec![],
+            ),
+            (
+                "unread_missing_topic",
+                InboxFetchOptions {
+                    unread_only: true,
+                    topic: Some("missing-topic"),
+                    ..metadata
+                },
+                vec![],
+            ),
+        ];
+        for (case, filters, expected_ids) in cases {
+            let original = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            let candidate = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            // The unchanged, uncapped header reader is the incumbent in the
+            // same invocation, rather than a self-comparison of the new route.
+            let start = std::time::Instant::now();
+            let expected = with_snapshot(&original, || {
+                let window =
+                    shared_header_window(&original, viewer, None, 20, filters, None)?
+                        .expect("uncapped reader completes");
+                hydrate(&original, 1, window, filters.body_policy, false)
+            })
+            .unwrap();
+            let original_us = start.elapsed().as_micros();
+            let start = std::time::Instant::now();
+            let actual =
+                fetch_inbox_rows_from_conn_impl(&candidate, 1, 2, None, 20, filters).unwrap();
+            let candidate_us = start.elapsed().as_micros();
+            same_rows(&actual, &expected);
+            assert_eq!(
+                actual.iter().map(|row| row.message.id.unwrap()).collect::<Vec<_>>(),
+                expected_ids,
+                "{case}: planted recipients, read state and ACK state must agree"
+            );
+            let (original_pages, _, _) = query_counts(&original.calls.borrow());
+            let calls = candidate.calls.borrow();
+            let (candidate_pages, _, _) = query_counts(&calls);
+            assert!(original_pages >= 64, "{case}: incumbent must walk project history");
+            assert_eq!(candidate_pages, 1, "{case}: bounded newest-first attempt");
+            let delivery_rows: usize = calls
+                .iter()
+                .filter(|(sql, _, _)| {
+                    sql.starts_with("SELECT message_id, delivered_ts FROM project_mailbox_deliveries")
+                })
+                .map(|(_, _, rows)| *rows)
+                .sum();
+            assert_eq!(delivery_rows, 64, "{case}: only actual shared deliveries");
+            assert!(calls.iter().all(|(_, _, rows)| *rows <= PAGE_SIZE));
+            assert!(actual.iter().all(|row| row.message.body_md.is_empty()));
+            println!(
+                "{{\"case\":\"gh399_{case}\",\"messages\":8192,\"shared_deliveries\":64,\"original_header_pages\":{original_pages},\"candidate_header_pages\":{candidate_pages},\"delivery_rows\":{delivery_rows},\"original_us\":{original_us},\"candidate_us\":{candidate_us}}}"
+            );
+        }
+        // Reads did not create receipts or leave their nested snapshot open.
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            64
+        );
+        conn.execute_raw("BEGIN; ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn gh399_delivery_pages_preserve_imported_times_visibility_and_dense_reads() {
+        let conn = walk_conn();
+        seed_walk(
+            &conn,
+            (1, 520),
+            i64::MAX,
+            |id| ((id * 373) % 521) * 1000,
+            |_| "normal",
+        );
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             SELECT id,1,'to',-9223372036854775808 FROM messages; \
+             UPDATE project_mailbox_deliveries SET delivered_ts=9223372036854775807 \
+             WHERE message_id>260; \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) \
+             SELECT id,2,1,NULL FROM messages; \
+             UPDATE project_mailbox_receipts SET read_ts=NULL WHERE message_id<=16; \
+             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) \
+             VALUES(7,2,'bcc',1,1); \
+             UPDATE messages SET sender_id=2 WHERE id=10; \
+             UPDATE messages SET project_id=2 WHERE id=12; \
+             UPDATE project_mailbox_deliveries SET project_id=2 WHERE message_id=13; \
+             UPDATE agents SET inception_ts=20000 WHERE id=2; \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+        let filters = InboxFetchOptions {
+            unread_only: true,
+            ..options()
+        };
+        let recording = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
+        let actual =
+            fetch_inbox_rows_from_conn_impl(&recording, 1, 2, Some(50_000), 20, filters).unwrap();
+        assert_eq!(
+            actual.iter().map(|row| row.message.id.unwrap()).collect::<Vec<_>>(),
+            [11, 4, 15, 8, 1, 5, 16, 9, 2, 6, 3],
+            "rank by message time; exclude sender, foreign projects and direct delivery"
+        );
+        assert!(actual.iter().all(|row| row.message.body_md.starts_with("body-")));
+        let delivery_pages = recording
+            .calls
+            .borrow()
+            .iter()
+            .filter(|(sql, _, _)| {
+                sql.starts_with("SELECT message_id, delivered_ts FROM project_mailbox_deliveries")
+            })
+            .count();
+        assert_eq!(delivery_pages, 5, "finish ties larger than a page at both i64 extremes");
+
+        // When unread mail fills a recent window, keep the existing one-page
+        // early stop rather than reading the whole shared-delivery history.
+        conn.execute_raw(
+            "PRAGMA query_only = OFF; \
+             UPDATE project_mailbox_receipts SET read_ts=NULL; \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+        let dense = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
+        let actual = fetch_inbox_rows_from_conn_impl(&dense, 1, 2, None, 20, filters).unwrap();
+        assert_eq!(actual.len(), 20);
+        assert_eq!(query_counts(&dense.calls.borrow()).0, 1);
+        assert!(
+            dense.calls.borrow().iter().all(|(sql, _, _)| {
+                !sql.starts_with("SELECT message_id, delivered_ts FROM project_mailbox_deliveries")
+            }),
+            "dense reads must not fall back to historical deliveries"
+        );
+        conn.execute_raw("BEGIN; ROLLBACK").unwrap();
+    }
+
+    #[test]
     fn gh374_large_inbox_bounds_direct_and_sparse_shared_history() {
         let conn = walk_conn();
         seed_walk(
@@ -2433,6 +2815,11 @@ mod tests {
             (first_header_sql.as_str(), false, None),
             (RECIPIENT_RANGE_SQL, false, None),
             (hydration_prefix, false, None),
+            (
+                "SELECT message_id, delivered_ts FROM project_mailbox_deliveries",
+                true,
+                Some("UPDATE message_recipients SET read_ts=1 WHERE agent_id=2"),
+            ),
         ] {
             for (body_policy, caller_transaction) in [
                 (InboxBodyPolicy::Full, false),
@@ -2463,7 +2850,14 @@ mod tests {
                 };
                 let expected =
                     fetch_inbox_rows_from_conn_impl(&control, 1, 2, None, 5, filters).unwrap();
-                assert_eq!(expected.len(), 5, "{needle}");
+                let expected_len = if needle
+                    == "SELECT message_id, delivered_ts FROM project_mailbox_deliveries"
+                {
+                    2
+                } else {
+                    5
+                };
+                assert_eq!(expected.len(), expected_len, "{needle}");
                 let target_sql = control
                     .calls
                     .borrow()
