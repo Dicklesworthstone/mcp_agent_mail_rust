@@ -3006,7 +3006,7 @@ async fn try_replay_message(
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\n    `Name@project` (project slug or human key) addresses an agent in another project;\n    see Edge cases. `project:<slug>` addresses this project's shared mailbox\n    (stored once; every other agent of the project reads it); see Edge cases.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- A plain name addresses this project only: a name that is not registered here but is your contact (or a product peer) in another project is refused with CROSS_PROJECT_RECIPIENT (never auto-registered locally).\n- `Name@project` (or `project:<project>#Name`) is resolved in that project only, never auto-registered, and delivered only over an approved, unexpired contact link with that agent (else CONTACT_REQUIRED / CONTACT_BLOCKED). The message is stored in the recipient's project, so it is read, acknowledged and replied to there; the delivery's `project` names it. One message lives in one project, so qualified and local recipients cannot be mixed in one call.\n- `project:<slug>` (or `project:<human_key>`) in `to` or `cc` addresses the sender's own project mailbox. The message is stored ONCE with one project delivery, not copied per agent: every other non-retired agent of the project that was registered when it was sent sees it in `fetch_inbox` with `via: \"project\"` (an agent whose contact_policy is `block_all` opts out; a direct to/cc/bcc delivery to the same agent takes precedence). Each agent's read/ack state is its own (`acknowledge_message`, `mark_message_read`); `get_message_delivery_receipt` reports them under `project_mailbox`. It can be combined with named recipients, cannot be bcc, and cannot name another project. This is not `broadcast`: nothing is fanned out.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\n    `Name@project` (project slug or human key) addresses an agent in another project;\n    see Edge cases. `project:<slug>` addresses this project's shared mailbox\n    (stored once; every other agent of the project reads it); see Edge cases.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments. Supported images are converted to WebP when image conversion is enabled; other files are stored unchanged.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces image conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- A plain name addresses this project only: a name that is not registered here but is your contact (or a product peer) in another project is refused with CROSS_PROJECT_RECIPIENT (never auto-registered locally).\n- `Name@project` (or `project:<project>#Name`) is resolved in that project only, never auto-registered, and delivered only over an approved, unexpired contact link with that agent (else CONTACT_REQUIRED / CONTACT_BLOCKED). The message is stored in the recipient's project, so it is read, acknowledged and replied to there; the delivery's `project` names it. One message lives in one project, so qualified and local recipients cannot be mixed in one call.\n- `project:<slug>` (or `project:<human_key>`) in `to` or `cc` addresses the sender's own project mailbox. The message is stored ONCE with one project delivery, not copied per agent: every other non-retired agent of the project that was registered when it was sent sees it in `fetch_inbox` with `via: \"project\"` (an agent whose contact_policy is `block_all` opts out; a direct to/cc/bcc delivery to the same agent takes precedence). Each agent's read/ack state is its own (`acknowledge_message`, `mark_message_read`); `get_message_delivery_receipt` reports them under `project_mailbox`. It can be combined with named recipients, cannot be bcc, and cannot name another project. This is not `broadcast`: nothing is fanned out.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -12519,6 +12519,86 @@ mod tests {
     fn reply_body_limit_empty_body_passes() {
         let cfg = config_with_limits(1, 0, 0, 0);
         assert!(validate_reply_body_limit(&cfg, "").is_ok());
+    }
+
+    #[test]
+    fn process_message_attachments_accepts_documents_with_default_conversion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            storage_root: tmp.path().join("storage"),
+            ..Config::default()
+        };
+        assert!(cfg.convert_images, "regression exercises the shipped default");
+        let bytes = b"# Review overflow\n\nDetails are preserved verbatim.\n";
+        std::fs::write(project_dir.path().join("overflow.md"), bytes).unwrap();
+        let paths = vec!["overflow.md".to_string()];
+        let body = "Please read the attached review.";
+
+        for policy in [
+            mcp_agent_mail_storage::EmbedPolicy::Auto,
+            mcp_agent_mail_storage::EmbedPolicy::Inline,
+            mcp_agent_mail_storage::EmbedPolicy::File,
+        ] {
+            let (final_body, metadata, rel_paths) = process_message_attachments(
+                &cfg,
+                "document-attachment",
+                project_dir.path().to_str().unwrap(),
+                project_dir.path(),
+                "Review",
+                body,
+                Some(&paths),
+                cfg.convert_images,
+                policy,
+            )
+            .expect("ordinary documents must work with image conversion enabled");
+
+            assert_eq!(final_body, body);
+            assert_eq!(metadata.len(), 1);
+            let attachment = &metadata[0];
+            assert_eq!(attachment["type"], "file");
+            assert_eq!(attachment["media_type"], "application/octet-stream");
+            assert_eq!(attachment["bytes"], bytes.len());
+            assert!(attachment.get("data_base64").is_none());
+            let path = attachment["path"].as_str().expect("stored document path");
+            assert_eq!(rel_paths, vec![path.to_string()]);
+            assert_eq!(std::fs::read(cfg.storage_root.join(path)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn process_message_attachments_counts_documents_toward_converted_total_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            storage_root: tmp.path().join("storage"),
+            max_total_message_bytes: 16,
+            ..Config::default()
+        };
+        std::fs::write(project_dir.path().join("overflow.md"), b"123456789").unwrap();
+        let paths = vec!["overflow.md".to_string()];
+
+        let error = process_message_attachments(
+            &cfg,
+            "document-attachment-budget",
+            project_dir.path().to_str().unwrap(),
+            project_dir.path(),
+            "Subject",
+            "Body",
+            Some(&paths),
+            true,
+            mcp_agent_mail_storage::EmbedPolicy::Inline,
+        )
+        .expect_err("raw documents still count toward the total message budget");
+
+        let data = error.data.expect("structured size error");
+        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["data"]["field"], "total");
+        assert!(
+            error.message.contains("Total message size exceeds limit"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

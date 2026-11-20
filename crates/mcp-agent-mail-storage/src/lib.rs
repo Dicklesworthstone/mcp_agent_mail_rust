@@ -13077,6 +13077,57 @@ impl EmbedPolicy {
     }
 }
 
+/// Read the bytes used for both attachment classification and storage. Keeping
+/// one bounded, no-follow read avoids a second path lookup after sniffing and
+/// also catches files that grow after the tool layer's size preflight.
+fn read_attachment_bytes(file_path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+    // Preserve the conversion safety bound; configured per-file and total
+    // message limits are enforced by the tool layer before archive work.
+    let effective_limit = max_bytes.max(FALLBACK_MAX_ATTACHMENT_BYTES);
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        file_path,
+        effective_limit as u64,
+    )
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::InvalidData => StorageError::InvalidPath(format!(
+            "Attachment too large (max {effective_limit} bytes): {error}"
+        )),
+        std::io::ErrorKind::InvalidInput => {
+            StorageError::InvalidPath(format!("Invalid attachment file: {error}"))
+        }
+        _ => StorageError::Io(error),
+    })?;
+    if bytes.is_empty() {
+        return Err(StorageError::InvalidPath(
+            "Attachment file is empty".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Explicit attachments may be documents as well as images. Content takes
+/// precedence over the extension, so extensionless/misnamed images still
+/// convert. A supported image extension remains a decoding claim when its
+/// signature is damaged; a decoder error must not silently turn it into a raw
+/// file. Formats without a compiled decoder (including SVG) stay byte-exact.
+fn store_explicit_attachment(
+    archive: &ProjectArchive,
+    config: &Config,
+    file_path: &Path,
+    embed_policy: EmbedPolicy,
+) -> Result<StoredAttachment> {
+    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
+    let bytes = read_attachment_bytes(file_path, config.max_attachment_bytes)?;
+    let convert = image::guess_format(&bytes)
+        .or_else(|_| image::ImageFormat::from_path(file_path))
+        .is_ok_and(|format| format.reading_enabled());
+    if convert {
+        store_image_attachment_bytes(archive, config, file_path, &bytes, embed_policy)
+    } else {
+        store_raw_attachment_bytes(archive, file_path, &bytes)
+    }
+}
+
 /// Reconstruct a [`StoredAttachment`] from cached WebP + manifest on disk.
 ///
 /// Called when the SHA1-based cache check finds that the WebP and manifest
@@ -13212,43 +13263,24 @@ pub fn store_attachment(
     embed_policy: EmbedPolicy,
 ) -> Result<StoredAttachment> {
     let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
+    let original_bytes = read_attachment_bytes(file_path, config.max_attachment_bytes)?;
+    store_image_attachment_bytes(archive, config, file_path, &original_bytes, embed_policy)
+}
+
+fn store_image_attachment_bytes(
+    archive: &ProjectArchive,
+    config: &Config,
+    file_path: &Path,
+    original_bytes: &[u8],
+    embed_policy: EmbedPolicy,
+) -> Result<StoredAttachment> {
     use base64::Engine;
     use image::GenericImageView;
-
-    // Guard against pathological decode times during WebP conversion.
-    // Use whichever is larger: the config limit (tool-layer) or the
-    // conversion-safety fallback.  The tool layer already validates
-    // against config.max_attachment_bytes; this guard is about OOM
-    // prevention in the image decoder, so it should never be MORE
-    // restrictive than the old hard-coded 50 MiB.
-    let effective_limit = if config.max_attachment_bytes > 0 {
-        config
-            .max_attachment_bytes
-            .max(FALLBACK_MAX_ATTACHMENT_BYTES)
-    } else {
-        FALLBACK_MAX_ATTACHMENT_BYTES
-    };
-    let meta = fs::metadata(file_path)?;
-    if meta.len() > effective_limit as u64 {
-        return Err(StorageError::InvalidPath(format!(
-            "Attachment too large ({} bytes, max {})",
-            meta.len(),
-            effective_limit,
-        )));
-    }
-
-    // Read original file
-    let original_bytes = fs::read(file_path)?;
-    if original_bytes.is_empty() {
-        return Err(StorageError::InvalidPath(
-            "Attachment file is empty".to_string(),
-        ));
-    }
 
     // Compute SHA1 of original bytes
     let digest = {
         let mut hasher = sha1::Sha1::new();
-        hasher.update(&original_bytes);
+        hasher.update(original_bytes);
         hex::encode(hasher.finalize())
     };
 
@@ -13283,19 +13315,10 @@ pub fn store_attachment(
         );
     }
 
-    // -- File size guard: reject pathologically large files --
-    if original_bytes.len() > effective_limit {
-        return Err(StorageError::InvalidPath(format!(
-            "Attachment too large for conversion ({} bytes, max {})",
-            original_bytes.len(),
-            effective_limit,
-        )));
-    }
-
     let mut rel_paths = Vec::new();
 
     // Convert to WebP
-    let img = image::load_from_memory(&original_bytes)
+    let img = image::load_from_memory(original_bytes)
         .map_err(|e| StorageError::InvalidPath(format!("Failed to decode image: {e}")))?;
     let (width, height) = img.dimensions();
 
@@ -13317,7 +13340,7 @@ pub fn store_attachment(
         let orig_dir = attach_dir.join("originals").join(prefix);
         ensure_dir(&orig_dir)?;
         let orig_path = orig_dir.join(format!("{digest}{original_ext}"));
-        atomic_write_bytes(&orig_path, &original_bytes, true)?;
+        atomic_write_bytes(&orig_path, original_bytes, true)?;
         let rel = rel_path_cached(&archive.canonical_repo_root, &orig_path)?;
         rel_paths.push(rel.clone());
         Some(rel)
@@ -13407,33 +13430,19 @@ pub fn store_raw_attachment(
     max_bytes: usize,
 ) -> Result<StoredAttachment> {
     let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
-    let effective_limit = if max_bytes > 0 {
-        max_bytes.max(FALLBACK_MAX_ATTACHMENT_BYTES)
-    } else {
-        FALLBACK_MAX_ATTACHMENT_BYTES
-    };
-    // Check size before reading entire file to prevent OOM
-    let meta = fs::metadata(file_path)?;
-    if meta.len() > effective_limit as u64 {
-        return Err(StorageError::InvalidPath(format!(
-            "Attachment too large ({} bytes, max {})",
-            meta.len(),
-            effective_limit,
-        )));
-    }
+    let bytes = read_attachment_bytes(file_path, max_bytes)?;
+    store_raw_attachment_bytes(archive, file_path, &bytes)
+}
 
-    // Read file
-    let bytes = fs::read(file_path)?;
-    if bytes.is_empty() {
-        return Err(StorageError::InvalidPath(
-            "Attachment file is empty".to_string(),
-        ));
-    }
-
+fn store_raw_attachment_bytes(
+    archive: &ProjectArchive,
+    file_path: &Path,
+    bytes: &[u8],
+) -> Result<StoredAttachment> {
     // Compute SHA1
     let digest = {
         let mut hasher = sha1::Sha1::new();
-        hasher.update(&bytes);
+        hasher.update(bytes);
         hex::encode(hasher.finalize())
     };
 
@@ -13471,7 +13480,7 @@ pub fn store_raw_attachment(
     };
 
     if needs_write {
-        atomic_write_bytes(&target_path, &bytes, true)?;
+        atomic_write_bytes(&target_path, bytes, true)?;
     }
 
     let rel_path = rel_path_cached(&archive.canonical_repo_root, &target_path)?;
@@ -13481,7 +13490,7 @@ pub fn store_raw_attachment(
         media_type: "application/octet-stream".to_string(),
         bytes: bytes.len(),
         sha1: digest,
-        content_sha256: Some(hex::encode(Sha256::digest(&bytes))),
+        content_sha256: Some(hex::encode(Sha256::digest(bytes))),
         width: 0,
         height: 0,
         data_base64: None,
@@ -13497,7 +13506,9 @@ pub fn store_raw_attachment(
 
 /// Process attachment paths and store them in the archive.
 ///
-/// Resolves paths sequentially (fast), then converts up to
+/// Supported images are converted to WebP; other files retain their original
+/// bytes regardless of the image embed policy. Resolves paths sequentially
+/// (fast), then processes up to
 /// `MAX_CONCURRENT_CONVERSIONS` attachments in parallel using
 /// `std::thread::scope` with chunk-based concurrency limiting.
 ///
@@ -13526,7 +13537,7 @@ pub fn process_attachments(
         .map(|p| resolve_attachment_source_path_from_canonical_base(&canonical_base, config, p))
         .collect::<Result<Vec<_>>>()?;
 
-    // Phase 2: convert in parallel chunks
+    // Phase 2: classify and store in parallel chunks
     let mut all_meta = Vec::with_capacity(resolved.len());
     let mut all_rel_paths = Vec::new();
 
@@ -13534,7 +13545,9 @@ pub fn process_attachments(
         let results: Vec<Result<StoredAttachment>> = std::thread::scope(|s| {
             let handles: Vec<_> = chunk
                 .iter()
-                .map(|path| s.spawn(|| store_attachment(archive, config, path, embed_policy)))
+                .map(|path| {
+                    s.spawn(|| store_explicit_attachment(archive, config, path, embed_policy))
+                })
                 .collect();
             handles
                 .into_iter()
@@ -24617,6 +24630,199 @@ mod tests {
 
         assert_eq!(meta.len(), 2);
         assert!(!rel_paths.is_empty());
+    }
+
+    #[test]
+    fn test_process_attachments_preserves_documents_alongside_converted_images() {
+        use base64::Engine as _;
+        use image::GenericImageView as _;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "mixed-attachments").unwrap();
+        let documents: [(&str, &[u8]); 4] = [
+            (
+                "overflow.md",
+                b"# Overflow\n\nThe complete review belongs here.\n",
+            ),
+            ("report.pdf", b"%PDF-1.7\noriginal PDF bytes\n%%EOF\n"),
+            ("diagram.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            ("opaque", b"\0\xff\x01\x7f\0\x80"),
+        ];
+        for (name, bytes) in documents {
+            fs::write(archive.root.join(name), bytes).unwrap();
+        }
+        create_test_png(&archive.root.join("image.png"));
+        // Five entries also cross the parallel conversion chunk boundary.
+        let paths = vec![
+            "overflow.md".to_string(),
+            "image.png".to_string(),
+            "report.pdf".to_string(),
+            "diagram.svg".to_string(),
+            "opaque".to_string(),
+        ];
+
+        for policy in [EmbedPolicy::File, EmbedPolicy::Inline, EmbedPolicy::Auto] {
+            let (metadata, rel_paths) =
+                process_attachments(&archive, &config, &archive.root, &paths, policy)
+                    .expect("image conversion must also accept ordinary documents");
+            assert_eq!(metadata.len(), paths.len());
+            assert!(
+                rel_paths
+                    .iter()
+                    .all(|path| archive.repo_root.join(path).is_file())
+            );
+
+            for ((_, bytes), index) in documents.iter().zip([0, 2, 3, 4]) {
+                let meta = &metadata[index];
+                assert_eq!(meta.kind, "file", "image policy must not inline documents");
+                assert_eq!(meta.media_type, "application/octet-stream");
+                assert_eq!(meta.bytes, bytes.len());
+                assert_eq!((meta.width, meta.height), (0, 0));
+                assert!(meta.data_base64.is_none());
+                assert!(meta.original_path.is_none());
+                assert_eq!(meta.sha1, hex::encode(sha1::Sha1::digest(bytes)));
+                assert_eq!(
+                    meta.content_sha256,
+                    Some(hex::encode(Sha256::digest(bytes)))
+                );
+                let path = meta
+                    .path
+                    .as_ref()
+                    .expect("raw attachment has an archive path");
+                assert!(path.contains("/attachments/files/"));
+                assert_eq!(fs::read(archive.repo_root.join(path)).unwrap(), *bytes);
+            }
+
+            let image = &metadata[1];
+            assert_eq!(image.media_type, "image/webp");
+            assert_eq!((image.width, image.height), (4, 4));
+            let stored_image = if let Some(encoded) = &image.data_base64 {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap()
+            } else {
+                fs::read(archive.repo_root.join(image.path.as_ref().unwrap())).unwrap()
+            };
+            assert_eq!(
+                image::guess_format(&stored_image).unwrap(),
+                image::ImageFormat::WebP
+            );
+            assert_eq!(
+                image::load_from_memory(&stored_image).unwrap().dimensions(),
+                (4, 4)
+            );
+        }
+    }
+
+    #[test]
+    fn test_process_attachments_sniffs_images_without_relying_on_extension() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "sniff-attachments").unwrap();
+        let source = archive.root.join("source.png");
+        create_test_png(&source);
+        let paths =
+            ["extensionless", "named-as-document.md", "UPPERCASE.PNG"].map(String::from);
+        for path in &paths {
+            fs::copy(&source, archive.root.join(path)).unwrap();
+        }
+
+        let (metadata, _) =
+            process_attachments(&archive, &config, &archive.root, &paths, EmbedPolicy::File)
+                .unwrap();
+        assert_eq!(metadata.len(), 3);
+        for meta in metadata {
+            assert_eq!(meta.media_type, "image/webp");
+            assert_eq!((meta.width, meta.height), (4, 4));
+            assert!(meta.path.unwrap().ends_with(".webp"));
+        }
+    }
+
+    #[test]
+    fn test_process_attachments_does_not_hide_corrupt_supported_images() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "corrupt-attachments").unwrap();
+        for (name, bytes) in [
+            ("broken.PNG", b"not a PNG".as_slice()),
+            ("truncated.bin", b"\x89PNG\r\n\x1a\n".as_slice()),
+        ] {
+            fs::write(archive.root.join(name), bytes).unwrap();
+            let error = process_attachments(
+                &archive,
+                &config,
+                &archive.root,
+                &[name.to_string()],
+                EmbedPolicy::Auto,
+            )
+            .expect_err("recognized image corruption must remain a decoding error");
+            assert!(
+                error.to_string().contains("Failed to decode image"),
+                "{error}"
+            );
+        }
+        assert!(
+            !archive.root.join("attachments/files").exists(),
+            "corrupt images must not be accepted as raw documents"
+        );
+    }
+
+    #[test]
+    fn test_process_attachments_rejects_empty_and_oversized_raw_files() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.max_attachment_bytes = 0;
+        let archive = ensure_archive(&config, "bounded-raw-attachments").unwrap();
+        fs::write(archive.root.join("empty.md"), []).unwrap();
+        let oversized = fs::File::create(archive.root.join("oversized.md")).unwrap();
+        oversized
+            .set_len(FALLBACK_MAX_ATTACHMENT_BYTES as u64 + 1)
+            .unwrap();
+
+        for (name, expected) in [("empty.md", "empty"), ("oversized.md", "too large")] {
+            let error = process_attachments(
+                &archive,
+                &config,
+                &archive.root,
+                &[name.to_string()],
+                EmbedPolicy::File,
+            )
+            .unwrap_err();
+            assert!(matches!(error, StorageError::InvalidPath(_)));
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        assert!(!archive.root.join("attachments/files").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_attachment_read_refuses_symlinks_and_non_regular_sources() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "attachment-source-authority").unwrap();
+        let source = tmp.path().join("source.md");
+        fs::write(&source, b"private source bytes").unwrap();
+        let substituted_path = archive.root.join("substituted.md");
+        symlink(&source, &substituted_path).unwrap();
+        // This is the post-resolution entrypoint: a leaf replaced with a link
+        // after path authorization must not be followed by either read path.
+        assert!(
+            store_explicit_attachment(&archive, &config, &substituted_path, EmbedPolicy::File)
+                .is_err()
+        );
+        assert!(store_raw_attachment(&archive, &substituted_path, 1024).is_err());
+        assert!(
+            store_attachment(&archive, &config, &substituted_path, EmbedPolicy::File).is_err()
+        );
+        assert!(
+            store_explicit_attachment(&archive, &config, &archive.root, EmbedPolicy::File)
+                .is_err()
+        );
+        assert!(!archive.root.join("attachments/files").exists());
+        assert_eq!(fs::read(source).unwrap(), b"private source bytes");
     }
 
     #[test]
