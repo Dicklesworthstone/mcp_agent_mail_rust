@@ -33,6 +33,17 @@ pub enum GuardError {
     )]
     GlobalHooksPath { hooks_path: String, origin: String },
     #[error(
+        "refusing to replace the customized or older Agent Mail chain runner '{path}': \
+         its contents differ from the generated {hook_name} runner. Move any custom \
+         checks into executable plugins in '{plugins_dir}', then move this runner aside \
+         and reinstall. No hooks were changed."
+    )]
+    CustomizedChainRunner {
+        path: String,
+        hook_name: String,
+        plugins_dir: String,
+    },
+    #[error(
         "pre-push scan was truncated, so part of the push was not checked against file \
          reservations: {detail}"
     )]
@@ -2279,6 +2290,31 @@ fn unused_path(base: &Path) -> PathBuf {
         .unwrap_or_else(|| base.to_path_buf())
 }
 
+fn validate_chain_runners(hooks_dir: &Path, hook_names: &[&str]) -> GuardResult<()> {
+    // GH#398: a generated header does not prove that the rest of the hook
+    // still belongs to us. Refuse before changing *any* hook: preserving a
+    // customized runner as a plugin could recurse into hooks.d, and replacing
+    // it would silently discard the repository's own checks.
+    for name in hook_names {
+        let chain_path = hooks_dir.join(name);
+        let content = match std::fs::read_to_string(&chain_path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if content.contains(&format!("mcp-agent-mail chain-runner ({name})"))
+            && content != render_chain_runner_script(name)
+        {
+            return Err(GuardError::CustomizedChainRunner {
+                path: chain_path.display().to_string(),
+                hook_name: (*name).to_string(),
+                plugins_dir: hooks_dir.join("hooks.d").join(name).display().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> GuardResult<()> {
     if !repo.exists() {
         return Err(GuardError::InvalidRepo {
@@ -2289,6 +2325,12 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
     // GH#223: install-time resolution refuses machine-wide (global/system)
     // core.hooksPath targets unless explicitly allowed.
     let hooks_dir = resolve_install_hooks_dir(repo)?;
+    let hook_names: &[&str] = if install_prepush {
+        &["pre-commit", "post-commit", "pre-push"]
+    } else {
+        &["pre-commit"]
+    };
+    validate_chain_runners(&hooks_dir, hook_names)?;
     std::fs::create_dir_all(&hooks_dir)?;
 
     // Helper to install a single hook type
@@ -2308,21 +2350,29 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
             std::fs::rename(&orig, &parked)?;
         }
         if chain_path.exists() {
-            let content = std::fs::read_to_string(&chain_path).unwrap_or_default();
-            let content = content.trim();
+            let content = std::fs::read_to_string(&chain_path)?;
             // Idempotent: backup if not ours. A legacy single-file agent-mail
             // guard is ours too, so the chain runner replaces it instead of
             // chaining the old guard behind the new one.
             if !content.contains(&format!("mcp-agent-mail chain-runner ({name})"))
-                && !is_legacy_single_file_guard(content)
+                && !is_legacy_single_file_guard(&content)
             {
                 if orig.exists() {
                     // The first install already chained `.orig`; this is a
                     // newer hook written since (husky, the pre-commit
                     // framework). Chain it too instead of overwriting it, so
                     // its checks keep running.
-                    let preserved = unused_path(&run_dir.join(format!("50-preserved-{name}")));
-                    std::fs::rename(&chain_path, &preserved)?;
+                    // If a tool restored the exact original hook, it is
+                    // already preserved and will run as .orig. Do not add a
+                    // second executable copy of the same checks.
+                    let already_preserved = std::fs::read(&orig)
+                        .is_ok_and(|original| original == content.as_bytes())
+                        && std::fs::metadata(&orig)?.permissions()
+                            == std::fs::metadata(&chain_path)?.permissions();
+                    if !already_preserved {
+                        let preserved = unused_path(&run_dir.join(format!("50-preserved-{name}")));
+                        std::fs::rename(&chain_path, &preserved)?;
+                    }
                 } else {
                     std::fs::rename(&chain_path, &orig)?;
                 }
@@ -2354,14 +2404,11 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
         Ok(())
     };
 
-    install_hook("pre-commit")?;
-
-    if install_prepush {
+    for name in hook_names {
         // Post-commit independently checks the immutable object before it
         // records admission. It does not infer success from pre-commit, and
         // Git ignores its exit status, so failure retains the push backstop.
-        install_hook("post-commit")?;
-        install_hook("pre-push")?;
+        install_hook(name)?;
     }
 
     Ok(())
@@ -2407,12 +2454,16 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
         }
 
         let content = std::fs::read_to_string(&hook_path).unwrap_or_default();
-        let content = content.trim();
 
         let is_chain_runner = content.contains("mcp-agent-mail chain-runner");
-        let is_legacy_hook = is_legacy_single_file_guard(content);
+        let is_legacy_hook = is_legacy_single_file_guard(&content);
 
         if is_chain_runner {
+            // Custom code remains owned by the repository after its Agent
+            // Mail plugin is removed. Never discard it on uninstall either.
+            if content != render_chain_runner_script(hook_name) {
+                continue;
+            }
             let run_dir = hooks_dir.join("hooks.d").join(hook_name);
             let orig_path = hooks_dir.join(format!("{hook_name}.orig"));
 
@@ -2448,22 +2499,9 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
     Ok(())
 }
 
-/// Check the guard installation status for a repository.
-/// Whether `hook_name` would run the guard. Our chain runner enforces nothing
-/// itself: it runs `hooks.d/<hook>/*`, skipping (on POSIX) files without an
-/// exec bit, so the guard is present only while its plugin is there and runnable.
-fn guard_hook_present(hooks_dir: &Path, hook_name: &str) -> bool {
-    let Ok(contents) = std::fs::read_to_string(hooks_dir.join(hook_name)) else {
-        return false;
-    };
-    if !contents.contains(&format!("mcp-agent-mail chain-runner ({hook_name})")) {
-        return contents.contains("mcp-agent-mail");
-    }
-    let plugin = hooks_dir
-        .join("hooks.d")
-        .join(hook_name)
-        .join(PLUGIN_FILE_NAME);
-    let Ok(metadata) = std::fs::metadata(&plugin) else {
+/// Git and the chain runner skip non-executable hook files on POSIX.
+fn hook_is_runnable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
     #[cfg(unix)]
@@ -2477,6 +2515,28 @@ fn guard_hook_present(hooks_dir: &Path, hook_name: &str) -> bool {
     }
 }
 
+/// Our chain runner enforces nothing itself: it runs `hooks.d/<hook>/*`,
+/// so the guard is present only while both it and its plugin are runnable.
+fn guard_hook_present(hooks_dir: &Path, hook_name: &str) -> bool {
+    let hook = hooks_dir.join(hook_name);
+    if !hook_is_runnable(&hook) {
+        return false;
+    }
+    let Ok(contents) = std::fs::read_to_string(&hook) else {
+        return false;
+    };
+    if !contents.contains(&format!("mcp-agent-mail chain-runner ({hook_name})")) {
+        return contents.contains("mcp-agent-mail");
+    }
+    hook_is_runnable(
+        &hooks_dir
+            .join("hooks.d")
+            .join(hook_name)
+            .join(PLUGIN_FILE_NAME),
+    )
+}
+
+/// Check the guard installation status for a repository.
 pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
     if !repo.exists() {
         return Err(GuardError::InvalidRepo {
@@ -4261,6 +4321,180 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&chained).expect("still there"),
             newer
+        );
+    }
+
+    #[test]
+    fn install_refuses_custom_chain_runners_without_changing_hooks() {
+        let python = python_executable().expect("Python is required to execute installed guards");
+        for customized_hook in ["pre-commit", "post-commit", "pre-push"] {
+            let td = tempfile::TempDir::new().expect("tempdir");
+            let repo_dir = td.path().join("repo");
+            std::fs::create_dir_all(&repo_dir).expect("mkdir");
+            run_git(&repo_dir, &["init", "-q"]);
+            run_git(&repo_dir, &["config", "core.hooksPath", ".githooks"]);
+            install_guard("/test/project", &repo_dir, true).expect("install");
+            let hooks_dir = repo_dir.join(".githooks");
+            let custom_path = hooks_dir.join(customized_hook);
+            let custom = render_chain_runner_script(customized_hook).replace(
+                "sys.exit(first_failure)",
+                "print('custom repository check')\nsys.exit(17)",
+            );
+            std::fs::write(&custom_path, &custom).expect("customize runner");
+            let paths: Vec<PathBuf> = ["pre-commit", "post-commit", "pre-push"]
+                .into_iter()
+                .flat_map(|name| {
+                    [
+                        hooks_dir.join(name),
+                        hooks_dir.join("hooks.d").join(name).join(PLUGIN_FILE_NAME),
+                        hooks_dir.join(format!("{name}.cmd")),
+                        hooks_dir.join(format!("{name}.ps1")),
+                    ]
+                })
+                .collect();
+            let before: Vec<_> = paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+
+            let error = install_guard("/different/project", &repo_dir, true)
+                .expect_err("must not replace custom repository checks");
+            assert!(matches!(
+                &error,
+                GuardError::CustomizedChainRunner { hook_name, .. } if hook_name == customized_hook
+            ));
+            assert!(error.to_string().contains("No hooks were changed"));
+            for (path, expected) in paths.iter().zip(before) {
+                assert_eq!(std::fs::read(path).unwrap(), expected, "{}", path.display());
+            }
+            assert!(!hooks_dir.join(format!("{customized_hook}.orig")).exists());
+            let output = Command::new(&python)
+                .arg(&custom_path)
+                .current_dir(&repo_dir)
+                .env("AGENT_MAIL_BYPASS", "1")
+                .output()
+                .expect("run retained custom checks");
+            assert_eq!(output.status.code(), Some(17));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("custom repository check"));
+        }
+    }
+
+    #[test]
+    fn custom_prepush_refusal_happens_before_creating_other_hooks() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        let hooks_dir = repo_dir.join(".git/hooks");
+        let custom = format!(
+            "{}\n# repository-owned check\n",
+            render_chain_runner_script("pre-push")
+        );
+        std::fs::write(hooks_dir.join("pre-push"), &custom).expect("custom runner");
+
+        assert!(matches!(
+            install_guard("/test/project", &repo_dir, true),
+            Err(GuardError::CustomizedChainRunner { .. })
+        ));
+        assert!(!hooks_dir.join("pre-commit").exists());
+        assert!(!hooks_dir.join("post-commit").exists());
+        assert!(!hooks_dir.join("hooks.d").exists());
+        assert_eq!(
+            std::fs::read_to_string(hooks_dir.join("pre-push")).unwrap(),
+            custom
+        );
+
+        // --no-prepush installs only pre-commit and leaves the custom runner alone.
+        install_guard("/test/project", &repo_dir, false).expect("pre-commit only");
+        assert_eq!(
+            std::fs::read_to_string(hooks_dir.join("pre-push")).unwrap(),
+            custom
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_preserves_custom_chain_runner_and_original_hook() {
+        let python = python_executable().expect("Python is required to execute installed guards");
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        let hooks_dir = repo_dir.join(".git/hooks");
+        let hook_path = hooks_dir.join("pre-commit");
+        let original = "#!/usr/bin/env python3\nprint('original check')\n";
+        write_guard_file_atomic(&hook_path, original, true).expect("original hook");
+        install_guard("/test/project", &repo_dir, false).expect("install");
+        let custom = render_chain_runner_script("pre-commit").replace(
+            "sys.exit(first_failure)",
+            "print('custom repository check')\nsys.exit(17)",
+        );
+        std::fs::write(&hook_path, &custom).expect("customize runner");
+
+        uninstall_guard(&repo_dir).expect("uninstall");
+        assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), custom);
+        assert_eq!(
+            std::fs::read_to_string(hooks_dir.join("pre-commit.orig")).unwrap(),
+            original
+        );
+        assert!(
+            !hooks_dir
+                .join("hooks.d/pre-commit")
+                .join(PLUGIN_FILE_NAME)
+                .exists()
+        );
+        let output = Command::new(python)
+            .arg(&hook_path)
+            .current_dir(&repo_dir)
+            .output()
+            .expect("run retained custom checks");
+        assert_eq!(output.status.code(), Some(17));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("original check"));
+        assert!(stdout.contains("custom repository check"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reinstall_does_not_run_an_exact_original_hook_twice() {
+        let python = python_executable().expect("Python is required to execute installed guards");
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        let hooks_dir = repo_dir.join(".git/hooks");
+        let hook_path = hooks_dir.join("pre-commit");
+        let original = "#!/usr/bin/env python3\nfrom pathlib import Path\n\
+                        with Path('checks.log').open('a') as log:\n    log.write('checked\\n')\n";
+        write_guard_file_atomic(&hook_path, original, true).expect("original hook");
+        install_guard("/test/project", &repo_dir, false).expect("install");
+        std::fs::write(&hook_path, original).expect("restore original hook");
+
+        install_guard("/test/project", &repo_dir, false).expect("reinstall");
+        install_guard("/test/project", &repo_dir, false).expect("idempotent reinstall");
+        assert_eq!(
+            std::fs::read_to_string(hooks_dir.join("pre-commit.orig")).unwrap(),
+            original
+        );
+        assert!(
+            !hooks_dir
+                .join("hooks.d/pre-commit/50-preserved-pre-commit")
+                .exists()
+        );
+        let output = Command::new(python)
+            .arg(&hook_path)
+            .current_dir(&repo_dir)
+            .env("AGENT_MAIL_BYPASS", "1")
+            .output()
+            .expect("run installed hooks");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.join("checks.log")).unwrap(),
+            "checked\n"
         );
     }
 
@@ -6079,6 +6313,18 @@ mod tests {
                 !guard_status(&repo_dir).expect("status").pre_commit_present,
                 "the chain runner skips a plugin without an exec bit"
             );
+            std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755))
+                .expect("restore plugin exec bit");
+            let runner = hooks_dir.join("pre-commit");
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o644))
+                .expect("remove runner exec bit");
+            assert!(
+                !guard_status(&repo_dir).expect("status").pre_commit_present,
+                "Git skips a non-executable runner even when its plugin is runnable"
+            );
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+                .expect("restore runner exec bit");
+            assert!(guard_status(&repo_dir).expect("status").pre_commit_present);
         }
     }
 
