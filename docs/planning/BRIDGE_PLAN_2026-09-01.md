@@ -223,8 +223,12 @@ open Beads. The scope and outcomes of individual checks follow below.
   directories retained their sentinel. An earlier run exceeded the
   five-second shutdown deadline. The second Mac also timed out during
   setup on an external volume. Both failures are retained.
-- [ ] Run the database regression and neighboring search tests on the final
-  source. Verify both workspace compiler graphs, strict Clippy and formatting.
+- [x] Run all 87 selected database and planner tests on the final source.
+  The test executable `0657d68c1b05` passed all 87 on local system storage.
+  On the network-backed build volume, five of 87 timed out acquiring a
+  database connection during setup. The separate two-test run there also
+  stopped at project setup. Both logs remain available.
+- [ ] Verify both workspace compiler graphs, strict Clippy and formatting.
 
 ### Storage recovery and concurrent writes
 
