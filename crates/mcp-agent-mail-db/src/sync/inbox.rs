@@ -879,10 +879,9 @@ pub fn fetch_shared_with_policy(
     // Read/ACK filters may reject every recent message (GH#399). Allow one
     // header page to satisfy a dense or recent window, then fall back to the
     // project's actual deliveries instead of scanning unrelated mail.
-    let max_pages = (options.unread_only
-        || options.ack_required_only
-        || options.ack_overdue_before.is_some())
-    .then_some(1);
+    let max_pages =
+        (options.unread_only || options.ack_required_only || options.ack_overdue_before.is_some())
+            .then_some(1);
     let newest = match shared_header_window(conn, viewer, since_ts, limit, options, max_pages)? {
         Some(newest) => newest,
         None => shared_delivery_window(conn, viewer, since_ts, limit, options)?,
@@ -2236,9 +2235,8 @@ mod tests {
             // same invocation, rather than a self-comparison of the new route.
             let start = std::time::Instant::now();
             let expected = with_snapshot(&original, || {
-                let window =
-                    shared_header_window(&original, viewer, None, 20, filters, None)?
-                        .expect("uncapped reader completes");
+                let window = shared_header_window(&original, viewer, None, 20, filters, None)?
+                    .expect("uncapped reader completes");
                 hydrate(&original, 1, window, filters.body_policy, false)
             })
             .unwrap();
@@ -2249,19 +2247,27 @@ mod tests {
             let candidate_us = start.elapsed().as_micros();
             same_rows(&actual, &expected);
             assert_eq!(
-                actual.iter().map(|row| row.message.id.unwrap()).collect::<Vec<_>>(),
+                actual
+                    .iter()
+                    .map(|row| row.message.id.unwrap())
+                    .collect::<Vec<_>>(),
                 expected_ids,
                 "{case}: planted recipients, read state and ACK state must agree"
             );
             let (original_pages, _, _) = query_counts(&original.calls.borrow());
             let calls = candidate.calls.borrow();
             let (candidate_pages, _, _) = query_counts(&calls);
-            assert!(original_pages >= 64, "{case}: incumbent must walk project history");
+            assert!(
+                original_pages >= 64,
+                "{case}: incumbent must walk project history"
+            );
             assert_eq!(candidate_pages, 1, "{case}: bounded newest-first attempt");
             let delivery_rows: usize = calls
                 .iter()
                 .filter(|(sql, _, _)| {
-                    sql.starts_with("SELECT message_id, delivered_ts FROM project_mailbox_deliveries")
+                    sql.starts_with(
+                        "SELECT message_id, delivered_ts FROM project_mailbox_deliveries",
+                    )
                 })
                 .map(|(_, _, rows)| *rows)
                 .sum();
@@ -2321,11 +2327,18 @@ mod tests {
         let actual =
             fetch_inbox_rows_from_conn_impl(&recording, 1, 2, Some(50_000), 20, filters).unwrap();
         assert_eq!(
-            actual.iter().map(|row| row.message.id.unwrap()).collect::<Vec<_>>(),
+            actual
+                .iter()
+                .map(|row| row.message.id.unwrap())
+                .collect::<Vec<_>>(),
             [11, 4, 15, 8, 1, 5, 16, 9, 2, 6, 3],
             "rank by message time; exclude sender, foreign projects and direct delivery"
         );
-        assert!(actual.iter().all(|row| row.message.body_md.starts_with("body-")));
+        assert!(
+            actual
+                .iter()
+                .all(|row| row.message.body_md.starts_with("body-"))
+        );
         let delivery_pages = recording
             .calls
             .borrow()
@@ -2334,7 +2347,10 @@ mod tests {
                 sql.starts_with("SELECT message_id, delivered_ts FROM project_mailbox_deliveries")
             })
             .count();
-        assert_eq!(delivery_pages, 5, "finish ties larger than a page at both i64 extremes");
+        assert_eq!(
+            delivery_pages, 5,
+            "finish ties larger than a page at both i64 extremes"
+        );
 
         // When unread mail fills a recent window, keep the existing one-page
         // early stop rather than reading the whole shared-delivery history.

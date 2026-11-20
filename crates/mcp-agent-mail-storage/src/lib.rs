@@ -24646,7 +24646,10 @@ mod tests {
                 b"# Overflow\n\nThe complete review belongs here.\n",
             ),
             ("report.pdf", b"%PDF-1.7\noriginal PDF bytes\n%%EOF\n"),
-            ("diagram.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            (
+                "diagram.svg",
+                b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+            ),
             ("opaque", b"\0\xff\x01\x7f\0\x80"),
         ];
         for (name, bytes) in documents {
@@ -24722,8 +24725,7 @@ mod tests {
         let archive = ensure_archive(&config, "sniff-attachments").unwrap();
         let source = archive.root.join("source.png");
         create_test_png(&source);
-        let paths =
-            ["extensionless", "named-as-document.md", "UPPERCASE.PNG"].map(String::from);
+        let paths = ["extensionless", "named-as-document.md", "UPPERCASE.PNG"].map(String::from);
         for path in &paths {
             fs::copy(&source, archive.root.join(path)).unwrap();
         }
@@ -24814,12 +24816,9 @@ mod tests {
                 .is_err()
         );
         assert!(store_raw_attachment(&archive, &substituted_path, 1024).is_err());
+        assert!(store_attachment(&archive, &config, &substituted_path, EmbedPolicy::File).is_err());
         assert!(
-            store_attachment(&archive, &config, &substituted_path, EmbedPolicy::File).is_err()
-        );
-        assert!(
-            store_explicit_attachment(&archive, &config, &archive.root, EmbedPolicy::File)
-                .is_err()
+            store_explicit_attachment(&archive, &config, &archive.root, EmbedPolicy::File).is_err()
         );
         assert!(!archive.root.join("attachments/files").exists());
         assert_eq!(fs::read(source).unwrap(), b"private source bytes");

@@ -12529,7 +12529,10 @@ mod tests {
             storage_root: tmp.path().join("storage"),
             ..Config::default()
         };
-        assert!(cfg.convert_images, "regression exercises the shipped default");
+        assert!(
+            cfg.convert_images,
+            "regression exercises the shipped default"
+        );
         let bytes = b"# Review overflow\n\nDetails are preserved verbatim.\n";
         std::fs::write(project_dir.path().join("overflow.md"), bytes).unwrap();
         let paths = vec!["overflow.md".to_string()];

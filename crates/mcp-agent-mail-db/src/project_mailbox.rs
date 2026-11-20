@@ -270,7 +270,8 @@ pub fn project_inbox_unread_counts_from_conn(
         let mut floor = None;
         let mut skip_at_floor = 0;
         loop {
-            let ids = project_mailbox_delivery_ids(conn, project_id, &mut floor, &mut skip_at_floor)?;
+            let ids =
+                project_mailbox_delivery_ids(conn, project_id, &mut floor, &mut skip_at_floor)?;
             if ids.is_empty() {
                 return Ok(counts);
             }
@@ -432,7 +433,8 @@ pub fn project_mailbox_inbox_counts_from_conn(
         let mut floor = None;
         let mut skip_at_floor = 0;
         loop {
-            let ids = project_mailbox_delivery_ids(conn, project_id, &mut floor, &mut skip_at_floor)?;
+            let ids =
+                project_mailbox_delivery_ids(conn, project_id, &mut floor, &mut skip_at_floor)?;
             if ids.is_empty() {
                 return Ok(counts);
             }

@@ -231,7 +231,14 @@ open Beads. The scope and outcomes of individual checks follow below.
   On the network-backed build volume, five of 87 timed out acquiring a
   database connection during setup. The separate two-test run there also
   stopped at project setup. Both logs remain available.
-- [ ] Verify both workspace compiler graphs, strict Clippy and formatting.
+- [x] Run the two SQL fallback regressions on Linux. RCH build
+  `30097316119576664` passed both in 1.06 seconds on `vmi1152480`.
+  Its source receipt matched the six published search and build inputs.
+  On macOS the same 87 selected tests passed again in 3.55 seconds after
+  spelling U+212A with a Unicode escape in the test literals.
+- [x] Verify both workspace compiler graphs, strict Clippy and formatting.
+  All four passed on Apple Silicon with the test literals corrected.
+  All 3,939 tracked file hashes matched before and after the run.
 
 ### Storage recovery and concurrent writes
 
