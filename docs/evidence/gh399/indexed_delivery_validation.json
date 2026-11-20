@@ -1,0 +1,293 @@
+{
+  "schema_version": 1,
+  "issue": {
+    "repository": "Dicklesworthstone/mcp_agent_mail_rust",
+    "number": 399,
+    "url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/399",
+    "reported_operation": "fetch_inbox(unread_only=true, include_bodies=false, mark_read=false)",
+    "reporter_latency_seconds": 28.73,
+    "latency_provenance": "Issue reporter's 0.3.40 deployment; not reproduced or measured in this validation environment"
+  },
+  "status": "implementation_complete_validation_blocked",
+  "provenance": {
+    "source_hashes_recorded_at_utc": "2026-11-20T21:36:18Z",
+    "branch": "main",
+    "initial_base_commit": "4e83ee583dcb39bad6dc8bbcdd8157c31820b2ab",
+    "current_base_commit": "6801933049d28ce840e2bee822976deb497ba2a2",
+    "patch_commit_reference": "The Git commit containing this report",
+    "base_refresh": "Integrated the concurrent indexed-delivery fix and the subsequent upstream formatting/Beads updates. Their production behavior, tests, and unrelated records are retained; this follow-up adds complementary coverage and an exact SQL constant.",
+    "rust_toolchain": "nightly-2026-08-31",
+    "rustc_version": "1.100.0-nightly",
+    "rustc_commit_prefix": "908501772",
+    "manifests_changed": false,
+    "dependency_versions_changed": false,
+    "lockfile_changed": false,
+    "dependency_fetch_note": "-Zgit=shallow-deps affected dependency cache transport only; it did not substitute dependencies or change their pinned revisions",
+    "upstream_implementation_commit": "d10c0e8aa82f6b818052ecf3f7e9fbaeaa416e93",
+    "validation_attempts_scope": "All Cargo compilation/test/Clippy attempts recorded below ran on the earlier independent candidate based on 4e83ee5 or 386c5d2, before the concurrent d10c0e8 fix was incorporated. They failed in unchanged dependencies or the execution service before any changed crate was reached. They are blocker evidence, not validation of the final integrated source hashes.",
+    "prior_candidate_source_files": [
+      {
+        "path": "crates/mcp-agent-mail-db/src/sync/inbox.rs",
+        "sha256": "0eabb5cdd2266191e7d691ab562aece77b424b6bdf322723d9246e8e2c4b1f3c"
+      },
+      {
+        "path": "crates/mcp-agent-mail-db/src/project_mailbox.rs",
+        "sha256": "23a60cfd597cfca303660b27e3dc3a0e603c468d770b08fda10b603641c1eef1"
+      },
+      {
+        "path": "crates/mcp-agent-mail-db/benches/inbox_bench.rs",
+        "sha256": "aa18c3818837a478247bf355ef0cd8d3ec1e7ea2aad78bf46fc9e550cbc966e0"
+      },
+      {
+        "path": "crates/mcp-agent-mail-tools/tests/project_mailbox.rs",
+        "sha256": "18a682b119816e0d46092383e5d357129ac051789722af40990f3493ab5e8370"
+      }
+    ]
+  },
+  "source_files": [
+    {
+      "path": "crates/mcp-agent-mail-db/src/sync/inbox.rs",
+      "sha256": "0c71e69de71a79183248f9022cebaea9f2143d41fdc0cb4588e8fa771d8ac32a"
+    },
+    {
+      "path": "crates/mcp-agent-mail-db/src/project_mailbox.rs",
+      "sha256": "fc10afc2480db224955811d8692328c895b1167fd9ef03ca1512fb7e5deef82a"
+    },
+    {
+      "path": "crates/mcp-agent-mail-db/benches/inbox_bench.rs",
+      "sha256": "aa18c3818837a478247bf355ef0cd8d3ec1e7ea2aad78bf46fc9e550cbc966e0"
+    },
+    {
+      "path": "crates/mcp-agent-mail-tools/tests/project_mailbox.rs",
+      "sha256": "23213ab061b53832664a6571b397e34b230803965bb4eac4b55d6343bb7a0a66"
+    }
+  ],
+  "upstream_format_files": [
+    {
+      "path": "crates/mcp-agent-mail-storage/src/lib.rs",
+      "sha256": "c98e237e56159d6a99b3dab18c8fed2e1a192d55df19af962d410b1be3b27db4"
+    },
+    {
+      "path": "crates/mcp-agent-mail-tools/src/messaging.rs",
+      "sha256": "7a8b8d2f554b32f75f8ec4bf147e561d4230acbc398abc743bc7dffa79f517c5"
+    }
+  ],
+  "patch": {
+    "summary": "Retain upstream's indexed delivery fallback for unread/ACK inboxes and add complementary real-engine, snapshot, tool, and benchmark coverage",
+    "speculative_header_page_budget": 1,
+    "page_size": 128,
+    "delivery_index": "idx_project_mailbox_deliveries_project_ts(project_id, delivered_ts)",
+    "schema_migration_required": false,
+    "selection": [
+      "Preserve upstream's single newest-header page for dense or tightly time-bounded unread/ACK reads",
+      "Page shared delivery IDs through the existing project/timestamp index after incomplete speculation",
+      "Apply direct-recipient precedence and per-viewer read/ACK state before loading fallback message headers",
+      "Retain the requested newest window using authoritative messages.created_ts and message ID",
+      "Treat delivered_ts only as a traversal key, including when imported delivery timestamps differ from message timestamps",
+      "Keep visibility, selection, receipts, and body hydration inside the existing read snapshot"
+    ],
+    "memory_bound": "One delivery page and the requested top-N window, with bounded primary-key header lookups; no materialized project-message history",
+    "scope_limit": "The indexed fallback applies to unread/ACK filters and still examines shared-delivery history. Unfiltered reads retain upstream behavior. Very large equal-delivered_ts runs can require repeated traversal because the existing cursor offsets within the current boundary timestamp run.",
+    "fallback_filters": [
+      "unread_only",
+      "ack_required_only",
+      "ack_overdue_before"
+    ],
+    "followup_changes": [
+      "Extract the existing delivery SQL unchanged so query-plan and snapshot tests observe the actual production query",
+      "Compare fixed shared-delivery populations at two unrelated-history sizes, including fully read inboxes",
+      "Check cursor seeks, cancellation at receipt/header stages, and a real peer-commit snapshot race",
+      "Exercise metadata peek, consuming reads, per-agent receipts, and direct-recipient precedence through real tools",
+      "Keep the legacy shared-merge reference on the uncapped incumbent and retain all concurrent upstream regressions",
+      "Add sparse-shared unread Criterion workloads and record validation blockers without performance claims"
+    ]
+  },
+  "validation": {
+    "workspace_format": {
+      "status": "passed",
+      "command": "cargo fmt --all --check",
+      "exit_code": 0,
+      "base_commit_at_execution": "6801933049d28ce840e2bee822976deb497ba2a2",
+      "note": "Final integrated tree; upstream attachment-test formatting fixes are retained"
+    },
+    "changed_file_format": {
+      "status": "passed",
+      "note": "Changed Rust files formatted with the pinned rustfmt"
+    },
+    "diff_whitespace": {
+      "status": "passed",
+      "command": "git diff --check",
+      "exit_code": 0
+    },
+    "source_review": {
+      "status": "completed",
+      "note": "Independent comparisons found no blocking correctness issue in the concurrent upstream implementation. Its production behavior and tests were preserved; the additive tests were adapted to its one-page budget and reviewed. Static review does not establish compilation or runtime correctness."
+    },
+    "native_db_test_build_attempts": [
+      {
+        "attempt": 1,
+        "target": "mcp-agent-mail-db native library tests, --no-run",
+        "status": "blocked_before_changed_crate",
+        "exit_code": 101,
+        "settings": {
+          "jobs": 1,
+          "dev_debug": 0,
+          "test_debug": 0,
+          "default_opt_level": 1
+        },
+        "failure": "rustc compiling asupersync was terminated by SIGKILL (signal 9); the build did not reach the changed crate",
+        "runtime_tests_executed": false
+      },
+      {
+        "attempt": 2,
+        "target": "mcp-agent-mail-db native library tests, --no-run",
+        "status": "blocked_before_changed_crate",
+        "exit_code": 101,
+        "settings": {
+          "jobs": 1,
+          "dev_debug": 0,
+          "test_debug": 0,
+          "default_opt_level": 1,
+          "cargo_config_overrides": [
+            "profile.dev.package.asupersync.opt-level=0",
+            "profile.dev.package.asupersync.codegen-units=256"
+          ]
+        },
+        "failure": "rustc compiling asupersync was terminated by SIGKILL (signal 9); the build did not reach the changed crate",
+        "runtime_tests_executed": false
+      },
+      {
+        "attempt": 3,
+        "target": "mcp-agent-mail-db native library tests filtered to gh399",
+        "command": "cargo -Zgit=shallow-deps --config profile.dev.package.asupersync.opt-level=0 --config profile.dev.package.asupersync.codegen-units=256 test --locked -p mcp-agent-mail-db --lib --no-default-features gh399 -- --nocapture",
+        "status": "blocked_before_changed_crate",
+        "exit_code": 101,
+        "settings": {
+          "jobs": 1,
+          "dev_debug": 0,
+          "test_debug": 0,
+          "default_opt_level": 1,
+          "cargo_config_overrides": [
+            "profile.dev.package.asupersync.opt-level=0",
+            "profile.dev.package.asupersync.codegen-units=256"
+          ]
+        },
+        "retry_reason": "Execution service recovered with 7698036 KiB of available memory, materially more than during the earlier attempts",
+        "failure": "rustc compiling asupersync was again terminated by SIGKILL (signal 9); no changed crate or test ran",
+        "runtime_tests_executed": false
+      }
+    ],
+    "workspace_check_all_targets": {
+      "status": "interrupted_by_execution_service",
+      "command": "cargo check --workspace --all-targets",
+      "exit_code": null,
+      "failure": "exec-server transport disconnected; executor key changed during session recovery. Dependency compilation was still in progress and no final compiler result was available."
+    },
+    "workspace_check_production_graph": {
+      "status": "blocked_before_changed_crate",
+      "command": "cargo check --workspace --lib --bins",
+      "exit_code": 101,
+      "failure": "rustc compiling asupersync was terminated by SIGKILL (signal 9) even with --emit=dep-info,metadata, before checking the changed crate"
+    },
+    "workspace_clippy": {
+      "status": "blocked_during_dependency_checkout",
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "exit_code": 101,
+      "failure": "Failed to make the Asupersync dependency checkout directory: No space left on device. No patched crate was linted."
+    },
+    "runtime_tests": {
+      "status": "not_executed",
+      "reason": "Native test executable builds stopped in asupersync before reaching the changed crate"
+    },
+    "criterion_benchmark": {
+      "status": "not_executed",
+      "group": "inbox_sparse_shared_unread",
+      "shared_deliveries": 256,
+      "unrelated_project_message_counts": [
+        0,
+        10000,
+        50000
+      ],
+      "remaining_unread_counts": [
+        5,
+        0
+      ],
+      "limit": 20,
+      "include_bodies": false,
+      "fixture_setup_timed": false,
+      "samples": []
+    },
+    "prior_candidate_workspace_format": {
+      "status": "passed",
+      "command": "cargo fmt --all --check",
+      "exit_code": 0,
+      "base_commit_at_execution": "386c5d27303cdebb817ec5ad83fd941870636c42",
+      "note": "Passed both before and after the unrelated fast-forward"
+    },
+    "final_integrated_candidate_build": {
+      "status": "not_executed",
+      "reason": "The prior candidate could not get through the same pinned Asupersync dependency even in metadata-only mode. Clippy also exhausted checkout storage. No further compilation is claimed for the integrated tree."
+    }
+  },
+  "added_regressions": [
+    {
+      "name": "gh399_unread_shared_work_is_independent_of_unrelated_message_history",
+      "coverage": "Live incumbent/result comparison, constant delivery population at two project-history sizes, all-read and sparse-unread states, bounded page/header work, direct read precedence, timestamp extremes/ties, and actual-engine index seek program"
+    },
+    {
+      "name": "gh399_sparse_shared_header_speculation_falls_back_without_losing_old_mail",
+      "coverage": "An incomplete single-page unread speculation selects the exact delivery fallback without dropping old shared mail"
+    },
+    {
+      "name": "gh399_dense_and_time_bounded_unread_reads_keep_the_short_header_path",
+      "coverage": "Dense and since-bounded unread reads retain their short header path"
+    },
+    {
+      "name": "gh399_cancelled_delivery_fallback_releases_its_snapshot",
+      "coverage": "Cancellation of the indexed fallback releases the read snapshot without publishing a partial inbox"
+    },
+    {
+      "name": "project_mailbox_unread_metadata_preserves_order_and_recipient_state",
+      "coverage": "Real send/read/ACK/fetch entrypoints with 300 newer unrelated headers forcing fallback; delivery timestamp skew, newest ties, metadata-only output, direct precedence, per-agent receipts, peek, consuming read, and eventual empty inbox"
+    }
+  ],
+  "extended_regressions": [
+    {
+      "name": "shared_inbox_snapshot_keeps_membership_body_and_receipts_consistent",
+      "coverage": "Preserves the original dense-header peer-commit race and adds a real second-connection commit after an indexed delivery-page read to check snapshot coherence and subsequent visibility of committed membership/body/receipt state"
+    }
+  ],
+  "existing_oracles_to_rerun": [
+    "paged_shared_inbox_matches_join_for_every_filter_and_body_policy",
+    "shared_inbox_finishes_large_timestamp_ties_and_skips_invisible_pages",
+    "mixed_direct_and_shared_inbox_preserves_one_ranked_window",
+    "indexed_inbox_matches_reference_for_all_filters_and_body_policies",
+    "indexed_pipeline_bounds_each_lookup_and_hydrates_only_selected_bodies",
+    "indexed_queries_use_recipient_range_and_message_primary_keys",
+    "gh374_header_pages_seek_with_timestamp_extremes_and_ties",
+    "gh374_shared_merge_bound_preserves_ties_filters_and_partial_windows",
+    "gh374_cancelled_inbox_pages_release_snapshot_without_publishing_partial_mail",
+    "gh399_unread_and_ack_windows_skip_unrelated_project_history",
+    "gh399_delivery_pages_preserve_imported_times_visibility_and_dense_reads"
+  ],
+  "rerun_commands": [
+    "cargo test --locked -p mcp-agent-mail-db --no-default-features --lib gh399 -- --nocapture",
+    "cargo test --locked -p mcp-agent-mail-db --no-default-features --lib project_mailbox::tests -- --nocapture",
+    "cargo test --locked -p mcp-agent-mail-db --no-default-features --lib sync::inbox::tests -- --nocapture",
+    "cargo test --locked -p mcp-agent-mail-tools --no-default-features --test it project_mailbox_unread_metadata_preserves_order_and_recipient_state -- --nocapture",
+    "cargo bench --locked -p mcp-agent-mail-db --no-default-features --bench inbox_bench -- inbox_sparse_shared_unread",
+    "cargo check --locked --workspace --all-targets",
+    "cargo check --locked --workspace --lib --bins",
+    "cargo clippy --locked --workspace --all-targets -- -D warnings",
+    "cargo fmt --all --check"
+  ],
+  "claims": {
+    "compilation_verified": false,
+    "lint_verified": false,
+    "runtime_correctness_verified": false,
+    "production_latency_measured": false,
+    "speedup_measured": false,
+    "issue_closed": false,
+    "note": "Regression code and benchmark fixtures have been added. Unexecuted assertions are coverage plans, not passing evidence; no speedup or issue-closure claim is made."
+  }
+}

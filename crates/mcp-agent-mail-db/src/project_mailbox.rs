@@ -457,6 +457,10 @@ pub fn project_mailbox_inbox_counts_from_conn(
     })
 }
 
+pub(crate) const DELIVERY_PAGE_SQL: &str = "SELECT message_id, delivered_ts FROM project_mailbox_deliveries \
+               WHERE project_id = ? AND delivered_ts >= ? \
+               ORDER BY delivered_ts ASC, message_id ASC LIMIT 128 OFFSET ?";
+
 /// Page in the existing project/timestamp index's order. Supply a typed
 /// lower timestamp bound even on the first page so the pinned engine can seek
 /// directly into this project's composite index instead of starting a history
@@ -469,16 +473,13 @@ pub(crate) fn project_mailbox_delivery_ids(
     floor: &mut Option<i64>,
     skip_at_floor: &mut i64,
 ) -> Result<Vec<i64>, DbError> {
-    let sql = "SELECT message_id, delivered_ts FROM project_mailbox_deliveries \
-               WHERE project_id = ? AND delivered_ts >= ? \
-               ORDER BY delivered_ts ASC, message_id ASC LIMIT 128 OFFSET ?";
     let params = vec![
         Value::BigInt(project_id),
         Value::BigInt(floor.unwrap_or(i64::MIN)),
         Value::BigInt(*skip_at_floor),
     ];
     let rows = conn
-        .query_sync(sql, &params)
+        .query_sync(DELIVERY_PAGE_SQL, &params)
         .map_err(|error| DbError::Sqlite(error.to_string()))?;
     if rows.len() > 128 {
         return Err(DbError::Internal(
@@ -2884,6 +2885,11 @@ mod tests {
 
     #[test]
     fn shared_inbox_snapshot_keeps_membership_body_and_receipts_consistent() {
+        assert_shared_inbox_snapshot_race(false);
+        assert_shared_inbox_snapshot_race(true);
+    }
+
+    fn assert_shared_inbox_snapshot_race(use_delivery_index: bool) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("shared-snapshot.sqlite3");
         let reader = crate::guard_db_conn(
@@ -2909,6 +2915,25 @@ mod tests {
             )
             .unwrap();
         seed_shared_reader(&reader, 1, 1);
+        if use_delivery_index {
+            // The one old shared message lies beyond the speculative header
+            // page, so the unread read must reach the indexed fallback.
+            reader.execute_raw("BEGIN IMMEDIATE").unwrap();
+            for first in (2..=301).step_by(100) {
+                let last = (first + 99).min(301);
+                let rows = (first..=last)
+                    .map(|id| format!("({id},1,1,'unrelated-{id}','unrelated body',{})", id * 1000))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                reader
+                    .execute_raw(&format!(
+                        "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                         VALUES {rows}"
+                    ))
+                    .unwrap();
+            }
+            reader.execute_raw("COMMIT").unwrap();
+        }
         let writer = crate::guard_db_conn(
             DbConn::open_file(path.to_str().unwrap()).unwrap(),
             "shared peer",
@@ -2916,7 +2941,10 @@ mod tests {
         struct Racing<'a> {
             reader: &'a DbConn,
             writer: &'a DbConn,
+            use_delivery_index: bool,
             committed: std::cell::Cell<bool>,
+            header_pages: std::cell::Cell<usize>,
+            delivery_pages: std::cell::Cell<usize>,
         }
         impl crate::pool::SyncQuery for Racing<'_> {
             fn query_sync(
@@ -2925,9 +2953,20 @@ mod tests {
                 params: &[Value],
             ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
                 let rows = self.reader.query_sync(sql, params)?;
-                if sql.contains("ORDER BY created_ts DESC, id DESC LIMIT 128")
-                    && !self.committed.replace(true)
-                {
+                let is_header = sql.contains("ORDER BY created_ts DESC, id DESC LIMIT 128");
+                let is_delivery = sql == DELIVERY_PAGE_SQL;
+                if is_header {
+                    self.header_pages.set(self.header_pages.get() + 1);
+                }
+                if is_delivery {
+                    self.delivery_pages.set(self.delivery_pages.get() + 1);
+                }
+                let inject = if self.use_delivery_index {
+                    is_delivery
+                } else {
+                    is_header
+                };
+                if inject && !self.committed.replace(true) {
                     self.writer.execute_raw("BEGIN IMMEDIATE;
                         UPDATE agents SET retired_at=99 WHERE id=2;
                         UPDATE messages SET body_md='changed body' WHERE id=1;
@@ -2943,15 +2982,25 @@ mod tests {
         let race = Racing {
             reader: &reader,
             writer: &writer,
+            use_delivery_index,
             committed: std::cell::Cell::new(false),
+            header_pages: std::cell::Cell::new(0),
+            delivery_pages: std::cell::Cell::new(0),
         };
         let filters = InboxFetchOptions {
+            unread_only: use_delivery_index,
             body_policy: InboxBodyPolicy::Full,
             ..options()
         };
         let old = fetch_project_mailbox_rows_from_conn(&race, 1, 2, None, 20, filters).unwrap();
         assert!(race.committed.get());
+        assert_eq!(
+            (race.header_pages.get(), race.delivery_pages.get()),
+            if use_delivery_index { (1, 1) } else { (1, 0) },
+            "the peer commit must occur on the intended reader path"
+        );
         assert_eq!(old.len(), 1);
+        assert_eq!(old[0].message.id, Some(1));
         assert_eq!(old[0].message.body_md, "body-1");
         assert_eq!((old[0].read_ts, old[0].ack_ts), (None, None));
         assert!(
@@ -2962,8 +3011,27 @@ mod tests {
         writer
             .execute_raw("UPDATE agents SET retired_at=NULL WHERE id=2")
             .unwrap();
-        let current =
-            fetch_project_mailbox_rows_from_conn(&*reader, 1, 2, None, 20, filters).unwrap();
+        if use_delivery_index {
+            assert!(
+                fetch_project_mailbox_rows_from_conn(&*reader, 1, 2, None, 20, filters)
+                    .unwrap()
+                    .is_empty(),
+                "the next unread snapshot observes the committed read receipt"
+            );
+        }
+        let current = fetch_project_mailbox_rows_from_conn(
+            &*reader,
+            1,
+            2,
+            None,
+            20,
+            InboxFetchOptions {
+                unread_only: false,
+                ..filters
+            },
+        )
+        .unwrap();
+        assert_eq!(current.len(), 1);
         assert_eq!(current[0].message.body_md, "changed body");
         assert_eq!(
             (current[0].read_ts, current[0].ack_ts),

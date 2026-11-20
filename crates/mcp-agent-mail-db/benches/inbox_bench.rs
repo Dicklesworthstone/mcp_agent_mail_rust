@@ -2,6 +2,8 @@
 //!
 //! Seeds an in-memory DB with 10K messages distributed across agents,
 //! then measures `fetch_inbox_rows_from_conn` at various limits.
+//! The GH#399 sparse-shared cases hold the delivery population fixed while
+//! increasing unrelated project traffic, including an entirely read inbox.
 
 use std::cell::OnceCell;
 use std::hint::black_box;
@@ -284,11 +286,91 @@ fn bench_inbox_stats_query(c: &mut Criterion) {
     });
 }
 
+fn seeded_sparse_shared_conn(unrelated_messages: usize) -> (DbConn, i64, Vec<i64>) {
+    let (conn, project_id, agent_ids) = seeded_conn(0);
+    let last_id = 256 + i64::try_from(unrelated_messages).expect("fixture size fits i64");
+    let body = "x".repeat(512);
+    conn.execute_raw("BEGIN IMMEDIATE")
+        .expect("begin sparse shared seed");
+    for first in (1..=last_id).step_by(128) {
+        let last = (first + 127).min(last_id);
+        let rows = (first..=last)
+            .map(|id| {
+                let created = 1_700_000_000_000_000_i64 + id * 1000;
+                format!("({id},1,1,'subject-{id}','{body}',{created})")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute_raw(&format!(
+            "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) VALUES {rows}"
+        ))
+        .expect("seed sparse shared message headers and bodies");
+    }
+    conn.execute_raw(
+        "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+         SELECT id,project_id,'to',created_ts FROM messages WHERE id <= 256; \
+         INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts) \
+         SELECT id,2,CASE WHEN id <= 251 THEN 1700000001000000 ELSE NULL END \
+         FROM messages WHERE id <= 256; \
+         INSERT INTO message_recipients(message_id,agent_id,kind) \
+         SELECT id,3,'to' FROM messages WHERE id > 256; \
+         COMMIT; PRAGMA query_only = ON",
+    )
+    .expect("seed shared receipt state and unrelated direct deliveries");
+    (conn, project_id, agent_ids)
+}
+
+fn bench_sparse_shared_unread(c: &mut Criterion) {
+    let mut group = c.benchmark_group("inbox_sparse_shared_unread");
+    group.sample_size(20);
+    for unrelated in [0, 10_000, 50_000] {
+        let state = OnceCell::new();
+        for unread in [5, 0] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("shared256_unread{unread}"), unrelated),
+                &unread,
+                |b, &unread| {
+                    let (conn, project_id, agent_ids) =
+                        state.get_or_init(|| seeded_sparse_shared_conn(unrelated));
+                    if unread == 0 {
+                        conn.execute_raw(
+                            "PRAGMA query_only = OFF; \
+                             UPDATE project_mailbox_receipts SET read_ts = 1700000001000000 \
+                             WHERE agent_id = 2 AND read_ts IS NULL; \
+                             PRAGMA query_only = ON",
+                        )
+                        .expect("mark the final shared deliveries read");
+                    }
+                    let fetch = || {
+                        fetch_inbox_metadata_rows_from_conn(
+                            conn,
+                            *project_id,
+                            agent_ids[1],
+                            false,
+                            true,
+                            false,
+                            None,
+                            20,
+                        )
+                        .expect("sparse shared unread inbox")
+                    };
+                    // Both workloads exhaust their candidates without filling
+                    // the limit: unrelated traffic cannot become a scan bound.
+                    assert_eq!(fetch().len(), unread);
+                    b.iter(|| black_box(fetch()));
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_inbox_fetch,
     bench_inbox_fetch_since,
     bench_inbox_fetch_body_policy,
     bench_inbox_stats_query,
+    bench_sparse_shared_unread,
 );
 criterion_main!(benches);

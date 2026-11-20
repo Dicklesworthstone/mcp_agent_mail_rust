@@ -162,6 +162,31 @@ async fn inbox(
     serde_json::from_str(&inbox).expect("inbox JSON")
 }
 
+async fn unread_metadata_inbox(
+    ctx: &McpContext,
+    project: &str,
+    agent: &str,
+    limit: i32,
+    mark_read: bool,
+) -> Vec<Value> {
+    let response = fetch_inbox(
+        ctx,
+        project.to_string(),
+        agent.to_string(),
+        None,
+        None,
+        Some(limit),
+        Some(false),
+        Some(true),
+        None,
+        None,
+        Some(mark_read),
+    )
+    .await
+    .expect("fetch unread metadata inbox");
+    serde_json::from_str(&response).expect("unread metadata inbox JSON")
+}
+
 /// Message ids and kinds on an agent's durable delivery-event page.
 async fn delivery_events(ctx: &McpContext, project: &str, agent: &str) -> Vec<(i64, String)> {
     let page: Value = serde_json::from_str(
@@ -548,6 +573,156 @@ fn project_mailbox_addresses_are_validated_and_combine_with_direct_recipients() 
                 .iter()
                 .any(|row| row["id"] == reply_id),
             "the replier does not receive its own project mail"
+        );
+    });
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn project_mailbox_unread_metadata_preserves_order_and_recipient_state() {
+    run_with_storage(|cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project = format!("/tmp/project-mailbox-{}", unique_suffix());
+        let slug = project_slug(&ctx, &project).await;
+        let address = format!("project:{slug}");
+        register(&ctx, &project, "GreenCastle", "open").await;
+        register(&ctx, &project, "BlueLake", "open").await;
+        register(&ctx, &project, "RedStone", "open").await;
+
+        let mut shared_ids = Vec::new();
+        for _ in 0..5 {
+            let sent = send(&ctx, &project, "GreenCastle", &[&address], None, None, true)
+                .await
+                .expect("send shared inbox fixture");
+            shared_ids.push(sent["deliveries"][0]["payload"]["id"].as_i64().unwrap());
+        }
+        let direct = send(
+            &ctx,
+            &project,
+            "GreenCastle",
+            &["BlueLake"],
+            Some(&[&address]),
+            None,
+            true,
+        )
+        .await
+        .expect("send direct and shared fixture");
+        let direct_id = direct["deliveries"][0]["payload"]["id"].as_i64().unwrap();
+
+        // A read direct receipt wins even though this same message also has
+        // an unread shared delivery. Shared read/ACK state is per viewer.
+        for id in [direct_id, shared_ids[3]] {
+            mark_message_read(&ctx, project.clone(), "BlueLake".to_string(), id)
+                .await
+                .expect("record an explicit read receipt");
+        }
+        acknowledge_message(
+            &ctx,
+            project.clone(),
+            "BlueLake".to_string(),
+            shared_ids[4],
+            None,
+        )
+        .await
+        .expect("acknowledge shared mail");
+
+        {
+            let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("DB pool");
+            let conn = pool.acquire(&cx).await.into_result().expect("DB checkout");
+            // GH#399: the delivery index locates candidates; its timestamp
+            // is not the authority for visibility or the newest window. In
+            // either traversal direction, stopping after two deliveries
+            // would select the oldest message instead of one of the newest.
+            for (id, delivered) in [
+                (shared_ids[0], 0_i64),
+                (shared_ids[1], -1),
+                (shared_ids[2], 1000),
+            ] {
+                conn.execute_sync(
+                    "UPDATE project_mailbox_deliveries SET delivered_ts = ? WHERE message_id = ?",
+                    &[delivered.into(), id.into()],
+                )
+                .expect("set delivery timestamps independently of message timestamps");
+            }
+            let newest_ts = conn
+                .query_sync(
+                    "SELECT created_ts FROM messages WHERE id = ?",
+                    &[shared_ids[2].into()],
+                )
+                .expect("read authoritative message timestamp")[0]
+                .get_as::<i64>(0)
+                .unwrap();
+            conn.execute_sync(
+                "UPDATE messages SET created_ts = ? WHERE id = ?",
+                &[newest_ts.into(), shared_ids[1].into()],
+            )
+            .expect("make the newest two messages share a timestamp");
+
+            // Force the real tool through the delivery-index fallback: the
+            // speculative header page contains only newer unrelated mail.
+            // These fixture headers have no direct or shared delivery rows.
+            let latest = conn
+                .query_sync(
+                    "SELECT project_id, sender_id, created_ts FROM messages WHERE id = ?",
+                    &[direct_id.into()],
+                )
+                .expect("read fixture project and sender");
+            let project_id = latest[0].get_named::<i64>("project_id").unwrap();
+            let sender_id = latest[0].get_named::<i64>("sender_id").unwrap();
+            let created = latest[0].get_named::<i64>("created_ts").unwrap();
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            for first in (1..=300).step_by(100) {
+                let rows = (first..first + 100)
+                    .map(|offset| {
+                        format!(
+                            "({project_id},{sender_id},'unrelated-{offset}','unrelated body',{})",
+                            created + offset
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages(project_id,sender_id,subject,body_md,created_ts) VALUES {rows}"
+                ))
+                .expect("seed unrelated project traffic");
+            }
+            conn.execute_raw("COMMIT").unwrap();
+        }
+
+        let rows = unread_metadata_inbox(&ctx, &project, "BlueLake", 2, false).await;
+        let ids = |rows: &[Value]| {
+            rows.iter()
+                .map(|row| row["id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&rows), vec![shared_ids[2], shared_ids[1]]);
+        assert!(rows.iter().all(|row| {
+            row["via"] == "project" && row.get("body_md").is_none() && row.get("read_ts").is_none()
+        }));
+        assert_eq!(
+            table_count(&cx, "SELECT COUNT(*) FROM project_mailbox_receipts").await,
+            2,
+            "a metadata-only peek must not materialize read receipts"
+        );
+
+        let red = unread_metadata_inbox(&ctx, &project, "RedStone", 100, false).await;
+        assert_eq!(red.len(), 6, "BlueLake's read and ACK state is private");
+        assert!(
+            red.iter()
+                .any(|row| row["id"] == direct_id && row["via"] == "project")
+        );
+
+        let consumed = unread_metadata_inbox(&ctx, &project, "BlueLake", 2, true).await;
+        assert_eq!(ids(&consumed), ids(&rows));
+        assert!(consumed.iter().all(|row| row["read_ts"].is_string()));
+        let remaining = unread_metadata_inbox(&ctx, &project, "BlueLake", 2, false).await;
+        assert_eq!(ids(&remaining), vec![shared_ids[0]]);
+        unread_metadata_inbox(&ctx, &project, "BlueLake", 2, true).await;
+        assert!(
+            unread_metadata_inbox(&ctx, &project, "BlueLake", 2, false)
+                .await
+                .is_empty(),
+            "fully read shared mail must not resurface through a different delivery kind"
         );
     });
 }

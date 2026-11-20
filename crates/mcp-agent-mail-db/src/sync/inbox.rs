@@ -2112,8 +2112,380 @@ mod tests {
         }
     }
 
+    /// The pre-GH#399 shared plan, run live on the same connection for work
+    /// and result comparisons. These fixtures all have a visible viewer;
+    /// read its actual inception so timestamp-extreme cases stay faithful.
+    fn original_shared_rows(
+        conn: &impl SyncQuery,
+        since: Option<i64>,
+        limit: usize,
+        filters: InboxFetchOptions<'_>,
+    ) -> Result<Vec<InboxRow>, DbError> {
+        let viewer = query(
+            conn,
+            crate::project_mailbox::SHARED_VIEWER_SQL,
+            &[2_i64.into()],
+        )?;
+        let viewer = SharedViewer {
+            project_id: 1,
+            agent_id: 2,
+            inception: viewer[0].get_named("inception_ts").map_err(db_error)?,
+        };
+        let newest = shared_header_window(conn, viewer, since, limit, filters, None)?
+            .expect("unbounded reference must finish its shared window");
+        hydrate(conn, 1, newest, filters.body_policy, false)
+    }
+
+    #[test]
+    fn gh399_unread_shared_work_is_independent_of_unrelated_message_history() {
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 257), i64::MAX, |id| id * 1000, |_| "normal");
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             SELECT id,project_id,'to',CASE WHEN id <= 200 THEN -9223372036854775808 \
+             ELSE 9223372036854775807 END FROM messages; \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) \
+             SELECT id,2,CASE WHEN id <= 252 THEN 1 ELSE NULL END,NULL FROM messages; \
+             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts) \
+             VALUES(257,2,'to',1); \
+             UPDATE messages SET created_ts = 1000 WHERE id <= 257",
+        )
+        .unwrap();
+        let mut previous_last = 257;
+        let mut work_by_state = HashMap::new();
+        for message_count in [2_000, 10_000] {
+            seed_walk(
+                &conn,
+                (previous_last + 1, message_count),
+                i64::MAX,
+                |id| id * 1000,
+                |_| "normal",
+            );
+            previous_last = message_count;
+            for all_read in [false, true] {
+                conn.execute_raw(if all_read {
+                    "UPDATE project_mailbox_receipts SET read_ts = 1 WHERE agent_id = 2"
+                } else {
+                    "UPDATE project_mailbox_receipts SET read_ts = NULL \
+                     WHERE agent_id = 2 AND message_id > 252"
+                })
+                .unwrap();
+                conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                let filters = InboxFetchOptions {
+                    unread_only: true,
+                    body_policy: InboxBodyPolicy::MetadataOnly,
+                    ..options()
+                };
+                let old = Recording {
+                    conn: &conn,
+                    calls: RefCell::new(Vec::new()),
+                };
+                let started = std::time::Instant::now();
+                let expected =
+                    with_snapshot(&old, || original_shared_rows(&old, None, 20, filters)).unwrap();
+                let original_us = started.elapsed().as_micros();
+                let observed = Recording {
+                    conn: &conn,
+                    calls: RefCell::new(Vec::new()),
+                };
+                let started = std::time::Instant::now();
+                let actual = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+                    &observed, 1, 2, None, 20, filters,
+                )
+                .unwrap();
+                let candidate_us = started.elapsed().as_micros();
+                same_rows(&actual, &expected);
+                let expected_ids: Vec<i64> = if all_read {
+                    Vec::new()
+                } else {
+                    vec![256, 255, 254, 253]
+                };
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|row| row.message.id.unwrap())
+                        .collect::<Vec<_>>(),
+                    expected_ids,
+                    "direct read receipt must suppress the shared copy; creation-time ties use ID"
+                );
+                let calls = observed.calls.borrow();
+                assert_eq!(
+                    query_counts(&calls).0,
+                    1,
+                    "sparse filtered reads must stop speculative project-header work"
+                );
+                let delivery_pages: Vec<_> = calls
+                    .iter()
+                    .filter(|(sql, _, _)| sql == crate::project_mailbox::DELIVERY_PAGE_SQL)
+                    .collect();
+                assert_eq!(delivery_pages.len(), 3);
+                assert_eq!(
+                    delivery_pages
+                        .iter()
+                        .map(|(_, _, rows)| *rows)
+                        .sum::<usize>(),
+                    257
+                );
+                let header_rows = calls
+                    .iter()
+                    .filter(|(sql, _, _)| {
+                        sql.starts_with(&format!(
+                            "SELECT {HEADER_COLUMNS} FROM messages WHERE id IN"
+                        ))
+                    })
+                    .map(|(_, _, rows)| *rows)
+                    .sum::<usize>();
+                assert_eq!(
+                    header_rows,
+                    expected_ids.len(),
+                    "read receipts must be filtered before headers"
+                );
+                assert!(calls.iter().all(|(sql, binds, rows)| !sql.contains("JOIN")
+                    && *binds <= SHARED_PAGE_SIZE
+                    && *rows <= SHARED_PAGE_SIZE));
+                assert!(actual.iter().all(|row| row.message.body_md.is_empty()));
+                let work = (calls.len(), delivery_pages.len(), header_rows);
+                if let Some(previous) = work_by_state.insert(all_read, work) {
+                    assert_eq!(
+                        work, previous,
+                        "unrelated messages changed shared inbox work"
+                    );
+                }
+                assert!(
+                    query_counts(&old.calls.borrow()).0
+                        >= usize::try_from(message_count).unwrap() / SHARED_PAGE_SIZE,
+                    "live incumbent must still exercise the project-history scan"
+                );
+                let original_pages = query_counts(&old.calls.borrow()).0;
+                let candidate_pages = query_counts(&calls).0;
+                println!(
+                    "{{\"case\":\"gh399_sparse_shared\",\"messages\":{message_count},\"shared_deliveries\":257,\"all_read\":{all_read},\"limit\":20,\"original_header_pages\":{original_pages},\"candidate_header_pages\":{candidate_pages},\"delivery_pages\":3,\"candidate_header_probes\":{header_rows},\"original_us\":{original_us},\"candidate_us\":{candidate_us}}}"
+                );
+                conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+            }
+        }
+        // The cursor must seek on both project and timestamp, including signed
+        // extremes and the second page of a long timestamp tie. Verify the
+        // actual pinned engine's program, not only its optimistic plan label.
+        for (floor, skip) in [(i64::MIN, 0_i64), (i64::MIN, 128), (i64::MAX, 56)] {
+            let sql = crate::project_mailbox::DELIVERY_PAGE_SQL;
+            let params = [1_i64.into(), floor.into(), skip.into()];
+            assert_bounded_seek(&conn, sql, &params, 2);
+            let ops = explain_ops(&conn, sql, &params);
+            assert!(
+                ops.iter().all(|(op, _, _)| !matches!(
+                    op.as_str(),
+                    "Rewind"
+                        | "Last"
+                        | "OpenEphemeral"
+                        | "SorterOpen"
+                        | "SorterInsert"
+                        | "SorterSort"
+                        | "Sort"
+                )),
+                "delivery cursor must seek without sorting or walking another project's history: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gh399_sparse_shared_header_speculation_falls_back_without_losing_old_mail() {
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 2_000), i64::MAX, |id| id * 1000, |_| "normal");
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             VALUES(1,1,'to',9223372036854775807),(2,1,'to',-9223372036854775808); \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+        let observed = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
+        let filters = InboxFetchOptions {
+            unread_only: true,
+            body_policy: InboxBodyPolicy::MetadataOnly,
+            ..options()
+        };
+        let actual = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+            &observed, 1, 2, None, 20, filters,
+        )
+        .unwrap();
+        let expected =
+            with_snapshot(&conn, || original_shared_rows(&conn, None, 20, filters)).unwrap();
+        same_rows(&actual, &expected);
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| row.message.id.unwrap())
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(query_counts(&observed.calls.borrow()).0, 1);
+        assert_eq!(
+            observed
+                .calls
+                .borrow()
+                .iter()
+                .filter(|(sql, _, _)| sql == crate::project_mailbox::DELIVERY_PAGE_SQL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn gh399_dense_and_time_bounded_unread_reads_keep_the_short_header_path() {
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 600), i64::MAX, |id| id * 1000, |_| "high");
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             SELECT id,project_id,'to',-id FROM messages; PRAGMA query_only = ON",
+        )
+        .unwrap();
+        for filters in [
+            options(),
+            InboxFetchOptions {
+                unread_only: true,
+                ..options()
+            },
+            InboxFetchOptions {
+                ack_required_only: true,
+                ..options()
+            },
+        ] {
+            for since in [None, Some(599_000), Some(600_000)] {
+                let observed = Recording {
+                    conn: &conn,
+                    calls: RefCell::new(Vec::new()),
+                };
+                let actual = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+                    &observed, 1, 2, since, 20, filters,
+                )
+                .unwrap();
+                let expected =
+                    with_snapshot(&conn, || original_shared_rows(&conn, since, 20, filters))
+                        .unwrap();
+                same_rows(&actual, &expected);
+                assert_eq!(query_counts(&observed.calls.borrow()).0, 1);
+                assert!(
+                    observed
+                        .calls
+                        .borrow()
+                        .iter()
+                        .all(|(sql, _, _)| sql != crate::project_mailbox::DELIVERY_PAGE_SQL),
+                    "a complete recent window must not scan delivery history"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gh399_cancelled_delivery_fallback_releases_its_snapshot() {
+        struct Interrupt<'a> {
+            conn: &'a DbConn,
+            cx: &'a Cx,
+            target: &'a str,
+            interrupted: Cell<bool>,
+            queries_after_cancel: Cell<usize>,
+            releases_after_cancel: Cell<usize>,
+        }
+        impl SyncQuery for Interrupt<'_> {
+            fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
+                if self.cx.is_cancel_requested() {
+                    self.queries_after_cancel
+                        .set(self.queries_after_cancel.get() + 1);
+                }
+                let rows = self.conn.query_sync(sql, params)?;
+                if sql.starts_with(self.target) {
+                    self.interrupted.set(true);
+                    self.cx.set_cancel_requested(true);
+                }
+                Ok(rows)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+                if self.cx.is_cancel_requested() && sql == "RELEASE SAVEPOINT am_inbox_read" {
+                    self.releases_after_cancel
+                        .set(self.releases_after_cancel.get() + 1);
+                }
+                self.conn.execute_raw(sql)
+            }
+        }
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 600), i64::MAX, |id| id * 1000, |_| "normal");
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             VALUES(1,1,'to',0),(2,1,'to',0),(3,1,'to',0); \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts) VALUES(1,2,1); \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+        let filters = InboxFetchOptions {
+            unread_only: true,
+            ..options()
+        };
+        let control = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
+        let expected = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+            &control, 1, 2, None, 20, filters,
+        )
+        .unwrap();
+        assert_eq!(expected.len(), 2);
+        let header_prefix = format!("SELECT {HEADER_COLUMNS} FROM messages WHERE id IN");
+        for prefix in [
+            crate::project_mailbox::DELIVERY_PAGE_SQL,
+            "SELECT message_id, read_ts, ack_ts FROM project_mailbox_receipts WHERE message_id IN",
+            header_prefix.as_str(),
+        ] {
+            assert!(
+                control
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|(sql, _, _)| sql.starts_with(prefix)),
+                "delivery cancellation stage did not execute: {prefix}"
+            );
+            let cx = Cx::for_testing();
+            let interrupt = Interrupt {
+                conn: &conn,
+                cx: &cx,
+                target: prefix,
+                interrupted: Cell::new(false),
+                queries_after_cancel: Cell::new(0),
+                releases_after_cancel: Cell::new(0),
+            };
+            let cancellable = CancellableRead::new(&interrupt, &cx);
+            let result = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+                &cancellable,
+                1,
+                2,
+                None,
+                20,
+                filters,
+            );
+            assert!(
+                matches!(cancellable.finish(result), Outcome::Cancelled(_)),
+                "{prefix}"
+            );
+            assert!(interrupt.interrupted.get(), "{prefix}");
+            assert_eq!(interrupt.queries_after_cancel.get(), 0, "{prefix}");
+            assert_eq!(interrupt.releases_after_cancel.get(), 1, "{prefix}");
+            assert!(
+                conn.execute_raw("RELEASE SAVEPOINT am_inbox_read").is_err(),
+                "{prefix}"
+            );
+            let reused = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+                &conn, 1, 2, None, 20, filters,
+            )
+            .unwrap();
+            same_rows(&reused, &expected);
+        }
+    }
+
     /// The pre-GH#374 merge, retained as an independent exact-result/work
-    /// comparison: each lane reads its complete top-N before merging.
+    /// comparison: each lane reads its complete top-N before merging. Keep
+    /// the original shared header plan even as production changes its plan.
     fn unbounded_shared_merge(
         conn: &impl SyncQuery,
         since: Option<i64>,
@@ -2122,9 +2494,7 @@ mod tests {
     ) -> Vec<InboxRow> {
         with_snapshot(conn, || {
             let direct = fetch_direct(conn, 1, 2, since, limit, filters)?;
-            let shared = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
-                conn, 1, 2, since, limit, filters,
-            )?;
+            let shared = original_shared_rows(conn, since, limit, filters)?;
             Ok(crate::project_mailbox::merge_inbox_rows(
                 direct, shared, limit,
             ))
