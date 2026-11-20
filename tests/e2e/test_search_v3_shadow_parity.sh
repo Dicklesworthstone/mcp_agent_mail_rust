@@ -945,7 +945,7 @@ PY
 e2e_case_banner "Setup: seed deterministic corpus for shadow parity"
 search_v3_log "Seeding alpha/beta projects, agents, threads, product links"
 
-SETUP_RESP="$(send_jsonrpc_session "$SEARCH_DB" lexical \
+SETUP_REQUESTS=(
     "$(mcp_tool 2 ensure_project "{\"human_key\":\"$PROJECT_ALPHA\"}")" \
     "$(mcp_tool 3 ensure_project "{\"human_key\":\"$PROJECT_BETA\"}")" \
     "$(mcp_tool 4 register_agent "{\"project_key\":\"$PROJECT_ALPHA\",\"program\":\"e2e\",\"model\":\"test\",\"name\":\"GoldFox\"}")" \
@@ -977,9 +977,16 @@ SETUP_RESP="$(send_jsonrpc_session "$SEARCH_DB" lexical \
     "$(mcp_tool 30 register_agent "{\"project_key\":\"$PROJECT_OTHER\",\"program\":\"e2e\",\"model\":\"test\",\"name\":\"GoldFox\"}")" \
     "$(mcp_tool 31 register_agent "{\"project_key\":\"$PROJECT_OTHER\",\"program\":\"e2e\",\"model\":\"test\",\"name\":\"RedPeak\"}")" \
     "$(mcp_tool 32 send_message "{\"project_key\":\"$PROJECT_OTHER\",\"sender_name\":\"GoldFox\",\"to\":[\"RedPeak\"],\"subject\":\"Unlinked deployment notes\",\"body_md\":\"Deployment outside the product.\"}")" \
-)"
+)
 
-e2e_save_artifact "shadow_parity/setup_rpc.jsonl" "$SETUP_RESP"
+# Keep each ordered session within the normal transport deadline on a cold
+# server. All sessions share the same mailbox, including the product links.
+mkdir -p "${E2E_ARTIFACT_DIR}/shadow_parity"
+setup_rpc="${E2E_ARTIFACT_DIR}/shadow_parity/setup_rpc.jsonl"
+for ((offset=0; offset<${#SETUP_REQUESTS[@]}; offset+=8)); do
+    send_jsonrpc_session "$SEARCH_DB" lexical "${SETUP_REQUESTS[@]:offset:8}"
+done > "$setup_rpc"
+SETUP_RESP="$(cat "$setup_rpc")"
 
 SETUP_OK=0
 SETUP_FAIL=0
