@@ -755,6 +755,37 @@ fn proactive_backup_health(
     }
 }
 
+fn proactive_backup_age_secs(path: &Path) -> std::io::Result<Option<u64>> {
+    use fixers::empty_or_truncated_db::{SQLITE_HEADER_BYTES, SQLITE_MAGIC};
+
+    let mut file = match mcp_agent_mail_core::disk::open_regular_file_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if metadata.len() == 0 {
+        return Err(std::io::Error::other("backup file is empty"));
+    }
+    if metadata.len() < SQLITE_HEADER_BYTES {
+        return Err(std::io::Error::other(
+            "backup is shorter than a SQLite header",
+        ));
+    }
+    let mut magic = [0; SQLITE_MAGIC.len()];
+    file.read_exact(&mut magic)?;
+    if &magic != SQLITE_MAGIC {
+        return Err(std::io::Error::other(
+            "backup is missing the SQLite file signature",
+        ));
+    }
+    metadata
+        .modified()?
+        .elapsed()
+        .map(|age| Some(age.as_secs()))
+        .map_err(|_| std::io::Error::other("backup modification time is in the future"))
+}
+
 fn inspect_proactive_backup_health(
     path: &Path,
     guard_enabled: bool,
@@ -764,21 +795,7 @@ fn inspect_proactive_backup_health(
     if !guard_enabled {
         return proactive_backup_health(false, guard_attested, None, owner_age_secs, true);
     }
-    let age = match fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.is_file() => {
-            Err(std::io::Error::other("expected a regular backup file"))
-        }
-        Ok(metadata) if metadata.len() == 0 => Err(std::io::Error::other("backup file is empty")),
-        Ok(metadata) => metadata.modified().and_then(|modified| {
-            modified
-                .elapsed()
-                .map(|age| Some(age.as_secs()))
-                .map_err(|_| std::io::Error::other("backup modification time is in the future"))
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    };
-    match age {
+    match proactive_backup_age_secs(path) {
         Ok(age) => proactive_backup_health(
             true,
             guard_attested,
@@ -4351,7 +4368,7 @@ mod tests {
             "warn",
             "a missing backup retains the startup policy"
         );
-        let file = fs::File::create_new(&backup).unwrap();
+        fs::File::create_new(&backup).unwrap();
         let (status, detail) = inspect();
         assert_eq!(status, "fail", "{detail}");
         assert!(detail.contains("empty"), "{detail}");
@@ -4364,12 +4381,12 @@ mod tests {
             "warn"
         );
 
-        drop(file);
-        let conn =
-            mcp_agent_mail_db::CanonicalDbConn::open_file(backup.display().to_string()).unwrap();
-        conn.execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
-            .unwrap();
-        drop(conn);
+        fs::write(&backup, b"cut short").unwrap();
+        assert!(inspect().1.contains("shorter than a SQLite header"));
+        fs::write(&backup, [0; 512]).unwrap();
+        assert!(inspect().1.contains("SQLite file signature"));
+        fs::rename(&backup, dir.path().join("invalid-image")).unwrap();
+        seed_healthy_live_mailbox(&backup);
         assert_eq!(inspect().0, "ok");
         let file = fs::OpenOptions::new().write(true).open(&backup).unwrap();
         let now = SystemTime::now();
@@ -4394,7 +4411,7 @@ mod tests {
             std::os::unix::fs::symlink(&backup, &link).unwrap();
             let (status, detail) = inspect_proactive_backup_health(&link, true, true, settled);
             assert_eq!(status, "fail", "{detail}");
-            assert!(detail.contains("regular"), "{detail}");
+            assert!(detail.contains("linked.bak"), "{detail}");
         }
     }
 
