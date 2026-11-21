@@ -14123,6 +14123,7 @@ fn fetch_ws_state_payload(endpoint: &AtcLiveEndpoint) -> crate::CliResult<serde_
 pub(crate) struct LiveServerMailboxConfig {
     pub database_url: String,
     pub storage_root: std::path::PathBuf,
+    pub server_uptime_secs: Option<u64>,
     /// Whether the server's integrity guard runs (and so refreshes the
     /// proactive backup); `None` when an older server does not say.
     pub integrity_guard_enabled: Option<bool>,
@@ -14153,6 +14154,9 @@ fn live_server_mailbox_config_from_ws_state(
     Ok(LiveServerMailboxConfig {
         database_url,
         storage_root,
+        server_uptime_secs: payload
+            .get("server_uptime_secs")
+            .and_then(serde_json::Value::as_u64),
         integrity_guard_enabled: config
             .get("integrity_guard_enabled")
             .and_then(serde_json::Value::as_bool),
@@ -19898,8 +19902,10 @@ mod tests {
         // A server that predates the field does not say whether its
         // integrity guard runs.
         assert_eq!(parsed.integrity_guard_enabled, None);
+        assert_eq!(parsed.server_uptime_secs, None);
 
         let parsed = live_server_mailbox_config_from_ws_state(&serde_json::json!({
+            "server_uptime_secs": 10_800,
             "config": {
                 "database_url": "sqlite:////srv/agent-mail/server.sqlite3",
                 "storage_root": "/srv/agent-mail/archive",
@@ -19908,6 +19914,7 @@ mod tests {
         }))
         .expect("parse server mailbox config");
         assert_eq!(parsed.integrity_guard_enabled, Some(false));
+        assert_eq!(parsed.server_uptime_secs, Some(10_800));
     }
 
     #[test]
@@ -19933,6 +19940,7 @@ mod tests {
                 database_url: "sqlite:////srv/agent-mail/server.sqlite3".to_string(),
                 storage_root: std::path::PathBuf::from("/srv/agent-mail/archive"),
                 integrity_guard_enabled: None,
+                server_uptime_secs: None,
             }),
             None,
         );
@@ -19958,6 +19966,7 @@ mod tests {
                 database_url: config.database_url.clone(),
                 storage_root: config.storage_root.clone(),
                 integrity_guard_enabled: None,
+                server_uptime_secs: None,
             }),
             None,
         );

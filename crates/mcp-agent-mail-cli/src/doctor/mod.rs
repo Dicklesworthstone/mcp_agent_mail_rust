@@ -685,6 +685,7 @@ struct DoctorLiveProbeTarget {
     database_url: String,
     storage_root: PathBuf,
     source: &'static str,
+    server_uptime_secs: Option<u64>,
     /// The live server's integrity-guard state, when it advertises one.
     integrity_guard_enabled: Option<bool>,
 }
@@ -751,6 +752,47 @@ fn proactive_backup_health(
             }
         }
         Some(age) => ("ok", format!("age {}{companions}", hours(age))),
+    }
+}
+
+fn inspect_proactive_backup_health(
+    path: &Path,
+    guard_enabled: bool,
+    guard_attested: bool,
+    owner_age_secs: Option<u64>,
+) -> (&'static str, String) {
+    if !guard_enabled {
+        return proactive_backup_health(false, guard_attested, None, owner_age_secs, true);
+    }
+    let age = match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            Err(std::io::Error::other("expected a regular backup file"))
+        }
+        Ok(metadata) if metadata.len() == 0 => Err(std::io::Error::other("backup file is empty")),
+        Ok(metadata) => metadata.modified().and_then(|modified| {
+            modified
+                .elapsed()
+                .map(|age| Some(age.as_secs()))
+                .map_err(|_| std::io::Error::other("backup modification time is in the future"))
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    };
+    match age {
+        Ok(age) => proactive_backup_health(
+            true,
+            guard_attested,
+            age,
+            owner_age_secs,
+            mcp_agent_mail_db::pool::sqlite_recovery_candidate_is_standalone(path),
+        ),
+        Err(error) => (
+            if guard_attested { "fail" } else { "warn" },
+            format!(
+                "cannot establish proactive backup freshness at {}: {error}",
+                path.display()
+            ),
+        ),
     }
 }
 
@@ -901,6 +943,7 @@ fn doctor_live_probe_target_from_server_config(
             database_url: server_config.database_url,
             storage_root: server_config.storage_root,
             source: "live_server",
+            server_uptime_secs: server_config.server_uptime_secs,
             integrity_guard_enabled: server_config.integrity_guard_enabled,
         };
     }
@@ -908,6 +951,7 @@ fn doctor_live_probe_target_from_server_config(
         database_url: config.database_url.clone(),
         storage_root: config.storage_root.clone(),
         source: "local_config_unattested",
+        server_uptime_secs: None,
         integrity_guard_enabled: None,
     }
 }
@@ -3667,7 +3711,14 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     // the server can no longer answer. Quiet when no owner runs; imminent
     // exhaustion is a finding.
     let self_pid = std::process::id();
-    let owner_pids: Vec<u32> = crate::gather_process_owner_model(&config)
+    let mut owner_config = config.clone();
+    owner_config
+        .database_url
+        .clone_from(&probe_target.database_url);
+    owner_config
+        .storage_root
+        .clone_from(&probe_target.storage_root);
+    let owner_pids: Vec<u32> = crate::gather_process_owner_model(&owner_config)
         .actual_owner_pids()
         .into_iter()
         .filter(|pid| *pid != self_pid)
@@ -3682,37 +3733,9 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         if descriptors.status == "fail" {
             return Err(CliError::ExitCode(1));
         }
-        // br-31eew (GH#337): a proactive backup that silently stopped
-        // refreshing left one mailbox with a 3.5-week-old backup and only a
-        // repeated log warning. With a live owner, say so here.
-        if let Ok(resolved) =
-            mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
-        {
-            let backup = PathBuf::from(format!("{}.bak", resolved.canonical_path));
-            let backup_age_secs = std::fs::symlink_metadata(&backup)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .map(|modified| modified.elapsed().map_or(0, |age| age.as_secs()));
-            let owner_age_secs = owner_pids
-                .iter()
-                .filter_map(|pid| crate::process_age_seconds(*pid))
-                .max();
-            let (status, detail) = proactive_backup_health(
-                probe_target
-                    .integrity_guard_enabled
-                    .unwrap_or(config.integrity_guard_enabled),
-                probe_target.integrity_guard_enabled.is_some(),
-                backup_age_secs,
-                owner_age_secs,
-                mcp_agent_mail_db::pool::sqlite_recovery_candidate_is_standalone(&backup),
-            );
-            ftui_runtime::ftui_println!("proactive_backup: {status} ({detail})");
-            if status == "fail" {
-                return Err(CliError::ExitCode(1));
-            }
-        }
     }
 
+    let mut reservation_health_failed = false;
     let reservation_parity =
         match crate::open_db_sync_read_only_with_database_url(&probe_target.database_url) {
             Ok(conn) => check_reservation_parity_with_sync_query(&conn, &probe_target.storage_root)
@@ -3756,9 +3779,9 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
                         Ok(note) => ftui_runtime::ftui_println!("{note}"),
                         Err(Some(stalled)) => {
                             ftui_runtime::ftui_println!("{stalled}");
-                            return Err(CliError::ExitCode(1));
+                            reservation_health_failed = true;
                         }
-                        Err(None) => return Err(CliError::ExitCode(1)),
+                        Err(None) => reservation_health_failed = true,
                     }
                 }
             }
@@ -3818,6 +3841,31 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     // Use the exact live mailbox target selected above and the producer's
     // shared count/projected-byte assessment; byte alarms cannot mask refusal.
     let mut backup_health_unavailable_or_blocked = false;
+    // Use the serving mailbox's clock even on systems without /proc. Older
+    // servers can still use the age of a locally observed mailbox owner.
+    if (probe_target.source == "live_server" || !owner_pids.is_empty())
+        && !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&probe_target.database_url)
+        && let Ok(resolved) =
+            mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
+    {
+        let backup = PathBuf::from(format!("{}.bak", resolved.canonical_path));
+        let owner_age_secs = probe_target.server_uptime_secs.or_else(|| {
+            owner_pids
+                .iter()
+                .filter_map(|pid| crate::process_age_seconds(*pid))
+                .max()
+        });
+        let (status, detail) = inspect_proactive_backup_health(
+            &backup,
+            probe_target
+                .integrity_guard_enabled
+                .unwrap_or(config.integrity_guard_enabled),
+            probe_target.integrity_guard_enabled.is_some(),
+            owner_age_secs,
+        );
+        ftui_runtime::ftui_println!("proactive_backup: {status} ({detail})");
+        backup_health_unavailable_or_blocked = status == "fail";
+    }
     match doctor_retention_health(&probe_target) {
         Ok(Some(DoctorRetentionHealth { stats, staging })) => {
             let live_database = stats
@@ -3895,7 +3943,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
             }
         }
     }
-    if backup_health_unavailable_or_blocked {
+    if backup_health_unavailable_or_blocked || reservation_health_failed {
         return Err(CliError::ExitCode(1));
     }
 
@@ -4287,6 +4335,66 @@ mod tests {
         ] {
             let (status, detail) = proactive_backup_health(guard, true, age, owner, true);
             assert_eq!(status, "ok", "{age:?} {owner:?} {guard}: {detail}");
+        }
+    }
+
+    #[test]
+    fn proactive_backup_inspection_distinguishes_an_image_from_an_unusable_entry() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("storage.sqlite3.bak");
+        let settled = Some(PROACTIVE_BACKUP_GRACE_SECS);
+        let inspect = || inspect_proactive_backup_health(&backup, true, true, settled);
+        assert_eq!(
+            inspect().0,
+            "warn",
+            "a missing backup retains the startup policy"
+        );
+        let file = fs::File::create_new(&backup).unwrap();
+        let (status, detail) = inspect();
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("empty"), "{detail}");
+        assert_eq!(
+            inspect_proactive_backup_health(&backup, false, true, settled).0,
+            "ok"
+        );
+        assert_eq!(
+            inspect_proactive_backup_health(&backup, true, false, settled).0,
+            "warn"
+        );
+
+        drop(file);
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(backup.display().to_string()).unwrap();
+        conn.execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        drop(conn);
+        assert_eq!(inspect().0, "ok");
+        let file = fs::OpenOptions::new().write(true).open(&backup).unwrap();
+        let now = SystemTime::now();
+        let stale_age = Duration::from_secs(STALE_PROACTIVE_BACKUP_SECS + 60);
+        file.set_modified(now - stale_age).unwrap();
+        assert_eq!(inspect().0, "fail");
+        assert_eq!(
+            inspect_proactive_backup_health(&backup, true, true, Some(0)).0,
+            "ok"
+        );
+        file.set_modified(now + stale_age).unwrap();
+        let (status, detail) = inspect();
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("future"), "{detail}");
+        let (status, detail) = inspect_proactive_backup_health(dir.path(), true, true, settled);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("regular"), "{detail}");
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("linked.bak");
+            std::os::unix::fs::symlink(&backup, &link).unwrap();
+            let (status, detail) = inspect_proactive_backup_health(&link, true, true, settled);
+            assert_eq!(status, "fail", "{detail}");
+            assert!(detail.contains("regular"), "{detail}");
         }
     }
 
@@ -5786,11 +5894,13 @@ mod tests {
                 database_url: "sqlite:////srv/agent-mail/server.sqlite3".to_string(),
                 storage_root: PathBuf::from("/srv/agent-mail/archive"),
                 integrity_guard_enabled: Some(false),
+                server_uptime_secs: Some(10_800),
             }),
         );
 
         assert_eq!(target.source, "live_server");
         assert_eq!(target.integrity_guard_enabled, Some(false));
+        assert_eq!(target.server_uptime_secs, Some(10_800));
         assert_eq!(
             target.database_url,
             "sqlite:////srv/agent-mail/server.sqlite3"

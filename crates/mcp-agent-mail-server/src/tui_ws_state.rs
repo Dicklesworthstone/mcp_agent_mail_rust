@@ -126,6 +126,7 @@ fn snapshot_payload(state: &TuiSharedState, limit: usize, include_system_health:
         "transport": "http-poll",
         "mode": "snapshot",
         "generated_at_us": now_micros(),
+        "server_uptime_secs": state.uptime().as_secs(),
         "next_seq": next_seq,
         "event_count": events.len(),
         "request_counters": request_counters_json(counters, state.avg_latency_ms()),
@@ -237,6 +238,7 @@ mod tests {
         let state = TuiSharedState::new(&config);
         let payload = poll_payload(&state, None);
         assert_eq!(payload["mode"], "snapshot");
+        assert!(payload["server_uptime_secs"].as_u64().unwrap() <= state.uptime().as_secs());
         assert_eq!(payload["transport"], "http-poll");
         assert!(payload["next_seq"].as_u64().is_some());
         assert!(

@@ -9934,15 +9934,18 @@ fn check_robot_and_doctor_live_daemon_health(memory_pressure: bool) {
             "{health}"
         );
     }
-    let output = Command::new(am_bin())
-        .env_clear()
-        .envs(env.isolated_env())
-        .env("HTTP_PORT", port.to_string())
-        .env("AGENT_MAIL_URL", format!("http://127.0.0.1:{port}/mcp/"))
-        .current_dir(env.hostile_repo())
-        .args(["doctor", "health"])
-        .output()
-        .unwrap();
+    let doctor = || {
+        Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("HTTP_PORT", port.to_string())
+            .env("AGENT_MAIL_URL", format!("http://127.0.0.1:{port}/mcp/"))
+            .current_dir(env.hostile_repo())
+            .args(["doctor", "health"])
+            .output()
+            .unwrap()
+    };
+    let output = doctor();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -9960,6 +9963,36 @@ fn check_robot_and_doctor_live_daemon_health(memory_pressure: bool) {
             stdout.contains("ok: live mailbox healthy"),
             "{stdout}\n{stderr}"
         );
+        // The producer's real staging limit holds off refresh while doctor
+        // observes a zero-byte backup left beside this private mailbox.
+        for n in 0..mcp_agent_mail_db::recovery_retention::staging::MAX_RETAINED_STAGES {
+            std::fs::create_dir(
+                env.tmp
+                    .path()
+                    .join(format!(".mcp-agent-mail-proactive-backup-case{n}")),
+            )
+            .unwrap();
+        }
+        let backup = env.db_path.with_added_extension("bak");
+        if backup.exists() {
+            std::fs::rename(&backup, env.tmp.path().join("original-backup")).unwrap();
+        }
+        std::fs::File::create_new(&backup).unwrap();
+        let blocked = doctor();
+        let report = String::from_utf8_lossy(&blocked.stdout);
+        assert_eq!(blocked.status.code(), Some(1), "{report}");
+        assert!(
+            report
+                .lines()
+                .any(|line| line.starts_with("proactive_backup: fail") && line.contains("empty")),
+            "{report}"
+        );
+        assert!(
+            report.contains("automatic_backup_staging: fail"),
+            "{report}"
+        );
+        assert!(report.contains("backup_retention:"), "{report}");
+        assert_eq!(std::fs::metadata(backup).unwrap().len(), 0);
     }
 }
 
