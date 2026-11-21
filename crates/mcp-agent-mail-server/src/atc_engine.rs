@@ -4151,6 +4151,9 @@ pub struct AtcEffectSemantics {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AtcEffectPlan {
+    /// Process-local authority is never restored from a saved/replayed report.
+    #[serde(skip)]
+    pub(crate) release_authority: Option<AtcReleaseAuthority>,
     pub decision_id: u64,
     pub effect_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4175,6 +4178,13 @@ pub struct AtcEffectPlan {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct AtcReleaseAuthority {
+    epoch: Arc<()>,
+    last_activity_micros: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct AtcTickReport {
     pub actions: Vec<AtcTickAction>,
     pub effects: Vec<AtcEffectPlan>,
@@ -4184,6 +4194,9 @@ pub struct AtcTickReport {
 /// Top-level ATC engine that orchestrates all subsystems.
 #[derive(Debug)]
 pub struct AtcEngine {
+    /// Retained by planned releases so even identical replay records cannot
+    /// acquire authority from a replacement engine.
+    release_epoch: Arc<()>,
     /// Configuration.
     config: AtcConfig,
     /// Whether the ATC has registered itself as an agent.
@@ -4399,6 +4412,7 @@ impl AtcEngine {
         debug_assert!(policy_bundle.validate().is_ok());
 
         Self {
+            release_epoch: Arc::new(()),
             config,
             registered: false,
             liveness_core,
@@ -5132,6 +5146,61 @@ impl AtcEngine {
             },
             |reason| Some(reason.to_string()),
         )
+    }
+
+    /// Validate a queued release against the same engine that holds the current
+    /// activity and policy. The retained epoch binds a proposal to this engine
+    /// even when replay reproduces the same numeric decision ID and trace.
+    fn release_effect_admission(&self, effect: &AtcEffectPlan) -> Result<i64, &'static str> {
+        let authority = effect
+            .release_authority
+            .as_ref()
+            .filter(|authority| Arc::ptr_eq(&authority.epoch, &self.release_epoch))
+            .ok_or("release_decision_stale")?;
+        let record = self
+            .ledger
+            .get(effect.decision_id)
+            .ok_or("release_decision_stale")?;
+        if effect.kind != "release_reservations_requested"
+            || effect.semantics.family != "reservation_release"
+            || record.subsystem != AtcSubsystem::Liveness
+            || record.action != "ReleaseReservations"
+            || record.subject != effect.agent
+            || record.timestamp_micros != effect.timestamp_micros
+            || record.trace_id != effect.trace_id
+            || record.claim_id != effect.claim_id
+            || record.evidence_id != effect.evidence_id
+            || record.policy_id != effect.policy_id
+            || effect.policy_revision != self.policy_revision
+            || effect.policy_id.as_deref() != Some(self.incumbent_policy.policy_id.as_str())
+        {
+            return Err("release_decision_stale");
+        }
+        let entry = self
+            .agents
+            .get(&effect.agent)
+            .ok_or("release_liveness_changed")?;
+        if effect.project_key.is_none()
+            || entry.project_key.as_deref() != effect.project_key.as_deref()
+        {
+            return Err("release_project_changed");
+        }
+        if entry.state != LivenessState::Dead
+            || entry.rhythm.last_activity_ts <= 0
+            || entry.rhythm.last_activity_ts != authority.last_activity_micros
+            || entry.rhythm.last_activity_ts > effect.timestamp_micros
+        {
+            return Err("release_liveness_changed");
+        }
+        let (action, _, _) = self.incumbent_policy.choose_action(
+            entry.core.posterior(),
+            self.current_release_guard_reason().is_some(),
+            self.capacity_guard_reason().is_some(),
+        );
+        if action != LivenessAction::ReleaseReservations {
+            return Err("release_policy_changed");
+        }
+        Ok(authority.last_activity_micros)
     }
 
     fn mark_agents_dirty(&mut self) {
@@ -6016,6 +6085,14 @@ impl AtcEngine {
             effect_seed.push_str(message);
         }
         AtcEffectPlan {
+            release_authority: (kind == "release_reservations_requested")
+                .then(|| {
+                    self.agents.get(&agent).map(|entry| AtcReleaseAuthority {
+                        epoch: Arc::clone(&self.release_epoch),
+                        last_activity_micros: entry.rhythm.last_activity_ts,
+                    })
+                })
+                .flatten(),
             decision_id: record.id,
             effect_id: format!("atc-effect-{:016x}", stable_fnv1a64(effect_seed.as_bytes())),
             experience_id: None,
@@ -12102,13 +12179,21 @@ pub fn atc_enabled() -> bool {
 /// unavailable or incomplete agent/conflict coverage always refuses execution
 /// admission, independently of the policy's optional fallback guard.
 #[allow(clippy::redundant_pub_crate)]
+#[cfg(test)]
 pub(crate) fn atc_release_capacity_admission() -> Result<(), &'static str> {
     release_capacity_admission_from_engine(ATC_ENGINE.get())
 }
 
+#[cfg(test)]
 fn release_capacity_admission_from_engine(
     engine_lock: Option<&Mutex<AtcEngine>>,
 ) -> Result<(), &'static str> {
+    lock_release_engine(engine_lock).map(|_| ())
+}
+
+fn lock_release_engine(
+    engine_lock: Option<&Mutex<AtcEngine>>,
+) -> Result<MutexGuard<'_, AtcEngine>, &'static str> {
     let engine_lock = engine_lock.ok_or("agent_coverage_unavailable")?;
     let engine = engine_lock
         .lock()
@@ -12119,7 +12204,68 @@ fn release_capacity_admission_from_engine(
     if let Some(reason) = engine.capacity_guard_reason() {
         return Err(reason);
     }
-    Ok(())
+    Ok(engine)
+}
+
+pub(super) fn atc_release_effect_admission(effect: &AtcEffectPlan) -> Result<i64, &'static str> {
+    let engine = lock_release_engine(ATC_ENGINE.get())?;
+    let last_activity = engine.release_effect_admission(effect)?;
+    // Match planning's ENGINE -> CONFORMAL ordering. New uncertainty can arrive
+    // after planning without changing the agent's stored Dead classification.
+    // An unavailable calibration observation grants no execution permission.
+    let conformal = ATC_CONFORMAL
+        .get()
+        .ok_or("release_calibration_unavailable")?
+        .lock()
+        .map_err(|_| "release_calibration_unavailable")?;
+    if conformal.is_uncertain(
+        AtcSubsystem::Liveness,
+        engine.liveness_core.max_possible_loss(),
+    ) {
+        return Err("conformal_uncertainty");
+    }
+    Ok(last_activity)
+}
+
+/// Seed strong silence evidence, then use the real planner and public delivery
+/// boundary. Callers hold `GLOBAL_ATC_TEST_LOCK` and reset before invoking this.
+#[cfg(test)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn planned_release_for_test(
+    agent: &str,
+    project: &str,
+    last_activity: i64,
+) -> AtcEffectPlan {
+    {
+        let mut engine = ATC_ENGINE
+            .get()
+            .expect("engine initialized")
+            .lock()
+            .unwrap();
+        engine.register_agent(agent, "codex-cli", Some(project));
+        engine.observe_activity(agent, Some(project), last_activity);
+        let entry = engine
+            .agents
+            .get_mut(agent)
+            .expect("tracked release target");
+        for _ in 0..30 {
+            entry.core.update_posterior(&[
+                (LivenessState::Alive, 0.01),
+                (LivenessState::Flaky, 0.05),
+                (LivenessState::Dead, 0.95),
+            ]);
+        }
+    }
+    for step in 1..=4 {
+        if let Some(report) = crate::atc::atc_tick_report(last_activity + step * 600_000_000)
+            && let Some(effect) = report.effects.into_iter().find(|effect| {
+                effect.agent == agent && effect.kind == "release_reservations_requested"
+            })
+        {
+            return effect;
+        }
+    }
+    panic!("real planner did not propose release for {agent}");
 }
 
 /// Record an agent registration in the ATC.

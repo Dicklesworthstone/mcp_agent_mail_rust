@@ -122,7 +122,7 @@ impl PopulationScope {
         matches!(self.by_name.get(name), Some(Some(observation)) if observation.project.key == project)
     }
 
-    fn permits_effect(&self, effect: &AtcEffectPlan) -> bool {
+    pub(super) fn permits_effect(&self, effect: &AtcEffectPlan) -> bool {
         if !self.permits(&effect.agent, effect.project_key.as_deref()) {
             return false;
         }
@@ -238,6 +238,7 @@ mod tests {
 
     fn effect(name: &str, project: Option<&str>, kind: &str, body: Option<&str>) -> AtcEffectPlan {
         AtcEffectPlan {
+            release_authority: None,
             decision_id: 1,
             effect_id: format!("effect:{name}:{kind}"),
             experience_id: None,

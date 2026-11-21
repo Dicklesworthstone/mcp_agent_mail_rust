@@ -9058,21 +9058,21 @@ fn execute_atc_release_effect(
     runtime: &Runtime,
     effect: &atc::AtcEffectPlan,
     project_key: &str,
-) -> Result<(), String> {
+    last_observed_activity_micros: i64,
+) -> Result<mcp_agent_mail_tools::reservations::AutomaticReservationRelease, String> {
     let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
     runtime
         .block_on(async {
-            mcp_agent_mail_tools::reservations::release_file_reservations(
+            mcp_agent_mail_tools::reservations::release_reservations_for_inactive_agent(
                 &ctx,
-                project_key.to_string(),
-                effect.agent.clone(),
-                None,
-                None,
+                project_key,
+                &effect.agent,
+                effect.timestamp_micros,
+                last_observed_activity_micros,
             )
             .await
         })
-        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
@@ -9114,18 +9114,27 @@ fn execute_atc_effect(
                 let Some(project_key) = effect.project_key.as_deref() else {
                     return "suppressed:missing_project_precondition".to_string();
                 };
-                // A queued proposal may predate a capacity refusal. Recheck at
-                // execution admission, outside hydration/delivery locks, and
-                // release the engine lock before entering the reservation tool.
-                // A refusal after this boundary does not cancel admitted work.
-                if let Err(reason) = atc::atc_release_capacity_admission() {
-                    return format!("suppressed:{reason}");
-                }
+                // A queued proposal may predate new activity, a population
+                // refresh, a safety change or an engine restart. Recheck its
+                // current authority, releasing all ATC locks before the tool.
+                // The writer separately checks durable activity and exact
+                // leases, including changes after this in-memory admission.
+                let last_activity = match atc::atc_release_effect_admission(effect) {
+                    Ok(last_activity) => last_activity,
+                    Err(reason) => return format!("suppressed:{reason}"),
+                };
                 let Some(runtime) = runtime else {
                     return "failed:executor_unavailable".to_string();
                 };
-                execute_atc_release_effect(runtime, effect, project_key)
-                    .map(|_| "executed".to_string())
+                execute_atc_release_effect(runtime, effect, project_key, last_activity)
+                    .map(|outcome| match outcome {
+                        mcp_agent_mail_tools::reservations::AutomaticReservationRelease::Released(_) => {
+                            "executed".to_string()
+                        }
+                        mcp_agent_mail_tools::reservations::AutomaticReservationRelease::Suppressed(reason) => {
+                            format!("suppressed:{reason}")
+                        }
+                    })
                     .unwrap_or_else(|error| format!("failed:{error}"))
             }
             "probe_agent" if executor_mode.executes_probes() => {
@@ -25493,6 +25502,7 @@ first body
 
     fn sample_probe_effect() -> atc::AtcEffectPlan {
         atc::AtcEffectPlan {
+            release_authority: None,
             decision_id: 7,
             effect_id: "atc-effect-probe".to_string(),
             experience_id: Some(17),
@@ -25814,14 +25824,10 @@ first body
             &[("AM_ATC_POPULATION_LIMIT", "1")],
             || {
                 atc::reset_global_atc_state_for_test(&config);
-                atc::atc_register_agent("AlphaAgent", "claude-code");
-                let mut effect = sample_probe_effect();
-                effect.kind = "release_reservations_requested".to_string();
-                effect.category = "liveness".to_string();
-                effect.semantics = sample_effect_semantics(
-                    "reservation_release",
+                let effect = atc::planned_release_for_test(
                     "AlphaAgent",
-                    effect.project_key.as_deref(),
+                    "/tmp/project-a",
+                    1_700_000_000_000_000,
                 );
                 let mut ensured_projects = AtcExecutorProjectCache::default();
                 assert_eq!(
@@ -25874,6 +25880,56 @@ first body
                 }
             },
         );
+        atc::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn queued_atc_release_rechecks_activity_and_engine_epoch() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        let observed = 1_700_000_000_000_000;
+        atc::reset_global_atc_state_for_test(&config);
+        let effect = atc::planned_release_for_test("AlphaAgent", "/tmp/project-a", observed);
+        let mut projects = AtcExecutorProjectCache::default();
+        assert_eq!(
+            execute_atc_effect(None, AtcExecutorMode::Live, &mut projects, &effect),
+            "failed:executor_unavailable",
+            "a current genuine proposal reaches execution"
+        );
+
+        atc::atc_observe_activity("AlphaAgent", effect.timestamp_micros + 1);
+        assert_eq!(
+            execute_atc_effect(None, AtcExecutorMode::Live, &mut projects, &effect),
+            "suppressed:release_liveness_changed"
+        );
+
+        atc::reset_global_atc_state_for_test(&config);
+        let replacement = atc::planned_release_for_test("AlphaAgent", "/tmp/project-a", observed);
+        assert_eq!(effect.decision_id, replacement.decision_id);
+        assert_eq!(
+            effect.trace_id, replacement.trace_id,
+            "exact replay control"
+        );
+        assert_eq!(
+            execute_atc_effect(None, AtcExecutorMode::Live, &mut projects, &effect),
+            "suppressed:release_decision_stale",
+            "identical replay cannot grant an old epoch's effect authority"
+        );
+        assert_eq!(
+            execute_atc_effect(None, AtcExecutorMode::Live, &mut projects, &replacement),
+            "failed:executor_unavailable"
+        );
+        let restored: atc::AtcEffectPlan =
+            serde_json::from_str(&serde_json::to_string(&replacement).expect("serialize report"))
+                .expect("restore report for display");
+        assert_eq!(
+            execute_atc_effect(None, AtcExecutorMode::Live, &mut projects, &restored),
+            "suppressed:release_decision_stale",
+            "saved diagnostics are not executable authority"
+        );
+        assert!(projects.projects.is_empty());
         atc::reset_global_atc_state_for_test(&config);
     }
 
@@ -42781,6 +42837,7 @@ first body
     #[test]
     fn atc_effect_semantic_key_is_project_scoped() {
         let left = atc::AtcEffectPlan {
+            release_authority: None,
             decision_id: 7,
             effect_id: "atc-effect-left".to_string(),
             experience_id: Some(17),

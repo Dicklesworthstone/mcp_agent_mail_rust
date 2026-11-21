@@ -8,9 +8,19 @@
 - [x] Prepare and validate reconciliation attachments before global archive
   publication admission, with cancellation checkpoints and final under-lock
   disk/Git/ancestor authority rechecks (`br-5a5s0`).
-- [ ] Complete native regression and workspace compiler/lint validation for
-  these scoped fixes; broader daemon memory attribution and archive soak
-  acceptance remain open.
+- [x] Revalidate queued ATC releases against the current engine, population,
+  policy and activity; use a bounded holder snapshot and guarded database
+  mutation, with atomic grant/renewal activity and no voluntary-release intent
+  fallback (`br-qo8j5`).
+- [x] Run native identity regressions: 150 passed, 0 failed, 1 ignored,
+  including all five new cache cases (`br-xai5l`).
+- [ ] Complete archive/ATC native regressions and workspace compiler/lint
+  validation. The all-targets check was killed while compiling the pinned
+  Asupersync dependency before reaching the application changes; broader
+  daemon memory attribution and archive soak acceptance remain open.
+- [ ] Prevent concurrent deliveries from losing notification wakeups during
+  inbox reads, including cross-process debounce and filtered/peek behavior
+  (`br-dksvp`).
 - [x] Bind ATC write mode and kill-switch authority to each server lifetime;
   prevent delayed observations or controls from reusing another mailbox policy
   and fail closed when the current marker authority cannot be inspected.

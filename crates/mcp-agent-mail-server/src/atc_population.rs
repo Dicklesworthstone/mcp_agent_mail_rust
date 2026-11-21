@@ -345,7 +345,8 @@ fn hydration() -> &'static Mutex<HydrationState> {
     HYDRATION.get_or_init(|| Mutex::new(HydrationState::default()))
 }
 
-pub(super) fn release_capacity_admission() -> Result<(), &'static str> {
+fn lock_release_population() -> Result<std::sync::MutexGuard<'static, HydrationState>, &'static str>
+{
     // Match refresh/reset's HYDRATION -> ENGINE order and keep the observed
     // population stable through the engine check. A busy or poisoned state is
     // unavailable evidence, not permission to use an older admitted report.
@@ -359,9 +360,28 @@ pub(super) fn release_capacity_admission() -> Result<(), &'static str> {
     {
         return Err("agent_coverage_unavailable");
     }
-    // Preserve standalone engine use before the first DB population. This is
-    // the existing capacity check, not a new target-scope authorization.
+    Ok(state)
+}
+
+#[cfg(test)]
+pub(super) fn release_capacity_admission() -> Result<(), &'static str> {
+    let _state = lock_release_population()?;
     engine::atc_release_capacity_admission()
+}
+
+pub(super) fn release_effect_admission(
+    effect: &engine::AtcEffectPlan,
+) -> Result<i64, &'static str> {
+    let state = lock_release_population()?;
+    // Keep the current population stable until the engine has checked its
+    // own activity and decision evidence. A completed refresh can revoke a
+    // target even though overall coverage is usable again.
+    if let Some(scope) = state.scope.as_ref()
+        && !scope.permits_effect(effect)
+    {
+        return Err("release_population_changed");
+    }
+    engine::atc_release_effect_admission(effect)
 }
 
 /// Keep the current population authority stable through delivery admission.
@@ -1674,6 +1694,7 @@ mod tests {
     fn release_report(now: i64) -> AtcTickReport {
         let mut report = tick_report(now).expect("planning report");
         report.effects = vec![engine::AtcEffectPlan {
+            release_authority: None,
             decision_id: 1,
             effect_id: "late-release".into(),
             experience_id: None,
@@ -1805,15 +1826,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(atc_sync_population_from_db(&pool).unwrap().agents, 1);
-        let epoch = super::super::capture_delivery_epoch().unwrap();
-        let planned = release_report(now + 1);
+        let queued = engine::planned_release_for_test("HydratedAgent0000", "/hydration", now);
         assert!(!hydration().lock().unwrap().resume_pending);
-        let admitted = super::super::admit_report(&epoch, planned, now + 1).unwrap();
-        let queued = admitted
-            .effects
-            .into_iter()
-            .find(|effect| effect.kind == "release_reservations_requested")
-            .expect("release was admitted before the invalid refresh");
         assert_eq!(super::super::atc_release_capacity_admission(), Ok(()));
         let mut projects = crate::AtcExecutorProjectCache::default();
         assert_eq!(
