@@ -58,7 +58,7 @@ pub(super) struct CommittedIdentityProof {
 /// Walk verified tree entries explicitly, without following symlinks or
 /// gitlinks, and propagate object-read failures instead of discarding them.
 /// Keep at most one additional native tree; a returned entry owns its data.
-fn committed_path_entry(
+pub(super) fn committed_path_entry(
     repo: &Repository,
     tree: Option<&Tree<'_>>,
     relative: &str,
@@ -72,9 +72,7 @@ fn committed_path_entry(
             .clone()
             .any(|name| matches!(name, "" | "." | ".."))
     {
-        return Err(invalid(
-            "committed canonical path is not a relative Git path",
-        ));
+        return Err(invalid("committed archive path is not a relative Git path"));
     }
     let Some(root) = tree else {
         return Ok(None);
@@ -92,7 +90,7 @@ fn committed_path_entry(
             }
             if entry.kind() != Some(ObjectType::Tree) || entry.filemode() != 0o040000 {
                 return Err(invalid(format!(
-                    "committed canonical ancestor {name} is not a directory; preserved"
+                    "committed archive ancestor {name} is not a directory; preserved"
                 )));
             }
             entry.id()
@@ -102,7 +100,7 @@ fn committed_path_entry(
         drop(parent.take());
         parent = Some(repo.find_tree(next)?);
     }
-    Err(invalid("committed canonical path has no terminal entry"))
+    Err(invalid("committed archive path has no terminal entry"))
 }
 
 fn canonical_is_committed(
@@ -618,7 +616,7 @@ mod tests {
                     reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
                         .unwrap_err();
                 assert!(
-                    error.to_string().contains("committed canonical ancestor"),
+                    error.to_string().contains("committed archive ancestor"),
                     "{error}"
                 );
                 assert_eq!(repo.head().unwrap().target(), Some(before));
@@ -636,6 +634,88 @@ mod tests {
                     assert!(paths.inbox.iter().all(|path| !path.exists()));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn prepared_attachments_reject_concurrent_committed_nondirectory_ancestors() {
+        use super::super::cancellable_tests::{ObserveScan, isolated};
+        use super::super::reconcile_message_bundle_cancellable;
+        use sha1::{Digest as _, Sha1};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        if isolated() {
+            return;
+        }
+        for mode in [0o100644, 0o100755, 0o120000, 0o160000] {
+            let (_dir, config, archive, mut message, recipients) = fixture();
+            let relative = format!("projects/{}/attachments/files/prepared.bin", archive.slug);
+            let attachment = archive.repo_root.join(&relative);
+            let bytes = b"verified attachment evidence";
+            crate::ensure_parent_dir(&attachment).unwrap();
+            std::fs::write(&attachment, bytes).unwrap();
+            message["attachments"] = json!([{
+                "type": "file", "path": relative, "bytes": bytes.len(),
+                "sha1": hex::encode(Sha1::digest(bytes)),
+            }]);
+            let ancestor =
+                crate::rel_path_cached(&archive.canonical_repo_root, attachment.parent().unwrap())
+                    .unwrap();
+            let source_dir = archive.root.join("attachments");
+            let retained = config.storage_root.join("retained-attachments");
+            let hook_source = source_dir.clone();
+            let hook_retained = retained.clone();
+            let hook_ancestor = ancestor.clone();
+            let repo_root = archive.repo_root.clone();
+            let repo = Repository::open(&repo_root).unwrap();
+            let index_before = std::fs::read(repo.path().join("index")).ok();
+            let committed = Arc::new(Mutex::new(None));
+            let hook_committed = committed.clone();
+            let observer = ObserveScan::new(move |stage| {
+                if stage != "attachment prepared" || hook_committed.lock().unwrap().is_some() {
+                    return;
+                }
+                let repo = Repository::open(&repo_root).unwrap();
+                *hook_committed.lock().unwrap() =
+                    Some(commit_ancestor(&repo, &hook_ancestor, mode));
+                // Retain the prepared source elsewhere so only the committed
+                // ancestor can stop publication into this now-absent path.
+                std::fs::rename(&hook_source, &hook_retained).unwrap();
+            });
+            let error = reconcile_message_bundle_cancellable(
+                &asupersync::Cx::for_testing(),
+                &archive,
+                &config,
+                entry(&message, &recipients),
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+            drop(observer);
+            assert!(
+                error
+                    .to_string()
+                    .contains("committed archive ancestor files is not a directory"),
+                "mode {mode:o}: {error}"
+            );
+            let (head, target) = committed.lock().unwrap().expect("concurrent Git change");
+            assert_eq!(repo.head().unwrap().target(), Some(head));
+            assert_eq!(std::fs::read(repo.path().join("index")).ok(), index_before);
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            let witness = tree.get_path(Path::new(&ancestor)).unwrap();
+            assert_eq!((witness.id(), witness.filemode()), (target, mode));
+            assert!(!source_dir.exists());
+            assert_eq!(
+                std::fs::read(retained.join("files/prepared.bin")).unwrap(),
+                bytes
+            );
+            let paths =
+                crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+                    .unwrap()
+                    .0;
+            assert!(!paths.canonical.exists());
+            assert!(!paths.outbox.exists());
+            assert!(paths.inbox.iter().all(|path| !path.exists()));
         }
     }
 
@@ -664,7 +744,7 @@ mod tests {
         let (before, _) = commit_ancestor(&repo, &ancestor, 0o100644);
         let error = revalidate_prepared(&repo, &archive, &proof, true, &mut budget).unwrap_err();
         assert!(
-            error.to_string().contains("committed canonical ancestor"),
+            error.to_string().contains("committed archive ancestor"),
             "{error}"
         );
         assert_eq!(repo.head().unwrap().target(), Some(before));

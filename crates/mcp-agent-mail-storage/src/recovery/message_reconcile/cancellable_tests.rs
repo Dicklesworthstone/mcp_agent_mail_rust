@@ -419,6 +419,208 @@ fn attachment_authority_is_required_before_any_cancellable_message_publication()
     assert_eq!(fs::read(attachment).unwrap(), bytes);
 }
 
+fn add_raw_attachment(
+    archive: &ProjectArchive,
+    message: &mut serde_json::Value,
+    name: &str,
+    bytes: &[u8],
+) -> PathBuf {
+    use sha1::{Digest as _, Sha1};
+    let relative = format!("projects/{}/attachments/files/{name}", archive.slug);
+    let path = archive.repo_root.join(&relative);
+    crate::ensure_parent_dir(&path).unwrap();
+    fs::write(&path, bytes).unwrap();
+    message["attachments"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "type": "file", "path": relative, "bytes": bytes.len(),
+            "sha1": hex::encode(Sha1::digest(bytes)),
+        }));
+    path
+}
+
+#[test]
+fn attachment_preparation_allows_an_unrelated_reservation_writer_to_publish() {
+    if isolated() {
+        return;
+    }
+    let (_temp, config, archive, mut message, recipients) = fixture();
+    let attachment = add_raw_attachment(&archive, &mut message, "evidence.bin", b"attachment");
+    let other = crate::ensure_archive(&config, "attachment-repair-peer").unwrap();
+    let op = crate::WriteOp::FileReservation {
+        project_slug: other.slug.clone(),
+        config: config.clone(),
+        reservations: vec![serde_json::json!({
+            "id": 1, "agent": "GreenCastle", "path_pattern": "src/**",
+            "exclusive": true, "reason": "unrelated reservation",
+            "created_ts": "2026-10-01T00:00:00Z", "expires_ts": "2030-10-01T00:00:00Z",
+        })],
+    };
+    let visited = std::sync::Arc::new(AtomicBool::new(false));
+    let hook_visited = visited.clone();
+    let observer = ObserveScan::new(move |stage| {
+        if stage != "attachment read" || hook_visited.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let op = op.clone();
+        let result = std::thread::spawn(move || crate::write_op_sync_direct(&op))
+            .join()
+            .unwrap();
+        assert!(
+            matches!(result, crate::DirectArchiveWrite::Written),
+            "attachment preparation blocked an unrelated archive writer: {result:?}"
+        );
+        crate::flush_async_commits();
+    });
+    let result = reconcile_message_bundle_cancellable(
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    drop(observer);
+    assert!(visited.load(Ordering::Acquire));
+    assert_eq!(result.files_created, 4);
+    assert_committed(&archive, &bundle_paths(&archive, &message, &recipients));
+    assert_committed(&archive, std::slice::from_ref(&attachment));
+    let reservation: serde_json::Value =
+        serde_json::from_slice(&fs::read(other.root.join("file_reservations/id-1.json")).unwrap())
+            .unwrap();
+    assert_eq!(reservation["agent"], "GreenCastle");
+    assert_eq!(reservation["path_pattern"], "src/**");
+    assert_scan_locks_released(&archive);
+}
+
+#[test]
+fn attachment_cancellation_preserves_sources_before_any_publication() {
+    if isolated() {
+        return;
+    }
+    for (stage, after) in [
+        ("attachment metadata", 1),
+        ("attachment read", 2),
+        ("attachment prepared", 1),
+    ] {
+        let (_temp, config, archive, mut message, recipients) = fixture();
+        let first = add_raw_attachment(&archive, &mut message, "a.bin", b"first");
+        let second = add_raw_attachment(&archive, &mut message, "b.bin", b"second");
+        let paths = bundle_paths(&archive, &message, &recipients);
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let head = repo.head().unwrap().target();
+        let epoch = crate::archive_mutation_epoch();
+        let observer = StopOnScan::new(stage, after);
+        let error = reconcile_message_bundle_cancellable(
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
+            &observer.stop,
+        )
+        .unwrap_err();
+        assert_scan_interrupted(&error, stage);
+        assert_eq!(observer.visits.load(Ordering::Acquire), after);
+        assert_eq!(crate::archive_mutation_epoch(), epoch);
+        assert_eq!(repo.head().unwrap().target(), head);
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert_eq!(fs::read(&first).unwrap(), b"first");
+        assert_eq!(fs::read(&second).unwrap(), b"second");
+        assert_scan_locks_released(&archive);
+        drop(observer);
+        let result = reconcile_message_bundle_cancellable(
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result.files_created, 4);
+        assert_committed(&archive, &paths);
+        assert_committed(&archive, &[first, second]);
+    }
+}
+
+#[test]
+fn prepared_attachments_are_rechecked_against_concurrent_disk_and_git_changes() {
+    if isolated() {
+        return;
+    }
+    for commit_conflict in [false, true] {
+        let (_temp, config, archive, mut message, recipients) = fixture();
+        let attachment = add_raw_attachment(&archive, &mut message, "evidence.bin", b"before");
+        let evidence = config.storage_root.join("concurrent-attachment.bin");
+        let hook_attachment = attachment.clone();
+        let hook_evidence = evidence.clone();
+        let hook_config = config.clone();
+        let repo_root = archive.repo_root.clone();
+        let canonical_repo_root = archive.canonical_repo_root.clone();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let expected_head =
+            std::sync::Arc::new(std::sync::Mutex::new(repo.head().unwrap().target()));
+        let hook_head = expected_head.clone();
+        let visited = std::sync::Arc::new(AtomicBool::new(false));
+        let hook_visited = visited.clone();
+        let observer = ObserveScan::new(move |stage| {
+            if stage != "attachment prepared" || hook_visited.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            fs::write(&hook_attachment, b"after!").unwrap();
+            if commit_conflict {
+                let relative =
+                    crate::rel_path_cached(&canonical_repo_root, &hook_attachment).unwrap();
+                crate::commit_paths_with_retry(
+                    &repo_root,
+                    &hook_config,
+                    "fixture: concurrent attachment",
+                    &[relative.as_str()],
+                )
+                .unwrap();
+                *hook_head.lock().unwrap() = Repository::open(&repo_root)
+                    .unwrap()
+                    .head()
+                    .unwrap()
+                    .target();
+                fs::rename(&hook_attachment, &hook_evidence).unwrap();
+            }
+        });
+        let result = reconcile_message_bundle_cancellable(
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
+            &AtomicBool::new(false),
+        );
+        drop(observer);
+        assert!(visited.load(Ordering::Acquire));
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with authoritative message"),
+            "{error}"
+        );
+        assert_eq!(
+            repo.head().unwrap().target(),
+            *expected_head.lock().unwrap()
+        );
+        assert!(
+            bundle_paths(&archive, &message, &recipients)
+                .iter()
+                .all(|path| !path.exists())
+        );
+        if commit_conflict {
+            assert!(!attachment.exists());
+            assert_eq!(fs::read(&evidence).unwrap(), b"after!");
+        } else {
+            assert_eq!(fs::read(&attachment).unwrap(), b"after!");
+        }
+        assert_scan_locks_released(&archive);
+    }
+}
+
 /// Cancel at a named real scan boundary on this test thread. The observer never
 /// substitutes a directory entry, file read, Git object or publication result.
 struct StopOnScan {

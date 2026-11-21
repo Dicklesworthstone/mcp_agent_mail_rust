@@ -2,6 +2,15 @@
 
 ## Current operational reliability improvements
 
+- [x] Bound project identity cache retention by freshness, entry count, aggregate
+  string bytes, and per-identity bytes; return oversized discovery results
+  unchanged without retaining them (`br-xai5l`).
+- [x] Prepare and validate reconciliation attachments before global archive
+  publication admission, with cancellation checkpoints and final under-lock
+  disk/Git/ancestor authority rechecks (`br-5a5s0`).
+- [ ] Complete native regression and workspace compiler/lint validation for
+  these scoped fixes; broader daemon memory attribution and archive soak
+  acceptance remain open.
 - [x] Bind ATC write mode and kill-switch authority to each server lifetime;
   prevent delayed observations or controls from reusing another mailbox policy
   and fail closed when the current marker authority cannot be inspected.
