@@ -4203,7 +4203,11 @@ impl DbPool {
                         // released when recovery finishes), so a checkout
                         // that lost the fence race retries like a failed
                         // validation ping instead of failing the tool call.
-                        is_checkout_validation_failure(&msg) || msg.contains("recovery in progress")
+                        // Inventory preflight owns a separate bounded wait;
+                        // do not restart it after that budget is exhausted.
+                        !is_mailbox_inventory_retry_exhausted(&msg)
+                            && (is_checkout_validation_failure(&msg)
+                                || msg.contains("recovery in progress"))
                     } =>
                 {
                     attempt += 1;
@@ -8314,15 +8318,30 @@ fn should_retry_sqlite_init_error(error: &SqlError) -> bool {
     is_sqlite_recovery_error_message(&msg) || is_lock_error(&msg)
 }
 
-/// How long initialization keeps retrying a lock/busy failure while another
-/// process initializes or migrates the same file (br-wp4am).
+/// How long each initialization phase retries contention while another
+/// process recovers or migrates the same file (br-wp4am, GH#400).
 const SQLITE_INIT_BUSY_RETRY_BUDGET: Duration = Duration::from_secs(30);
 const SQLITE_INIT_BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
+
+pub(crate) const SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED: &str =
+    "mailbox database inventory busy retry budget exhausted";
+
+/// Keep the original busy cause actionable without allowing outer checkout
+/// and query retry loops to restart an already-spent startup phase budget.
+#[must_use]
+pub(crate) fn is_mailbox_inventory_retry_exhausted(message: &str) -> bool {
+    message.contains(SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED)
+}
 
 #[cfg(test)]
 thread_local! {
     /// Busy retries taken by `retry_sqlite_init_while_busy` on this thread.
     static SQLITE_INIT_BUSY_RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Busy retries taken by startup's read-only mailbox inventory.
+    static SQLITE_INVENTORY_BUSY_RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Errors returned at the inventory boundary to exercise pre-init wiring.
+    static SQLITE_INVENTORY_FAULTS: std::cell::RefCell<std::collections::VecDeque<SqlError>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     /// Errors the next `run_sqlite_init_once` calls on this thread return
     /// before touching the file, oldest first.
     static SQLITE_INIT_FAULTS: std::cell::RefCell<std::collections::VecDeque<SqlError>> =
@@ -8482,6 +8501,10 @@ pub fn archive_metadata_advantage_is_decisive(
 
 #[allow(clippy::result_large_err)]
 pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInventory, SqlError> {
+    #[cfg(test)]
+    if let Some(fault) = SQLITE_INVENTORY_FAULTS.with(|faults| faults.borrow_mut().pop_front()) {
+        return Err(fault);
+    }
     if primary_path.as_os_str() == ":memory:" {
         return Err(SqlError::Custom(
             "DB inventory is unavailable for in-memory databases".to_string(),
@@ -8573,6 +8596,97 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         max_message_id,
         project_identities,
     })
+}
+
+/// Writable startup may encounter recovery contention before it reaches the
+/// migration retry loop (GH#400). Give only the inventory phase a bounded
+/// wait: retrying all of reconciliation could repeat archive mutations, and
+/// extending the public inventory probe would delay read-only diagnostics.
+#[allow(clippy::result_large_err)]
+fn inspect_mailbox_db_inventory_for_init(
+    primary_path: &Path,
+) -> Result<MailboxDbInventory, SqlError> {
+    retry_mailbox_db_inventory(
+        primary_path,
+        || inspect_mailbox_db_inventory(primary_path),
+        Instant::now,
+        std::thread::sleep,
+    )
+}
+
+fn is_mailbox_inventory_busy_error(error: &SqlError) -> bool {
+    let message = error.to_string();
+    // The general lock classifier also includes path/I/O errors and live
+    // owner refusals. Those must not acquire a new 30-second wait here, nor
+    // may a busy wrapper hide an underlying corruption or authority refusal.
+    if is_mailbox_inventory_retry_exhausted(&message)
+        || crate::error::classify_db_error_message(&message).class
+            != crate::error::DbErrorClass::BusyRetryable
+        || is_sqlite_recovery_error_message(&message)
+    {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    !lower.contains("refus")
+        && (lower.contains("database is busy")
+            || lower.contains("database is locked")
+            || lower.contains("database table is locked")
+            || lower.contains("database schema is locked")
+            || lower.contains("sqlite_busy")
+            || lower.contains("locked by another process"))
+}
+
+#[allow(clippy::result_large_err)]
+fn retry_mailbox_db_inventory<F, N, S>(
+    primary_path: &Path,
+    mut inspect: F,
+    mut now: N,
+    mut sleep: S,
+) -> Result<MailboxDbInventory, SqlError>
+where
+    F: FnMut() -> Result<MailboxDbInventory, SqlError>,
+    N: FnMut() -> Instant,
+    S: FnMut(Duration),
+{
+    // Start after the archive scan/health checks: their time must not consume
+    // the contention budget before the first inventory attempt can retry.
+    let deadline = now() + SQLITE_INIT_BUSY_RETRY_BUDGET;
+    let mut delay = Duration::from_millis(25);
+    let mut attempt = 0_u32;
+    let error = loop {
+        let error = match inspect() {
+            Ok(inventory) => return Ok(inventory),
+            Err(error) if is_mailbox_inventory_busy_error(&error) => error,
+            Err(error) => return Err(error),
+        };
+        // The failed inspection has dropped its connection and namespace
+        // lease before sleeping, allowing another process to finish recovery.
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            break error;
+        }
+        let pause = delay.min(remaining);
+        attempt += 1;
+        tracing::warn!(
+            path = %primary_path.display(),
+            error = %error,
+            attempt,
+            delay_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+            "mailbox startup inventory is busy; retrying read-only inspection"
+        );
+        sleep(pause);
+        if now() >= deadline {
+            break error;
+        }
+        #[cfg(test)]
+        SQLITE_INVENTORY_BUSY_RETRIES.with(|retries| retries.set(retries.get() + 1));
+        delay = (delay * 2).min(SQLITE_INIT_BUSY_RETRY_MAX_DELAY);
+    };
+    Err(SqlError::Custom(format!(
+        "{SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED} after {} ms for {}: {error}",
+        SQLITE_INIT_BUSY_RETRY_BUDGET.as_millis(),
+        primary_path.display()
+    )))
 }
 
 fn archive_has_real_projects(storage_root: &Path) -> bool {
@@ -8780,7 +8894,10 @@ fn reconcile_archive_state_before_init_with_owner(
         return Ok(false);
     }
 
-    let db_inventory = inspect_mailbox_db_inventory(primary_path)?;
+    let db_inventory = inspect_mailbox_db_inventory_for_init(primary_path)?;
+    // A competing server may have become the owner during the bounded wait.
+    // Revalidate before either reconciling the archive or continuing init.
+    refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
     let archive_max_id = archive.latest_message_id.unwrap_or(0);
     let archive_message_count = archive.unique_message_ids;
     let db_message_count = db_inventory.messages;
@@ -8885,7 +9002,8 @@ fn reconcile_archive_state_before_init_with_owner(
         .map_err(|error| SqlError::Custom(error.to_string()))
     }) {
         Ok(crate::reconstruct::ArchiveDeltaApplyOutcome::Applied(applied)) => {
-            let db_after = inspect_mailbox_db_inventory(primary_path)?;
+            let db_after = inspect_mailbox_db_inventory_for_init(primary_path)?;
+            refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
             let still_missing_projects = crate::reconstruct::archive_missing_project_identities(
                 &archive,
                 &db_after.project_identities,
@@ -44252,6 +44370,418 @@ mod tests {
         assert!(
             err.to_string().contains("symlinked path"),
             "unexpected error: {err}"
+        );
+    }
+
+    fn inventory_recovery_busy_for_test(path: &Path) -> SqlError {
+        SqlError::Custom(format!(
+            "mailbox database inventory: cannot open {} read-only: Connection error: database is busy (recovery in progress)",
+            path.display()
+        ))
+    }
+
+    fn with_sqlite_inventory_faults<T>(faults: Vec<SqlError>, body: impl FnOnce() -> T) -> T {
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                SQLITE_INVENTORY_FAULTS.with(|faults| faults.borrow_mut().clear());
+                SQLITE_INVENTORY_BUSY_RETRIES.with(|retries| retries.set(0));
+            }
+        }
+        SQLITE_INVENTORY_FAULTS.with(|queue| {
+            assert!(
+                queue.borrow().is_empty(),
+                "an earlier test leaked inventory faults"
+            );
+            *queue.borrow_mut() = faults.into();
+        });
+        SQLITE_INVENTORY_BUSY_RETRIES.with(|retries| retries.set(0));
+        let _reset = ResetGuard;
+        body()
+    }
+
+    /// GH#400, R3: inventory error injection forces the startup retry branch
+    /// against a real mailbox. It does not reproduce the engine's recovery
+    /// race; mailbox_inventory_retry_reads_after_real_namespace_contention_clears
+    /// supplies compensating real-engine admission/read coverage.
+    #[test]
+    fn sqlite_init_retries_recovery_busy_inventory_before_migration() {
+        let directory = tempfile::tempdir().expect("temporary mailbox");
+        let primary = directory.path().join("storage.sqlite3");
+        let storage_root = directory.path().join("archive");
+        seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cx = Cx::for_testing();
+        let initialize = || {
+            runtime.block_on(initialize_sqlite_file_once(
+                &cx,
+                primary.to_str().expect("UTF-8 mailbox path"),
+                true,
+                &storage_root,
+            ))
+        };
+        initialize()
+            .into_result()
+            .expect("normalize fixture schema");
+        let writer = DbConn::open_file(primary.to_str().expect("UTF-8 mailbox path"))
+            .expect("open fixture writer");
+        writer
+            .execute_raw(
+                "INSERT OR IGNORE INTO db_identity (singleton, generation_id) VALUES (0, 'inventory-retry-generation');",
+            )
+            .expect("seed a generation identity retained across inventory retries");
+        crate::close_db_conn(writer, "seed inventory retry generation");
+        let inventory_before = inspect_mailbox_db_inventory(&primary).expect("real seed inventory");
+        assert_eq!(inventory_before.messages, 1);
+        assert_eq!(inventory_before.max_message_id, 1);
+        let generation_before = read_db_generation_id_for_path(&primary).expect("seed generation");
+        let files_before = exact_diagnostic_parent_snapshot(directory.path())
+            .into_keys()
+            .collect::<Vec<_>>();
+
+        with_sqlite_inventory_faults(
+            (0..3)
+                .map(|_| inventory_recovery_busy_for_test(&primary))
+                .collect(),
+            || {
+                initialize()
+                    .into_result()
+                    .expect("startup waits for inventory before migrating");
+                SQLITE_INVENTORY_FAULTS.with(|faults| {
+                    assert!(
+                        faults.borrow().is_empty(),
+                        "startup must reach the inventory seam"
+                    );
+                });
+                assert_eq!(SQLITE_INVENTORY_BUSY_RETRIES.with(std::cell::Cell::get), 3);
+            },
+        );
+
+        assert_eq!(
+            inspect_mailbox_db_inventory(&primary).expect("real inventory after retries"),
+            inventory_before,
+            "contention must preserve live identities and durable message IDs"
+        );
+        assert_eq!(
+            read_db_generation_id_for_path(&primary),
+            Some(generation_before),
+            "contention must not replace the database generation"
+        );
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path())
+                .into_keys()
+                .collect::<Vec<_>>(),
+            files_before,
+            "contention must not publish recovery or quarantine artifacts"
+        );
+        let conn = open_guarded_read_only_sqlite_file(&primary, "verify inventory retry")
+            .expect("read retained message through its actual engine");
+        let rows = conn
+            .query_sync("SELECT id, subject, body_md FROM messages", &[])
+            .expect("read retained message");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<String>("subject").unwrap(), "First");
+        assert!(
+            rows[0]
+                .get_named::<String>("body_md")
+                .unwrap()
+                .contains("first body")
+        );
+    }
+
+    /// R3: injected inventory failures prove startup refuses before mutation;
+    /// the real namespace test below compensates for actual engine admission.
+    #[test]
+    fn sqlite_init_inventory_fatal_errors_preserve_the_mailbox() {
+        let directory = tempfile::tempdir().expect("temporary mailbox");
+        let primary = directory.path().join("storage.sqlite3");
+        let storage_root = directory.path().join("archive");
+        seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cx = Cx::for_testing();
+        let initialize = || {
+            runtime.block_on(initialize_sqlite_file_once(
+                &cx,
+                primary.to_str().expect("UTF-8 mailbox path"),
+                true,
+                &storage_root,
+            ))
+        };
+        initialize()
+            .into_result()
+            .expect("normalize fixture schema");
+        let before = exact_diagnostic_parent_snapshot(directory.path());
+
+        for busy_first in [false, true] {
+            let mut faults = Vec::new();
+            if busy_first {
+                faults.push(inventory_recovery_busy_for_test(&primary));
+            }
+            faults.push(SqlError::Custom(
+                "mailbox database inventory: permission denied".into(),
+            ));
+            with_sqlite_inventory_faults(faults, || {
+                let outcome = initialize();
+                assert!(
+                    matches!(outcome, Outcome::Err(ref error) if error.to_string().contains("permission denied")),
+                    "an unreadable inventory must fail closed before migrations: {outcome:?}"
+                );
+                assert_eq!(
+                    SQLITE_INVENTORY_BUSY_RETRIES.with(std::cell::Cell::get),
+                    u32::from(busy_first)
+                );
+            });
+            assert_eq!(
+                exact_diagnostic_parent_snapshot(directory.path()),
+                before,
+                "inventory refusal must preserve every mailbox file and byte"
+            );
+        }
+    }
+
+    /// R3: fake time and busy results prove the wait budget deterministically,
+    /// not real engine recovery. The namespace contention test below supplies
+    /// compensating real-engine admission/read coverage.
+    #[test]
+    fn mailbox_inventory_retry_exhausts_its_budget_without_an_extra_probe() {
+        let primary = Path::new("inventory-retry.sqlite3");
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let attempts = std::cell::Cell::new(0_u32);
+        let error = retry_mailbox_db_inventory(
+            primary,
+            || {
+                assert!(
+                    clock.get() < start + SQLITE_INIT_BUSY_RETRY_BUDGET,
+                    "an expired budget must not admit another engine probe"
+                );
+                attempts.set(attempts.get() + 1);
+                Err(SqlError::Custom(format!(
+                    "database is busy (recovery in progress), attempt {}",
+                    attempts.get()
+                )))
+            },
+            || clock.get(),
+            |delay| {
+                assert!(!delay.is_zero());
+                assert!(delay <= SQLITE_INIT_BUSY_RETRY_MAX_DELAY);
+                clock.set(clock.get() + delay);
+            },
+        )
+        .expect_err("persistent contention must terminate");
+        assert_eq!(
+            clock.get().duration_since(start),
+            SQLITE_INIT_BUSY_RETRY_BUDGET
+        );
+        assert!(attempts.get() > 3, "the short opener retry is insufficient");
+        let message = error.to_string();
+        assert!(message.contains(SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED));
+        assert!(message.contains(&format!(
+            "database is busy (recovery in progress), attempt {}",
+            attempts.get()
+        )));
+    }
+
+    /// R3: fabricated errors isolate classification and immediate stop behavior.
+    /// Real engine reads are covered by the namespace contention test below.
+    #[test]
+    fn mailbox_inventory_retry_stops_on_non_contention_errors() {
+        for fatal in [
+            "mailbox database inventory: permission denied",
+            "mailbox database inventory: unable to open database file",
+            "mailbox database inventory: disk I/O error",
+            "mailbox database inventory: database disk image is malformed",
+            "mailbox database inventory: namespace authority is malformed or unsafe",
+        ] {
+            for busy_first in [false, true] {
+                let primary = Path::new("inventory-retry.sqlite3");
+                let start = Instant::now();
+                let clock = std::cell::Cell::new(start);
+                let attempts = std::cell::Cell::new(0_u32);
+                let error = retry_mailbox_db_inventory(
+                    primary,
+                    || {
+                        attempts.set(attempts.get() + 1);
+                        if busy_first && attempts.get() == 1 {
+                            Err(inventory_recovery_busy_for_test(primary))
+                        } else {
+                            Err(SqlError::Custom(fatal.into()))
+                        }
+                    },
+                    || clock.get(),
+                    |delay| clock.set(clock.get() + delay),
+                )
+                .expect_err("non-contention must terminate retries");
+                assert_eq!(
+                    error.to_string(),
+                    SqlError::Custom(fatal.into()).to_string()
+                );
+                assert_eq!(attempts.get(), 1 + u32::from(busy_first));
+                assert_eq!(
+                    clock.get().duration_since(start),
+                    if busy_first {
+                        Duration::from_millis(25)
+                    } else {
+                        Duration::ZERO
+                    }
+                );
+            }
+        }
+    }
+
+    /// R1: real engine reads and namespace locks prove admission after a
+    /// competing lease clears. The sleeper only controls owner release;
+    /// the virtual-clock test above separately proves the retry budget.
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
+    fn mailbox_inventory_retry_reads_after_real_namespace_contention_clears() {
+        use fsqlite::fsqlite_vfs::namespace::{NamespaceOpenIntent, PendingNamespaceOpen};
+
+        let directory = tempfile::tempdir().expect("temporary mailbox");
+        let primary = directory.path().join("storage.sqlite3");
+        let storage_root = directory.path().join("archive");
+        seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        let admitted = DbConn::open_file(primary.to_str().expect("UTF-8 mailbox path"))
+            .expect("admit fixture through the runtime engine");
+        admitted
+            .query_sync("SELECT id FROM messages", &[])
+            .expect("read fixture through the runtime engine");
+        crate::close_db_conn(admitted, "admit inventory contention fixture");
+        let stable_path = primary.canonicalize().expect("canonical mailbox path");
+        let before = exact_diagnostic_parent_snapshot(directory.path());
+        let mut exclusive = Some(
+            PendingNamespaceOpen::begin(&stable_path, NamespaceOpenIntent::ReservedExclusive)
+                .expect("reserve namespace until inventory observes contention"),
+        );
+        let clock = std::cell::Cell::new(Instant::now());
+        let attempts = std::cell::Cell::new(0_u32);
+        let waits = std::cell::Cell::new(0_u32);
+        let inventory = retry_mailbox_db_inventory(
+            &primary,
+            || {
+                attempts.set(attempts.get() + 1);
+                let result = inspect_mailbox_db_inventory(&primary);
+                if attempts.get() == 1 {
+                    assert!(
+                        matches!(&result, Err(error) if is_mailbox_inventory_busy_error(error)),
+                        "the real namespace owner must prevent the first read: {result:?}"
+                    );
+                }
+                result
+            },
+            || clock.get(),
+            |delay| {
+                waits.set(waits.get() + 1);
+                drop(
+                    exclusive
+                        .take()
+                        .expect("release namespace after the first refusal"),
+                );
+                clock.set(clock.get() + delay);
+            },
+        )
+        .expect("real read-only inventory succeeds after namespace release");
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(waits.get(), 1);
+        assert_eq!(inventory.messages, 1);
+        assert_eq!(inventory.max_message_id, 1);
+        assert_eq!(
+            exact_diagnostic_parent_snapshot(directory.path()),
+            before,
+            "waiting and reading must not rewrite namespace or mailbox bytes"
+        );
+    }
+
+    /// R3: injected inventory errors make a diagnostic retry observable. The
+    /// namespace test above and the existing read-intent reconciliation test
+    /// compensate for actual database/archive behavior.
+    #[test]
+    fn diagnostic_inventory_and_read_intent_keep_their_existing_read_only_paths() {
+        let directory = tempfile::tempdir().expect("temporary mailbox");
+        let primary = directory.path().join("storage.sqlite3");
+        let storage_root = directory.path().join("archive");
+        seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        let before = exact_diagnostic_parent_snapshot(directory.path());
+        with_sqlite_inventory_faults(
+            vec![
+                inventory_recovery_busy_for_test(&primary),
+                inventory_recovery_busy_for_test(&primary),
+            ],
+            || {
+                let error = inspect_mailbox_db_inventory(&primary)
+                    .expect_err("standalone diagnostics keep their existing bounded opener");
+                assert!(error.to_string().contains("recovery in progress"));
+                assert_eq!(SQLITE_INVENTORY_BUSY_RETRIES.with(std::cell::Cell::get), 0);
+                SQLITE_INVENTORY_FAULTS.with(|faults| assert_eq!(faults.borrow().len(), 1));
+
+                let _read_intent = ReadOnlyIntentGuard::enter();
+                assert!(
+                    !reconcile_archive_state_before_init(&primary, &storage_root)
+                        .expect("read intent skips mutable startup reconciliation")
+                );
+                SQLITE_INVENTORY_FAULTS.with(|faults| assert_eq!(faults.borrow().len(), 1));
+                assert_eq!(SQLITE_INVENTORY_BUSY_RETRIES.with(std::cell::Cell::get), 0);
+            },
+        );
+        assert_eq!(exact_diagnostic_parent_snapshot(directory.path()), before);
+    }
+
+    /// R3: an injected exhausted error forces the outer pool retry boundary
+    /// without a 30-second delay. The real namespace test above covers
+    /// admission; this test proves acquire does not restart the spent budget.
+    #[test]
+    fn pool_acquire_does_not_restart_an_exhausted_inventory_retry_budget() {
+        let directory = tempfile::tempdir().expect("temporary mailbox");
+        let primary = directory.path().join("storage.sqlite3");
+        let storage_root = directory.path().join("archive");
+        seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cx = Cx::for_testing();
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: sqlite_url_from_path(&primary),
+            storage_root: Some(storage_root),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct pool without initializing it");
+        with_sqlite_inventory_faults(
+            vec![
+                SqlError::Custom(format!(
+                    "{SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED} after 30000 ms for {}: database is busy (recovery in progress)",
+                    primary.display()
+                )),
+                SqlError::Custom("unexpected second inventory attempt".into()),
+            ],
+            || {
+                let error = match runtime.block_on(pool.acquire(&cx)) {
+                    Outcome::Err(error) => error,
+                    Outcome::Ok(_) => panic!("exhausted inventory must fail the acquire"),
+                    Outcome::Cancelled(reason) => panic!("acquire cancelled: {reason:?}"),
+                    Outcome::Panicked(payload) => std::panic::panic_any(payload),
+                };
+                assert!(is_mailbox_inventory_retry_exhausted(&error.to_string()));
+                assert_eq!(SQLITE_INVENTORY_BUSY_RETRIES.with(std::cell::Cell::get), 0);
+                SQLITE_INVENTORY_FAULTS.with(|faults| {
+                    let faults = faults.borrow();
+                    assert_eq!(faults.len(), 1, "acquire retried the spent budget");
+                    assert!(
+                        faults
+                            .front()
+                            .unwrap()
+                            .to_string()
+                            .contains("unexpected second inventory attempt")
+                    );
+                });
+            },
         );
     }
 

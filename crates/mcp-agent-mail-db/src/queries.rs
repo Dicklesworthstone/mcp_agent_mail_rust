@@ -4424,7 +4424,9 @@ static WRITE_CONTENTION_EXHAUSTED_LAST_MINUTE: RollingMinuteCounter = RollingMin
 fn is_mvcc_error(e: &DbError) -> bool {
     matches!(
         e,
-        DbError::Sqlite(msg) | DbError::ResourceBusy(msg) if crate::error::is_mvcc_conflict(msg)
+        DbError::Sqlite(msg) | DbError::ResourceBusy(msg)
+            if !crate::pool::is_mailbox_inventory_retry_exhausted(msg)
+                && crate::error::is_mvcc_conflict(msg)
     )
 }
 
@@ -4438,11 +4440,14 @@ fn is_plain_write_contention_error(e: &DbError) -> bool {
         e,
         DbError::Sqlite(msg) | DbError::ResourceBusy(msg) if {
             let lower = msg.to_ascii_lowercase();
-            lower.contains("database is locked")
-                || lower.contains("database table is locked")
-                || lower.contains("database schema is locked")
-                || lower.contains("database is busy")
-                || lower.contains("locked by another process")
+            // GH#400: pool startup has already spent the inventory's busy
+            // budget. A query retry must not restart that whole wait.
+            !crate::pool::is_mailbox_inventory_retry_exhausted(msg)
+                && (lower.contains("database is locked")
+                    || lower.contains("database table is locked")
+                    || lower.contains("database schema is locked")
+                    || lower.contains("database is busy")
+                    || lower.contains("locked by another process"))
         }
     )
 }
@@ -24233,6 +24238,73 @@ mod tests {
         });
         assert!(matches!(result, Outcome::Err(DbError::Sqlite(_))));
         assert_eq!(attempts.get(), 1, "a non-busy error is returned at once");
+    }
+
+    /// GH#400, R3: inject the SQL startup failure to test exhaustion propagation
+    /// through the real read/write retry loops, not engine recovery behavior.
+    /// Real-path compensation:
+    /// `pool::tests::mailbox_inventory_retry_reads_after_real_namespace_contention_clears`.
+    #[test]
+    fn retry_loops_preserve_exhausted_mailbox_inventory_budget() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        for read_only in [true, false] {
+            for cause in [
+                "Connection error: database is busy (recovery in progress)",
+                "database is busy (snapshot conflict on pages: 7)",
+            ] {
+                let sql_error = SqlError::Custom(format!(
+                    "{} after 30s: {cause}",
+                    crate::pool::SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED,
+                ));
+                let message = sql_error.to_string();
+                let attempts = std::cell::Cell::new(0_u32);
+                let operation = || {
+                    let attempt = attempts.get() + 1;
+                    attempts.set(attempt);
+                    let error = map_sql_error(&sql_error);
+                    async move {
+                        if attempt == 1 {
+                            Outcome::Err(error)
+                        } else {
+                            // An accidental retry fails this contract promptly.
+                            Outcome::Ok(())
+                        }
+                    }
+                };
+                let result = if read_only {
+                    rt.block_on(run_read_with_mvcc_retry(
+                        &cx,
+                        "test_exhausted_inventory_read",
+                        operation,
+                    ))
+                } else {
+                    rt.block_on(run_with_mvcc_retry(
+                        &cx,
+                        "test_exhausted_inventory_write",
+                        operation,
+                    ))
+                };
+
+                assert_eq!(attempts.get(), 1, "read_only={read_only}: {cause}");
+                let Outcome::Err(error) = result else {
+                    panic!("inventory exhaustion must propagate unchanged: {result:?}");
+                };
+                assert!(
+                    matches!(&error, DbError::ResourceBusy(detail) if detail == &message),
+                    "startup busy cause must be preserved: {error:?}"
+                );
+                assert_eq!(error.error_code(), "RESOURCE_BUSY");
+                assert_eq!(
+                    crate::error::classify_db_error_message(&error.to_string()).class,
+                    crate::error::DbErrorClass::BusyRetryable,
+                );
+            }
+        }
     }
 
     #[test]
