@@ -2,6 +2,15 @@
 
 ## Current operational reliability improvements
 
+- [x] Bind ATC write mode and kill-switch authority to each server lifetime;
+  prevent delayed observations or controls from reusing another mailbox policy
+  and fail closed when the current marker authority cannot be inspected.
+- [x] Make archive flushes honor FIFO persistence barriers and report unresolved
+  write failures; retain failure status across unrelated successful writes,
+  shutdown, and restart until the existing repair ledger verifies recovery.
+- [x] Reject invalid or unresolved query filters before search routing and caching;
+  preserve explicit facet precedence and propagate project lookup failures and
+  cancellation without broadening the search.
 - [x] Publish archive epoch and index-sync control markers through private,
   exclusively created staging files; preserve foreign staging entries and reject
   symlinked control paths and nonregular destinations.

@@ -184,9 +184,9 @@ fn normalize_datetime_hint(value: &str, boundary: HintTimeBoundary) -> Option<St
     let day_start = date.and_hms_micro_opt(0, 0, 0, 0)?;
     let normalized = match boundary {
         HintTimeBoundary::StartInclusive => day_start,
-        HintTimeBoundary::EndInclusive => {
-            day_start + chrono::TimeDelta::try_days(1)? - chrono::TimeDelta::microseconds(1)
-        }
+        // Construct this day's final microsecond directly. Advancing through
+        // tomorrow overflows for the last date Chrono can represent.
+        HintTimeBoundary::EndInclusive => date.and_hms_micro_opt(23, 59, 59, 999_999)?,
     };
     Some(
         normalized
@@ -1010,6 +1010,17 @@ mod tests {
         assert_eq!(
             assistance.applied_filter_hints[0].value,
             "2026-01-31T22:30:00.000000Z"
+        );
+    }
+
+    #[test]
+    fn parse_query_assistance_handles_last_representable_day_without_panicking() {
+        let date = chrono::NaiveDate::MAX;
+        let assistance = parse_query_assistance(&format!("before:{date}"));
+        assert_eq!(assistance.applied_filter_hints.len(), 1);
+        assert_eq!(
+            assistance.applied_filter_hints[0].value,
+            format!("{date}T23:59:59.999999Z")
         );
     }
 

@@ -709,8 +709,9 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::AtomicU64;
 
-        let capacity = ops.len() + 1;
+        let capacity = ops.len() + 2;
         let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+        let (flush_sender, flush_receiver) = std::sync::mpsc::sync_channel(1);
         let depth = Arc::new(AtomicU64::new(0));
         if shutdown_first {
             assert!(sender.send(crate::WbqMsg::Shutdown).is_ok());
@@ -722,6 +723,7 @@ mod tests {
             });
             assert!(crate::wbq_try_send_counted(&sender, &depth, message, None).is_ok());
         }
+        assert!(sender.send(crate::WbqMsg::Flush(flush_sender)).is_ok());
         if !shutdown_first {
             assert!(sender.send(crate::WbqMsg::Shutdown).is_ok());
         }
@@ -733,6 +735,11 @@ mod tests {
             batch_cap,
         );
         assert_eq!(depth.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            flush_receiver.recv().unwrap(),
+            crate::WbqFlushOutcome::PersistenceFailed,
+            "both normal and post-shutdown barriers must report real failed writes"
+        );
         crate::flush_async_commits();
     }
 
@@ -849,6 +856,148 @@ mod tests {
     #[test]
     fn real_wbq_post_shutdown_failure_is_not_lost_by_the_second_drain_path() {
         exercise_real_drain_failure(2, true);
+    }
+
+    #[test]
+    fn real_wbq_flush_refuses_false_success_until_verified_repair() {
+        super::super::tests::retention_fixture(2, |cx, pool, config| {
+            clear_by_operator();
+            let failed = prepare_message_classified(cx, pool, 901).unwrap();
+            let healthy = prepare_message_classified(cx, pool, 902).unwrap();
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &failed.message,
+                &failed.sender,
+                &failed.recipients,
+            )
+            .unwrap()
+            .0;
+            std::fs::create_dir_all(&paths.outbox).unwrap();
+            crate::wbq_start();
+            assert_eq!(
+                crate::wbq_enqueue(op(config, &failed)),
+                crate::WbqEnqueueResult::Enqueued
+            );
+            // This assertion also reproduces the original false-success bug
+            // using only the pre-existing public flush API.
+            assert_ne!(
+                crate::wbq_flush_status(),
+                crate::WbqFlushOutcome::Drained,
+                "a real archive write failure must not receive a successful flush"
+            );
+            assert!(crate::durability_degraded());
+            let failures = crate::wbq_stats().unrecoverable_errors;
+            assert_eq!(failures, 1);
+
+            assert_eq!(
+                crate::wbq_enqueue(op(config, &healthy)),
+                crate::WbqEnqueueResult::Enqueued
+            );
+            assert_ne!(
+                crate::wbq_flush_status(),
+                crate::WbqFlushOutcome::Drained,
+                "a later successful operation must not forgive the earlier failure"
+            );
+            crate::flush_async_commits();
+            assert_committed(config, &healthy);
+            assert_eq!(crate::wbq_stats().unrecoverable_errors, failures);
+            assert_eq!(ledger().entries.len(), 1);
+
+            std::fs::rename(
+                &paths.outbox,
+                config.storage_root.join("retained-flush-obstruction"),
+            )
+            .unwrap();
+            drive(cx, pool, config, &AtomicBool::new(false)).unwrap();
+            assert_committed(config, &failed);
+            assert!(!crate::durability_degraded());
+            assert_eq!(crate::wbq_flush_status(), crate::WbqFlushOutcome::Drained);
+            assert_eq!(crate::wbq_stats().unrecoverable_errors, failures);
+            crate::wbq_shutdown();
+        });
+    }
+
+    #[test]
+    fn real_wbq_profile_failure_survives_message_repair_and_shutdown() {
+        super::super::tests::retention_fixture(1, |cx, pool, config| {
+            clear_by_operator();
+            let prepared = prepare_message_classified(cx, pool, 901).unwrap();
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let profile = archive.root.join("agents/BrokenProfile/profile.json");
+            std::fs::create_dir_all(&profile).unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &prepared.message,
+                &prepared.sender,
+                &prepared.recipients,
+            )
+            .unwrap()
+            .0;
+            std::fs::create_dir_all(&paths.outbox).unwrap();
+            crate::wbq_start();
+            for operation in [
+                WriteOp::AgentProfile {
+                    project_slug: "project".to_string(),
+                    config: config.clone(),
+                    agent_json: json!({"name": "BrokenProfile", "program": "test", "model": "test"}),
+                },
+                op(config, &prepared),
+            ] {
+                assert_eq!(
+                    crate::wbq_enqueue(operation),
+                    crate::WbqEnqueueResult::Enqueued
+                );
+            }
+            assert_eq!(
+                crate::wbq_flush_status(),
+                crate::WbqFlushOutcome::PersistenceFailed
+            );
+            assert_eq!(crate::wbq_stats().unrecoverable_errors, 2);
+            assert_eq!(ledger().entries.len(), 1);
+            assert!(ledger().unknown_failure);
+
+            std::fs::rename(
+                &paths.outbox,
+                config.storage_root.join("retained-message-obstruction"),
+            )
+            .unwrap();
+            drive(cx, pool, config, &AtomicBool::new(false)).unwrap();
+            assert_committed(config, &prepared);
+            assert!(
+                ledger().entries.is_empty(),
+                "the known message was verified"
+            );
+            assert!(profile.is_dir(), "the failed profile remains unresolved");
+            assert!(crate::durability_degraded());
+            assert_eq!(
+                crate::wbq_shutdown_status(),
+                crate::WbqFlushOutcome::PersistenceFailed,
+                "a negative persistence acknowledgement still permits an orderly shutdown"
+            );
+            assert!(crate::WBQ.get().unwrap().drain_handle.lock().is_none());
+            assert_eq!(
+                crate::wbq_flush_status(),
+                crate::WbqFlushOutcome::PersistenceFailed,
+                "a stopped queue must not hide unresolved non-message failure"
+            );
+
+            crate::wbq_start();
+            assert_eq!(
+                crate::wbq_enqueue(op(config, &prepared)),
+                crate::WbqEnqueueResult::Enqueued
+            );
+            assert_eq!(
+                crate::wbq_flush_status(),
+                crate::WbqFlushOutcome::PersistenceFailed,
+                "restarting and successfully rewriting mail cannot forgive a profile failure"
+            );
+            assert_eq!(
+                crate::wbq_shutdown_status(),
+                crate::WbqFlushOutcome::PersistenceFailed
+            );
+            assert_eq!(crate::wbq_stats().unrecoverable_errors, 2);
+        });
     }
 
     fn witness(id: i64) -> Witness {

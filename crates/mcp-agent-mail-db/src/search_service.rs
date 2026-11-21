@@ -342,6 +342,8 @@ fn query_assistance_payload(query: &SearchQuery) -> Option<QueryAssistance> {
 /// `thread:`, `importance:`, `after:`, `before:`, and `project:` (by slug, on
 /// an unscoped search only). An explicit facet wins over a hint. Only hints
 /// that took effect are reported in the assistance payload.
+/// Invalid or unresolved active filters fail the query: removing a filter
+/// must never silently broaden a search to other dates, priorities or projects.
 ///
 /// Returns the hinted query (`None` when the text has no hints) and the
 /// assistance payload.
@@ -349,14 +351,14 @@ async fn apply_query_hints(
     cx: &Cx,
     pool: &DbPool,
     query: &SearchQuery,
-) -> (Option<SearchQuery>, Option<QueryAssistance>) {
+) -> Outcome<(Option<SearchQuery>, Option<QueryAssistance>), DbError> {
     if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) {
-        return (None, query_assistance_payload(query));
+        return Outcome::Ok((None, query_assistance_payload(query)));
     }
     let mut assistance = parse_query_assistance(&query.text);
     if assistance.applied_filter_hints.is_empty() {
         let payload = (!assistance.did_you_mean.is_empty()).then_some(assistance);
-        return (None, payload);
+        return Outcome::Ok((None, payload));
     }
     let hint_micros = |value: &str| {
         chrono::DateTime::parse_from_rfc3339(value)
@@ -376,22 +378,51 @@ async fn apply_query_hints(
                 hinted.thread_id = Some(hint.value.clone());
                 true
             }
-            "importance" if hinted.importance.is_empty() => Importance::parse(&hint.value)
-                .map(|importance| hinted.importance = vec![importance])
-                .is_some(),
-            "after" if hinted.time_range.min_ts.is_none() => hint_micros(&hint.value)
-                .map(|ts| hinted.time_range.min_ts = Some(ts))
-                .is_some(),
-            "before" if hinted.time_range.max_ts.is_none() => hint_micros(&hint.value)
-                .map(|ts| hinted.time_range.max_ts = Some(ts))
-                .is_some(),
+            "importance" if hinted.importance.is_empty() => {
+                let Some(importance) = Importance::parse(&hint.value) else {
+                    return Outcome::Err(DbError::invalid(
+                        "query",
+                        format!(
+                            "invalid importance filter {:?}; expected low, normal, high or urgent",
+                            hint.value
+                        ),
+                    ));
+                };
+                hinted.importance = vec![importance];
+                true
+            }
+            "after" | "before"
+                if (hint.field == "after" && hinted.time_range.min_ts.is_none())
+                    || (hint.field == "before" && hinted.time_range.max_ts.is_none()) =>
+            {
+                let Some(timestamp) = hint_micros(&hint.value) else {
+                    return Outcome::Err(DbError::invalid(
+                        "query",
+                        format!(
+                            "invalid {} filter {:?}; expected YYYY-MM-DD or an ISO 8601 timestamp",
+                            hint.field, hint.value
+                        ),
+                    ));
+                };
+                if hint.field == "after" {
+                    hinted.time_range.min_ts = Some(timestamp);
+                } else {
+                    hinted.time_range.max_ts = Some(timestamp);
+                }
+                true
+            }
             "project" if hinted.project_id.is_none() && hinted.product_id.is_none() => {
                 match crate::queries::get_project_by_slug(cx, pool, &hint.value).await {
                     Outcome::Ok(project) => {
-                        hinted.project_id = project.id;
-                        project.id.is_some()
+                        let Some(id) = project.id else {
+                            return Outcome::Err(DbError::not_found("Project", &hint.value));
+                        };
+                        hinted.project_id = Some(id);
+                        true
                     }
-                    _ => false,
+                    Outcome::Err(error) => return Outcome::Err(error),
+                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
                 }
             }
             _ => false,
@@ -403,7 +434,7 @@ async fn apply_query_hints(
     let payload = (!assistance.applied_filter_hints.is_empty()
         || !assistance.did_you_mean.is_empty())
     .then_some(assistance);
-    (Some(hinted), payload)
+    Outcome::Ok((Some(hinted), payload))
 }
 
 /// Generate zero-result recovery guidance based on query facets and result count.
@@ -5706,7 +5737,12 @@ pub async fn execute_search(
         return lexical_failure(cx, DbError::Sqlite(error));
     }
     // Hints become filters before routing, caching and planning see the query.
-    let (hinted, assistance) = apply_query_hints(cx, pool, query).await;
+    let (hinted, assistance) = match apply_query_hints(cx, pool, query).await {
+        Outcome::Ok(parsed) => parsed,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
     let query = hinted.as_ref().unwrap_or(query);
     let product_sql_budget = product_sql_budget_state(cx, query);
     let (resolved_engine, kill_switched) =
@@ -11237,6 +11273,230 @@ mod tests {
         assert_eq!(assistance.applied_filter_hints[0].value, "br-123");
         assert_eq!(assistance.did_you_mean.len(), 1);
         assert_eq!(assistance.did_you_mean[0].suggested_field, "from");
+    }
+
+    async fn query_hint_mailbox(cx: &Cx) -> (tempfile::TempDir, DbPool, crate::models::ProjectRow) {
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "query-hints.sqlite3");
+        let mut primary = None;
+        for (project_key, rows) in [
+            (
+                "/query-hint-alpha",
+                vec![
+                    (1, "2026-01-01T12:00:00Z", "high"),
+                    (2, "2026-01-02T00:00:00Z", "high"),
+                    (3, "2026-01-01T12:00:00Z", "low"),
+                ],
+            ),
+            (
+                "/query-hint-beta",
+                vec![(4, "2026-01-01T12:00:00Z", "high")],
+            ),
+        ] {
+            let project = crate::queries::ensure_project(cx, &pool, project_key)
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let sender = crate::queries::register_agent(
+                cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let conn = pool.acquire(cx).await.into_result().unwrap();
+            for (id, timestamp, importance) in rows {
+                let created_ts = chrono::DateTime::parse_from_rfc3339(timestamp)
+                    .unwrap()
+                    .timestamp_micros();
+                conn.execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts) \
+                     VALUES (?, ?, ?, 'commonmail', 'retained message body', ?, ?)",
+                    &[
+                        Value::BigInt(id),
+                        Value::BigInt(project_id),
+                        Value::BigInt(sender.id.unwrap()),
+                        Value::Text(importance.to_string()),
+                        Value::BigInt(created_ts),
+                    ],
+                )
+                .unwrap();
+            }
+            if primary.is_none() {
+                primary = Some(project);
+            }
+        }
+        (root, pool, primary.unwrap())
+    }
+
+    #[test]
+    fn search_query_hints_refuse_unknown_project_instead_of_searching_every_project() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let (_root, pool, _) = query_hint_mailbox(&cx).await;
+            let options = SearchOptions::default();
+            let unscoped = SearchQuery {
+                ranking: RankingMode::Recency,
+                ..Default::default()
+            };
+            let control = execute_search(&cx, &pool, &unscoped, &options)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(control.results.len(), 4, "both projects must contain mail");
+
+            let outcome = execute_search(
+                &cx,
+                &pool,
+                &SearchQuery {
+                    text: "project:no-such-hint-project".to_string(),
+                    ..unscoped
+                },
+                &options,
+            )
+            .await;
+            assert!(
+                matches!(outcome, Outcome::Err(DbError::NotFound { entity: "Project", ref identifier })
+                    if identifier == "no-such-hint-project"),
+                "an unresolved project must not return another project's mail: {outcome:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn search_query_hints_refuse_invalid_filters_instead_of_dropping_them() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let (_root, pool, project) = query_hint_mailbox(&cx).await;
+            for (text, field) in [
+                ("after:not-a-date", "after"),
+                ("before:2026-02-30", "before"),
+                ("importance:urgnet", "importance"),
+                ("since:not-a-date", "after"),
+                ("priority:urgnet", "importance"),
+            ] {
+                let outcome = execute_search(
+                    &cx,
+                    &pool,
+                    &SearchQuery {
+                        ranking: RankingMode::Recency,
+                        ..SearchQuery::messages(text, project.id.unwrap())
+                    },
+                    &SearchOptions::default(),
+                )
+                .await;
+                assert!(
+                    matches!(outcome, Outcome::Err(DbError::InvalidArgument { field: "query", ref message })
+                        if message.contains(field)),
+                    "invalid {text} must not broaden the result set: {outcome:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn search_query_hints_preserve_project_lookup_failure_and_cancellation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let pool = DbPool::new(&crate::DbPoolConfig {
+                database_url: format!(
+                    "sqlite:///{}",
+                    root.path().join("uninitialized.sqlite3").display()
+                ),
+                storage_root: Some(root.path().to_path_buf()),
+                min_connections: 0,
+                max_connections: 1,
+                warmup_connections: 0,
+                run_migrations: false,
+                ..Default::default()
+            })
+            .unwrap();
+            let cx = Cx::for_testing();
+            let query = SearchQuery {
+                text: "project:unresolved-during-outage".to_string(),
+                ..Default::default()
+            };
+            // The actual database has no schema. Its lookup error must not be
+            // mistaken for an optional hint that simply did not apply.
+            let failed = apply_query_hints(&cx, &pool, &query).await;
+            assert!(matches!(failed, Outcome::Err(_)), "{failed:?}");
+
+            cx.set_cancel_requested(true);
+            let cancelled = apply_query_hints(&cx, &pool, &query).await;
+            assert!(matches!(cancelled, Outcome::Cancelled(_)), "{cancelled:?}");
+        });
+    }
+
+    #[test]
+    fn search_query_hints_apply_valid_filters_and_preserve_explicit_facets() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let (_root, pool, project) = query_hint_mailbox(&cx).await;
+            let options = SearchOptions::default();
+            let query = SearchQuery {
+                text: format!(
+                    "project:{} from:BlueLake after:2026-01-01 before:2026-01-01 importance:high",
+                    project.slug
+                ),
+                ranking: RankingMode::Recency,
+                ..Default::default()
+            };
+            let filtered = execute_search(&cx, &pool, &query, &options)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                filtered
+                    .results
+                    .iter()
+                    .map(|row| row.result.id)
+                    .collect::<Vec<_>>(),
+                vec![1],
+                "project, inclusive day bounds and importance must all constrain the same query"
+            );
+            assert_eq!(filtered.assistance.unwrap().applied_filter_hints.len(), 5);
+
+            let explicit = SearchQuery {
+                text: "project:absent importance:invalid after:invalid before:invalid".to_string(),
+                importance: vec![Importance::Low],
+                time_range: crate::search_planner::TimeRange {
+                    min_ts: Some(
+                        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                            .unwrap()
+                            .timestamp_micros(),
+                    ),
+                    max_ts: Some(
+                        chrono::DateTime::parse_from_rfc3339("2026-01-01T23:59:59.999999Z")
+                            .unwrap()
+                            .timestamp_micros(),
+                    ),
+                },
+                ranking: RankingMode::Recency,
+                ..SearchQuery::messages("", project.id.unwrap())
+            };
+            let filtered = execute_search(&cx, &pool, &explicit, &options)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(filtered.results.len(), 1);
+            assert_eq!(filtered.results[0].result.id, 3);
+            assert!(
+                filtered.assistance.is_none(),
+                "overridden hints were not applied"
+            );
+        });
     }
 
     #[cfg(feature = "hybrid")]
