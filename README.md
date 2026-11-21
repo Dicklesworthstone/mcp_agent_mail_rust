@@ -561,11 +561,18 @@ project entry can run. They check the active canonical `mcp.json`
 (`mcp-agent-mail`, `mcp_agent_mail`, and `agent-mail`). OMP also discovers the
 read-only `.mcp.json` sibling after `mcp.json` in both project and active-user
 scopes. An exact repeated server name is shadowed by the earlier source, while a
-different Agent Mail alias remains a separate MCP key; setup status reports and
-fingerprints that conflict without mirror-writing the secondary file. Status
-also evaluates
-`mcp.enableProjectConfig` with OMP's persistent settings precedence: the active
-profile's `config.yml` (falling back to `config.yaml` only when it is absent).
+different Agent Mail alias can survive as a separate MCP connection. Setup
+status checks the sources that can contribute those aliases, including root
+`mcp.json` and `.mcp.json`, imported harness configurations, and configured
+or installed extension packages. It treats the imported sources as read-only.
+`disabledProviders` removes a provider before discovery, and OMP uses
+`enabledProviders` to opt into foreign user configuration. An active marketplace
+registration with an empty plugin name can expose an unqualified alias. Setup
+status reports the registry path as unsupported in that case.
+
+Status evaluates `mcp.enableProjectConfig` and provider switches using OMP's
+persistent settings precedence. It starts with the active profile's
+`config.yml`, falling back to `config.yaml` only when the former is absent.
 When both main YAML names are absent, an existing legacy `settings.json` or
 `agent.db` remains a migration authority and setup fails closed until OMP has
 migrated it or an operator has inspected it. Project settings providers then
