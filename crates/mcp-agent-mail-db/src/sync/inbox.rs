@@ -1079,6 +1079,8 @@ fn shared_header_window(
 /// timestamps and IDs are traversal keys, never message-time cutoffs: imports
 /// may preserve creation times while assigning different delivery timestamps.
 /// Exhaust those pages and retain only the newest requested message window.
+/// Without a receipt-state filter, read/ACK timestamps are only response data;
+/// load them after selection instead of probing the whole delivery history.
 fn shared_delivery_window(
     conn: &impl SyncQuery,
     viewer: SharedViewer,
@@ -1087,6 +1089,8 @@ fn shared_delivery_window(
     options: InboxFetchOptions<'_>,
 ) -> Result<NewestWindow, DbError> {
     let mut newest = NewestWindow::new();
+    let filter_receipts =
+        options.unread_only || options.ack_required_only || options.ack_overdue_before.is_some();
     let mut floor = None;
     let mut skip_at_floor = 0_i64;
     loop {
@@ -1122,26 +1126,28 @@ fn shared_delivery_window(
             // exclude it. A shared receipt must never resurrect that mail.
             candidates.remove(&row.get_named::<i64>("message_id").map_err(db_error)?);
         }
-        let ids: Vec<i64> = candidates.keys().copied().collect();
-        for row in shared_receipt_rows(
-            conn,
-            "project_mailbox_receipts",
-            "message_id, read_ts, ack_ts",
-            &ids,
-            viewer.agent_id,
-        )? {
-            let id = row.get_named::<i64>("message_id").map_err(db_error)?;
-            let receipt = candidates
-                .get_mut(&id)
-                .ok_or_else(|| DbError::Internal("unrequested shared inbox receipt".into()))?;
-            receipt.read_ts = row.get_named("read_ts").map_err(db_error)?;
-            receipt.ack_ts = row.get_named("ack_ts").map_err(db_error)?;
+        if filter_receipts {
+            let ids: Vec<i64> = candidates.keys().copied().collect();
+            for row in shared_receipt_rows(
+                conn,
+                "project_mailbox_receipts",
+                "message_id, read_ts, ack_ts",
+                &ids,
+                viewer.agent_id,
+            )? {
+                let id = row.get_named::<i64>("message_id").map_err(db_error)?;
+                let receipt = candidates
+                    .get_mut(&id)
+                    .ok_or_else(|| DbError::Internal("unrequested shared inbox receipt".into()))?;
+                receipt.read_ts = row.get_named("read_ts").map_err(db_error)?;
+                receipt.ack_ts = row.get_named("ack_ts").map_err(db_error)?;
+            }
+            candidates.retain(|_, receipt| {
+                (!options.unread_only || receipt.read_ts.is_none())
+                    && (!(options.ack_required_only || options.ack_overdue_before.is_some())
+                        || receipt.ack_ts.is_none())
+            });
         }
-        candidates.retain(|_, receipt| {
-            (!options.unread_only || receipt.read_ts.is_none())
-                && (!(options.ack_required_only || options.ack_overdue_before.is_some())
-                    || receipt.ack_ts.is_none())
-        });
         if !candidates.is_empty() {
             let ids: Vec<i64> = candidates.keys().copied().collect();
             let (sql, params) = lookup_query("messages", HEADER_COLUMNS, &ids);
@@ -1183,9 +1189,42 @@ fn shared_delivery_window(
             }
         }
         if finished {
+            if !filter_receipts {
+                hydrate_shared_window_receipts(conn, viewer.agent_id, &mut newest)?;
+            }
             return Ok(newest);
         }
     }
+}
+
+/// Read the selected shared rows' state in the same snapshot as selection.
+/// Direct recipients have already been removed, so these lazy receipts must
+/// never override a direct delivery's read/ACK state.
+fn hydrate_shared_window_receipts(
+    conn: &impl SyncQuery,
+    agent_id: i64,
+    newest: &mut NewestWindow,
+) -> Result<(), DbError> {
+    let mut keys: HashMap<i64, (i64, i64)> = newest.keys().map(|&key| (key.1, key)).collect();
+    let ids: Vec<i64> = keys.keys().copied().collect();
+    for row in shared_receipt_rows(
+        conn,
+        "project_mailbox_receipts",
+        "message_id, read_ts, ack_ts",
+        &ids,
+        agent_id,
+    )? {
+        let id = row.get_named::<i64>("message_id").map_err(db_error)?;
+        let key = keys
+            .remove(&id)
+            .ok_or_else(|| DbError::Internal("unrequested shared inbox receipt".into()))?;
+        let receipt = newest
+            .get_mut(&key)
+            .ok_or_else(|| DbError::Internal("missing selected shared inbox receipt".into()))?;
+        receipt.read_ts = row.get_named("read_ts").map_err(db_error)?;
+        receipt.ack_ts = row.get_named("ack_ts").map_err(db_error)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2342,6 +2381,230 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn shared_delivery_receipts_are_hydrated_only_for_selected_rows() {
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 257), i64::MAX, |id| id * 1000, mixed_importance);
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             SELECT id,project_id,'to',-id FROM messages; \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) \
+             SELECT id,2,2000000,2500000 FROM messages; \
+             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) \
+             VALUES(256,2,'bcc',2000000,2500000)",
+        )
+        .unwrap();
+        let metadata = InboxFetchOptions {
+            body_policy: InboxBodyPolicy::MetadataOnly,
+            ..options()
+        };
+        let cases = [
+            ("default", metadata),
+            (
+                "urgent",
+                InboxFetchOptions {
+                    urgent_only: true,
+                    ..metadata
+                },
+            ),
+            (
+                "topic",
+                InboxFetchOptions {
+                    topic: Some("HANDOFFS"),
+                    ..metadata
+                },
+            ),
+            (
+                "empty_topic",
+                InboxFetchOptions {
+                    topic: Some("absent"),
+                    ..metadata
+                },
+            ),
+        ];
+        let mut previous_last = 257;
+        let mut work_by_case = HashMap::new();
+        for message_count in [2_000, 10_000] {
+            seed_walk(
+                &conn,
+                (previous_last + 1, message_count),
+                i64::MAX,
+                |id| id * 1000,
+                mixed_importance,
+            );
+            previous_last = message_count;
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            for (case, filters) in cases {
+                let expected = unbounded_shared_merge(&conn, None, 20, filters);
+                let candidate = Recording {
+                    conn: &conn,
+                    calls: RefCell::new(Vec::new()),
+                };
+                let actual =
+                    fetch_inbox_rows_from_conn_impl(&candidate, 1, 2, None, 20, filters).unwrap();
+                same_rows(&actual, &expected);
+                if case == "empty_topic" {
+                    assert!(actual.is_empty());
+                } else {
+                    assert_eq!(actual.len(), 20, "{case}");
+                    assert!(actual.iter().all(|row| row.read_ts == Some(2_000_000)));
+                    assert!(actual.iter().all(|row| row.ack_ts == Some(2_500_000)));
+                }
+                assert!(actual.iter().all(|row| row.message.body_md.is_empty()));
+                if matches!(case, "default" | "topic") {
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .find(|row| row.message.id == Some(256))
+                            .map(|row| row.kind.as_str()),
+                        Some("bcc"),
+                        "direct delivery must remain present and override the shared copy"
+                    );
+                }
+                let calls = candidate.calls.borrow();
+                let header_pages = query_counts(&calls).0;
+                assert_eq!(header_pages, 8, "{case}: bounded header speculation");
+                let delivery_rows: usize = calls
+                    .iter()
+                    .filter(|(sql, _, _)| sql == crate::project_mailbox::DELIVERY_PAGE_SQL)
+                    .map(|(_, _, rows)| *rows)
+                    .sum();
+                assert_eq!(delivery_rows, 257, "{case}: exhaust actual deliveries");
+                let receipt_calls: Vec<_> = calls
+                    .iter()
+                    .filter(|(sql, _, _)| {
+                        sql.starts_with(
+                            "SELECT message_id, read_ts, ack_ts FROM project_mailbox_receipts",
+                        )
+                    })
+                    .collect();
+                let receipt_rows: usize = receipt_calls.iter().map(|(_, _, rows)| *rows).sum();
+                // The shared lane retains its own top twenty before merging
+                // with the one direct row. Every planted shared receipt exists,
+                // so both returned rows and probe count measure actual work.
+                let expected_receipts: usize = if case == "empty_topic" { 0 } else { 20 };
+                assert_eq!(receipt_rows, expected_receipts, "{case}");
+                assert_eq!(receipt_calls.len(), expected_receipts.div_ceil(8), "{case}");
+                assert!(calls.iter().all(|(_, _, rows)| *rows <= PAGE_SIZE));
+                let work = (calls.len(), header_pages, delivery_rows, receipt_rows);
+                if let Some(previous) = work_by_case.insert(case, work) {
+                    assert_eq!(work, previous, "{case}: unrelated history changed work");
+                }
+            }
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+        }
+        conn.execute_raw("BEGIN; ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn shared_default_fallback_completes_partial_windows_across_timestamp_ties() {
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 1400), i64::MAX, |_| 1000, |_| "normal");
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             VALUES(1,1,'to',9223372036854775807),(40,1,'to',0), \
+                   (1399,1,'to',-9223372036854775808),(1400,1,'to',1); \
+             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) \
+             VALUES(1400,2,'cc',2000,3000); \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) \
+             VALUES(40,2,2000,3000); \
+             UPDATE agents SET inception_ts=1000 WHERE id=2; PRAGMA query_only = ON",
+        )
+        .unwrap();
+        for since in [None, Some(999), Some(1000)] {
+            let recording = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            let actual =
+                fetch_inbox_rows_from_conn_impl(&recording, 1, 2, since, 20, options()).unwrap();
+            same_rows(
+                &actual,
+                &unbounded_shared_merge(&conn, since, 20, options()),
+            );
+            if since == Some(1000) {
+                assert!(actual.is_empty(), "since_ts is exclusive");
+                assert_eq!(query_counts(&recording.calls.borrow()).0, 1);
+                continue;
+            }
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|row| row.message.id.unwrap())
+                    .collect::<Vec<_>>(),
+                [1400, 1399, 40, 1],
+                "retain both the speculative match and older shared deliveries"
+            );
+            assert_eq!(actual[0].kind, "cc");
+            assert_eq!(actual[2].read_ts, Some(2000));
+            assert_eq!(actual[2].ack_ts, Some(3000));
+            assert!(
+                actual
+                    .iter()
+                    .all(|row| row.message.body_md.starts_with("body-"))
+            );
+            let calls = recording.calls.borrow();
+            assert_eq!(query_counts(&calls).0, 8);
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(sql, _, _)| sql == crate::project_mailbox::DELIVERY_PAGE_SQL)
+                    .map(|(_, _, rows)| *rows)
+                    .sum::<usize>(),
+                4
+            );
+        }
+        conn.execute_raw("BEGIN; ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn shared_candidate_only_fallback_retains_read_and_ack_state() {
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 1600), i64::MAX, |id| id * 1000, |_| "high");
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             SELECT id,project_id,'to',-id FROM messages WHERE id <= 17; \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) \
+             SELECT message_id,2,2000000,2500000 FROM project_mailbox_deliveries; \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+        let recording = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
+        let actual = crate::project_mailbox::fetch_project_mailbox_rows_with_policy(
+            &recording,
+            1,
+            2,
+            None,
+            10,
+            InboxFetchOptions {
+                body_policy: InboxBodyPolicy::MetadataOnly,
+                ..options()
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| row.message.id.unwrap())
+                .collect::<Vec<_>>(),
+            (8..=17).rev().collect::<Vec<_>>()
+        );
+        assert!(actual.iter().all(|row| row.read_ts == Some(2_000_000)));
+        assert!(actual.iter().all(|row| row.ack_ts == Some(2_500_000)));
+        assert!(
+            actual
+                .iter()
+                .all(|row| row.kind == crate::project_mailbox::PROJECT_MAILBOX_KIND)
+        );
+        assert!(actual.iter().all(|row| row.message.body_md.is_empty()));
+        assert_eq!(query_counts(&recording.calls.borrow()).0, 8);
+        conn.execute_raw("BEGIN; ROLLBACK").unwrap();
     }
 
     #[test]
