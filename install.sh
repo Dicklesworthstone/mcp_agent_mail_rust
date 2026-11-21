@@ -420,7 +420,9 @@ detect_platform() {
   # though the host CPU is ARM64. Prefer the native aarch64 release binary
   # whenever macOS reports Apple Silicon hardware.
   if [ "$OS" = "darwin" ] && [ "$ARCH" = "x86_64" ] && command -v sysctl >/dev/null 2>&1; then
-    if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = "1" ]; then
+    local is_apple_silicon
+    is_apple_silicon="$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)"
+    if [ "$is_apple_silicon" = "1" ]; then
       verbose "detect_platform:rosetta_override detected Apple Silicon hardware (hw.optional.arm64=1); preferring aarch64"
       ARCH="aarch64"
     fi
@@ -7386,6 +7388,7 @@ sync_codex_http_configs() {
 update_mcp_configs() {
   local binary_path="$1"
   local am_cli="${2:-}"
+  local remote_targets="${3:-}"
 
   # Resolve am CLI path: prefer explicit, then adjacent, then PATH
   if [ -z "$am_cli" ]; then
@@ -7428,18 +7431,29 @@ update_mcp_configs() {
   local setup_rc
   local setup_token
   setup_token="$(resolve_setup_http_bearer_token)"
-  if [ -n "$setup_token" ]; then
-    if setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 7<&- 8<&- 2>&1); then
-      setup_rc=0
-    else
-      setup_rc=$?
+  # Automatic native detection can omit a project-config-only target. Give
+  # both native passes the same credential, even if the first pass has no
+  # agents and never persists a token.
+  if [ -n "$remote_targets" ] && [ -z "$setup_token" ]; then
+    if ! setup_token="$(generate_bearer_token)"; then
+      warn "Refusing to update MCP clients without a cryptographically secure bearer token."
+      return 1
     fi
+  fi
+  if setup_out=$(
+    exec 7<&- 8<&- 2>&1
+    export AM_INTERFACE_MODE=cli
+    if [ -n "$setup_token" ]; then
+      export HTTP_BEARER_TOKEN="$setup_token"
+    fi
+    "$am_cli" setup run --yes --no-hooks || exit "$?"
+    if [ -n "$remote_targets" ]; then
+      "$am_cli" setup run --agent "${remote_targets//$'\n'/,}" --yes --no-hooks || exit "$?"
+    fi
+  ); then
+    setup_rc=0
   else
-    if setup_out=$(AM_INTERFACE_MODE=cli "$am_cli" setup run --yes --no-hooks 7<&- 8<&- 2>&1); then
-      setup_rc=0
-    else
-      setup_rc=$?
-    fi
+    setup_rc=$?
   fi
 
   verbose "update_mcp_configs:result rc=${setup_rc}"
@@ -7482,7 +7496,7 @@ update_mcp_configs() {
 
     # Parse counts from output (e.g., "7 config files processed: 2 created, 1 updated, 4 unchanged")
     local counts_line created updated
-    counts_line=$(echo "$setup_out" | command grep "config files processed" 2>/dev/null || true)
+    counts_line=$(echo "$setup_out" | command grep "config files processed" | tail -n 1 || true)
     created="0"
     updated="0"
     if [ -n "$counts_line" ]; then
@@ -7508,8 +7522,9 @@ update_mcp_configs() {
 configure_mcp_clients() {
   local binary_path="$1"
   local am_cli="$2"
+  local remote_targets="${3:-}"
 
-  if ! update_mcp_configs "$binary_path" "$am_cli"; then
+  if ! update_mcp_configs "$binary_path" "$am_cli" "$remote_targets"; then
     warn "Skipping shell MCP fallback writers because native setup did not prove durable token continuity."
     return 1
   fi
@@ -7544,7 +7559,7 @@ configure_mcp_clients_for_install() {
     return "$targets_rc"
   fi
 
-  if configure_mcp_clients "$binary_path" "$am_cli"; then
+  if configure_mcp_clients "$binary_path" "$am_cli" "$targets"; then
     return 0
   fi
   if [ -n "$targets" ]; then
