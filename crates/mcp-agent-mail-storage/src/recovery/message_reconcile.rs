@@ -117,7 +117,7 @@ pub fn reconcile_message_bundle(
 /// bounded, cancellation-aware global publication-fence admission; project mutex/flock
 /// contention also defers immediately instead of waiting with that fence held.
 /// The worker stop flag and Cx are checked before and after lock admission,
-/// during canonical identity scans, between file publications,
+/// during canonical identity scans and attachment preparation, between file publications,
 /// and before committing. Completed
 /// files survive cancellation and are revalidated on retry, never redelivered.
 ///
@@ -237,15 +237,18 @@ fn reconcile_message_bundle_inner(
         initial_message_files_missing,
         &mut committed_budget,
     )?;
-    // Missing-file publication creates parent directories inside the project
-    // lock. Enter their mutation fence first, matching ordinary bundle writes
-    // and archive-verified retention, so repair cannot invert that lock order.
-    let _mutation = match control {
-        Some(control) => control.begin_at(repo_root)?,
-        None => crate::ArchiveMutationGuard::begin_at(repo_root),
-    };
-    let attachment_files =
-        attachments::prepare(&repo, archive, entry.message, MAX_BUNDLE_BYTES - bytes)?;
+    // Reading and hashing up to a bundle's attachment budget confers no
+    // publication authority. Do that work before taking the process-wide
+    // fence, so a slow source cannot block unrelated messages/reservations.
+    // The publish closure below still rechecks every committed object and
+    // working-tree destination under the ordinary fence and project lock.
+    let attachment_files = attachments::prepare(
+        &repo,
+        archive,
+        entry.message,
+        MAX_BUNDLE_BYTES - bytes,
+        control,
+    )?;
     targets.extend(
         attachment_files
             .iter()
@@ -260,13 +263,22 @@ fn reconcile_message_bundle_inner(
         .map(|(_, bytes)| Oid::hash_object(ObjectType::Blob, bytes))
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    checkpoint(control)?;
+    // Missing-file publication creates parent directories inside the project
+    // lock. Enter their mutation fence first, matching ordinary bundle writes
+    // and archive-verified retention, so repair cannot invert that lock order.
+    let _mutation = match control {
+        Some(control) => control.begin_at(repo_root)?,
+        None => crate::ArchiveMutationGuard::begin_at(repo_root),
+    };
+
     let publish = || {
         checkpoint(control)?;
         // Missing working-tree copies do not erase the Git ledger's authority.
         // Check every committed copy before publishing even the first repair;
         // otherwise a different reply parent or extension field could silently
         // replace history that SQLite cannot reconstruct independently.
-        reject_committed_message_conflicts(&repo, &rel_paths, &expected_oids)?;
+        reject_committed_message_conflicts(&repo, &rel_paths, &expected_oids, control)?;
         // Inspect every destination before publishing any repair. In particular,
         // a conflicting inbox must not be silently overwritten after repairing
         // the canonical file. The publication primitive rechecks collisions.
@@ -432,24 +444,28 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+fn scan_checkpoint(control: Option<RepairControl<'_>>, stage: &'static str) -> crate::Result<()> {
+    #[cfg(test)]
+    if control.is_some() {
+        SCAN_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(stage);
+            }
+        });
+    }
+    if control.is_some_and(RepairControl::cancelled) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("message archive repair cancelled during {stage}"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl CanonicalScanBudget<'_> {
     fn checkpoint(&self, stage: &'static str) -> crate::Result<()> {
-        #[cfg(test)]
-        if self.control.is_some() {
-            SCAN_HOOK.with(|slot| {
-                if let Some(hook) = slot.borrow_mut().as_mut() {
-                    hook(stage);
-                }
-            });
-        }
-        if self.control.is_some_and(RepairControl::cancelled) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                format!("message archive repair cancelled during canonical {stage}"),
-            )
-            .into());
-        }
-        Ok(())
+        scan_checkpoint(self.control, stage)
     }
 
     fn visit(&mut self) -> crate::Result<()> {
@@ -611,6 +627,7 @@ fn reject_committed_message_conflicts(
     repo: &Repository,
     paths: &[String],
     oids: &[Oid],
+    control: Option<RepairControl<'_>>,
 ) -> crate::Result<()> {
     if paths.len() != oids.len() {
         return Err(invalid("archive verification path/object count mismatch"));
@@ -623,11 +640,16 @@ fn reject_committed_message_conflicts(
         Err(error) => return Err(error.into()),
     };
     let tree = head.peel_to_tree()?;
+    let budget = CanonicalScanBudget {
+        control,
+        ..Default::default()
+    };
     for (path, expected) in paths.iter().zip(oids) {
-        let entry = match tree.get_path(Path::new(path)) {
-            Ok(entry) => entry,
-            Err(error) if error.code() == ErrorCode::NotFound => continue,
-            Err(error) => return Err(error.into()),
+        // NotFound from Tree::get_path also covers a non-directory ancestor.
+        // Such committed evidence must survive: a repair may create an absent
+        // leaf, but cannot turn a blob, symlink or gitlink back into a directory.
+        let Some(entry) = identity::committed_path_entry(repo, Some(&tree), path, &budget)? else {
+            continue;
         };
         if entry.kind() != Some(ObjectType::Blob)
             || !matches!(entry.filemode(), 0o100644 | 0o100755)
@@ -1334,7 +1356,7 @@ mod tests {
         )
         .unwrap();
         let paths = vec!["message.md".to_string()];
-        reject_committed_message_conflicts(&repo, &paths, &[oid]).unwrap();
+        reject_committed_message_conflicts(&repo, &paths, &[oid], None).unwrap();
         assert!(!head_contains(&repo, &paths, &[oid]).unwrap());
         assert_eq!(repo.blob(bytes).unwrap(), oid);
         assert!(head_contains(&repo, &paths, &[oid]).unwrap());

@@ -4424,7 +4424,9 @@ static WRITE_CONTENTION_EXHAUSTED_LAST_MINUTE: RollingMinuteCounter = RollingMin
 fn is_mvcc_error(e: &DbError) -> bool {
     matches!(
         e,
-        DbError::Sqlite(msg) | DbError::ResourceBusy(msg) if crate::error::is_mvcc_conflict(msg)
+        DbError::Sqlite(msg) | DbError::ResourceBusy(msg)
+            if !crate::pool::is_mailbox_inventory_retry_exhausted(msg)
+                && crate::error::is_mvcc_conflict(msg)
     )
 }
 
@@ -4438,11 +4440,14 @@ fn is_plain_write_contention_error(e: &DbError) -> bool {
         e,
         DbError::Sqlite(msg) | DbError::ResourceBusy(msg) if {
             let lower = msg.to_ascii_lowercase();
-            lower.contains("database is locked")
-                || lower.contains("database table is locked")
-                || lower.contains("database schema is locked")
-                || lower.contains("database is busy")
-                || lower.contains("locked by another process")
+            // GH#400: pool startup has already spent the inventory's busy
+            // budget. A query retry must not restart that whole wait.
+            !crate::pool::is_mailbox_inventory_retry_exhausted(msg)
+                && (lower.contains("database is locked")
+                    || lower.contains("database table is locked")
+                    || lower.contains("database schema is locked")
+                    || lower.contains("database is busy")
+                    || lower.contains("locked by another process"))
         }
     )
 }
@@ -15830,6 +15835,37 @@ pub async fn get_reservation_conflict_snapshot(
     .await
 }
 
+// A successful grant/renewal is durable holder activity, even when the tool's
+// earlier best-effort touch was throttled or failed. Record it in the SAME
+// transaction as the lease change so stale-release readers can never observe a
+// renewed lease with pre-renewal inactivity evidence.
+async fn record_reservation_activity_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    project_id: i64,
+    agent_id: i64,
+    now: i64,
+) -> Outcome<(), DbError> {
+    map_sql_outcome(
+        traw_execute(
+            cx,
+            tracked,
+            "UPDATE agents SET last_active_ts = MAX(last_active_ts, ?) WHERE id = ? AND project_id = ?",
+            &[Value::BigInt(now), Value::BigInt(agent_id), Value::BigInt(project_id)],
+        )
+        .await,
+    )
+    .map(|_| ())
+}
+
+fn invalidate_reservation_holder_cache(pool: &DbPool, agent_id: i64) {
+    let cache = crate::cache::read_cache();
+    let scope = cache_scope_for_pool(pool);
+    if let Some(agent) = cache.get_agent_by_id_scoped(&scope, agent_id) {
+        cache.invalidate_agent_scoped(&scope, agent.project_id, &agent.name, Some(agent_id));
+    }
+}
+
 /// Create file reservations
 #[allow(clippy::too_many_arguments)]
 pub async fn create_file_reservations(
@@ -16190,6 +16226,14 @@ async fn create_file_reservations_impl(
             out.push(row);
         }
 
+        if !out.is_empty() {
+            try_in_tx!(
+                cx,
+                &tracked,
+                record_reservation_activity_in_tx(cx, &tracked, project_id, agent_id, now).await
+            );
+        }
+
         // Record the idempotency key + serialized reservation rows in the SAME
         // transaction as the inserts, so a crash cannot split the key from the
         // leases (which would let a retry create a duplicate reservation set).
@@ -16220,6 +16264,9 @@ async fn create_file_reservations_impl(
         }
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        if !out.is_empty() {
+            invalidate_reservation_holder_cache(pool, agent_id);
+        }
         Outcome::Ok(IdempotentOutcome::Fresh(out))
     })
     .await
@@ -16238,15 +16285,34 @@ pub async fn get_active_reservations(
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
     run_read_with_mvcc_retry(cx, "get_active_reservations", || {
-        get_active_reservations_once(cx, pool, project_id)
+        get_active_reservations_once(cx, pool, project_id, None)
     })
     .await
 }
 
+/// Read one holder's active leases from a fresh committed snapshot.
+/// Automatic intervention must never materialize every holder in a project.
+/// Candidate rows and raw payload bytes are bounded before materialization;
+/// release-ledger lookups are limited to those candidates. A holder above the
+/// snapshot bounds fails closed instead of releasing a silently truncated subset.
+pub async fn get_active_reservations_for_agent(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    run_read_with_mvcc_retry(cx, "get_active_reservations_for_agent", || {
+        get_active_reservations_once(cx, pool, project_id, Some(agent_id))
+    })
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
 async fn get_active_reservations_once(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,
+    agent_id: Option<i64>,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
     let now = now_micros();
     let candidate_predicate = active_reservation_candidate_predicate_for("fr");
@@ -16270,17 +16336,87 @@ async fn get_active_reservations_once(
     // a ~24s daemon-dispatch query on a 30k-row store, while producing identical
     // results. Survivors are (by definition) absent from the release ledger, so
     // their authoritative `released_ts` is `fr.released_ts`.
-    let candidate_sql = format!(
+    let mut candidate_sql = format!(
         "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                 fr.created_ts, fr.expires_ts, fr.released_ts AS released_ts, fr.revision \
          FROM file_reservations fr \
          WHERE fr.project_id = ? AND {candidate_predicate} AND fr.expires_ts > ?"
     );
-    let candidate_params = [Value::BigInt(project_id), Value::BigInt(now)];
+    let mut candidate_params = vec![Value::BigInt(project_id), Value::BigInt(now)];
+    if let Some(agent_id) = agent_id {
+        candidate_sql.push_str(" AND fr.agent_id = ? LIMIT ?");
+        candidate_params.push(Value::BigInt(agent_id));
+        candidate_params.push(Value::BigInt(
+            i64::try_from(FILE_RESERVATION_SNAPSHOT_MAX_ROWS + 1).unwrap_or(i64::MAX),
+        ));
+        // Check the same snapshot before copying any potentially large reason
+        // or path into Rust. Count alone cannot bound one oversized row. All
+        // projected columns count, including malformed text in numeric fields.
+        // Legacy ledger-only releases may conservatively consume this candidate
+        // budget; incomplete evidence must never authorize a truncated release.
+        let bounds_sql = format!(
+            "SELECT COUNT(*) AS row_count, COALESCE(SUM(\
+             COALESCE(length(CAST(fr.id AS BLOB)), 0) + \
+             COALESCE(length(CAST(fr.project_id AS BLOB)), 0) + \
+             COALESCE(length(CAST(fr.agent_id AS BLOB)), 0) + \
+             COALESCE(length(CAST(fr.path_pattern AS BLOB)), 0) + \
+             COALESCE(length(CAST(fr.\"exclusive\" AS BLOB)), 0) + \
+             COALESCE(length(CAST(fr.reason AS BLOB)), 0) + \
+             COALESCE(length(CAST(fr.created_ts AS BLOB)), 0) + \
+             COALESCE(length(CAST(fr.expires_ts AS BLOB)), 0) + \
+             COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
+             COALESCE(length(CAST(fr.revision AS BLOB)), 0)), 0) AS raw_bytes \
+             FROM file_reservations fr \
+             WHERE fr.project_id = ? AND {candidate_predicate} AND fr.expires_ts > ? AND fr.agent_id = ?"
+        );
+        let bounds = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &bounds_sql, &candidate_params[..3]).await)
+        );
+        let decoded = bounds
+            .first()
+            .ok_or_else(|| {
+                DbError::Internal("missing holder reservation snapshot bounds".to_string())
+            })
+            .and_then(|row| {
+                let count = row
+                    .get_named::<i64>("row_count")
+                    .map_err(|e| map_sql_error(&e))?;
+                let bytes = row
+                    .get_named::<i64>("raw_bytes")
+                    .map_err(|e| map_sql_error(&e))?;
+                Ok((count, bytes))
+            });
+        let (count, bytes) = match decoded {
+            Ok(bounds) => bounds,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+        if !usize::try_from(count).is_ok_and(|count| count <= FILE_RESERVATION_SNAPSHOT_MAX_ROWS)
+            || !usize::try_from(bytes)
+                .is_ok_and(|bytes| bytes <= FILE_RESERVATION_SNAPSHOT_MAX_BYTES)
+        {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::invalid(
+                "reservations",
+                "holder active reservation snapshot exceeds its row or byte bound",
+            ));
+        }
+    }
 
     let mut candidates =
         match map_sql_outcome(traw_query(cx, &tracked, &candidate_sql, &candidate_params).await) {
             Outcome::Ok(rows) => {
+                if agent_id.is_some() && rows.len() > FILE_RESERVATION_SNAPSHOT_MAX_ROWS {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::invalid(
+                        "reservations",
+                        "holder active reservation snapshot exceeds its row bound",
+                    ));
+                }
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
                     match decode_file_reservation_row(&row) {
@@ -16307,7 +16443,39 @@ async fn get_active_reservations_once(
             }
         };
 
-    let released_ids =
+    let released_ids = if agent_id.is_some() {
+        // The automatic path is bounded by this holder, not all historical
+        // releases in the mailbox. Query primary-key membership in chunks to
+        // retain the separate-ledger optimization without an unbounded scan.
+        let mut set = std::collections::HashSet::new();
+        for chunk in candidates.chunks(MAX_IN_CLAUSE_ITEMS) {
+            let params: Vec<Value> = chunk
+                .iter()
+                .filter_map(|row| row.id.map(Value::BigInt))
+                .collect();
+            if params.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; params.len()].join(",");
+            let sql =
+                format!("{RELEASED_RESERVATION_IDS_SQL} WHERE reservation_id IN ({placeholders})");
+            let rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await)
+            );
+            for row in &rows {
+                let Some(id) = row.get(0).and_then(value_as_i64) else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(
+                        "invalid holder reservation release-ledger identity".to_string(),
+                    ));
+                };
+                set.insert(id);
+            }
+        }
+        set
+    } else {
         match map_sql_outcome(traw_query(cx, &tracked, RELEASED_RESERVATION_IDS_SQL, &[]).await) {
             Outcome::Ok(rows) => {
                 let mut set = std::collections::HashSet::with_capacity(rows.len());
@@ -16330,7 +16498,8 @@ async fn get_active_reservations_once(
                 rollback_tx(cx, &tracked).await;
                 return Outcome::Panicked(p);
             }
-        };
+        }
+    };
 
     candidates.retain(|row| row.id.is_none_or(|id| !released_ids.contains(&id)));
 
@@ -17470,7 +17639,17 @@ pub async fn renew_reservations(
             }
         }
 
+        if !reservations.is_empty() {
+            try_in_tx!(
+                cx,
+                &tracked,
+                record_reservation_activity_in_tx(cx, &tracked, project_id, agent_id, now).await
+            );
+        }
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        if !reservations.is_empty() {
+            invalidate_reservation_holder_cache(pool, agent_id);
+        }
         Outcome::Ok(reservations)
     })
     .await
@@ -24233,6 +24412,73 @@ mod tests {
         });
         assert!(matches!(result, Outcome::Err(DbError::Sqlite(_))));
         assert_eq!(attempts.get(), 1, "a non-busy error is returned at once");
+    }
+
+    /// GH#400, R3: inject the SQL startup failure to test exhaustion propagation
+    /// through the real read/write retry loops, not engine recovery behavior.
+    /// Real-path compensation:
+    /// `pool::tests::mailbox_inventory_retry_reads_after_real_namespace_contention_clears`.
+    #[test]
+    fn retry_loops_preserve_exhausted_mailbox_inventory_budget() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        for read_only in [true, false] {
+            for cause in [
+                "Connection error: database is busy (recovery in progress)",
+                "database is busy (snapshot conflict on pages: 7)",
+            ] {
+                let sql_error = SqlError::Custom(format!(
+                    "{} after 30s: {cause}",
+                    crate::pool::SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED,
+                ));
+                let message = sql_error.to_string();
+                let attempts = std::cell::Cell::new(0_u32);
+                let operation = || {
+                    let attempt = attempts.get() + 1;
+                    attempts.set(attempt);
+                    let error = map_sql_error(&sql_error);
+                    async move {
+                        if attempt == 1 {
+                            Outcome::Err(error)
+                        } else {
+                            // An accidental retry fails this contract promptly.
+                            Outcome::Ok(())
+                        }
+                    }
+                };
+                let result = if read_only {
+                    rt.block_on(run_read_with_mvcc_retry(
+                        &cx,
+                        "test_exhausted_inventory_read",
+                        operation,
+                    ))
+                } else {
+                    rt.block_on(run_with_mvcc_retry(
+                        &cx,
+                        "test_exhausted_inventory_write",
+                        operation,
+                    ))
+                };
+
+                assert_eq!(attempts.get(), 1, "read_only={read_only}: {cause}");
+                let Outcome::Err(error) = result else {
+                    panic!("inventory exhaustion must propagate unchanged: {result:?}");
+                };
+                assert!(
+                    matches!(&error, DbError::ResourceBusy(detail) if detail == &message),
+                    "startup busy cause must be preserved: {error:?}"
+                );
+                assert_eq!(error.error_code(), "RESOURCE_BUSY");
+                assert_eq!(
+                    crate::error::classify_db_error_message(&error.to_string()).class,
+                    crate::error::DbErrorClass::BusyRetryable,
+                );
+            }
+        }
     }
 
     #[test]

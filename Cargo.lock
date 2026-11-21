@@ -5264,6 +5264,7 @@ dependencies = [
  "loom",
  "mcp-agent-mail-core",
  "mcp-agent-mail-test-helpers",
+ "mimalloc",
  "nix 0.32.0",
  "proptest",
  "rayon",

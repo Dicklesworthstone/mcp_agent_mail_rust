@@ -578,9 +578,111 @@ pub fn compute_project_slug(human_key: &str) -> String {
     }
 }
 
-static IDENTITY_CACHE: std::sync::OnceLock<
-    Mutex<std::collections::HashMap<String, (ProjectIdentity, Instant)>>,
-> = std::sync::OnceLock::new();
+const IDENTITY_CACHE_FRESHNESS: Duration = Duration::from_secs(5);
+const IDENTITY_CACHE_MAX_ENTRIES: usize = 2048;
+const IDENTITY_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const IDENTITY_CACHE_MAX_ENTRY_BYTES: usize = 64 * 1024;
+
+struct IdentityCacheEntry {
+    identity: ProjectIdentity,
+    validated_at: Instant,
+    retained_bytes: usize,
+}
+
+/// Memoization is optional: a long-lived daemon must not retain every project
+/// path it has ever resolved, or large identity/discovery markers indefinitely.
+/// The byte budget covers owned string payloads; the entry limit bounds map and
+/// struct overhead. Eviction never changes the identity returned to the caller.
+#[derive(Default)]
+struct ProjectIdentityCache {
+    entries: HashMap<String, IdentityCacheEntry>,
+    retained_bytes: usize,
+}
+
+impl ProjectIdentityCache {
+    fn get(&mut self, key: &str, now: Instant) -> Option<ProjectIdentity> {
+        let entry = self.entries.get(key)?;
+        if now
+            .checked_duration_since(entry.validated_at)
+            .is_some_and(|age| age < IDENTITY_CACHE_FRESHNESS)
+        {
+            return Some(entry.identity.clone());
+        }
+        self.remove(key);
+        None
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.retained_bytes -= entry.retained_bytes;
+        }
+    }
+
+    fn insert(&mut self, key: &str, identity: &ProjectIdentity, now: Instant) {
+        // Even an uncacheable replacement must invalidate an earlier value.
+        self.remove(key);
+        self.entries.retain(|_, entry| {
+            let fresh = now
+                .checked_duration_since(entry.validated_at)
+                .is_some_and(|age| age < IDENTITY_CACHE_FRESHNESS);
+            if !fresh {
+                self.retained_bytes -= entry.retained_bytes;
+            }
+            fresh
+        });
+
+        let bytes = identity_cache_payload_bytes(key, identity);
+        if bytes > IDENTITY_CACHE_MAX_ENTRY_BYTES {
+            return;
+        }
+        while self.entries.len() >= IDENTITY_CACHE_MAX_ENTRIES
+            || self.retained_bytes.saturating_add(bytes) > IDENTITY_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.validated_at)
+                .map(|(key, _)| key.clone())
+            else {
+                return;
+            };
+            self.remove(&oldest);
+        }
+        self.entries.insert(
+            key.to_string(),
+            IdentityCacheEntry {
+                identity: identity.clone(),
+                validated_at: now,
+                retained_bytes: bytes,
+            },
+        );
+        self.retained_bytes += bytes;
+    }
+}
+
+fn identity_cache_payload_bytes(key: &str, identity: &ProjectIdentity) -> usize {
+    let discovery = identity.discovery.as_ref();
+    [
+        Some(key),
+        Some(identity.slug.as_str()),
+        Some(identity.identity_mode_used.as_str()),
+        Some(identity.canonical_path.as_str()),
+        Some(identity.human_key.as_str()),
+        identity.repo_root.as_deref(),
+        identity.git_common_dir.as_deref(),
+        identity.branch.as_deref(),
+        identity.worktree_name.as_deref(),
+        identity.normalized_remote.as_deref(),
+        Some(identity.project_uid.as_str()),
+        discovery.and_then(|info| info.project_uid.as_deref()),
+        discovery.and_then(|info| info.product_uid.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(0usize, |bytes, value| bytes.saturating_add(value.len()))
+}
+
+static IDENTITY_CACHE: OnceLock<Mutex<ProjectIdentityCache>> = OnceLock::new();
 
 fn fallback_identity(
     _human_key: &str,
@@ -610,12 +712,11 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
     let target_path = resolve_project_path(human_key);
     let target_str = target_path.to_string_lossy().to_string();
 
-    let cache = IDENTITY_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Ok(guard) = cache.lock()
-        && let Some((ident, ts)) = guard.get(&target_str)
-        && ts.elapsed() < Duration::from_secs(5)
+    let cache = IDENTITY_CACHE.get_or_init(|| Mutex::new(ProjectIdentityCache::default()));
+    if let Ok(mut guard) = cache.lock()
+        && let Some(ident) = guard.get(&target_str, Instant::now())
     {
-        return ident.clone();
+        return ident;
     }
 
     let config = &Config::get();
@@ -629,7 +730,7 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
     if !config.worktrees_enabled {
         let ident = fallback_identity(human_key, &target_str, "dir");
         if let Ok(mut guard) = cache.lock() {
-            guard.insert(target_str, (ident.clone(), Instant::now()));
+            guard.insert(&target_str, &ident, Instant::now());
         }
         return ident;
     }
@@ -637,7 +738,7 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
     if !target_path.exists() {
         let ident = fallback_identity(human_key, &target_str, &mode_used);
         if let Ok(mut guard) = cache.lock() {
-            guard.insert(target_str, (ident.clone(), Instant::now()));
+            guard.insert(&target_str, &ident, Instant::now());
         }
         return ident;
     }
@@ -804,7 +905,7 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
     };
 
     if let Ok(mut guard) = cache.lock() {
-        guard.insert(target_str, (ident.clone(), Instant::now()));
+        guard.insert(&target_str, &ident, Instant::now());
     }
     ident
 }
@@ -1230,6 +1331,160 @@ mod tests {
         assert_ne!(identity.human_key, "");
         assert_ne!(identity.project_uid, "");
         assert_ne!(identity.identity_mode_used, "");
+    }
+
+    #[test]
+    fn identity_cache_reclaims_expired_paths_without_revisiting_them() {
+        let mut cache = ProjectIdentityCache::default();
+        let start = Instant::now();
+        let identity = fallback_identity("/old", "/old", "dir");
+        cache.insert("/old", &identity, start);
+        cache.insert("/also-old", &identity, start);
+
+        let before_expiry = (start + IDENTITY_CACHE_FRESHNESS)
+            .checked_sub(Duration::from_nanos(1))
+            .expect("the cache lifetime exceeds one nanosecond");
+        assert!(cache.get("/old", before_expiry).is_some());
+        // A hit does not extend the existing five-second validation lifetime.
+        assert!(
+            cache
+                .get("/old", start + IDENTITY_CACHE_FRESHNESS)
+                .is_none()
+        );
+
+        let fresh = fallback_identity("/fresh", "/fresh", "dir");
+        cache.insert("/fresh", &fresh, start + IDENTITY_CACHE_FRESHNESS);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(!cache.entries.contains_key("/also-old"));
+        assert_eq!(
+            cache.retained_bytes,
+            identity_cache_payload_bytes("/fresh", &fresh)
+        );
+        assert!(
+            cache
+                .get("/fresh", start + IDENTITY_CACHE_FRESHNESS * 2)
+                .is_none()
+        );
+        assert_eq!(cache.retained_bytes, 0);
+    }
+
+    #[test]
+    fn identity_cache_bounds_path_churn_and_preserves_recent_identity() {
+        let mut cache = ProjectIdentityCache::default();
+        let start = Instant::now();
+        for index in 0..(IDENTITY_CACHE_MAX_ENTRIES * 3) {
+            let key = format!("/workspace/project-{index}");
+            let identity = fallback_identity(&key, &key, "dir");
+            let now = start + Duration::from_nanos(u64::try_from(index).unwrap());
+            cache.insert(&key, &identity, now);
+            assert!(cache.entries.len() <= IDENTITY_CACHE_MAX_ENTRIES);
+            assert!(cache.retained_bytes <= IDENTITY_CACHE_MAX_BYTES);
+            let cached = cache.get(&key, now).expect("new identity cached");
+            assert_eq!(
+                serde_json::to_value(cached).unwrap(),
+                serde_json::to_value(identity).unwrap()
+            );
+        }
+        assert_eq!(cache.entries.len(), IDENTITY_CACHE_MAX_ENTRIES);
+        assert!(!cache.entries.contains_key("/workspace/project-0"));
+    }
+
+    #[test]
+    fn identity_cache_byte_budget_counts_discovery_and_replacement_payloads() {
+        let mut cache = ProjectIdentityCache::default();
+        let start = Instant::now();
+        let mut identity = fallback_identity("/project", "/project", "dir");
+        identity.project_uid = "p".repeat(20_000);
+        identity.discovery = Some(DiscoveryInfo {
+            project_uid: Some("d".repeat(20_000)),
+            product_uid: Some("v".repeat(20_000)),
+        });
+        for index in 0..200 {
+            let key = format!("/project-{index}");
+            let now = start + Duration::from_nanos(index);
+            cache.insert(&key, &identity, now);
+            assert!(cache.retained_bytes <= IDENTITY_CACHE_MAX_BYTES);
+        }
+        assert!(cache.entries.len() < 200, "payload pressure must evict");
+        assert!(!cache.entries.contains_key("/project-0"));
+        assert_eq!(
+            serde_json::to_value(cache.get("/project-199", start + Duration::from_secs(1)))
+                .unwrap(),
+            serde_json::to_value(Some(&identity)).unwrap()
+        );
+
+        // Replacing an entry must subtract its previous owned strings, and an
+        // uncacheable replacement must not leave the stale identity readable.
+        let small = fallback_identity("/project-199", "/project-199", "dir");
+        let before = cache.retained_bytes;
+        cache.insert("/project-199", &small, start + Duration::from_secs(1));
+        assert!(cache.retained_bytes < before - 50_000);
+        identity.project_uid = "x".repeat(IDENTITY_CACHE_MAX_ENTRY_BYTES);
+        cache.insert("/project-199", &identity, start + Duration::from_secs(1));
+        assert!(
+            cache
+                .get("/project-199", start + Duration::from_secs(1))
+                .is_none()
+        );
+        assert!(cache.entries.contains_key("/project-198"));
+    }
+
+    #[test]
+    fn identity_cache_rejects_oversized_keys_and_aggregate_optional_fields() {
+        let mut cache = ProjectIdentityCache::default();
+        let now = Instant::now();
+        let mut identity = fallback_identity("/project", "/project", "dir");
+        cache.insert(&"k".repeat(IDENTITY_CACHE_MAX_ENTRY_BYTES), &identity, now);
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+
+        identity.slug = "s".repeat(6000);
+        identity.identity_mode_used = "m".repeat(6000);
+        identity.canonical_path = "c".repeat(6000);
+        identity.human_key = "h".repeat(6000);
+        identity.repo_root = Some("r".repeat(6000));
+        identity.git_common_dir = Some("g".repeat(6000));
+        identity.branch = Some("b".repeat(6000));
+        identity.worktree_name = Some("w".repeat(6000));
+        identity.normalized_remote = Some("n".repeat(6000));
+        identity.project_uid = "p".repeat(6000);
+        identity.discovery = Some(DiscoveryInfo {
+            project_uid: Some("d".repeat(6000)),
+            product_uid: Some("v".repeat(6000)),
+        });
+        cache.insert("/project", &identity, now);
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+    }
+
+    #[test]
+    fn resolve_project_identity_returns_large_discovery_without_retaining_it() {
+        crate::config::with_process_env_overrides_for_test(
+            &[("WORKTREES_ENABLED", "1"), ("PROJECT_IDENTITY_MODE", "dir")],
+            || {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let marker = tmp.path().join(".agent-mail.yaml");
+                let uid = "x".repeat(IDENTITY_CACHE_MAX_ENTRY_BYTES);
+                std::fs::write(&marker, format!("project_uid: {uid}\n")).expect("write discovery");
+                let key = tmp.path().to_string_lossy();
+                let first = resolve_project_identity(&key);
+                assert_eq!(first.project_uid, uid);
+                assert_eq!(
+                    first
+                        .discovery
+                        .as_ref()
+                        .and_then(|info| info.project_uid.as_deref()),
+                    Some(uid.as_str())
+                );
+
+                std::fs::write(&marker, "project_uid: ReplacementIdentity\n")
+                    .expect("replace discovery");
+                let second = resolve_project_identity(&key);
+                assert_eq!(second.project_uid, "ReplacementIdentity");
+                assert_eq!(second.human_key, first.human_key);
+                assert_eq!(second.slug, first.slug);
+            },
+        );
     }
 
     #[test]

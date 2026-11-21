@@ -2034,6 +2034,7 @@ fn claude_user_base(cwd: &Path, home: &Path) -> Result<(PathBuf, PathBuf), PathB
 fn omp_mcp_authority_sources(
     params: &SetupParams,
     extension_sources: Vec<OmpMcpAuthoritySource>,
+    switches: OmpProviderSwitches<'_>,
 ) -> Vec<OmpMcpAuthoritySource> {
     use OmpMcpAuthorityFormat::{
         CodexToml, Native, OpenCodeJsonc, Standalone, StandardJson, Unsupported, VsCodeJson,
@@ -2263,6 +2264,27 @@ fn omp_mcp_authority_sources(
         true,
     );
 
+    sources.retain(|source| {
+        let id = match source.provider {
+            NativeProvider => "native",
+            OmpMcpAuthorityProvider::Extension => "omp-plugins",
+            ClaudeProject | ClaudeUser => "claude",
+            Codex => "codex",
+            Gemini => "gemini",
+            OpenCode => "opencode",
+            Cursor => "cursor",
+            Windsurf => "windsurf",
+            VsCode => "vscode",
+            StandaloneProvider => "mcp-json",
+        };
+        switches.allows(id)
+            && (source.project_level
+                || matches!(
+                    source.provider,
+                    NativeProvider | OmpMcpAuthorityProvider::Extension
+                )
+                || switches.foreign_user_enabled(id))
+    });
     sources
 }
 
@@ -2278,9 +2300,12 @@ pub fn omp_mcp_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
     let settings = inspect_omp_settings_authority(params);
     let extensions = inspect_omp_configured_extensions(params, &settings);
     let mut paths = Vec::new();
-    for source in omp_mcp_authority_sources(params, extensions.sources) {
-        if source.format != OmpMcpAuthorityFormat::Unsupported && !paths.contains(&source.path) {
-            paths.push(source.path);
+    if let Ok(switches) = settings.provider_switches() {
+        for source in omp_mcp_authority_sources(params, extensions.sources, switches) {
+            if source.format != OmpMcpAuthorityFormat::Unsupported && !paths.contains(&source.path)
+            {
+                paths.push(source.path);
+            }
         }
     }
     for observation in settings.observations.iter().chain(&extensions.observations) {
@@ -5765,6 +5790,7 @@ struct OmpSettingsAuthorityInspection {
     merged_mcp_settings: Option<Value>,
     configured_extensions: Option<OmpSourcedSetting>,
     disabled_providers: Option<OmpSourcedSetting>,
+    enabled_providers: Option<OmpSourcedSetting>,
     project_config_enabled: bool,
     effective_source: Option<PathBuf>,
     unsupported_path: Option<PathBuf>,
@@ -5774,6 +5800,49 @@ struct OmpSourcedSetting {
     value: Value,
     source_path: PathBuf,
     project_level: bool,
+}
+
+#[derive(Clone, Copy)]
+struct OmpProviderSwitches<'a> {
+    disabled: &'a [Value],
+    enabled: &'a [Value],
+}
+
+impl OmpSettingsAuthorityInspection {
+    fn provider_switches(&self) -> Result<OmpProviderSwitches<'_>, &Path> {
+        fn ids(setting: Option<&OmpSourcedSetting>) -> Result<&[Value], &Path> {
+            let Some(setting) = setting else {
+                return Ok(&[]);
+            };
+            setting
+                .value
+                .as_array()
+                .filter(|values| values.iter().all(Value::is_string))
+                .map(Vec::as_slice)
+                .ok_or(setting.source_path.as_path())
+        }
+        Ok(OmpProviderSwitches {
+            disabled: ids(self.disabled_providers.as_ref())?,
+            enabled: ids(self.enabled_providers.as_ref())?,
+        })
+    }
+}
+
+impl OmpProviderSwitches<'_> {
+    fn allows(self, provider: &str) -> bool {
+        !self.disabled.iter().any(|id| id == provider)
+    }
+
+    fn foreign_user_enabled(self, provider: &str) -> bool {
+        self.allows(provider)
+            && (self.enabled.iter().any(|id| {
+                id == provider
+                    || id == "*"
+                    || id == "all"
+                    || (provider == "claude-plugins" && id == "claude")
+            }) || (provider == "claude"
+                && std::env::var("CLAUDE_CONFIG_DIR").is_ok_and(|dir| !dir.trim().is_empty())))
+    }
 }
 
 #[derive(Default)]
@@ -6238,15 +6307,20 @@ fn omp_marketplace_enabled_overrides(
     Ok(overrides)
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+struct OmpMarketplaceInstall {
+    id: String,
+    path: String,
+    registry: PathBuf,
+    foreign_user: bool,
+}
+
 fn read_omp_marketplace_roots(
     path: &Path,
-    claude: bool,
+    claude_dir: Option<&Path>,
     project: bool,
-    active_project: &Path,
+    project_root: Option<&Path>,
     params: &SetupParams,
-    overrides: &Map<String, Value>,
-    roots: &mut Vec<(String, PathBuf)>,
+    roots: &mut Vec<OmpMarketplaceInstall>,
     inspection: &mut OmpExtensionAuthorityInspection,
 ) -> Result<(), ()> {
     let Some(document) = read_omp_plugin_json(path, inspection)? else {
@@ -6263,21 +6337,29 @@ fn read_omp_marketplace_roots(
         inspection.unsupported_paths.push(path.to_path_buf());
         return Err(());
     };
+    let active_project = project_root
+        .and_then(|root| root.parent()?.parent())
+        .unwrap_or(&params.project_dir);
+    let overrides = if let Some(dir) = claude_dir.filter(|_| !plugins.is_empty()) {
+        omp_marketplace_enabled_overrides(params, dir, project_root, inspection)?
+    } else {
+        Map::new()
+    };
     let mut remaining = OMP_CONFIGURED_EXTENSION_MAX_ROOTS;
     for (id, entries) in plugins {
         let Some(entries) = entries.as_array().filter(|entries| !entries.is_empty()) else {
             continue;
         };
-        let Some((plugin_name, _)) = id.rsplit_once('@') else {
+        if !id.contains('@') {
             continue;
-        };
+        }
         remaining = remaining.checked_sub(entries.len()).ok_or_else(|| {
             inspection.unsupported_paths.push(path.to_path_buf());
         })?;
         // OMP user installs replace Claude entries even if all are disabled.
         // Project installs replace user entries only when one remains enabled.
-        if !claude && !project {
-            roots.retain(|(existing, _)| existing != id);
+        if claude_dir.is_none() && !project {
+            roots.retain(|existing| &existing.id != id);
         }
         let mut selected = Vec::new();
         for entry in entries {
@@ -6291,7 +6373,7 @@ fn read_omp_marketplace_roots(
             if entry.get("enabled") == Some(&Value::Bool(false)) {
                 continue;
             }
-            if claude {
+            if claude_dir.is_some() {
                 let enabled = overrides.get(id).and_then(Value::as_bool);
                 if enabled == Some(false) {
                     continue;
@@ -6311,89 +6393,96 @@ fn read_omp_marketplace_roots(
                     }
                 }
             }
-            if plugin_name.is_empty() {
-                // claude-plugins only prefixes MCP names for a nonempty
-                // plugin name. An active malformed entry cannot justify an
-                // exclusion; disabled and out-of-scope entries stay inert.
-                inspection.unsupported_paths.push(path.to_path_buf());
-                return Err(());
-            }
-            let install_path = resolve_omp_agent_dir_override(&params.project_dir, install_path)
-                .map_err(|_| inspection.unsupported_paths.push(path.to_path_buf()))?;
-            // Registry precedence is decided before probing the filesystem.
-            // An enabled project install still shadows the same user ID when
-            // its directory is missing; otherwise a stale user registration
-            // could incorrectly hide an independently enabled npm package.
-            let canonical = if observe_omp_plugin_path(&install_path, inspection)?.is_some() {
-                std::fs::canonicalize(&install_path).map_err(|_| {
-                    inspection.unsupported_paths.push(path.to_path_buf());
-                })?
-            } else {
-                install_path
-            };
-            selected.push((id.clone(), canonical));
+            selected.push(OmpMarketplaceInstall {
+                id: id.clone(),
+                path: install_path.to_owned(),
+                registry: path.to_path_buf(),
+                foreign_user: claude_dir.is_some()
+                    && !matches!(
+                        entry.get("scope").and_then(Value::as_str),
+                        Some("project" | "local")
+                    ),
+            });
         }
         if project && !selected.is_empty() {
-            roots.retain(|(existing, _)| existing != id);
+            roots.retain(|existing| &existing.id != id);
         }
         roots.extend(selected);
     }
     Ok(())
 }
 
-fn exclude_omp_marketplace_extensions(
+fn inspect_omp_marketplace(
     params: &SetupParams,
     home: &Path,
     user_root: &Path,
     project_root: Option<&Path>,
     extensions: &mut Vec<OmpInstalledExtension>,
+    switches: OmpProviderSwitches<'_>,
     inspection: &mut OmpExtensionAuthorityInspection,
 ) -> Result<(), ()> {
-    if extensions.is_empty() {
+    if !switches.allows("claude-plugins") && extensions.is_empty() {
         return Ok(());
     }
     let (_, claude_dir) = claude_user_base(&params.project_dir, home).map_err(|path| {
         inspection.unsupported_paths.push(path);
     })?;
-    let overrides =
-        omp_marketplace_enabled_overrides(params, &claude_dir, project_root, inspection)?;
-    let active_project = project_root
-        .and_then(|root| root.parent()?.parent())
-        .unwrap_or(&params.project_dir);
     let mut roots = Vec::new();
     let mut registries = vec![
         (
             claude_dir.join("plugins/installed_plugins.json"),
-            true,
+            Some(claude_dir.as_path()),
             false,
         ),
-        (user_root.join("installed_plugins.json"), false, false),
+        (user_root.join("installed_plugins.json"), None, false),
     ];
     if let Some(project_root) = project_root {
-        registries.push((project_root.join("installed_plugins.json"), false, true));
+        registries.push((project_root.join("installed_plugins.json"), None, true));
     }
     for (path, claude, project) in registries {
         read_omp_marketplace_roots(
             &path,
             claude,
             project,
-            active_project,
+            project_root,
             params,
-            &overrides,
             &mut roots,
             inspection,
         )?;
     }
-    extensions.retain(|extension| {
-        !roots
-            .iter()
-            .any(|(_, root)| omp_plugin_paths_equal(&extension.root, root))
-    });
+    for install in roots {
+        // Only the winning registry entries can expose an unqualified MCP
+        // alias or suppress an independently installed npm package.
+        if switches.allows("claude-plugins")
+            && (!install.foreign_user
+                || switches.foreign_user_enabled("claude-plugins")
+                || switches.foreign_user_enabled("claude"))
+            && install
+                .id
+                .rsplit_once('@')
+                .is_some_and(|(name, _)| name.is_empty())
+        {
+            inspection.unsupported_paths.push(install.registry);
+            return Err(());
+        }
+        if !extensions.is_empty() {
+            let path = resolve_omp_agent_dir_override(&params.project_dir, &install.path)
+                .map_err(|_| inspection.unsupported_paths.push(install.registry.clone()))?;
+            let canonical = if observe_omp_plugin_path(&path, inspection)?.is_some() {
+                std::fs::canonicalize(&path)
+                    .map_err(|_| inspection.unsupported_paths.push(install.registry))?
+            } else {
+                path
+            };
+            extensions.retain(|extension| !omp_plugin_paths_equal(&extension.root, &canonical));
+        }
+    }
     Ok(())
 }
 
 fn inspect_omp_installed_extensions(
     params: &SetupParams,
+    switches: OmpProviderSwitches<'_>,
     inspection: &mut OmpExtensionAuthorityInspection,
 ) -> Result<Vec<OmpInstalledExtension>, ()> {
     let home = omp_provider_home(params).ok_or_else(|| {
@@ -6414,27 +6503,30 @@ fn inspect_omp_installed_extensions(
     let user_root = omp_user_plugins_root(params, config_dir, &home, inspection)?;
     let project_root = omp_project_plugins_root(params, &home, config_dir, &user_root, inspection)?
         .filter(|root| !omp_plugin_paths_equal(root, &user_root));
-    let disabled = omp_project_disabled_plugins(params, inspection)?;
-    let mut extensions =
-        collect_omp_installed_extensions(&user_root, false, &disabled, inspection)?;
-    if let Some(root) = &project_root {
-        for extension in collect_omp_installed_extensions(root, true, &disabled, inspection)? {
-            if let Some(existing) = extensions
-                .iter_mut()
-                .find(|existing| existing.name == extension.name)
-            {
-                *existing = extension;
-            } else {
-                extensions.push(extension);
+    let mut extensions = Vec::new();
+    if switches.allows("omp-plugins") {
+        let disabled = omp_project_disabled_plugins(params, inspection)?;
+        extensions = collect_omp_installed_extensions(&user_root, false, &disabled, inspection)?;
+        if let Some(root) = &project_root {
+            for extension in collect_omp_installed_extensions(root, true, &disabled, inspection)? {
+                if let Some(existing) = extensions
+                    .iter_mut()
+                    .find(|existing| existing.name == extension.name)
+                {
+                    *existing = extension;
+                } else {
+                    extensions.push(extension);
+                }
             }
         }
     }
-    exclude_omp_marketplace_extensions(
+    inspect_omp_marketplace(
         params,
         &home,
         &user_root,
         project_root.as_deref(),
         &mut extensions,
+        switches,
         inspection,
     )?;
     Ok(extensions)
@@ -6492,28 +6584,16 @@ fn inspect_omp_configured_extensions(
     if settings.unsupported_path.is_some() {
         return inspection;
     }
-    if let Some(disabled) = &settings.disabled_providers {
-        let Some(providers) = disabled
-            .value
-            .as_array()
-            .filter(|providers| providers.iter().all(Value::is_string))
-        else {
-            // Path-scoped provider rules need OMP's own path matcher; do not
-            // silently interpret an unmodeled effective value as enabled.
-            inspection
-                .unsupported_paths
-                .push(disabled.source_path.clone());
-            return inspection;
-        };
-        if providers
-            .iter()
-            .any(|provider| provider.as_str() == Some("omp-plugins"))
-        {
-            return inspection;
-        }
+    let Ok(switches) = settings.provider_switches() else {
+        return inspection;
+    };
+    if !switches.allows("omp-plugins") && !switches.allows("claude-plugins") {
+        return inspection;
     }
     let mut roots = Vec::new();
-    if let Some(configured) = &settings.configured_extensions {
+    if switches.allows("omp-plugins")
+        && let Some(configured) = &settings.configured_extensions
+    {
         let Some(entries) = configured
             .value
             .as_array()
@@ -6538,7 +6618,7 @@ fn inspect_omp_configured_extensions(
             }
         }
     }
-    if let Ok(installed) = inspect_omp_installed_extensions(params, &mut inspection) {
+    if let Ok(installed) = inspect_omp_installed_extensions(params, switches, &mut inspection) {
         roots.extend(installed.into_iter().map(|extension| {
             (
                 extension.root,
@@ -7718,10 +7798,26 @@ fn inspect_omp_mcp_aliases(params: &SetupParams, action_path: &Path) -> OmpMcpAl
     inspection
         .unsupported_paths
         .extend(extensions.unsupported_paths);
-    if let Some(path) = settings.unsupported_path {
-        inspection.unsupported_paths.push(path);
+    if let Some(path) = &settings.unsupported_path {
+        inspection.unsupported_paths.push(path.clone());
     }
     let project_config_enabled = settings.project_config_enabled;
+    let switches = match settings.provider_switches() {
+        Ok(switches) => switches,
+        Err(path) => {
+            inspection.unsupported_paths.push(path.to_path_buf());
+            return inspection;
+        }
+    };
+    if !switches.allows("native")
+        && let Some(disabled) = &settings.disabled_providers
+    {
+        // Setup writes native MCP config. A correct-looking entry from a
+        // disabled provider cannot establish a working connection.
+        inspection
+            .unsupported_paths
+            .push(disabled.source_path.clone());
+    }
 
     let (disabled_servers, forced_enabled) = inspect_omp_runtime_server_lists(params)
         .unwrap_or_else(|path| {
@@ -7755,7 +7851,7 @@ fn inspect_omp_mcp_aliases(params: &SetupParams, action_path: &Path) -> OmpMcpAl
         };
 
     let mut in_open_code = false;
-    for source in omp_mcp_authority_sources(params, extensions.sources) {
+    for source in omp_mcp_authority_sources(params, extensions.sources, switches) {
         if in_open_code && source.provider != OmpMcpAuthorityProvider::OpenCode {
             flush_open_code(
                 &mut candidates,
@@ -8149,6 +8245,13 @@ fn merge_omp_settings_document(
             project_level,
         });
     }
+    if let Some(value) = root.remove("enabledProviders") {
+        inspection.enabled_providers = Some(OmpSourcedSetting {
+            value,
+            source_path: path.to_path_buf(),
+            project_level,
+        });
+    }
     let Some(incoming_mcp) = root.remove("mcp") else {
         return;
     };
@@ -8225,6 +8328,7 @@ fn inspect_omp_settings_authority(params: &SetupParams) -> OmpSettingsAuthorityI
         merged_mcp_settings: None,
         configured_extensions: None,
         disabled_providers: None,
+        enabled_providers: None,
         project_config_enabled: true,
         effective_source: None,
         unsupported_path: None,
@@ -15161,6 +15265,111 @@ http_headers = { Authorization = "Bearer tok" }
     }
 
     #[test]
+    fn omp_status_respects_mcp_provider_switches_before_alias_deduplication() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let settings = params.project_dir.join(".omp/config.yml");
+        let root = params.project_dir.join("mcp.json");
+        let cursor = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".cursor/mcp.json");
+        std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+        let alias = r#"{"mcpServers":{"agent-mail":{"url":"http://localhost:9999/mcp/"}}}"#;
+        std::fs::write(&root, alias).unwrap();
+        std::fs::write(&cursor, alias).unwrap();
+        for (config, root_active, user_active) in [
+            ("disabledProviders: [mcp-json]", false, false),
+            ("disabledProviders: []", true, false),
+            (
+                "disabledProviders: [mcp-json]\nenabledProviders: [cursor]",
+                false,
+                true,
+            ),
+            (
+                "disabledProviders: [mcp-json, cursor]\nenabledProviders: ['*']",
+                false,
+                false,
+            ),
+        ] {
+            std::fs::write(&settings, config).unwrap();
+            let paths = omp_mcp_authority_paths(&params);
+            assert_eq!(paths.contains(&root), root_active, "{config}");
+            assert_eq!(paths.contains(&cursor), user_active, "{config}");
+            assert_eq!(
+                first_setup_status_file(&params).omp_mcp_alias_drift,
+                root_active || user_active,
+                "{config}"
+            );
+        }
+        std::fs::write(&settings, "disabledProviders: [native]").unwrap();
+        let status = first_setup_status_file(&params);
+        assert!(
+            status
+                .drift_reasons
+                .contains(&ConfigDriftReason::UnsupportedConfig)
+        );
+        assert!(status.remediation.contains(".omp/config.yml"));
+    }
+
+    #[test]
+    fn omp_marketplace_only_registry_is_authoritative_without_npm_packages() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let home = params.home_dir_override.as_ref().unwrap();
+        let registry = home.join(".omp/plugins/installed_plugins.json");
+        let claude = home.join(".claude/plugins/installed_plugins.json");
+        let root = params.project_dir.join("market-plugin");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"agent-mail":{"url":"http://localhost:9999/mcp/"}}}"#,
+        )
+        .unwrap();
+        let install = |enabled| {
+            serde_json::to_string(&json!({
+                "version": 2, "plugins": {"@local": [{"installPath": root, "enabled": enabled}]}
+            }))
+            .unwrap()
+        };
+        let check = || first_setup_status_file(&params);
+        assert!(omp_mcp_authority_paths(&params).contains(&registry));
+        for path in [&claude, &registry] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        let settings = params.project_dir.join(".omp/config.yml");
+        std::fs::write(&settings, "enabledProviders: [claude]\n").unwrap();
+        std::fs::write(&claude, install(true)).unwrap();
+        assert!(
+            check()
+                .drift_reasons
+                .contains(&ConfigDriftReason::UnsupportedConfig)
+        );
+        std::fs::write(&registry, install(false)).unwrap();
+        assert!(
+            check().drift_reasons.is_empty(),
+            "disabled OMP registration overrides the Claude install"
+        );
+        std::fs::write(&registry, install(true)).unwrap();
+        std::fs::write(&settings, "disabledProviders: [omp-plugins]\n").unwrap();
+        let active = check();
+        assert!(
+            active
+                .drift_reasons
+                .contains(&ConfigDriftReason::UnsupportedConfig)
+        );
+        assert!(active.remediation.contains("installed_plugins.json"));
+        std::fs::write(&settings, "disabledProviders: [claude-plugins]\n").unwrap();
+        assert!(
+            check().drift_reasons.is_empty(),
+            "the disabled marketplace cannot expose an alias"
+        );
+    }
+
+    #[test]
     fn omp_installed_plugins_preserve_missing_project_marketplace_precedence() {
         let tmp = setup_real_tempdir();
         let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
@@ -16048,6 +16257,15 @@ http_headers = { Authorization = "Bearer tok" }
         )
         .unwrap();
 
+        assert!(
+            !first_setup_status_file(&params).omp_mcp_alias_drift,
+            "without the user opt-in, the project layer has no endpoint to inherit"
+        );
+        std::fs::write(
+            params.project_dir.join(".omp/config.yml"),
+            "enabledProviders: [opencode]\n",
+        )
+        .unwrap();
         let merged = first_setup_status_file(&params);
         assert!(merged.omp_mcp_alias_drift);
         assert!(merged.remediation.contains("opencode.jsonc"));
@@ -17329,7 +17547,8 @@ url = \"http://127.0.0.1:8766/old/\"
 
     #[test]
     fn setup_toml_refusal_never_echoes_existing_or_generated_credentials() {
-        let existing_secret = "fixture-existing-bearer-secret";
+        let existing_secret = generate_token().unwrap();
+        let replacement = generate_token().unwrap();
         let corrupted = format!(
             "[other]\n\
              http_headers = {{ Authorization = \"Bearer {existing_secret}\" }}\n\
@@ -17338,18 +17557,18 @@ url = \"http://127.0.0.1:8766/old/\"
         let error = merge_toml_section(
             Some(&corrupted),
             "[mcp_servers.mcp_agent_mail]",
-            &codex_http_key_values("fixture-replacement-token"),
+            &codex_http_key_values(&replacement),
         )
         .expect_err("unmanaged duplicate keys must still refuse publication");
         for message in [error.to_string(), format!("{error:?}")] {
             assert!(message.contains("not valid TOML"), "{message}");
             assert!(message.contains("duplicate key"), "{message}");
             assert!(message.contains("bytes "), "{message}");
-            assert!(!message.contains(existing_secret), "{message}");
-            assert!(!message.contains("fixture-replacement-token"), "{message}");
+            assert!(!message.contains(&existing_secret), "{message}");
+            assert!(!message.contains(&replacement), "{message}");
         }
 
-        let generated_secret = "fixture-generated-bearer-secret";
+        let generated_secret = generate_token().unwrap();
         let invalid_value =
             format!("{{ Authorization = \"Bearer {generated_secret}\", invalid = }}");
         let error = merge_toml_section(
@@ -17361,7 +17580,7 @@ url = \"http://127.0.0.1:8766/old/\"
         for message in [error.to_string(), format!("{error:?}")] {
             assert!(message.contains("merged TOML does not parse"), "{message}");
             assert!(message.contains("bytes "), "{message}");
-            assert!(!message.contains(generated_secret), "{message}");
+            assert!(!message.contains(&generated_secret), "{message}");
         }
     }
 

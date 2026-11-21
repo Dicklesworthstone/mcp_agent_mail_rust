@@ -1643,6 +1643,7 @@ fn verify_retention_archive_at(
         archive,
         &prepared.message,
         bundle_bytes - message_bytes,
+        control,
     )
     .map_err(|error| error.to_string())?;
     for (path, bytes) in files {

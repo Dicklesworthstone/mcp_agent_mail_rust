@@ -4151,6 +4151,9 @@ pub struct AtcEffectSemantics {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AtcEffectPlan {
+    /// Process-local authority is never restored from a saved/replayed report.
+    #[serde(skip)]
+    pub(crate) release_authority: Option<AtcReleaseAuthority>,
     pub decision_id: u64,
     pub effect_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4175,6 +4178,13 @@ pub struct AtcEffectPlan {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct AtcReleaseAuthority {
+    epoch: Arc<()>,
+    last_activity_micros: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct AtcTickReport {
     pub actions: Vec<AtcTickAction>,
     pub effects: Vec<AtcEffectPlan>,
@@ -4184,6 +4194,9 @@ pub struct AtcTickReport {
 /// Top-level ATC engine that orchestrates all subsystems.
 #[derive(Debug)]
 pub struct AtcEngine {
+    /// Retained by planned releases so even identical replay records cannot
+    /// acquire authority from a replacement engine.
+    release_epoch: Arc<()>,
     /// Configuration.
     config: AtcConfig,
     /// Whether the ATC has registered itself as an agent.
@@ -4399,6 +4412,7 @@ impl AtcEngine {
         debug_assert!(policy_bundle.validate().is_ok());
 
         Self {
+            release_epoch: Arc::new(()),
             config,
             registered: false,
             liveness_core,
@@ -5132,6 +5146,61 @@ impl AtcEngine {
             },
             |reason| Some(reason.to_string()),
         )
+    }
+
+    /// Validate a queued release against the same engine that holds the current
+    /// activity and policy. The retained epoch binds a proposal to this engine
+    /// even when replay reproduces the same numeric decision ID and trace.
+    fn release_effect_admission(&self, effect: &AtcEffectPlan) -> Result<i64, &'static str> {
+        let authority = effect
+            .release_authority
+            .as_ref()
+            .filter(|authority| Arc::ptr_eq(&authority.epoch, &self.release_epoch))
+            .ok_or("release_decision_stale")?;
+        let record = self
+            .ledger
+            .get(effect.decision_id)
+            .ok_or("release_decision_stale")?;
+        if effect.kind != "release_reservations_requested"
+            || effect.semantics.family != "reservation_release"
+            || record.subsystem != AtcSubsystem::Liveness
+            || record.action != "ReleaseReservations"
+            || record.subject != effect.agent
+            || record.timestamp_micros != effect.timestamp_micros
+            || record.trace_id != effect.trace_id
+            || record.claim_id != effect.claim_id
+            || record.evidence_id != effect.evidence_id
+            || record.policy_id != effect.policy_id
+            || effect.policy_revision != self.policy_revision
+            || effect.policy_id.as_deref() != Some(self.incumbent_policy.policy_id.as_str())
+        {
+            return Err("release_decision_stale");
+        }
+        let entry = self
+            .agents
+            .get(&effect.agent)
+            .ok_or("release_liveness_changed")?;
+        if effect.project_key.is_none()
+            || entry.project_key.as_deref() != effect.project_key.as_deref()
+        {
+            return Err("release_project_changed");
+        }
+        if entry.state != LivenessState::Dead
+            || entry.rhythm.last_activity_ts <= 0
+            || entry.rhythm.last_activity_ts != authority.last_activity_micros
+            || entry.rhythm.last_activity_ts > effect.timestamp_micros
+        {
+            return Err("release_liveness_changed");
+        }
+        let (action, _, _) = self.incumbent_policy.choose_action(
+            entry.core.posterior(),
+            self.current_release_guard_reason().is_some(),
+            self.capacity_guard_reason().is_some(),
+        );
+        if action != LivenessAction::ReleaseReservations {
+            return Err("release_policy_changed");
+        }
+        Ok(authority.last_activity_micros)
     }
 
     fn mark_agents_dirty(&mut self) {
@@ -6016,6 +6085,14 @@ impl AtcEngine {
             effect_seed.push_str(message);
         }
         AtcEffectPlan {
+            release_authority: (kind == "release_reservations_requested")
+                .then(|| {
+                    self.agents.get(&agent).map(|entry| AtcReleaseAuthority {
+                        epoch: Arc::clone(&self.release_epoch),
+                        last_activity_micros: entry.rhythm.last_activity_ts,
+                    })
+                })
+                .flatten(),
             decision_id: record.id,
             effect_id: format!("atc-effect-{:016x}", stable_fnv1a64(effect_seed.as_bytes())),
             experience_id: None,
@@ -11826,18 +11903,70 @@ impl KaplanMeierEstimator {
 // ── Global ATC Engine Singleton ─────────────────────────────────────
 
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 static ATC_ENGINE: OnceLock<Mutex<AtcEngine>> = OnceLock::new();
-static ATC_WRITE_MODE: OnceLock<mcp_agent_mail_core::AtcWriteMode> = OnceLock::new();
-static ATC_KILL_SWITCH: AtomicBool = AtomicBool::new(false);
-static ATC_KILL_SWITCH_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+// The public server API supports sequential mailbox lifetimes in one process.
+// Keep policy and its file authority together, and replace them with the engine.
+// Lock order is ENGINE -> WRITE_POLICY. File operations retain an immutable
+// lifetime and perform I/O without either global mutex.
+static ATC_WRITE_POLICY: Mutex<Option<Arc<AtcWritePolicy>>> = Mutex::new(None);
 static ATC_POPULATION: OnceLock<Mutex<HierarchicalAgentModel>> = OnceLock::new();
 static ATC_CONFORMAL: OnceLock<Mutex<AtcConformalSet>> = OnceLock::new();
 static ATC_THRESHOLDS: OnceLock<Mutex<HashMap<String, AdaptiveThreshold>>> = OnceLock::new();
 static ATC_SURVIVAL: OnceLock<Mutex<HashMap<String, KaplanMeierEstimator>>> = OnceLock::new();
 static ATC_LIVENESS_TUNER: OnceLock<Mutex<LossMatrixTuner<LivenessAction, LivenessState>>> =
     OnceLock::new();
+
+struct AtcWritePolicy {
+    mode: mcp_agent_mail_core::AtcWriteMode,
+    kill_switch_path: std::path::PathBuf,
+    kill_switch_active: AtomicBool,
+}
+
+impl AtcWritePolicy {
+    fn effective_mode(&self) -> mcp_agent_mail_core::AtcWriteMode {
+        if self.kill_switch_active.load(AtomicOrdering::Acquire) {
+            mcp_agent_mail_core::AtcWriteMode::Off
+        } else {
+            self.mode
+        }
+    }
+}
+
+fn replace_global_atc_engine(config: &mcp_agent_mail_core::Config) {
+    let atc_config = AtcEngine::config_from_env(config);
+    let engine_lock = ATC_ENGINE.get_or_init(|| Mutex::new(AtcEngine::new(atc_config.clone())));
+    // Construction may emit diagnostics. Never invoke subscribers under either
+    // mutex, where a subscriber inspecting the current policy would deadlock.
+    let fresh_engine = AtcEngine::new(atc_config);
+    let fresh_policy = Arc::new(AtcWritePolicy {
+        mode: config.atc_write_mode,
+        kill_switch_path: config.storage_root.join(".atc_kill_switch"),
+        // New state has no permission to write until its own marker is read.
+        kill_switch_active: AtomicBool::new(true),
+    });
+    {
+        let mut engine = engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut policy = ATC_WRITE_POLICY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *engine = fresh_engine;
+        *policy = Some(Arc::clone(&fresh_policy));
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .set_kill_switch_enabled(true);
+        // Both states were replaced wholesale; a failed previous lifetime supplies
+        // no authority, but its poison flags do not invalidate this complete reset.
+        engine_lock.clear_poison();
+        ATC_WRITE_POLICY.clear_poison();
+    }
+    // A slow filesystem must not stall observers holding the engine mutex.
+    // Initial observation is not a change from a previous lifetime's marker.
+    let _ = refresh_kill_switch_policy(&fresh_policy);
+}
 
 fn current_adaptive_threshold_k(agent_name: &str) -> Option<f64> {
     ATC_THRESHOLDS
@@ -11999,17 +12128,9 @@ impl AtcEngine {
     }
 }
 
-/// Initialize the global ATC engine. Call once at server startup.
+/// Initialize the global ATC engine and policy for this server lifetime.
 pub fn init_global_atc(config: &mcp_agent_mail_core::Config) {
-    let _ = ATC_WRITE_MODE.set(config.atc_write_mode);
-    let kill_switch_path = config.storage_root.join(".atc_kill_switch");
-    let _ = ATC_KILL_SWITCH_PATH.set(kill_switch_path);
-    refresh_kill_switch();
-    let atc_config = AtcEngine::config_from_env(config);
-    let engine_lock = ATC_ENGINE.get_or_init(|| Mutex::new(AtcEngine::new(atc_config.clone())));
-    *engine_lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = AtcEngine::new(atc_config);
+    replace_global_atc_engine(config);
 
     let population_lock = ATC_POPULATION.get_or_init(|| Mutex::new(HierarchicalAgentModel::new()));
     *population_lock
@@ -12058,13 +12179,21 @@ pub fn atc_enabled() -> bool {
 /// unavailable or incomplete agent/conflict coverage always refuses execution
 /// admission, independently of the policy's optional fallback guard.
 #[allow(clippy::redundant_pub_crate)]
+#[cfg(test)]
 pub(crate) fn atc_release_capacity_admission() -> Result<(), &'static str> {
     release_capacity_admission_from_engine(ATC_ENGINE.get())
 }
 
+#[cfg(test)]
 fn release_capacity_admission_from_engine(
     engine_lock: Option<&Mutex<AtcEngine>>,
 ) -> Result<(), &'static str> {
+    lock_release_engine(engine_lock).map(|_| ())
+}
+
+fn lock_release_engine(
+    engine_lock: Option<&Mutex<AtcEngine>>,
+) -> Result<MutexGuard<'_, AtcEngine>, &'static str> {
     let engine_lock = engine_lock.ok_or("agent_coverage_unavailable")?;
     let engine = engine_lock
         .lock()
@@ -12075,7 +12204,68 @@ fn release_capacity_admission_from_engine(
     if let Some(reason) = engine.capacity_guard_reason() {
         return Err(reason);
     }
-    Ok(())
+    Ok(engine)
+}
+
+pub(super) fn atc_release_effect_admission(effect: &AtcEffectPlan) -> Result<i64, &'static str> {
+    let engine = lock_release_engine(ATC_ENGINE.get())?;
+    let last_activity = engine.release_effect_admission(effect)?;
+    // Match planning's ENGINE -> CONFORMAL ordering. New uncertainty can arrive
+    // after planning without changing the agent's stored Dead classification.
+    // An unavailable calibration observation grants no execution permission.
+    let conformal = ATC_CONFORMAL
+        .get()
+        .ok_or("release_calibration_unavailable")?
+        .lock()
+        .map_err(|_| "release_calibration_unavailable")?;
+    if conformal.is_uncertain(
+        AtcSubsystem::Liveness,
+        engine.liveness_core.max_possible_loss(),
+    ) {
+        return Err("conformal_uncertainty");
+    }
+    Ok(last_activity)
+}
+
+/// Seed strong silence evidence, then use the real planner and public delivery
+/// boundary. Callers hold `GLOBAL_ATC_TEST_LOCK` and reset before invoking this.
+#[cfg(test)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn planned_release_for_test(
+    agent: &str,
+    project: &str,
+    last_activity: i64,
+) -> AtcEffectPlan {
+    {
+        let mut engine = ATC_ENGINE
+            .get()
+            .expect("engine initialized")
+            .lock()
+            .unwrap();
+        engine.register_agent(agent, "codex-cli", Some(project));
+        engine.observe_activity(agent, Some(project), last_activity);
+        let entry = engine
+            .agents
+            .get_mut(agent)
+            .expect("tracked release target");
+        for _ in 0..30 {
+            entry.core.update_posterior(&[
+                (LivenessState::Alive, 0.01),
+                (LivenessState::Flaky, 0.05),
+                (LivenessState::Dead, 0.95),
+            ]);
+        }
+    }
+    for step in 1..=4 {
+        if let Some(report) = crate::atc::atc_tick_report(last_activity + step * 600_000_000)
+            && let Some(effect) = report.effects.into_iter().find(|effect| {
+                effect.agent == agent && effect.kind == "release_reservations_requested"
+            })
+        {
+            return effect;
+        }
+    }
+    panic!("real planner did not propose release for {agent}");
 }
 
 /// Record an agent registration in the ATC.
@@ -12279,96 +12469,165 @@ pub struct AtcConflictObservation {
 }
 
 fn atc_write_mode() -> mcp_agent_mail_core::AtcWriteMode {
-    if ATC_KILL_SWITCH.load(AtomicOrdering::Relaxed) {
-        return mcp_agent_mail_core::AtcWriteMode::Off;
-    }
-    ATC_WRITE_MODE
-        .get()
-        .copied()
+    ATC_WRITE_POLICY
+        .lock()
+        .ok()
+        .and_then(|policy| policy.as_ref().map(|policy| policy.effective_mode()))
         .unwrap_or(mcp_agent_mail_core::AtcWriteMode::Off)
 }
 
-pub fn refresh_kill_switch() {
-    let active = ATC_KILL_SWITCH_PATH.get().is_some_and(|p| p.exists());
-    let was_active = ATC_KILL_SWITCH.swap(active, AtomicOrdering::Relaxed);
-    mcp_agent_mail_core::global_metrics()
-        .atc
-        .set_kill_switch_enabled(active);
-    if active != was_active {
-        let reason = if active {
-            ATC_KILL_SWITCH_PATH
-                .get()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        if active {
-            tracing::info!(
-                event = "atc.kill_switch.change",
-                from_state = "disabled",
-                to_state = "enabled",
-                reason,
-                path = ?ATC_KILL_SWITCH_PATH.get(),
-                "ATC kill switch ACTIVATED — all experience writes suppressed"
-            );
-        } else {
-            tracing::info!(
-                event = "atc.kill_switch.change",
-                from_state = "enabled",
-                to_state = "disabled",
-                reason = "",
-                path = ?ATC_KILL_SWITCH_PATH.get(),
-                "ATC kill switch DEACTIVATED — experience writes resume per AM_ATC_WRITE_MODE"
-            );
-        }
+/// Acquire the engine before sampling policy, so a caller that waited through
+/// reinitialization cannot apply the previous lifetime's Live mode to new state.
+fn atc_write_engine() -> Option<(
+    MutexGuard<'static, AtcEngine>,
+    mcp_agent_mail_core::AtcWriteMode,
+)> {
+    // Default-Off observations need no engine admission. Live/Shadow callers
+    // recheck after acquiring it because a reset may have changed the policy.
+    if atc_write_mode().is_off() {
+        return None;
+    }
+    let engine = ATC_ENGINE.get()?.lock().ok()?;
+    if !engine.enabled() {
+        return None;
+    }
+    let mode = atc_write_mode();
+    (!mode.is_off()).then_some((engine, mode))
+}
+
+fn refresh_kill_switch_policy(policy: &Arc<AtcWritePolicy>) -> Option<bool> {
+    // A retained policy binds both observation and publication to one lifetime.
+    // Refused observations cannot authorize writes. A reset can proceed while
+    // the filesystem is slow without an old refresh clearing its stop signal.
+    let active = policy.kill_switch_path.try_exists().unwrap_or(true);
+    let was_active = policy
+        .kill_switch_active
+        .swap(active, AtomicOrdering::AcqRel);
+    if let Ok(current) = ATC_WRITE_POLICY.lock()
+        && current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, policy))
+    {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .set_kill_switch_enabled(active);
+    }
+    (active != was_active).then_some(active)
+}
+
+fn log_kill_switch_change(policy: &AtcWritePolicy, change: Option<bool>) {
+    let Some(active) = change else {
+        return;
+    };
+    // Subscribers can query policy. Diagnostics run only after releasing its
+    // mutex, and name the exact lifetime whose state changed.
+    if active {
+        let reason = std::fs::read_to_string(&policy.kill_switch_path).unwrap_or_default();
+        tracing::info!(
+            event = "atc.kill_switch.change",
+            from_state = "disabled",
+            to_state = "enabled",
+            reason,
+            path = ?policy.kill_switch_path,
+            "ATC kill switch ACTIVATED — all experience writes suppressed"
+        );
+    } else {
+        tracing::info!(
+            event = "atc.kill_switch.change",
+            from_state = "enabled",
+            to_state = "disabled",
+            reason = "",
+            path = ?policy.kill_switch_path,
+            "ATC kill switch DEACTIVATED — experience writes resume per AM_ATC_WRITE_MODE"
+        );
     }
 }
 
+pub fn refresh_kill_switch() {
+    let Ok(policy) = current_atc_write_policy() else {
+        return;
+    };
+    let change = refresh_kill_switch_policy(&policy);
+    log_kill_switch_change(&policy, change);
+}
+
 pub fn atc_kill_switch_active() -> bool {
-    ATC_KILL_SWITCH.load(AtomicOrdering::Relaxed)
+    ATC_WRITE_POLICY.lock().map_or(true, |policy| {
+        policy
+            .as_ref()
+            .is_some_and(|policy| policy.kill_switch_active.load(AtomicOrdering::Acquire))
+    })
+}
+
+fn current_atc_write_policy() -> std::io::Result<Arc<AtcWritePolicy>> {
+    ATC_WRITE_POLICY
+        .lock()
+        .map_err(|_| std::io::Error::other("ATC write policy is unavailable"))?
+        .clone()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "kill switch path not initialized",
+            )
+        })
 }
 
 pub fn activate_kill_switch(reason: &str) -> std::io::Result<()> {
-    let Some(path) = ATC_KILL_SWITCH_PATH.get() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "kill switch path not initialized",
-        ));
-    };
-    std::fs::write(path, reason)?;
-    tracing::info!(reason, path = ?path, "ATC kill switch file written");
-    refresh_kill_switch();
+    let policy = current_atc_write_policy()?;
+    std::fs::write(&policy.kill_switch_path, reason)?;
+    let change = refresh_kill_switch_policy(&policy);
+    tracing::info!(reason, path = ?policy.kill_switch_path, "ATC kill switch file written");
+    log_kill_switch_change(&policy, change);
     Ok(())
 }
 
 pub fn deactivate_kill_switch() -> std::io::Result<()> {
-    let Some(path) = ATC_KILL_SWITCH_PATH.get() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "kill switch path not initialized",
-        ));
-    };
-    if path.exists() {
-        std::fs::remove_file(path)?;
-        tracing::info!(path = ?path, "ATC kill switch file removed");
+    let policy = current_atc_write_policy()?;
+    let removed = policy.kill_switch_path.try_exists()?;
+    if removed {
+        std::fs::remove_file(&policy.kill_switch_path)?;
+        tracing::info!(path = ?policy.kill_switch_path, "ATC kill switch file removed");
     }
-    refresh_kill_switch();
+    let change = refresh_kill_switch_policy(&policy);
+    log_kill_switch_change(&policy, change);
     Ok(())
 }
 
 pub fn kill_switch_status() -> serde_json::Value {
-    let active = atc_kill_switch_active();
-    let reason = ATC_KILL_SWITCH_PATH
-        .get()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    // One snapshot prevents old-path/new-mode mixtures during a server reset.
+    let policy = match ATC_WRITE_POLICY.lock() {
+        Ok(policy) => policy.clone(),
+        Err(_) => {
+            return serde_json::json!({
+                "active": true,
+                "reason": "ATC write policy is unavailable",
+                "path": null,
+                "write_mode": "off",
+                "effective_mode": "off",
+            });
+        }
+    };
+    let active = policy
+        .as_ref()
+        .is_some_and(|policy| policy.kill_switch_active.load(AtomicOrdering::Acquire));
+    let mode = policy
+        .as_ref()
+        .map_or(mcp_agent_mail_core::AtcWriteMode::Off, |policy| policy.mode);
+    let effective_mode = if active {
+        mcp_agent_mail_core::AtcWriteMode::Off
+    } else {
+        mode
+    };
+    let reason = policy
+        .as_ref()
+        .and_then(|policy| std::fs::read_to_string(&policy.kill_switch_path).ok())
         .unwrap_or_default();
     serde_json::json!({
         "active": active,
         "reason": if active { reason.as_str() } else { "" },
-        "path": ATC_KILL_SWITCH_PATH.get().map(|p| p.display().to_string()),
-        "write_mode": ATC_WRITE_MODE.get().copied().unwrap_or(mcp_agent_mail_core::AtcWriteMode::Off).to_string(),
-        "effective_mode": atc_write_mode().to_string(),
+        "path": policy.as_ref().map(|policy| policy.kill_switch_path.display().to_string()),
+        "write_mode": mode.to_string(),
+        "effective_mode": effective_mode.to_string(),
     })
 }
 
@@ -12378,19 +12637,9 @@ pub fn atc_note_message_sent(
     thread_id: Option<&str>,
     timestamp_micros: i64,
 ) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -12410,19 +12659,9 @@ pub fn atc_note_message_sent(
 }
 
 pub fn atc_note_message_received(agent: &str, thread_id: Option<&str>, timestamp_micros: i64) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -12447,19 +12686,9 @@ pub fn atc_note_reservation_granted(
     project: &str,
     timestamp_micros: i64,
 ) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -12485,19 +12714,9 @@ pub fn atc_note_reservation_released(
     project: &str,
     timestamp_micros: i64,
 ) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -12522,19 +12741,9 @@ pub fn atc_note_reservation_conflicts(
     conflicts: &[AtcConflictObservation],
     timestamp_micros: i64,
 ) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -12571,19 +12780,9 @@ pub fn atc_note_reservation_renewed(
     project: &str,
     timestamp_micros: i64,
 ) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -12608,19 +12807,9 @@ pub fn atc_note_reservation_force_released(
     project: &str,
     timestamp_micros: i64,
 ) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -12648,19 +12837,9 @@ pub fn atc_note_build_slot_acquired(
     project: &str,
     timestamp_micros: i64,
 ) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -12689,19 +12868,9 @@ pub fn atc_note_build_slot_renewed(
     project: &str,
     timestamp_micros: i64,
 ) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -12722,19 +12891,9 @@ pub fn atc_note_build_slot_renewed(
 }
 
 pub fn atc_note_build_slot_released(agent: &str, slot: &str, project: &str, timestamp_micros: i64) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -12768,19 +12927,9 @@ pub(crate) fn atc_reservation_outcome_for_agent(
 }
 
 pub fn atc_note_intervention(timestamp_micros: i64) {
-    let mode = atc_write_mode();
-    if mode.is_off() {
-        return;
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
+    let Some((mut e, mode)) = atc_write_engine() else {
         return;
     };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
-    if !e.enabled() {
-        return;
-    }
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -13202,13 +13351,7 @@ pub(crate) static GLOBAL_ATC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex:
 #[cfg(test)]
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn reset_global_atc_state_for_test(config: &mcp_agent_mail_core::Config) {
-    let atc_config = AtcEngine::config_from_env(config);
-    let fresh_engine = AtcEngine::new(atc_config);
-
-    let engine_lock = ATC_ENGINE.get_or_init(|| Mutex::new(AtcEngine::new_for_testing()));
-    *engine_lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh_engine;
+    replace_global_atc_engine(config);
 
     let population_lock = ATC_POPULATION.get_or_init(|| Mutex::new(HierarchicalAgentModel::new()));
     *population_lock
@@ -14626,6 +14769,215 @@ mod alien_enhancement_tests {
             (engine.eprocess().e_value() - 1.0).abs() < f64::EPSILON,
             "disabled ATC should not update calibration state"
         );
+    }
+
+    #[test]
+    fn init_global_atc_rebinds_write_mode_and_kill_switch_to_current_mailbox() {
+        use mcp_agent_mail_core::AtcWriteMode;
+
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first_root = tempfile::tempdir().expect("first mailbox");
+        let second_root = tempfile::tempdir().expect("second mailbox");
+        let first_marker = first_root.path().join(".atc_kill_switch");
+        let second_marker = second_root.path().join(".atc_kill_switch");
+        let mut config = mcp_agent_mail_core::Config {
+            storage_root: first_root.path().to_path_buf(),
+            atc_enabled: true,
+            atc_write_mode: AtcWriteMode::Live,
+            ..Default::default()
+        };
+
+        crate::atc::init_global_atc(&config);
+        assert_eq!(atc_write_mode(), AtcWriteMode::Live);
+        activate_kill_switch("first mailbox remains stopped").expect("stop first mailbox");
+        assert!(atc_kill_switch_active());
+
+        config.storage_root = second_root.path().to_path_buf();
+        config.atc_write_mode = AtcWriteMode::Off;
+        crate::atc::init_global_atc(&config);
+        let status = kill_switch_status();
+        assert_eq!(status["path"], second_marker.display().to_string());
+        assert_eq!(status["write_mode"], "off");
+        assert_eq!(status["effective_mode"], "off");
+        assert_eq!(status["active"], false);
+        atc_note_reservation_granted("BlueFox", &[], false, "/second", 100);
+        assert_eq!(
+            atc_reservation_outcome_for_agent("BlueFox", "/second", 0),
+            None
+        );
+
+        activate_kill_switch("second mailbox stopped").expect("stop second mailbox");
+        assert_eq!(
+            std::fs::read_to_string(&second_marker).expect("second marker"),
+            "second mailbox stopped"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first_marker).expect("first marker retained"),
+            "first mailbox remains stopped"
+        );
+        deactivate_kill_switch().expect("resume second mailbox");
+        assert!(!second_marker.exists());
+        assert!(first_marker.exists());
+
+        config.atc_write_mode = AtcWriteMode::Live;
+        crate::atc::init_global_atc(&config);
+        atc_note_reservation_granted("BlueFox", &[], false, "/second", 200);
+        assert_eq!(
+            atc_reservation_outcome_for_agent("BlueFox", "/second", 0),
+            Some(ReservationEventKind::Granted)
+        );
+        activate_kill_switch("suppress new observations").expect("stop live observation");
+        atc_note_reservation_released("BlueFox", &[], "/second", 300);
+        assert_eq!(
+            atc_reservation_outcome_for_agent("BlueFox", "/second", 0),
+            Some(ReservationEventKind::Granted)
+        );
+
+        config.atc_write_mode = AtcWriteMode::Shadow;
+        crate::atc::init_global_atc(&config);
+        assert!(atc_kill_switch_active());
+        assert_eq!(atc_write_mode(), AtcWriteMode::Off);
+        deactivate_kill_switch().expect("resume shadow observation");
+        assert_eq!(atc_write_mode(), AtcWriteMode::Shadow);
+        atc_note_reservation_released("BlueFox", &[], "/second", 400);
+        assert_eq!(
+            atc_reservation_outcome_for_agent("BlueFox", "/second", 0),
+            None
+        );
+
+        config.storage_root = first_root.path().to_path_buf();
+        config.atc_write_mode = AtcWriteMode::Live;
+        crate::atc::init_global_atc(&config);
+        assert!(
+            atc_kill_switch_active(),
+            "returning to the first mailbox honors its marker"
+        );
+        assert_eq!(atc_write_mode(), AtcWriteMode::Off);
+        assert_eq!(
+            std::fs::read_to_string(&first_marker).expect("first marker unchanged"),
+            "first mailbox remains stopped"
+        );
+        assert!(!second_marker.exists());
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+    }
+
+    #[test]
+    fn init_global_atc_rebinds_failed_kill_switch_write_without_touching_prior_mailbox() {
+        use mcp_agent_mail_core::AtcWriteMode;
+
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir().expect("mailbox roots");
+        let first_marker = root.path().join(".atc_kill_switch");
+        let mut config = mcp_agent_mail_core::Config {
+            storage_root: root.path().to_path_buf(),
+            atc_enabled: true,
+            atc_write_mode: AtcWriteMode::Live,
+            ..Default::default()
+        };
+        crate::atc::init_global_atc(&config);
+        activate_kill_switch("retain prior authority").expect("first marker");
+
+        config.storage_root = root.path().join("unavailable-mailbox");
+        config.atc_write_mode = AtcWriteMode::Off;
+        crate::atc::init_global_atc(&config);
+        let error = activate_kill_switch("must not write the old mailbox")
+            .expect_err("new unavailable authority must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(atc_write_mode(), AtcWriteMode::Off);
+        assert_eq!(
+            std::fs::read_to_string(&first_marker).expect("prior marker retained"),
+            "retain prior authority"
+        );
+        assert!(!config.storage_root.exists());
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+    }
+
+    #[test]
+    fn init_global_atc_rebinds_without_a_stale_refresh_changing_current_stop_state() {
+        use mcp_agent_mail_core::AtcWriteMode;
+
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first_root = tempfile::tempdir().expect("first mailbox");
+        let second_root = tempfile::tempdir().expect("second mailbox");
+        let first_marker = first_root.path().join(".atc_kill_switch");
+        let second_marker = second_root.path().join(".atc_kill_switch");
+        let mut config = mcp_agent_mail_core::Config {
+            storage_root: first_root.path().to_path_buf(),
+            atc_enabled: true,
+            atc_write_mode: AtcWriteMode::Live,
+            ..Default::default()
+        };
+        crate::atc::init_global_atc(&config);
+        // A refresh that captured its authority before reset can finish later.
+        let previous = current_atc_write_policy().expect("first lifetime");
+        assert_eq!(previous.effective_mode(), AtcWriteMode::Live);
+
+        std::fs::write(&second_marker, "current mailbox stopped").expect("current stop marker");
+        config.storage_root = second_root.path().to_path_buf();
+        crate::atc::init_global_atc(&config);
+        assert!(atc_kill_switch_active());
+        let _ = refresh_kill_switch_policy(&previous);
+        assert!(atc_kill_switch_active());
+        assert_eq!(atc_write_mode(), AtcWriteMode::Off);
+        assert_eq!(
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .snapshot()
+                .kill_switch_enabled_gauge,
+            1,
+            "an old absent marker cannot clear current stop telemetry"
+        );
+
+        deactivate_kill_switch().expect("resume current mailbox");
+        std::fs::write(&first_marker, "old mailbox stopped").expect("old stop marker");
+        assert_eq!(refresh_kill_switch_policy(&previous), Some(true));
+        assert!(!atc_kill_switch_active());
+        assert_eq!(atc_write_mode(), AtcWriteMode::Live);
+        assert_eq!(
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .snapshot()
+                .kill_switch_enabled_gauge,
+            0,
+            "an old present marker cannot stop the current mailbox"
+        );
+        assert!(!second_marker.exists());
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_global_atc_rebinds_unreadable_stop_authority_fail_closed() {
+        use mcp_agent_mail_core::AtcWriteMode;
+
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir().expect("mailbox root");
+        let blocked_root = root.path().join("not-a-directory");
+        std::fs::write(&blocked_root, "retain this file").expect("invalid parent authority");
+        let config = mcp_agent_mail_core::Config {
+            storage_root: blocked_root.clone(),
+            atc_enabled: true,
+            atc_write_mode: AtcWriteMode::Live,
+            ..Default::default()
+        };
+        crate::atc::init_global_atc(&config);
+        assert!(atc_kill_switch_active());
+        assert_eq!(atc_write_mode(), AtcWriteMode::Off);
+        assert!(activate_kill_switch("refused").is_err());
+        assert!(deactivate_kill_switch().is_err());
+        assert_eq!(
+            std::fs::read_to_string(&blocked_root).expect("authority preserved"),
+            "retain this file"
+        );
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
     }
 
     #[test]

@@ -149,6 +149,14 @@ pub struct ReleaseResult {
     pub released_ids: Vec<i64>,
 }
 
+/// Result of an automatic liveness intervention, separate from a holder's
+/// voluntary release request. Suppression never queues a deferred release.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AutomaticReservationRelease {
+    Released(usize),
+    Suppressed(&'static str),
+}
+
 #[derive(Debug, Clone)]
 struct ReleaseIntentReceipt {
     intent_id: String,
@@ -1321,6 +1329,133 @@ fn mcp_error_supports_release_intent(error: &McpError) -> bool {
                     | "RESOURCE_BUSY"
             )
         })
+}
+
+/// Execute an admitted liveness proposal against current durable evidence.
+///
+/// This Rust-only entry point does not impersonate or touch the holder, create
+/// identities, or persist a voluntary-release intent on failure. The caller
+/// supplies the last activity actually seen by its liveness decision. Newer
+/// durable activity invalidates that decision even when it predates dispatch.
+/// Exact observed leases, heartbeat, mail activity and reaper exemption are
+/// checked again inside the authoritative writer transaction.
+#[allow(clippy::too_many_lines)]
+pub async fn release_reservations_for_inactive_agent(
+    ctx: &McpContext,
+    project_key: &str,
+    agent_name: &str,
+    decision_timestamp_micros: i64,
+    last_observed_activity_micros: i64,
+) -> McpResult<AutomaticReservationRelease> {
+    use AutomaticReservationRelease::{Released, Suppressed};
+    use mcp_agent_mail_db::queries;
+
+    ensure_request_live(ctx)?;
+    if last_observed_activity_micros <= 0
+        || last_observed_activity_micros >= decision_timestamp_micros
+    {
+        return Ok(Suppressed("release_invalid_activity_evidence"));
+    }
+    let pool = get_db_pool_for_request(ctx)?;
+    let resolved_project = resolve_existing_project(ctx, &pool, project_key).await?;
+    let Some(project_id) = resolved_project.id.filter(|id| *id > 0) else {
+        return Ok(Suppressed("release_project_changed"));
+    };
+    // Cached name lookup may locate an ID, but never supplies release authority.
+    let project =
+        db_outcome_to_mcp_result(queries::get_project_by_id(ctx.cx(), &pool, project_id).await)?;
+    if project.human_key != project_key || project.created_at > decision_timestamp_micros {
+        return Ok(Suppressed("release_project_changed"));
+    }
+    let resolved_agent = db_outcome_to_mcp_result(
+        queries::get_agent(ctx.cx(), &pool, project_id, agent_name).await,
+    )?;
+    let Some(agent_id) = resolved_agent.id.filter(|id| *id > 0) else {
+        return Ok(Suppressed("release_liveness_changed"));
+    };
+    let holder =
+        db_outcome_to_mcp_result(queries::get_agent_by_id_fresh(ctx.cx(), &pool, agent_id).await)?;
+    if holder.project_id != project_id
+        || !holder.name.eq_ignore_ascii_case(agent_name)
+        || holder.inception_ts > decision_timestamp_micros
+        || holder.last_active_ts <= 0
+        || holder.last_active_ts > last_observed_activity_micros
+        || holder.reaper_exempt != 0
+    {
+        return Ok(Suppressed("release_liveness_changed"));
+    }
+    let last_mail_activity_ts = db_outcome_to_mcp_result(
+        queries::get_agent_last_mail_activity(ctx.cx(), &pool, agent_id, project_id).await,
+    )?;
+    if last_mail_activity_ts.is_some_and(|ts| ts > last_observed_activity_micros) {
+        return Ok(Suppressed("release_liveness_changed"));
+    }
+    let reservations = db_outcome_to_mcp_result(
+        queries::get_active_reservations_for_agent(ctx.cx(), &pool, project_id, agent_id).await,
+    )?;
+    if reservations
+        .iter()
+        .any(|row| row.created_ts > last_observed_activity_micros)
+    {
+        // A legacy/imported grant can outlive a failed holder touch. Its own
+        // creation time contradicts the inactivity evidence for the entire
+        // target; omitting just that row would still revoke the holder's work.
+        return Ok(Suppressed("release_liveness_changed"));
+    }
+    let candidates: Vec<_> = reservations
+        .into_iter()
+        .filter(|row| {
+            row.id.is_some_and(|id| id > 0)
+                && row.project_id == project_id
+                && row.agent_id == agent_id
+                && row.created_ts > 0
+                && row.created_ts <= decision_timestamp_micros
+                && row.expires_ts > decision_timestamp_micros
+        })
+        .map(|reservation| queries::StaleReservationCandidate {
+            reservation,
+            agent_last_active_ts: holder.last_active_ts,
+            last_mail_activity_ts,
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Suppressed("release_no_current_candidates"));
+    }
+
+    #[cfg(test)]
+    tests::after_automatic_release_snapshot().await;
+    ensure_request_live(ctx)?;
+    // ATC has already evaluated inactivity using its current calibrated policy.
+    // Zero thresholds preserve that policy's timing while the original proposal
+    // timestamp and exact observations prohibit newer database activity.
+    let released_ids = db_outcome_to_mcp_result(
+        queries::release_stale_reservations(
+            ctx.cx(),
+            &pool,
+            project_id,
+            &candidates,
+            decision_timestamp_micros,
+            0,
+            0,
+        )
+        .await,
+    )?;
+    if released_ids.is_empty() {
+        return Ok(Suppressed("release_evidence_changed"));
+    }
+    let released_rows = db_outcome_to_mcp_result(
+        queries::get_reservations_by_ids(ctx.cx(), &pool, &released_ids).await,
+    )?;
+    let db_generation = fetch_db_generation(ctx, &pool).await;
+    dispatch_release_archive_write(
+        ctx,
+        &project,
+        &holder,
+        &released_rows,
+        &Config::get(),
+        db_generation.as_deref(),
+    );
+    Ok(Released(released_ids.len()))
 }
 
 fn dispatch_release_archive_write(
@@ -3950,6 +4085,8 @@ mod tests {
             const { std::cell::RefCell::new(None) };
         static AFTER_FORCE_RELEASE_ACTIVITY: std::cell::RefCell<Option<ReservationInterleaving>> =
             const { std::cell::RefCell::new(None) };
+        static AFTER_AUTOMATIC_RELEASE_SNAPSHOT: std::cell::RefCell<Option<ReservationInterleaving>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     pub(super) async fn after_reservation_precheck() {
@@ -3961,6 +4098,13 @@ mod tests {
 
     pub(super) async fn after_force_release_activity() {
         let action = AFTER_FORCE_RELEASE_ACTIVITY.with_borrow_mut(Option::take);
+        if let Some(action) = action {
+            action.await;
+        }
+    }
+
+    pub(super) async fn after_automatic_release_snapshot() {
+        let action = AFTER_AUTOMATIC_RELEASE_SNAPSHOT.with_borrow_mut(Option::take);
         if let Some(action) = action {
             action.await;
         }
@@ -4135,6 +4279,7 @@ mod tests {
                         AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| *hook = None);
                         AFTER_RESERVATION_CONFLICT.with_borrow_mut(|hook| *hook = None);
                         AFTER_FORCE_RELEASE_ACTIVITY.with_borrow_mut(|hook| *hook = None);
+                        AFTER_AUTOMATIC_RELEASE_SNAPSHOT.with_borrow_mut(|hook| *hook = None);
                     }
                 }
                 let _clear_hooks = ClearHooks;
@@ -9835,6 +9980,33 @@ mod tests {
         }
     }
 
+    async fn inactive_automatic_release_fixture(
+        cx: &Cx,
+        pool: &DbPool,
+        project_key: &str,
+        path: &str,
+    ) -> ForceReleaseFixture {
+        let mut fixture = inactive_force_release_fixture(cx, pool, project_key, path).await;
+        // The decision observed this old lease before the holder went silent.
+        // Keep the manual force-release fixture's independent age heuristics
+        // unchanged: automatic release additionally binds inference chronology.
+        fixture.reservation.created_ts = fixture.holder.last_active_ts;
+        let conn = pool
+            .acquire(cx)
+            .await
+            .into_result()
+            .expect("fixture writer");
+        conn.execute_sync(
+            "UPDATE file_reservations SET created_ts = ? WHERE id = ?",
+            &[
+                SqlValue::BigInt(fixture.reservation.created_ts),
+                SqlValue::BigInt(fixture.reservation.id.expect("reservation id")),
+            ],
+        )
+        .expect("age lease consistently with observed inactivity");
+        fixture
+    }
+
     async fn assert_force_release_preserves_claim(cx: &Cx, pool: &DbPool, id: i64) {
         let rows = queries::get_reservations_by_ids(cx, pool, &[id])
             .await
@@ -10370,6 +10542,413 @@ mod tests {
                 assert_force_release_preserves_claim(&cx, &pool, id).await;
             });
         });
+    }
+
+    #[test]
+    fn automatic_release_snapshot_bounds_active_target_bytes_without_loading_peers_or_history() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/automatic-bounds-{}", unique_suffix());
+                let fixture =
+                    inactive_automatic_release_fixture(&cx, &pool, &project_key, "held.rs").await;
+                let project_id = fixture.project.id.expect("project id");
+                let holder_id = fixture.holder.id.expect("holder id");
+                let actor_id = fixture.actor.id.expect("peer id");
+                let active_id = fixture.reservation.id.expect("active lease id");
+                let historical = create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "historical.rs",
+                    3600,
+                    true,
+                )
+                .await;
+                let historical_id = historical.id.expect("historical id");
+                queries::release_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    None,
+                    Some(&[historical_id]),
+                )
+                .await
+                .into_result()
+                .expect("release old history");
+                let peer = create_test_reservation(
+                    &cx, &pool, project_id, actor_id, "peer.rs", 3600, true,
+                )
+                .await;
+                let large_reason = "x".repeat(queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1);
+                {
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("fixture writer");
+                    conn.execute_sync(
+                        "UPDATE file_reservations SET reason = ? WHERE id = ?",
+                        &[
+                            SqlValue::Text(large_reason.clone()),
+                            SqlValue::BigInt(historical_id),
+                        ],
+                    )
+                    .expect("oversized released history");
+                }
+                let selected =
+                    queries::get_active_reservations_for_agent(&cx, &pool, project_id, holder_id)
+                        .await
+                        .into_result()
+                        .expect("released history is not an active snapshot cost");
+                assert_eq!(selected.len(), 1);
+                assert_eq!(selected[0].id, Some(active_id));
+                {
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("fixture writer");
+                    conn.execute_sync(
+                        "UPDATE file_reservations SET reason = ? WHERE id = ?",
+                        &[SqlValue::Text(large_reason), SqlValue::BigInt(active_id)],
+                    )
+                    .expect("oversized active target metadata");
+                }
+                assert!(
+                    queries::get_active_reservations_for_agent(&cx, &pool, project_id, holder_id,)
+                        .await
+                        .into_result()
+                        .is_err(),
+                    "oversized target fails closed before materialization"
+                );
+                let unaffected =
+                    queries::get_active_reservations_for_agent(&cx, &pool, project_id, actor_id)
+                        .await
+                        .into_result()
+                        .expect("another holder stays available");
+                assert_eq!(unaffected.len(), 1);
+                assert_eq!(unaffected[0].id, peer.id);
+                assert_force_release_preserves_claim(&cx, &pool, active_id).await;
+            });
+        });
+    }
+
+    #[test]
+    fn automatic_release_commits_only_the_inactive_targets_observed_leases() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/automatic-release-{}", unique_suffix());
+                let fixture =
+                    inactive_automatic_release_fixture(&cx, &pool, &project_key, "inactive.rs")
+                        .await;
+                let project_id = fixture.project.id.expect("project id");
+                let holder_id = fixture.holder.id.expect("holder id");
+                let id = fixture.reservation.id.expect("reservation id");
+                let peer = create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    fixture.actor.id.expect("peer id"),
+                    "peer.rs",
+                    3600,
+                    true,
+                )
+                .await;
+                let outcome = release_reservations_for_inactive_agent(
+                    &McpContext::new(cx.clone(), 1),
+                    &fixture.project.human_key,
+                    &fixture.holder.name,
+                    mcp_agent_mail_db::now_micros(),
+                    fixture.holder.last_active_ts,
+                )
+                .await
+                .expect("guarded automatic release");
+                assert_eq!(outcome, AutomaticReservationRelease::Released(1));
+                let released = queries::get_reservations_by_ids(&cx, &pool, &[id])
+                    .await
+                    .into_result()
+                    .expect("released row");
+                assert!(released[0].released_ts.is_some_and(|ts| ts > 0));
+                assert_force_release_preserves_claim(&cx, &pool, peer.id.expect("peer lease"))
+                    .await;
+                let holder = queries::get_agent_by_id_fresh(&cx, &pool, holder_id)
+                    .await
+                    .into_result()
+                    .expect("holder activity");
+                assert_eq!(
+                    holder.last_active_ts, 1,
+                    "ATC must not touch or impersonate its target"
+                );
+                assert!(
+                    !Config::get()
+                        .storage_root
+                        .join(RELEASE_INTENT_DIR)
+                        .join(RELEASE_INTENT_LOG_FILE)
+                        .exists()
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn automatic_release_revalidates_database_evidence_after_snapshot() {
+        for change in [
+            "heartbeat",
+            "mail",
+            "renewal",
+            "revision",
+            "new_lease",
+            "exemption",
+            "cancel",
+        ] {
+            with_serialized_reservations(|| {
+                run_async(|cx| async move {
+                    let pool = get_db_pool().expect("db pool");
+                    let project_key = format!("/tmp/automatic-race-{}", unique_suffix());
+                    let fixture =
+                        inactive_automatic_release_fixture(&cx, &pool, &project_key, "held.rs")
+                            .await;
+                    let project_id = fixture.project.id.expect("project id");
+                    let holder_id = fixture.holder.id.expect("holder id");
+                    let actor_id = fixture.actor.id.expect("actor id");
+                    let id = fixture.reservation.id.expect("reservation id");
+                    let proposed_at = mcp_agent_mail_db::now_micros();
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let competing_cx = cx.clone();
+                    let competing_request = ctx.clone();
+                    let competing_pool = get_db_pool().expect("competing pool");
+                    AFTER_AUTOMATIC_RELEASE_SNAPSHOT.with_borrow_mut(|hook| {
+                        *hook = Some(Box::pin(async move {
+                            match change {
+                                "renewal" => {
+                                    queries::renew_reservations(
+                                        &competing_cx, &competing_pool, project_id,
+                                        holder_id, 7200, None, Some(&[id]),
+                                    ).await.into_result().expect("competing renewal");
+                                }
+                                "new_lease" => {
+                                    queries::create_file_reservations(
+                                        &competing_cx, &competing_pool, project_id,
+                                        holder_id, &["new-work.rs"], 3600, true, "new work",
+                                    ).await.into_result().expect("competing grant");
+                                }
+                                "mail" => {
+                                    queries::create_message_with_recipients(
+                                        &competing_cx, &competing_pool, project_id, holder_id,
+                                        "Still working", "Activity after release admission",
+                                        None, "normal", false, "[]", &[(actor_id, "to")],
+                                    ).await.into_result().expect("competing send");
+                                }
+                                "cancel" => {
+                                    competing_request.request_cancellation().cancel();
+                                }
+                                _ => {
+                                    let conn = competing_pool.acquire(&competing_cx)
+                                        .await.into_result().expect("competing transaction");
+                                    match change {
+                                        "heartbeat" => conn.execute_sync(
+                                            "UPDATE agents SET last_active_ts = ? WHERE id = ?",
+                                            &[SqlValue::BigInt(proposed_at + 1), SqlValue::BigInt(holder_id)],
+                                        ),
+                                        "exemption" => conn.execute_sync(
+                                            "UPDATE agents SET reaper_exempt = 1 WHERE id = ?",
+                                            &[SqlValue::BigInt(holder_id)],
+                                        ),
+                                        "revision" => conn.execute_sync(
+                                            "UPDATE file_reservations SET revision = revision + 1 WHERE id = ?",
+                                            &[SqlValue::BigInt(id)],
+                                        ),
+                                        _ => unreachable!("known change"),
+                                    }.expect("commit new evidence");
+                                }
+                            }
+                        }));
+                    });
+                    let result = release_reservations_for_inactive_agent(
+                        &ctx,
+                        &fixture.project.human_key,
+                        &fixture.holder.name,
+                        proposed_at,
+                        fixture.holder.last_active_ts,
+                    )
+                    .await;
+                    assert!(AFTER_AUTOMATIC_RELEASE_SNAPSHOT.with_borrow(Option::is_none));
+                    if change == "cancel" {
+                        assert_eq!(
+                            result.expect_err("cancelled").code,
+                            McpErrorCode::RequestCancelled
+                        );
+                    } else {
+                        assert_eq!(
+                            result.expect("safe suppression"),
+                            AutomaticReservationRelease::Suppressed("release_evidence_changed"),
+                            "{change}"
+                        );
+                    }
+                    assert_force_release_preserves_claim(&cx, &pool, id).await;
+                    let active = queries::get_active_reservations_for_agent(
+                        &cx, &pool, project_id, holder_id,
+                    )
+                    .await
+                    .into_result()
+                    .expect("preserved active leases");
+                    assert_eq!(
+                        active.len(),
+                        if change == "new_lease" { 2 } else { 1 },
+                        "{change}"
+                    );
+                    assert!(
+                        !Config::get()
+                            .storage_root
+                            .join(RELEASE_INTENT_DIR)
+                            .join(RELEASE_INTENT_LOG_FILE)
+                            .exists(),
+                        "automatic release never queues a voluntary intent"
+                    );
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn automatic_release_rejects_newer_legacy_lease_for_the_entire_target() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/automatic-legacy-grant-{}", unique_suffix());
+                let fixture =
+                    inactive_automatic_release_fixture(&cx, &pool, &project_key, "old-work.rs")
+                        .await;
+                let project_id = fixture.project.id.expect("project id");
+                let holder_id = fixture.holder.id.expect("holder id");
+                let old_id = fixture.reservation.id.expect("old lease id");
+                let newer = create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "resumed-work.rs",
+                    3600,
+                    true,
+                )
+                .await;
+                // Model a pre-upgrade grant whose best-effort touch did not
+                // commit. The lease remains durable evidence of newer work.
+                {
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("legacy fixture writer");
+                    conn.execute_sync(
+                        "UPDATE agents SET last_active_ts = ? WHERE id = ?",
+                        &[
+                            SqlValue::BigInt(fixture.holder.last_active_ts),
+                            SqlValue::BigInt(holder_id),
+                        ],
+                    )
+                    .expect("legacy stale heartbeat");
+                }
+                let proposed_at = mcp_agent_mail_db::now_micros();
+                assert!(newer.created_ts > fixture.holder.last_active_ts);
+                assert!(newer.created_ts <= proposed_at);
+                let outcome = release_reservations_for_inactive_agent(
+                    &McpContext::new(cx.clone(), 1),
+                    &fixture.project.human_key,
+                    &fixture.holder.name,
+                    proposed_at,
+                    fixture.holder.last_active_ts,
+                )
+                .await
+                .expect("newer lease contradicts inference");
+                assert_eq!(
+                    outcome,
+                    AutomaticReservationRelease::Suppressed("release_liveness_changed")
+                );
+                assert_force_release_preserves_claim(&cx, &pool, old_id).await;
+                assert_force_release_preserves_claim(&cx, &pool, newer.id.expect("new lease id"))
+                    .await;
+            });
+        });
+    }
+
+    #[test]
+    fn automatic_release_rejects_renewal_or_reacquisition_before_candidate_snapshot() {
+        for reacquire in [false, true] {
+            with_serialized_reservations(|| {
+                run_async(|cx| async move {
+                    let pool = get_db_pool().expect("db pool");
+                    let project_key = format!("/tmp/automatic-pre-snapshot-{}", unique_suffix());
+                    let fixture =
+                        inactive_automatic_release_fixture(&cx, &pool, &project_key, "held.rs")
+                            .await;
+                    let project_id = fixture.project.id.expect("project id");
+                    let holder_id = fixture.holder.id.expect("holder id");
+                    let id = fixture.reservation.id.expect("reservation id");
+                    let proposed_at = mcp_agent_mail_db::now_micros();
+                    // Warm the stale identity cache, then change the lease
+                    // directly through the writer API: no tool-level touch.
+                    let _ = queries::get_agent(&cx, &pool, project_id, &fixture.holder.name)
+                        .await
+                        .into_result()
+                        .expect("cached identity");
+                    if reacquire {
+                        queries::create_file_reservations(
+                            &cx,
+                            &pool,
+                            project_id,
+                            holder_id,
+                            &["held.rs"],
+                            7200,
+                            true,
+                            "resumed work",
+                        )
+                        .await
+                        .into_result()
+                        .expect("durable reacquisition");
+                    } else {
+                        queries::renew_reservations(
+                            &cx,
+                            &pool,
+                            project_id,
+                            holder_id,
+                            7200,
+                            None,
+                            Some(&[id]),
+                        )
+                        .await
+                        .into_result()
+                        .expect("durable renewal");
+                    }
+                    let holder = queries::get_agent_by_id_fresh(&cx, &pool, holder_id)
+                        .await
+                        .into_result()
+                        .expect("committed holder activity");
+                    assert!(
+                        holder.last_active_ts >= proposed_at,
+                        "lease mutation and activity commit together without a best-effort touch"
+                    );
+                    let outcome = release_reservations_for_inactive_agent(
+                        &McpContext::new(cx.clone(), 1),
+                        &fixture.project.human_key,
+                        &fixture.holder.name,
+                        proposed_at,
+                        fixture.holder.last_active_ts,
+                    )
+                    .await
+                    .expect("old inference is safely suppressed");
+                    assert_eq!(
+                        outcome,
+                        AutomaticReservationRelease::Suppressed("release_liveness_changed")
+                    );
+                    assert_force_release_preserves_claim(&cx, &pool, id).await;
+                });
+            });
+        }
     }
 
     #[test]

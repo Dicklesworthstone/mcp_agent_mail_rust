@@ -724,12 +724,20 @@ fn proactive_backup_health(
             format!("the integrity guard is off, so no proactive backup is expected{unattested}"),
         );
     }
+    let problem_status = if guard_attested { "fail" } else { "warn" };
+    if !standalone {
+        let main = backup_age_secs.map_or_else(
+            || "there is no main backup file".to_string(),
+            |age| format!("backup is {} old", hours(age)),
+        );
+        return (
+            problem_status,
+            format!(
+                "{main} and backup companion files are present. The backup is unavailable for standalone recovery{unattested}. Check the server's integrity guard diagnostics"
+            ),
+        );
+    }
     let settled = owner_age_secs.is_some_and(|age| age >= PROACTIVE_BACKUP_GRACE_SECS);
-    let companions = if standalone {
-        ""
-    } else {
-        "; backup companion files are present"
-    };
     match backup_age_secs {
         None if settled => (
             "warn",
@@ -739,19 +747,15 @@ fn proactive_backup_health(
             ),
         ),
         None => ("ok", "no proactive backup yet".to_string()),
-        Some(age) if age > STALE_PROACTIVE_BACKUP_SECS && settled => {
-            let detail = format!(
-                "proactive backup is {} old although the server has run {}: automatic backups are blocked or failing{companions}; check the server's integrity guard diagnostics and 'automatic backup failed' warnings",
+        Some(age) if age > STALE_PROACTIVE_BACKUP_SECS && settled => (
+            problem_status,
+            format!(
+                "proactive backup is {} old although the server has run {}: automatic backups are blocked or failing. Check the server's integrity guard diagnostics and 'automatic backup failed' warnings{unattested}",
                 hours(age),
                 hours(owner_age_secs.unwrap_or_default())
-            );
-            if guard_attested {
-                ("fail", detail)
-            } else {
-                ("warn", format!("{detail}{unattested}"))
-            }
-        }
-        Some(age) => ("ok", format!("age {}{companions}", hours(age))),
+            ),
+        ),
+        Some(age) => ("ok", format!("age {}", hours(age))),
     }
 }
 
@@ -772,12 +776,39 @@ fn proactive_backup_age_secs(path: &Path) -> std::io::Result<Option<u64>> {
             "backup is shorter than a SQLite header",
         ));
     }
-    let mut magic = [0; SQLITE_MAGIC.len()];
-    file.read_exact(&mut magic)?;
-    if &magic != SQLITE_MAGIC {
+    let mut header = [0; SQLITE_HEADER_BYTES as usize];
+    file.read_exact(&mut header)?;
+    if &header[..SQLITE_MAGIC.len()] != SQLITE_MAGIC {
         return Err(std::io::Error::other(
             "backup is missing the SQLite file signature",
         ));
+    }
+    let encoded_page_size = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = match encoded_page_size {
+        1 => 65_536,
+        size if size >= 512 && size.is_power_of_two() => u64::from(size),
+        _ => {
+            return Err(std::io::Error::other(
+                "backup has an invalid SQLite page size",
+            ));
+        }
+    };
+    let len = metadata.len();
+    if !len.is_multiple_of(page_size) {
+        return Err(std::io::Error::other(format!(
+            "backup ends within a SQLite page ({len} bytes with {page_size}-byte pages)"
+        )));
+    }
+    let physical_pages = len / page_size;
+    // Older SQLite writers may leave a stale page count. It is authoritative
+    // only when it is nonzero and the change counter matches version-valid-for.
+    let declared_pages = u64::from(u32::from_be_bytes([
+        header[28], header[29], header[30], header[31],
+    ]));
+    if header[24..28] == header[92..96] && declared_pages > physical_pages {
+        return Err(std::io::Error::other(format!(
+            "backup contains {physical_pages} SQLite pages of the declared {declared_pages}"
+        )));
     }
     metadata
         .modified()?
@@ -4309,14 +4340,25 @@ mod tests {
 
     #[test]
     fn proactive_backup_health_fails_on_a_backup_that_stopped_refreshing() {
-        // br-31eew (GH#337): a 3.5-week-old backup under a long-running
-        // server with blocking companions is a failure, not a quiet warning.
+        // br-31eew (GH#337): blocked refresh and non-standalone backups
+        // are actionable even when the main backup is a valid SQLite file.
         let day = 24 * 60 * 60;
         let (status, detail) =
             proactive_backup_health(true, true, Some(25 * day), Some(30 * day), false);
         assert_eq!(status, "fail", "{detail}");
         assert!(detail.contains("600h00m old"), "{detail}");
         assert!(detail.contains("companion files"), "{detail}");
+        for age in [Some(0), None] {
+            let (status, detail) = proactive_backup_health(true, true, age, Some(0), false);
+            assert_eq!(status, "fail", "{detail}");
+            assert!(
+                detail.contains("unavailable for standalone recovery"),
+                "{detail}"
+            );
+        }
+        let (status, detail) = proactive_backup_health(true, false, Some(0), Some(0), false);
+        assert_eq!(status, "warn", "{detail}");
+        assert!(detail.contains("did not report"), "{detail}");
         let (status, detail) =
             proactive_backup_health(true, true, Some(2 * day), Some(3 * day), true);
         assert_eq!(status, "fail", "{detail}");
@@ -4353,6 +4395,10 @@ mod tests {
             let (status, detail) = proactive_backup_health(guard, true, age, owner, true);
             assert_eq!(status, "ok", "{age:?} {owner:?} {guard}: {detail}");
         }
+        assert_eq!(
+            proactive_backup_health(false, true, Some(0), Some(0), false).0,
+            "ok"
+        );
     }
 
     #[test]
@@ -4388,6 +4434,44 @@ mod tests {
         fs::rename(&backup, dir.path().join("invalid-image")).unwrap();
         seed_healthy_live_mailbox(&backup);
         assert_eq!(inspect().0, "ok");
+        let image = fs::read(&backup).unwrap();
+        let page_size = match u16::from_be_bytes([image[16], image[17]]) {
+            1 => 65_536,
+            size => usize::from(size),
+        };
+        assert!(image.len() > page_size);
+        for (name, len, diagnostic) in [
+            ("header-only", 100, "ends within a SQLite page"),
+            ("partial-page", image.len() - 1, "ends within a SQLite page"),
+            ("missing-page", image.len() - page_size, "of the declared"),
+        ] {
+            let truncated = dir.path().join(name);
+            fs::write(&truncated, &image[..len]).unwrap();
+            let (status, detail) = inspect_proactive_backup_health(&truncated, true, true, settled);
+            assert_eq!(status, "fail", "{name}: {detail}");
+            assert!(detail.contains(diagnostic), "{name}: {detail}");
+            assert_eq!(fs::read(truncated).unwrap(), &image[..len]);
+        }
+
+        let old_header = dir.path().join("stale-header-count");
+        let mut image = image;
+        let counter_byte = image[92];
+        image[24] = counter_byte.wrapping_add(1);
+        image[28..32].copy_from_slice(&u32::MAX.to_be_bytes());
+        fs::write(&old_header, &image).unwrap();
+        assert_eq!(
+            inspect_proactive_backup_health(&old_header, true, true, settled).0,
+            "ok",
+            "SQLite uses physical size when the change counters disagree"
+        );
+        let invalid_page_size = dir.path().join("invalid-page-size");
+        image[16..18].copy_from_slice(&0u16.to_be_bytes());
+        fs::write(&invalid_page_size, &image).unwrap();
+        let (status, detail) =
+            inspect_proactive_backup_health(&invalid_page_size, true, true, settled);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("invalid SQLite page size"), "{detail}");
+
         let file = fs::OpenOptions::new().write(true).open(&backup).unwrap();
         let now = SystemTime::now();
         let stale_age = Duration::from_secs(STALE_PROACTIVE_BACKUP_SECS + 60);
@@ -4403,10 +4487,18 @@ mod tests {
         assert!(detail.contains("future"), "{detail}");
         let (status, detail) = inspect_proactive_backup_health(dir.path(), true, true, settled);
         assert_eq!(status, "fail", "{detail}");
+        assert!(
+            detail.contains(&dir.path().display().to_string()),
+            "{detail}"
+        );
+        // Windows may reject the directory open before its type can be read.
+        #[cfg(unix)]
         assert!(detail.contains("regular"), "{detail}");
 
         #[cfg(unix)]
         {
+            file.set_modified(now).unwrap();
+            assert_eq!(inspect().0, "ok", "the symlink target must be usable");
             let link = dir.path().join("linked.bak");
             std::os::unix::fs::symlink(&backup, &link).unwrap();
             let (status, detail) = inspect_proactive_backup_health(&link, true, true, settled);

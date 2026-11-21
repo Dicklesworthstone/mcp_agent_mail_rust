@@ -444,7 +444,7 @@ enum WbqMsg {
     // `WriteOp` is large (contains `Config` + payloads). Boxing keeps the channel
     // messages small and avoids repeatedly moving ~KB-sized values around.
     Op(WbqOpEnvelope),
-    Flush(std::sync::mpsc::SyncSender<()>),
+    Flush(std::sync::mpsc::SyncSender<WbqFlushOutcome>),
     Shutdown,
 }
 
@@ -3751,8 +3751,9 @@ fn wbq_send_control_with_deadline(
     }
 }
 
-/// Outcome of a write-behind-queue flush, so a durability-sensitive caller can
-/// tell "the archive is now on disk" from "the drain thread never confirmed".
+/// Outcome of a write-behind-queue flush, including unresolved persistence
+/// failures. This covers archive materialization, not the separate async Git
+/// commit coalescer; use [`flush_async_commits`] before depending on Git history.
 ///
 /// [`wbq_flush`] discards this and only warns. Callers that MUST see their write
 /// land before returning should prefer [`write_op_sync_direct`] (GH#178) — the
@@ -3761,16 +3762,50 @@ fn wbq_send_control_with_deadline(
 /// `wbq_flush_status` remains for drain-the-world callers (shutdown, tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WbqFlushOutcome {
-    /// The drain thread acknowledged the flush; all enqueued ops are on disk.
+    /// All operations preceding this FIFO barrier finished and no known WBQ
+    /// persistence failure remains unverified. Later enqueues are not covered.
     Drained,
+    /// The barrier was reached, but an earlier operation failed to persist and
+    /// has not been verified repaired. A later successful write or empty flush
+    /// does not discharge this failure; see [`durability_degraded`].
+    PersistenceFailed,
     /// The flush did not complete within the 30s budget — the drain thread is
     /// stuck (e.g. a wedged git index lock). Enqueued ops may not be durable.
     TimedOut,
     /// The drain thread's channel is gone (it panicked / shut down). Enqueued
     /// ops after the disconnect are not durable.
     Disconnected,
-    /// The queue was never initialized (or its sender is gone). Nothing to flush.
+    /// The queue was never initialized or has stopped with no retained worker,
+    /// queued operations, or known unverified persistence failure.
     NoQueue,
+}
+
+fn wbq_persistence_status() -> WbqFlushOutcome {
+    if durability_degraded() {
+        WbqFlushOutcome::PersistenceFailed
+    } else {
+        WbqFlushOutcome::Drained
+    }
+}
+
+fn wbq_empty_status() -> WbqFlushOutcome {
+    if durability_degraded() {
+        WbqFlushOutcome::PersistenceFailed
+    } else {
+        WbqFlushOutcome::NoQueue
+    }
+}
+
+fn wbq_absent_sender_status(wbq: &WriteBehindQueue) -> WbqFlushOutcome {
+    // A timed-out shutdown retains its worker; failed startup can retain a
+    // staged receiver without any worker. Neither is an empty, flushed queue.
+    // Even a finished but unreaped worker may have panicked before persisting
+    // its in-flight operation, so only a fully retired queue is empty.
+    if wbq.op_depth.load(Ordering::Relaxed) > 0 || wbq.drain_handle.lock().is_some() {
+        WbqFlushOutcome::Disconnected
+    } else {
+        wbq_empty_status()
+    }
 }
 
 /// Block until all pending write ops have been drained, reporting the outcome.
@@ -3782,10 +3817,10 @@ pub enum WbqFlushOutcome {
 #[must_use]
 pub fn wbq_flush_status() -> WbqFlushOutcome {
     let Some(wbq) = WBQ.get() else {
-        return WbqFlushOutcome::NoQueue;
+        return wbq_empty_status();
     };
     let Some(sender) = wbq_sender_clone(wbq) else {
-        return WbqFlushOutcome::NoQueue;
+        return wbq_absent_sender_status(wbq);
     };
     let deadline = Instant::now() + Duration::from_secs(WBQ_FLUSH_BUDGET_SECS);
     let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
@@ -3801,7 +3836,7 @@ pub fn wbq_flush_status() -> WbqFlushOutcome {
         Err(WbqControlSendError::Disconnected) => return WbqFlushOutcome::Disconnected,
     }
     match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(()) => WbqFlushOutcome::Drained,
+        Ok(outcome) => outcome,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             tracing::warn!(
                 "wbq_flush timed out after {WBQ_FLUSH_BUDGET_SECS}s; drain thread may be stuck"
@@ -3818,10 +3853,15 @@ pub fn wbq_flush_status() -> WbqFlushOutcome {
 /// Block until all pending write ops have been drained.
 ///
 /// Best-effort variant of [`wbq_flush_status`]: it waits for the drain
-/// acknowledgement and only warns on timeout/disconnect. Durability-sensitive
-/// callers should prefer [`wbq_flush_status`].
+/// acknowledgement and warns on unverified persistence failure, timeout or
+/// disconnect. Durability-sensitive callers should prefer [`wbq_flush_status`].
 pub fn wbq_flush() {
-    let _ = wbq_flush_status();
+    if wbq_flush_status() == WbqFlushOutcome::PersistenceFailed {
+        tracing::warn!(
+            "wbq_flush: queue reached its barrier with unverified persistence failures; \
+             archive repair is still required"
+        );
+    }
 }
 
 /// Drain remaining ops, stop the drain thread, and join it.
@@ -3833,20 +3873,35 @@ pub fn wbq_flush() {
 /// An unfinished worker remains registered after an unsuccessful shutdown;
 /// startup can reap it and salvage its channel only after it actually exits.
 pub fn wbq_shutdown() {
-    if let Some(wbq) = WBQ.get() {
+    if wbq_shutdown_status() == WbqFlushOutcome::PersistenceFailed {
+        tracing::warn!(
+            "wbq_shutdown: archive persistence failures remain unverified after drain; \
+             queue shutdown does not establish durability"
+        );
+    }
+}
+
+/// Stop the queue using bounded control-message waits and report whether its
+/// persistence barrier succeeded. Once acknowledged and told to stop, the
+/// worker is joined; operation admission stays closed throughout. A failed
+/// persistence acknowledgement still proves worker progress, allowing that
+/// join. It does not clear the failure ledger or confirm async Git commits.
+#[must_use]
+pub fn wbq_shutdown_status() -> WbqFlushOutcome {
+    WBQ.get().map_or_else(wbq_empty_status, |wbq| {
         wbq_shutdown_inner(
             wbq,
             Duration::from_secs(WBQ_FLUSH_BUDGET_SECS),
             Duration::from_secs(WBQ_SHUTDOWN_SEND_BUDGET_SECS),
-        );
-    }
+        )
+    })
 }
 
 fn wbq_shutdown_inner(
     wbq: &WriteBehindQueue,
     flush_budget: Duration,
     shutdown_send_budget: Duration,
-) {
+) -> WbqFlushOutcome {
     let _lifecycle = wbq
         .lifecycle
         .lock()
@@ -3854,35 +3909,46 @@ fn wbq_shutdown_inner(
     // Join only when the drain thread demonstrably keeps consuming (flush
     // acknowledged and Shutdown delivered) or is already gone. A wedged
     // thread with a full channel must not hang shutdown forever (br-lrrry).
+    // The lifecycle guard excludes all operation admission until the sender
+    // closes, so this flush covers every operation the worker can still own.
     // In particular, a second shutdown with no sender must not join a
     // still-running worker retained by an earlier timeout.
     let mut flush_acked = false;
     let mut shutdown_delivered = false;
+    let mut outcome = wbq_absent_sender_status(wbq);
     if let Some(sender) = wbq_sender_clone(wbq) {
         let deadline = Instant::now() + flush_budget;
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         match wbq_send_control_with_deadline(&sender, WbqMsg::Flush(done_tx), deadline) {
             Ok(()) => {
                 match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(()) => flush_acked = true,
+                    Ok(acknowledged) => {
+                        flush_acked = true;
+                        outcome = acknowledged;
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        outcome = WbqFlushOutcome::TimedOut;
                         tracing::warn!(
                             "wbq_shutdown: flush timed out after {flush_budget:?}; \
                              drain thread may be stuck"
                         );
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        outcome = WbqFlushOutcome::Disconnected;
                         tracing::warn!("wbq_shutdown: drain thread channel disconnected");
                     }
                 }
             }
             Err(WbqControlSendError::TimedOut) => {
+                outcome = WbqFlushOutcome::TimedOut;
                 tracing::warn!(
                     "wbq_shutdown: could not deliver flush request within \
                      {flush_budget:?} (channel full); drain thread may be stuck"
                 );
             }
-            Err(WbqControlSendError::Disconnected) => {}
+            Err(WbqControlSendError::Disconnected) => {
+                outcome = WbqFlushOutcome::Disconnected;
+            }
         }
         // Tell the drain thread to exit, bounded for the same reason.
         match wbq_send_control_with_deadline(
@@ -3892,13 +3958,16 @@ fn wbq_shutdown_inner(
         ) {
             Ok(()) => shutdown_delivered = true,
             Err(WbqControlSendError::TimedOut) => {
+                outcome = WbqFlushOutcome::TimedOut;
                 tracing::warn!(
                     "wbq_shutdown: could not deliver Shutdown within \
                      {shutdown_send_budget:?} (channel full); retaining drain \
                      thread for later reaping"
                 );
             }
-            Err(WbqControlSendError::Disconnected) => {}
+            Err(WbqControlSendError::Disconnected) => {
+                outcome = WbqFlushOutcome::Disconnected;
+            }
         }
     }
     // Dropping the stored sender (and our clone above, at scope end) lets
@@ -3920,8 +3989,10 @@ fn wbq_shutdown_inner(
             (None, guard.is_some())
         }
     };
-    if let Some(h) = handle {
-        let _ = h.join();
+    if let Some(h) = handle
+        && h.join().is_err()
+    {
+        outcome = WbqFlushOutcome::Disconnected;
     }
     if retained {
         // The worker still reads the shared receiver slot between batches.
@@ -3931,6 +4002,16 @@ fn wbq_shutdown_inner(
             "wbq_shutdown: retaining unfinished drain thread; queue restart remains \
              unavailable until it exits"
         );
+        if outcome == WbqFlushOutcome::Drained {
+            outcome = WbqFlushOutcome::Disconnected;
+        }
+    }
+    // The final drain may process operations after the first flush barrier.
+    // Its failures must not be hidden by an earlier successful acknowledgement.
+    if outcome == WbqFlushOutcome::Drained {
+        wbq_persistence_status()
+    } else {
+        outcome
     }
 }
 
@@ -4402,11 +4483,11 @@ fn wbq_drain_loop(
     drain_batch_cap: usize,
 ) {
     let flush_interval = Duration::from_millis(Config::get().wbq_flush_interval_ms);
-    let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
     let mut shutting_down = false;
 
     loop {
         let mut batch: Vec<WbqOpEnvelope> = Vec::new();
+        let mut flush_waiter = None;
 
         // Receive under the slot lock but execute outside it (br-b9x63): if an
         // op panics this thread, the receiver survives in the slot and the
@@ -4421,14 +4502,16 @@ fn wbq_drain_loop(
                     Ok(first) => {
                         match first {
                             WbqMsg::Op(op) => batch.push(op),
-                            WbqMsg::Flush(done_tx) => flush_waiters.push(done_tx),
+                            WbqMsg::Flush(done_tx) => flush_waiter = Some(done_tx),
                             WbqMsg::Shutdown => shutting_down = true,
                         }
-                        // Drain remaining items from the channel (up to batch cap).
-                        while batch.len() < drain_batch_cap {
+                        // A flush is a FIFO boundary. Do not batch later writes
+                        // with its predecessors: later work may block or fail,
+                        // and must not delay or contaminate this acknowledgement.
+                        while batch.len() < drain_batch_cap && flush_waiter.is_none() {
                             match rx.try_recv() {
                                 Ok(WbqMsg::Op(op)) => batch.push(op),
-                                Ok(WbqMsg::Flush(done_tx)) => flush_waiters.push(done_tx),
+                                Ok(WbqMsg::Flush(done_tx)) => flush_waiter = Some(done_tx),
                                 Ok(WbqMsg::Shutdown) => shutting_down = true,
                                 Err(_) => break,
                             }
@@ -4444,12 +4527,7 @@ fn wbq_drain_loop(
         };
         match pass {
             WbqRecvPass::Work => {}
-            WbqRecvPass::Tick => {
-                for w in flush_waiters.drain(..) {
-                    let _ = w.try_send(());
-                }
-                continue;
-            }
+            WbqRecvPass::Tick => continue,
             WbqRecvPass::Disconnected => break,
             WbqRecvPass::Stolen => return,
         }
@@ -4553,8 +4631,8 @@ fn wbq_drain_loop(
             .wbq_errors_total
             .add(u64::try_from(errors).unwrap_or(u64::MAX));
 
-        for w in flush_waiters.drain(..) {
-            let _ = w.try_send(());
+        if let Some(waiter) = flush_waiter {
+            let _ = waiter.try_send(wbq_persistence_status());
         }
 
         if shutting_down {
@@ -4627,7 +4705,7 @@ fn wbq_drain_loop(
                 }
             }
             WbqMsg::Flush(done_tx) => {
-                let _ = done_tx.try_send(());
+                let _ = done_tx.try_send(wbq_persistence_status());
             }
             WbqMsg::Shutdown => {} // already shutting down
         }
@@ -26515,9 +26593,7 @@ mod tests {
 
     #[test]
     fn wbq_flush_status_reports_drained_on_healthy_queue() {
-        // The durability-sensitive variant (F1): a healthy enqueue + flush must
-        // report Drained so the reservation chokepoint knows the archive landed
-        // and does NOT need its synchronous write_op_sync fallback.
+        // A healthy enqueue + flush must confirm archive materialization.
         wbq_start();
         let op = wbq_test_clear_signal_op("test-flush-status");
         wbq_enqueue(op);
@@ -26526,6 +26602,69 @@ mod tests {
             WbqFlushOutcome::Drained,
             "a healthy drain thread must acknowledge the flush"
         );
+    }
+
+    #[test]
+    fn wbq_flush_barriers_separate_later_failures() {
+        if !isolated_coalescer_regression("tests::wbq_flush_barriers_separate_later_failures") {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "flush-boundary").unwrap();
+        let profile_path =
+            |agent: &str| archive.root.join("agents").join(agent).join("profile.json");
+        fs::create_dir_all(profile_path("BrokenAgent")).unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let depth = Arc::new(AtomicU64::new(0));
+        let mut acknowledgements = Vec::new();
+        for agent in ["BeforeAgent", "BrokenAgent", "AfterAgent"] {
+            assert_eq!(
+                wbq_enqueue_with_sender(
+                    &sender,
+                    &depth,
+                    WriteOp::AgentProfile {
+                        project_slug: "flush-boundary".to_string(),
+                        config: config.clone(),
+                        agent_json: serde_json::json!({"name": agent, "program": "test", "model": "test"}),
+                    },
+                ),
+                WbqEnqueueResult::Enqueued,
+            );
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            sender.send(WbqMsg::Flush(done_tx)).unwrap();
+            acknowledgements.push(done_rx);
+        }
+        sender.send(WbqMsg::Shutdown).unwrap();
+        drop(sender);
+        // Prefill the real channel so batching would otherwise pull all three
+        // operations across their barriers into the same drain pass.
+        wbq_drain_loop(
+            Arc::new(Mutex::new(Some(receiver))),
+            Arc::clone(&depth),
+            8,
+            8,
+        );
+        let outcomes = acknowledgements
+            .into_iter()
+            .map(|receiver| receiver.recv().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![
+                WbqFlushOutcome::Drained,
+                WbqFlushOutcome::PersistenceFailed,
+                WbqFlushOutcome::PersistenceFailed,
+            ],
+            "later failure must not contaminate the first barrier, nor may later success erase it"
+        );
+        assert!(profile_path("BeforeAgent").is_file());
+        assert!(profile_path("BrokenAgent").is_dir());
+        assert!(profile_path("AfterAgent").is_file());
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+        assert_eq!(wbq_stats().drained, 3);
+        assert_eq!(wbq_stats().unrecoverable_errors, 1);
+        flush_async_commits();
     }
 
     #[test]
@@ -27469,9 +27608,13 @@ mod tests {
                 if final_drain { 1 } else { 8 },
             );
         });
-        done_rx
-            .recv_timeout(Duration::from_secs(20))
-            .expect("a panicked write must not lose later writes or the flush acknowledgement");
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("a panicked write must not lose later writes or the flush acknowledgement"),
+            WbqFlushOutcome::PersistenceFailed,
+            "containing a writer panic must not turn its failed publication into flush success"
+        );
         if !final_drain {
             assert!(
                 !worker.is_finished(),
@@ -29965,6 +30108,10 @@ mod tests {
         assert!(wbq_sender_clone(&wbq).is_none());
         assert!(wbq.drain_handle.lock().is_none());
         assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            wbq_absent_sender_status(&wbq),
+            WbqFlushOutcome::Disconnected
+        );
         assert!(wbq.receiver_slot.lock().unwrap().is_some());
         assert!(!signal.exists());
         assert_eq!(
@@ -30467,6 +30614,62 @@ mod tests {
     }
 
     #[test]
+    fn wbq_shutdown_reports_stop_delivery_failure_after_successful_flush() {
+        for disconnected in [false, true] {
+            let wbq = new_write_behind_queue();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            *wbq.sender.lock().unwrap() = Some(sender.clone());
+            let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let WbqMsg::Flush(done_tx) = receiver.recv_timeout(Duration::from_secs(5)).unwrap()
+                else {
+                    panic!("shutdown must first request its persistence barrier");
+                };
+                // Exercise control delivery only: a concurrent flush can fill
+                // the channel after the barrier, even though operation
+                // admission is correctly closed by the lifecycle guard.
+                let retained_receiver = if disconnected {
+                    drop(receiver);
+                    None
+                } else {
+                    let (other_tx, _other_rx) = std::sync::mpsc::sync_channel(1);
+                    sender.send(WbqMsg::Flush(other_tx)).unwrap();
+                    Some(receiver)
+                };
+                done_tx.send(WbqFlushOutcome::Drained).unwrap();
+                resume_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release retained control worker");
+                drop(retained_receiver);
+            });
+            *wbq.drain_handle.lock() = Some(worker);
+            let started = Instant::now();
+            let outcome =
+                wbq_shutdown_inner(&wbq, Duration::from_secs(1), Duration::from_millis(10));
+            assert_eq!(
+                outcome,
+                if disconnected {
+                    WbqFlushOutcome::Disconnected
+                } else {
+                    WbqFlushOutcome::TimedOut
+                },
+                "a completed flush cannot conceal failure to stop the worker"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(wbq_sender_clone(&wbq).is_none());
+            assert!(
+                wbq.drain_handle
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished())
+            );
+            resume_tx.send(()).unwrap();
+            let worker = wbq.drain_handle.lock().take().unwrap();
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
     fn wbq_timed_out_shutdown_retains_worker_until_restart_is_safe() {
         const CHILD: &str = "AM_TEST_WBQ_RETIRED_WORKER";
         const COMPLETED: &str = "WBQ retired worker ownership verified";
@@ -30575,9 +30778,17 @@ mod tests {
         // is delivered but cannot be acknowledged and when both controls find
         // a full channel. Neither outcome grants ownership to a replacement.
         let started = Instant::now();
-        wbq_shutdown_inner(wbq, budget, budget);
+        assert_eq!(
+            wbq_shutdown_inner(wbq, budget, budget),
+            WbqFlushOutcome::TimedOut
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(wbq_sender_clone(wbq).is_none());
+        assert_eq!(
+            wbq_flush_status(),
+            WbqFlushOutcome::Disconnected,
+            "a retained worker and queued writes must not be reported as an empty queue"
+        );
         {
             let handle = wbq.drain_handle.lock();
             let worker = handle.as_ref().expect("unfinished worker must stay owned");
@@ -30587,7 +30798,10 @@ mod tests {
 
         // A repeated shutdown must not infer termination from sender=None.
         let started = Instant::now();
-        wbq_shutdown_inner(wbq, budget, budget);
+        assert_eq!(
+            wbq_shutdown_inner(wbq, budget, budget),
+            WbqFlushOutcome::Disconnected
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(
             wbq_enqueue(signal_op("NewRejected")),

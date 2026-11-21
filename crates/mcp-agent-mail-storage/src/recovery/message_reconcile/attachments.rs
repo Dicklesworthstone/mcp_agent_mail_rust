@@ -21,7 +21,7 @@ use serde_json::Value;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 
-use super::invalid;
+use super::{RepairControl, invalid, scan_checkpoint};
 use crate::ProjectArchive;
 
 const MAX_ATTACHMENT_RECORDS: usize = 128;
@@ -197,12 +197,16 @@ fn required_files(
 /// Prepare only explicitly referenced file/original attachments. Unique bytes
 /// share the caller's remaining bundle budget; duplicate references still have
 /// to agree about size and original-content identity. No files are written here.
+/// Cancellation is observed before and after each bounded attachment read;
+/// filesystem/libgit2 calls themselves are not preemptible.
 pub(super) fn prepare(
     repo: &Repository,
     archive: &ProjectArchive,
     message: &Value,
     mut remaining_bytes: usize,
+    control: Option<RepairControl<'_>>,
 ) -> crate::Result<Vec<(PathBuf, Vec<u8>)>> {
+    scan_checkpoint(control, "attachment metadata")?;
     let files = required_files(archive, message)?;
     if files.is_empty() {
         return Ok(Vec::new());
@@ -216,6 +220,7 @@ pub(super) fn prepare(
     let mut prepared = Vec::with_capacity(files.len());
     let mut staged = staged::StagedAttachments::default();
     for (relative, expected) in files {
+        scan_checkpoint(control, "attachment read")?;
         let path = root.join(&relative);
         if crate::path_existing_prefix_has_symlink(&path)? {
             return Err(invalid(
@@ -231,6 +236,7 @@ pub(super) fn prepare(
             remaining_bytes,
             &mut staged,
         )?;
+        scan_checkpoint(control, "attachment prepared")?;
         remaining_bytes -= bytes.len();
         prepared.push((path, bytes));
     }
@@ -501,8 +507,11 @@ mod tests {
         let repo = Repository::open(&archive.repo_root).unwrap();
         let metadata = serde_json::to_value(&stored.meta).unwrap();
         message["attachments"] = json!([metadata, metadata]);
-        assert_eq!(prepare(&repo, &archive, &message, 5).unwrap().len(), 1);
-        assert!(prepare(&repo, &archive, &message, 4).is_err());
+        assert_eq!(
+            prepare(&repo, &archive, &message, 5, None).unwrap().len(),
+            1
+        );
+        assert!(prepare(&repo, &archive, &message, 4, None).is_err());
         message["attachments"][1]["bytes"] = json!(6);
         assert!(repair(&archive, &config, &message, &recipients).is_err());
         message["attachments"] = json!([metadata]);
@@ -512,7 +521,7 @@ mod tests {
         message["attachments"][0]["sha1"] = json!("0".repeat(40));
         assert!(repair(&archive, &config, &message, &recipients).is_err());
         message["attachments"] = json!(vec![metadata; MAX_ATTACHMENT_RECORDS + 1]);
-        assert!(prepare(&repo, &archive, &message, usize::MAX).is_err());
+        assert!(prepare(&repo, &archive, &message, usize::MAX, None).is_err());
         assert!(!archive.root.join("messages").exists());
     }
 
@@ -632,12 +641,12 @@ mod tests {
         );
         message["attachments"] = json!([stored.meta]);
         assert_eq!(
-            prepare(&repo, &archive, &message, bytes.len())
+            prepare(&repo, &archive, &message, bytes.len(), None)
                 .unwrap()
                 .len(),
             1
         );
-        assert!(prepare(&repo, &archive, &message, bytes.len() - 1).is_err());
+        assert!(prepare(&repo, &archive, &message, bytes.len() - 1, None).is_err());
 
         let result = repair(&archive, &config, &message, &recipients).unwrap();
         assert_eq!(result.files_created, 4);
@@ -876,7 +885,7 @@ mod tests {
         }
         message["attachments"] = json!([metadata, metadata]);
         assert_eq!(
-            prepare(&repo, &archive, &message, usize::MAX)
+            prepare(&repo, &archive, &message, usize::MAX, None)
                 .unwrap()
                 .len(),
             2
@@ -940,7 +949,7 @@ mod tests {
         );
         let index_before = std::fs::read(repo.path().join("index")).unwrap();
         message["attachments"] = json!([stored.meta]);
-        let prepared = prepare(&repo, &archive, &message, bytes.len()).unwrap();
+        let prepared = prepare(&repo, &archive, &message, bytes.len(), None).unwrap();
         assert_eq!(prepared, vec![(path.clone(), bytes.to_vec())]);
         assert!(!path.exists());
         assert_eq!(repo.head().unwrap().target().unwrap(), head);
@@ -948,7 +957,7 @@ mod tests {
             std::fs::read(repo.path().join("index")).unwrap(),
             index_before
         );
-        assert!(prepare(&repo, &archive, &message, bytes.len() - 1).is_err());
+        assert!(prepare(&repo, &archive, &message, bytes.len() - 1, None).is_err());
 
         let result = repair(&archive, &config, &message, &recipients).unwrap();
         assert_eq!(result.files_created, 5);
@@ -1192,7 +1201,7 @@ mod tests {
             let index_path = repo.path().join("index");
             std::fs::rename(&index_path, repo.path().join("retained-index")).unwrap();
             std::fs::write(&index_path, b"invalid unrelated index").unwrap();
-            let prepared = prepare(&repo, &archive, &message, 7).unwrap();
+            let prepared = prepare(&repo, &archive, &message, 7, None).unwrap();
             assert_eq!(prepared.len(), 1);
             assert_eq!(prepared[0].1, b"healthy");
             assert_eq!(
@@ -1227,8 +1236,11 @@ mod tests {
             "type": "file", "path": path, "bytes": 5,
             "sha1": hex::encode(Sha1::digest(b"12345")),
         })));
-        assert!(prepare(&repo, &archive, &message, 9).is_err());
-        assert_eq!(prepare(&repo, &archive, &message, 10).unwrap().len(), 2);
+        assert!(prepare(&repo, &archive, &message, 9, None).is_err());
+        assert_eq!(
+            prepare(&repo, &archive, &message, 10, None).unwrap().len(),
+            2
+        );
         assert!(
             paths
                 .iter()
@@ -1281,10 +1293,10 @@ mod tests {
             let index_before = std::fs::read(repo.path().join("index")).unwrap();
 
             assert_eq!(
-                prepare(&repo, &archive, &message, bytes.len()).unwrap(),
+                prepare(&repo, &archive, &message, bytes.len(), None).unwrap(),
                 vec![(path.clone(), bytes.to_vec())]
             );
-            assert!(prepare(&repo, &archive, &message, bytes.len() - 1).is_err());
+            assert!(prepare(&repo, &archive, &message, bytes.len() - 1, None).is_err());
             assert_committed_object_missing(&archive, oid);
             assert_eq!(repo.head().unwrap().target().unwrap(), head);
             assert_eq!(
@@ -1447,8 +1459,11 @@ mod tests {
         let repo = Repository::open(&archive.repo_root).unwrap();
         let head = repo.head().unwrap().target().unwrap();
         let index_before = std::fs::read(repo.path().join("index")).unwrap();
-        assert!(prepare(&repo, &archive, &message, 10).is_err());
-        assert_eq!(prepare(&repo, &archive, &message, 11).unwrap().len(), 2);
+        assert!(prepare(&repo, &archive, &message, 10, None).is_err());
+        assert_eq!(
+            prepare(&repo, &archive, &message, 11, None).unwrap().len(),
+            2
+        );
         for oid in oids {
             assert_committed_object_missing(&archive, oid);
         }
@@ -1514,7 +1529,7 @@ mod tests {
         let index = repo.path().join("index");
         std::fs::rename(&index, repo.path().join("retained-original-index")).unwrap();
         std::fs::write(&index, b"unrelated invalid index").unwrap();
-        let prepared = prepare(&repo, &archive, &message, 6).unwrap();
+        let prepared = prepare(&repo, &archive, &message, 6, None).unwrap();
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared[0].1, b"before");
         assert_committed_object_missing(&archive, oid);

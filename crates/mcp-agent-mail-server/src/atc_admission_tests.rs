@@ -7,6 +7,7 @@ const SECOND: i64 = 1_000_000;
 
 fn effect(agent: &str, family: &str) -> AtcEffectPlan {
     AtcEffectPlan {
+        release_authority: None,
         decision_id: 1,
         effect_id: format!("effect:{family}:{agent}"),
         experience_id: None,

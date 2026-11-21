@@ -146,6 +146,105 @@ fn expect_outcome<T>(outcome: Outcome<T, DbError>, context: &str) -> T {
     }
 }
 
+#[test]
+fn seeded_single_connection_pool_commits_autocommit_ddl() {
+    let dir = tempfile::tempdir().expect("private mailbox");
+    let db_path = dir.path().join("mailbox.sqlite3");
+    let project = dir.path().join("project");
+    fs::create_dir(&project).expect("create project");
+    let pool = DbPool::new(&DbPoolConfig {
+        database_url: format!("sqlite:///{}", db_path.display()),
+        storage_root: Some(dir.path().join("archive")),
+        min_connections: 1,
+        max_connections: 1,
+        ..Default::default()
+    })
+    .expect("start the single-connection pool");
+
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+        || {
+            let pool = &pool;
+            let project = &project;
+            block_on(|cx| async move {
+                let project_id = expect_outcome(
+                    queries::ensure_project(&cx, pool, project.to_str().expect("project path"))
+                        .await,
+                    "ensure project",
+                )
+                .id
+                .expect("project ID");
+                let agent_id = expect_outcome(
+                    queries::register_agent(
+                        &cx,
+                        pool,
+                        project_id,
+                        "GreenLake",
+                        "test",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await,
+                    "register agent",
+                )
+                .id
+                .expect("agent ID");
+                let reservations = expect_outcome(
+                    queries::create_file_reservations(
+                        &cx,
+                        pool,
+                        project_id,
+                        agent_id,
+                        &["src/sample.rs"],
+                        3600,
+                        true,
+                        "DDL test",
+                    )
+                    .await,
+                    "create reservation",
+                );
+                assert_eq!(reservations.len(), 1);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(error) => panic!("acquire seeded pool connection: {error}"),
+                    _ => panic!("seeded pool acquisition did not complete"),
+                };
+                conn.execute_raw("ALTER TABLE messages RENAME TO retained_messages")
+                    .expect("commit pooled autocommit ALTER after seeding");
+                assert_eq!(
+                    conn.query_sync("SELECT id FROM file_reservations", &[])
+                        .expect("read after commit")
+                        .len(),
+                    1
+                );
+                conn.execute_raw("ALTER TABLE retained_messages RENAME TO restored_messages")
+                    .expect("commit pooled autocommit ALTER after SELECT");
+            });
+        },
+    );
+    let reopened = fresh_conn(&pool);
+    assert_eq!(
+        reopened
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'restored_messages'",
+                &[],
+            )
+            .expect("reopen must see the committed schema")
+            .len(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .query_sync("SELECT id FROM file_reservations", &[])
+            .expect("reopen must see the reservation")
+            .len(),
+        1
+    );
+}
+
 fn setup_project(pool: &DbPool, seed: u64, idx: usize) -> i64 {
     let pool = pool.clone();
     block_on(|cx| async move {

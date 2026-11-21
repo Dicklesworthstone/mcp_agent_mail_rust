@@ -146,9 +146,17 @@ pub fn atc_delivery_stats() -> AtcDeliveryStats {
         .stats()
 }
 
-/// Recheck population and engine coverage before executing a queued release.
-/// A report admitted before a failed or unfinished refresh grants no exemption.
-/// Locks are released before the caller enters the reservation tool.
+/// Recheck population, liveness and decision authority for a queued release.
+/// Planning is not permission to release after activity, scope or policy changes.
+/// Returns the activity timestamp that informed this proposal. The reservation
+/// writer must still revalidate durable activity and exact leases before release.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn atc_release_effect_admission(effect: &AtcEffectPlan) -> Result<i64, &'static str> {
+    population::release_effect_admission(effect)
+}
+
+/// Inspect coverage independently of a target when testing its safety boundary.
+#[cfg(test)]
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn atc_release_capacity_admission() -> Result<(), &'static str> {
     population::release_capacity_admission()
@@ -457,6 +465,7 @@ mod admission_boundary_tests {
     fn staged_report(now: i64) -> AtcTickReport {
         let mut report = population::tick_report(now).expect("enabled planning report");
         let release = AtcEffectPlan {
+            release_authority: None,
             decision_id: 1,
             effect_id: "release:BlueFox".into(),
             experience_id: None,
