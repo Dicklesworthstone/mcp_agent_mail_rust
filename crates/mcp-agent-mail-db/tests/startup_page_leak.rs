@@ -631,7 +631,7 @@ struct MailboxMemoryMeasurement {
 
 #[cfg(target_os = "linux")]
 impl MailboxMemoryMeasurement {
-    fn growth_kib(&self) -> u64 {
+    const fn growth_kib(&self) -> u64 {
         self.peak_kib.saturating_sub(self.baseline_rss_kib)
     }
 }
@@ -1086,10 +1086,12 @@ fn verify_memory_mailbox(path: &Path, message_count: i64, body: &str) {
 }
 
 /// GH#372 / br-kp1in.46: bound memory for small reads on an existing mailbox.
+///
 /// Compare one and five live connections on byte-identical fixtures in fresh
 /// processes. Keep every child's original `VmHWM - baseline VmRSS` measurement;
 /// the initial high-water mark and mapping diagnostics never replace that metric.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
 #[test]
 fn existing_mailbox_reads_have_bounded_connection_memory() {
     const CHILD_ENV: &str = "AM_GH372_MEMORY_FIXTURE";

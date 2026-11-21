@@ -80,7 +80,7 @@ getrandom = "0.4.2"
 # nix is Unix-only (it doesn't compile on Windows). The CLI's nix usages
 # (PID liveness, mkfifo, mode bits) live in #[cfg(unix)] code paths.
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["signal", "process"] }
+nix = { workspace = true, features = ["feature", "process", "signal", "user"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1.9.0"

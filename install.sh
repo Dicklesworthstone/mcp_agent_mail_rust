@@ -416,6 +416,15 @@ detect_platform() {
     arm64|aarch64) ARCH="aarch64" ;;
     *) warn "Unknown arch $ARCH, using as-is" ;;
   esac
+  # GH#394: Under Rosetta 2 on Apple Silicon, `uname -m` reports x86_64 even
+  # though the host CPU is ARM64. Prefer the native aarch64 release binary
+  # whenever macOS reports Apple Silicon hardware.
+  if [ "$OS" = "darwin" ] && [ "$ARCH" = "x86_64" ] && command -v sysctl >/dev/null 2>&1; then
+    if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = "1" ]; then
+      verbose "detect_platform:rosetta_override detected Apple Silicon hardware (hw.optional.arm64=1); preferring aarch64"
+      ARCH="aarch64"
+    fi
+  fi
 
   TARGET=""
   # For linux x86_64 we prefer the statically-linked musl artifact so the

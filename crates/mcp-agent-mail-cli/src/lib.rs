@@ -96728,20 +96728,39 @@ fn handle_doctor_reconstruct_with(
         dry_run,
         yes,
     )? {
-        ftui_runtime::ftui_println!("Reconstruction cancelled.");
+        if json {
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::json!({
+                    "status": "cancelled",
+                    "db_path": db_path.display().to_string(),
+                    "storage_root": storage_root.display().to_string(),
+                    "actions_taken": 0,
+                })
+            );
+        } else {
+            ftui_runtime::ftui_println!("Reconstruction cancelled.");
+        }
         return Ok(());
     }
 
-    if !dry_run
-        && let Some(bundle_dir) = capture_doctor_forensic_bundle(
+    let forensics_dir = if !dry_run {
+        capture_doctor_forensic_bundle(
             "reconstruct",
             &forensic_database_url,
             &db_path,
             &storage_root,
             None,
         )?
-    {
-        ftui_runtime::ftui_println!("Forensics: {}", bundle_dir.display());
+    } else {
+        None
+    };
+    if let Some(bundle_dir) = &forensics_dir {
+        if json {
+            ftui_runtime::ftui_eprintln!("Forensics: {}", bundle_dir.display());
+        } else {
+            ftui_runtime::ftui_println!("Forensics: {}", bundle_dir.display());
+        }
     }
 
     // Build a temp path for reconstruction. The original DB is NOT touched
@@ -96749,11 +96768,19 @@ fn handle_doctor_reconstruct_with(
     // invariant (see issue #59).
     let temp_db_path = next_doctor_artifact_path(&db_path, "reconstruct", "sqlite3");
 
-    ftui_runtime::ftui_println!(
-        "Reconstructing database from archive at {} into temporary file {}",
-        storage_root.display(),
-        temp_db_path.display()
-    );
+    if json {
+        ftui_runtime::ftui_eprintln!(
+            "Reconstructing database from archive at {} into temporary file {}",
+            storage_root.display(),
+            temp_db_path.display()
+        );
+    } else {
+        ftui_runtime::ftui_println!(
+            "Reconstructing database from archive at {} into temporary file {}",
+            storage_root.display(),
+            temp_db_path.display()
+        );
+    }
 
     // Attempt salvage through a guarded private snapshot of the original DB
     // (no rename yet), or from nearby offline doctor artifacts when an
@@ -96847,6 +96874,7 @@ fn handle_doctor_reconstruct_with(
             serde_json::json!({
                 "status": "ok",
                 "db_path": db_path.display().to_string(),
+                "forensics_dir": forensics_dir.as_ref().map(|p| p.display().to_string()),
                 "recovered": {
                     "projects": stats.projects,
                     "agents": stats.agents,

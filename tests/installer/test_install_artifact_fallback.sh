@@ -102,6 +102,7 @@ extract_function() {
     echo 'verbose() { :; }'
     extract_function establish_release_contract
     extract_function establish_release_trust_model
+    extract_function detect_platform
     extract_function capture_command_with_timeout
     extract_function set_artifact_url
     extract_function artifact_url_for_target_ext
@@ -2342,5 +2343,44 @@ if [ -z "$ps_pair_start" ] || [ -z "$ps_pair_end" ] || \
     echo "FAIL: PowerShell binary pair path still deletes transaction evidence" >&2
     exit 1
 fi
+
+# GH#394: detect_platform selects aarch64-apple-darwin on Apple Silicon even when
+# invoked inside a Rosetta 2 shell (uname -m == x86_64, hw.optional.arm64 == 1),
+# while keeping x86_64-apple-darwin on Intel Macs (hw.optional.arm64 == 0).
+step "GH#394 Rosetta Apple Silicon vs Intel macOS platform detection"
+(
+    # shellcheck disable=SC1090
+    source "$extract"
+    FROM_SOURCE=0
+    ARTIFACT_URL=""
+    uname() {
+        case "${1:-}" in
+            -s) echo "Darwin" ;;
+            -m) echo "x86_64" ;;
+            *) command uname "$@" ;;
+        esac
+    }
+    sysctl() {
+        if [ "${1:-}" = "-n" ] && [ "${2:-}" = "hw.optional.arm64" ]; then
+            echo "1"
+            return 0
+        fi
+        return 1
+    }
+    detect_platform
+    [ "$ARCH" = "aarch64" ] || { echo "FAIL: Rosetta Apple Silicon expected ARCH=aarch64, got $ARCH" >&2; exit 1; }
+    [ "$TARGET" = "aarch64-apple-darwin" ] || { echo "FAIL: Rosetta Apple Silicon expected TARGET=aarch64-apple-darwin, got $TARGET" >&2; exit 1; }
+
+    sysctl() {
+        if [ "${1:-}" = "-n" ] && [ "${2:-}" = "hw.optional.arm64" ]; then
+            echo "0"
+            return 0
+        fi
+        return 1
+    }
+    detect_platform
+    [ "$ARCH" = "x86_64" ] || { echo "FAIL: Intel Mac expected ARCH=x86_64, got $ARCH" >&2; exit 1; }
+    [ "$TARGET" = "x86_64-apple-darwin" ] || { echo "FAIL: Intel Mac expected TARGET=x86_64-apple-darwin, got $TARGET" >&2; exit 1; }
+)
 
 step "ALL SCENARIOS PASSED"

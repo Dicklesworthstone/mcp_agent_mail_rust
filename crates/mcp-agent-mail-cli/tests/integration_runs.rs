@@ -9274,6 +9274,20 @@ fn check_reconstruct_preview_reservations(ambiguous_source: bool, check_reseed: 
             "{}",
             String::from_utf8_lossy(&repaired.stderr)
         );
+        let repaired_json: Value = serde_json::from_slice(&repaired.stdout).unwrap_or_else(|error| {
+            panic!(
+                // ubs:ignore — GH#386 regression: real `--yes --json` stdout must be one JSON value
+                "reconstruct --yes --json stdout must be a single JSON value ({error}):\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&repaired.stdout),
+                String::from_utf8_lossy(&repaired.stderr)
+            )
+        });
+        assert_eq!(repaired_json["status"], "ok");
+        assert!(
+            String::from_utf8_lossy(&repaired.stderr)
+                .contains("Reconstructing database from archive at"),
+            "progress lines should go to stderr in --json mode"
+        );
         assert_eq!(preview_json["candidate_validation"]["status"], "valid");
         assert_eq!(
             preview_json["candidate_validation"]["recovered"]["reservations"],

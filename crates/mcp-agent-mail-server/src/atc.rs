@@ -147,6 +147,7 @@ pub fn atc_delivery_stats() -> AtcDeliveryStats {
 }
 
 /// Recheck population, liveness and decision authority for a queued release.
+///
 /// Planning is not permission to release after activity, scope or policy changes.
 /// Returns the activity timestamp that informed this proposal. The reservation
 /// writer must still revalidate durable activity and exact leases before release.

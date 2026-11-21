@@ -5149,8 +5149,10 @@ impl AtcEngine {
     }
 
     /// Validate a queued release against the same engine that holds the current
-    /// activity and policy. The retained epoch binds a proposal to this engine
-    /// even when replay reproduces the same numeric decision ID and trace.
+    /// activity and policy.
+    ///
+    /// The retained epoch binds a proposal to this engine even when replay
+    /// reproduces the same numeric decision ID and trace.
     fn release_effect_admission(&self, effect: &AtcEffectPlan) -> Result<i64, &'static str> {
         let authority = effect
             .release_authority

@@ -16291,6 +16291,7 @@ pub async fn get_active_reservations(
 }
 
 /// Read one holder's active leases from a fresh committed snapshot.
+///
 /// Automatic intervention must never materialize every holder in a project.
 /// Candidate rows and raw payload bytes are bounded before materialization;
 /// release-ledger lookups are limited to those candidates. A holder above the
