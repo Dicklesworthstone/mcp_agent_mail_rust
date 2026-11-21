@@ -676,6 +676,11 @@ e2e_case_banner "Force-release stale reservation via tool call"
 
 # Use a fresh DB for this complex scenario
 FR_DB="${WORK}/force_release_test.sqlite3"
+FR_PROJECT="${WORK}/force_release_project"
+FR_PROJECT_JSON="$(_e2e_json_escape "$FR_PROJECT")"
+mkdir -p "$FR_PROJECT/src"
+# The unexpired lease requires a complete activity scan of a real workspace.
+touch -t 200001010000 "$FR_PROJECT/src/main.rs"
 
 # Step 1: Create project + register two agents + reserve a file + make agent stale
 # All done in one session to minimize server launches
@@ -684,13 +689,13 @@ SETUP_REQS=(
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-force-release","version":"1.0"}}}'
     "$INITIALIZED_NOTIFICATION"
     # Create project
-    '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"ensure_project","arguments":{"human_key":"/tmp/e2e_force_release_project"}}}'
+    "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${FR_PROJECT_JSON}\"}}}"
     # Register AgentA (will hold the reservation)
-    '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_force_release_project","program":"test","model":"test","name":"GreenLake"}}}'
+    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${FR_PROJECT_JSON}\",\"program\":\"test\",\"model\":\"test\",\"name\":\"GreenLake\"}}}"
     # Register AgentB (will force-release)
-    '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_force_release_project","program":"test","model":"test","name":"BluePeak"}}}'
+    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${FR_PROJECT_JSON}\",\"program\":\"test\",\"model\":\"test\",\"name\":\"BluePeak\"}}}"
     # AgentA reserves a file
-    '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"file_reservation_paths","arguments":{"project_key":"/tmp/e2e_force_release_project","agent_name":"GreenLake","paths":["src/main.rs"],"ttl_seconds":3600,"exclusive":true,"reason":"editing main"}}}'
+    "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${FR_PROJECT_JSON}\",\"agent_name\":\"GreenLake\",\"paths\":[\"src/main.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"editing main\"}}}"
 )
 
 SETUP_RESP="$(send_jsonrpc_session "$FR_DB" "case_06_force_release_setup" "${SETUP_REQS[@]}")"
@@ -717,24 +722,26 @@ for line in sys.stdin:
 print('')
 " 2>/dev/null)"
 
-if [ -n "$RES_ID" ] && [ "$RES_ID" != "" ]; then
+if [[ "$RES_ID" =~ ^[1-9][0-9]*$ ]]; then
     e2e_pass "setup: created reservation id=$RES_ID for GreenLake"
 else
     e2e_fail "setup: failed to create reservation"
     echo "    response: $(echo "$SETUP_RESP" | tail -5)"
+    e2e_summary
+    exit 1
 fi
 
 # Step 2: Make GreenLake stale by updating last_active_ts to 2 hours ago
 # The force-release inactivity threshold is 30 minutes, so 2 hours ensures staleness
 STALE_TS=$(($(date +%s) * 1000000 - 7200 * 1000000))
-sqlite3 "$FR_DB" "UPDATE agents SET last_active_ts = $STALE_TS WHERE name = 'GreenLake';"
-e2e_pass "setup: made GreenLake stale (last_active_ts set to 2h ago)"
+STALE_ROWS="$(sqlite3 "$FR_DB" "UPDATE agents SET last_active_ts = $STALE_TS WHERE name = 'GreenLake'; SELECT changes();")"
+e2e_assert_eq "setup: made GreenLake stale (last_active_ts set to 2h ago)" "1" "$STALE_ROWS"
 
 # Step 3: BluePeak force-releases GreenLake's reservation
 FORCE_REQS=(
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-force-release","version":"1.0"}}}'
     "$INITIALIZED_NOTIFICATION"
-    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"/tmp/e2e_force_release_project\",\"agent_name\":\"BluePeak\",\"file_reservation_id\":$RES_ID,\"note\":\"e2e test force release\",\"notify_previous\":true}}}"
+    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${FR_PROJECT_JSON}\",\"agent_name\":\"BluePeak\",\"file_reservation_id\":$RES_ID,\"note\":\"e2e test force release\",\"notify_previous\":true}}}"
 )
 
 FORCE_RESP="$(send_jsonrpc_session "$FR_DB" "case_06_force_release_action" "${FORCE_REQS[@]}")"
@@ -794,11 +801,31 @@ else
     e2e_fail "force-release did not notify the registered previous holder"
 fi
 
+RELEASED_BEFORE_EXPIRY="$(sqlite3 -readonly "$FR_DB" "
+    SELECT count(*)
+    FROM file_reservations AS reservation
+    JOIN file_reservation_releases AS release ON release.reservation_id = reservation.id
+    WHERE reservation.id = $RES_ID AND release.released_ts > 0
+      AND release.released_ts < reservation.expires_ts;
+")"
+e2e_assert_eq "release persisted before lease expiry" "1" "$RELEASED_BEFORE_EXPIRY"
+
+HOLDER_NOTICES="$(sqlite3 -readonly "$FR_DB" "
+    SELECT count(*)
+    FROM messages AS message
+    JOIN agents AS sender ON sender.id = message.sender_id
+    JOIN message_recipients AS delivery ON delivery.message_id = message.id
+    JOIN agents AS holder ON holder.id = delivery.agent_id
+    WHERE sender.name = 'BluePeak' AND holder.name = 'GreenLake' AND delivery.kind = 'to'
+      AND message.subject = '[file-reservations] Released stale lock on src/main.rs';
+")"
+e2e_assert_eq "one force-release notice persisted for the former holder" "1" "$HOLDER_NOTICES"
+
 # Step 4: Verify force-release error path (non-existent reservation)
 ERROR_REQS=(
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-force-release","version":"1.0"}}}'
     "$INITIALIZED_NOTIFICATION"
-    '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"force_release_file_reservation","arguments":{"project_key":"/tmp/e2e_force_release_project","agent_name":"BluePeak","file_reservation_id":99999}}}'
+    "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${FR_PROJECT_JSON}\",\"agent_name\":\"BluePeak\",\"file_reservation_id\":99999}}}"
 )
 
 ERROR_RESP="$(send_jsonrpc_session "$FR_DB" "case_06_force_release_error" "${ERROR_REQS[@]}")"
