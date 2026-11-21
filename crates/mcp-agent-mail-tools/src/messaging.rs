@@ -5263,9 +5263,11 @@ pub async fn fetch_inbox(
     //
     // `mark_read=false` skips this entirely: a non-consuming peek (GH#207)
     // must leave read state untouched.
-    if mark_read.unwrap_or(true) && !messages.is_empty() {
+    let consumes = mark_read.unwrap_or(true);
+    let live_sqlite_path = read_pool.live_sqlite_path();
+    if consumes && !messages.is_empty() {
         let (ids, shared_ids) = unread_receipt_targets(&messages);
-        if let Some(live_sqlite_path) = read_pool.live_sqlite_path()
+        if let Some(live_sqlite_path) = live_sqlite_path
             && !shared_ids.is_empty()
         {
             match mcp_agent_mail_db::project_mailbox::mark_project_mailbox_read_batch_sync(
@@ -5285,7 +5287,7 @@ pub async fn fetch_inbox(
                 ),
             }
         }
-        if let Some(live_sqlite_path) = read_pool.live_sqlite_path() {
+        if let Some(live_sqlite_path) = live_sqlite_path {
             match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,
                 agent_id,
@@ -5318,25 +5320,54 @@ pub async fn fetch_inbox(
         }
     }
     // An archive snapshot never writes back (see above), activity included.
-    if read_pool.live_sqlite_path().is_some() {
+    if live_sqlite_path.is_some() {
         crate::tool_util::touch_acting_agent_after_live_read(ctx, &read_pool, agent.id).await;
     }
     phase.mark("downstream_cache_update");
 
-    // Clear notification signal (best-effort).
+    // Preserve the wakeup whenever the caller chose a partial view or the
+    // live read could have left unread rows. Successful receipt writes set
+    // read_ts above, including for the project mailbox.
     let config = &Config::get();
-    match mcp_agent_mail_storage::clear_notification_signal(config, &project.slug, &agent.name) {
-        mcp_agent_mail_storage::SignalClearOutcome::RemoveFailed => tracing::warn!(
-            project = %project.slug,
-            agent = %agent.name,
-            "failed to clear notification signal after fetch_inbox"
-        ),
-        mcp_agent_mail_storage::SignalClearOutcome::InvalidTarget => tracing::warn!(
-            project = %project.slug,
-            agent = %agent.name,
-            "resolved agent produced invalid notification target during fetch_inbox clear"
-        ),
-        _ => {}
+    if config.notifications_enabled
+        && consumes
+        && live_sqlite_path.is_some()
+        && !urgent
+        && !unread
+        && !ack_overdue
+        && since_micros.is_none()
+        && topic.is_none()
+        && limit.is_none()
+        && messages.iter().all(|message| message.read_ts.is_some())
+        && mcp_agent_mail_storage::notification_signal_may_exist(config, &project.slug, &agent.name)
+        && let Outcome::Ok(can_clear) = mcp_agent_mail_db::queries::prepare_inbox_drain_check(
+            ctx.cx(),
+            &read_pool,
+            project_id,
+            agent_id,
+        )
+        .await
+    {
+        // Even a short page can race a later committed delivery. Check both
+        // inbox lanes while the recipient's signal is locked against emit.
+        match mcp_agent_mail_storage::clear_notification_signal_if(
+            config,
+            &project.slug,
+            &agent.name,
+            &can_clear,
+        ) {
+            mcp_agent_mail_storage::SignalClearOutcome::RemoveFailed => tracing::warn!(
+                project = %project.slug,
+                agent = %agent.name,
+                "failed to clear notification signal after fetch_inbox"
+            ),
+            mcp_agent_mail_storage::SignalClearOutcome::InvalidTarget => tracing::warn!(
+                project = %project.slug,
+                agent = %agent.name,
+                "resolved agent produced invalid notification target during fetch_inbox clear"
+            ),
+            _ => {}
+        }
     }
     phase.mark("notification_signal_clear");
 
@@ -6548,7 +6579,16 @@ mod tests {
 
     #[test]
     fn fetch_inbox_live_read_receipts_preserve_peek_and_ack_state() {
-        with_messaging_mailbox(&[], |mailbox| {
+        let signals = tempfile::tempdir().expect("test signals directory");
+        let overrides = [
+            ("NOTIFICATIONS_ENABLED", "1"),
+            ("NOTIFICATIONS_DEBOUNCE_MS", "0"),
+            (
+                "NOTIFICATIONS_SIGNALS_DIR",
+                signals.path().to_str().unwrap(),
+            ),
+        ];
+        with_messaging_mailbox(&overrides, |mailbox| {
             let database_path = &mailbox.database_path;
             let database_url = &mailbox.database_url;
             let rt = RuntimeBuilder::current_thread().build().expect("runtime");
@@ -6583,6 +6623,16 @@ mod tests {
                 };
                 let mut first_read_ts = None;
                 for mark_read in [Some(false), None, Some(false), Some(true)] {
+                    let config = Config::get();
+                    assert_eq!(
+                        mcp_agent_mail_storage::emit_notification_signal(
+                            &config,
+                            &project.slug,
+                            &recipient.name,
+                            None,
+                        ),
+                        mcp_agent_mail_storage::SignalEmitOutcome::Emitted
+                    );
                     let response = fetch_inbox(
                         &ctx,
                         project.human_key.clone(),
@@ -6630,6 +6680,9 @@ mod tests {
                     );
                     assert!(ack_ts.is_none(), "reading must not acknowledge a message");
                     assert!(messages[0]["ack_ts"].is_null());
+                    let pending =
+                        mcp_agent_mail_storage::list_pending_signals(&config, Some(&project.slug));
+                    assert_eq!(pending.is_empty(), mark_read.unwrap_or(true));
                 }
             });
         });

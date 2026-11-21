@@ -12,12 +12,19 @@
   policy and activity; use a bounded holder snapshot and guarded database
   mutation, with atomic grant/renewal activity and no voluntary-release intent
   fallback (`br-qo8j5`).
+- [x] Carry request-token and request-scope liveness through database checkout,
+  writer admission and pre-commit checks for automatic releases; roll back
+  observed cancellation before commit admission (`br-qo8j5`).
 - [x] Run native identity regressions: 150 passed, 0 failed, 1 ignored,
   including all five new cache cases (`br-xai5l`).
-- [ ] Complete archive/ATC native regressions and workspace compiler/lint
-  validation. The all-targets check was killed while compiling the pinned
-  Asupersync dependency before reaching the application changes; broader
-  daemon memory attribution and archive soak acceptance remain open.
+- [x] Pass the core production library check and strict core all-targets Clippy.
+- [ ] Complete archive/ATC native regressions and final workspace compiler/lint
+  validation. On this executor, both workspace check graphs (all targets and production
+  libraries/binaries) and strict workspace Clippy were killed with SIGKILL
+  while compiling the pinned Asupersync dependency before reaching the
+  application changes, including a single-job, no-debug, dependency opt-level
+  zero retry. Broader daemon memory attribution and archive soak acceptance
+  remain open.
 - [ ] Prevent concurrent deliveries from losing notification wakeups during
   inbox reads, including cross-process debounce and filtered/peek behavior
   (`br-dksvp`).

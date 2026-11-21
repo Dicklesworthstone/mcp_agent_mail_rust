@@ -1429,7 +1429,7 @@ pub async fn release_reservations_for_inactive_agent(
     // Zero thresholds preserve that policy's timing while the original proposal
     // timestamp and exact observations prohibit newer database activity.
     let released_ids = db_outcome_to_mcp_result(
-        queries::release_stale_reservations(
+        queries::release_stale_reservations_if_live(
             ctx.cx(),
             &pool,
             project_id,
@@ -1437,6 +1437,7 @@ pub async fn release_reservations_for_inactive_agent(
             decision_timestamp_micros,
             0,
             0,
+            &|| ctx.ensure_live().is_ok(),
         )
         .await,
     )?;
@@ -10692,6 +10693,135 @@ mod tests {
                 );
             });
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn automatic_release_rechecks_request_liveness_after_waiting_for_writer_checkout() {
+        use std::future::Future;
+        use std::sync::Arc;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        for interruption in ["live", "request_token", "request_scope", "raw_cx"] {
+            crate::test_support::with_isolated_mailbox(
+                &RESERVATION_TEST_LOCK,
+                "automatic-release-cancellation",
+                &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+                |_| {
+                    struct ClearHook;
+                    impl Drop for ClearHook {
+                        fn drop(&mut self) {
+                            AFTER_AUTOMATIC_RELEASE_SNAPSHOT.with_borrow_mut(|hook| *hook = None);
+                        }
+                    }
+                    let _clear_hook = ClearHook;
+                    run_async(|cx| async move {
+                        let pool = get_db_pool().expect("real mailbox pool");
+                        let fixture = inactive_automatic_release_fixture(
+                            &cx,
+                            &pool,
+                            "/tmp/automatic-release-cancellation",
+                            "held.rs",
+                        )
+                        .await;
+                        let id = fixture.reservation.id.expect("lease id");
+                        let request_cx = Cx::for_testing();
+                        let (ctx, lease) = McpContext::new(request_cx.clone(), 1)
+                            .begin_request_scope()
+                            .expect("request scope");
+                        let mut lease = Some(lease);
+                        let held = Arc::new(Mutex::new(None));
+                        let held_by_hook = Arc::clone(&held);
+                        let hook_pool = get_db_pool().expect("same one-connection pool");
+                        let hook_cx = cx.clone();
+                        AFTER_AUTOMATIC_RELEASE_SNAPSHOT.with_borrow_mut(|hook| {
+                            *hook = Some(Box::pin(async move {
+                                let checkout = hook_pool
+                                    .acquire(&hook_cx)
+                                    .await
+                                    .into_result()
+                                    .expect("occupy sole writer checkout");
+                                *held_by_hook.lock().unwrap() = Some(checkout);
+                            }));
+                        });
+                        let mut waiting = std::pin::pin!(release_reservations_for_inactive_agent(
+                            &ctx,
+                            &fixture.project.human_key,
+                            &fixture.holder.name,
+                            mcp_agent_mail_db::now_micros(),
+                            fixture.holder.last_active_ts,
+                        ));
+                        // The snapshot hook obtains the sole connection but
+                        // leaves the request live. Keep polling until the tool
+                        // has passed its final synchronous checkpoint and is
+                        // actually waiting inside the guarded DB writer path.
+                        asupersync::time::timeout(
+                            cx.now(),
+                            Duration::from_secs(5),
+                            std::future::poll_fn(|poll_context| {
+                                match waiting.as_mut().poll(poll_context) {
+                                    Poll::Ready(result) => panic!(
+                                        "release must wait for its writer checkout: {result:?}"
+                                    ),
+                                    Poll::Pending if held.lock().unwrap().is_some() => {
+                                        Poll::Ready(())
+                                    }
+                                    Poll::Pending => Poll::Pending,
+                                }
+                            }),
+                        )
+                        .await
+                        .expect("reach real writer wait");
+                        assert!(AFTER_AUTOMATIC_RELEASE_SNAPSHOT.with_borrow(Option::is_none));
+                        ensure_request_live(&ctx).expect("request was live at the writer wait");
+                        match interruption {
+                            "request_token" => {
+                                assert!(ctx.request_cancellation().cancel());
+                            }
+                            "request_scope" => drop(lease.take()),
+                            "raw_cx" => request_cx.set_cancel_requested(true),
+                            "live" => {}
+                            _ => unreachable!("known interruption"),
+                        }
+                        if interruption != "raw_cx" {
+                            assert!(
+                                !request_cx.is_cancel_requested(),
+                                "request-local liveness must not cancel the raw context"
+                            );
+                        }
+                        let checkout = held.lock().unwrap().take();
+                        drop(checkout);
+                        let result =
+                            asupersync::time::timeout(cx.now(), Duration::from_secs(5), waiting)
+                                .await
+                                .expect("release leaves the writer wait");
+                        if interruption == "live" {
+                            assert_eq!(
+                                result.expect("live release succeeds"),
+                                AutomaticReservationRelease::Released(1)
+                            );
+                            let rows = queries::get_reservations_by_ids(&cx, &pool, &[id])
+                                .await
+                                .into_result()
+                                .expect("committed release");
+                            assert!(rows[0].released_ts.is_some_and(|ts| ts > 0));
+                        } else {
+                            assert_eq!(
+                                result.expect_err("cancelled release fails").code,
+                                McpErrorCode::RequestCancelled,
+                                "{interruption}"
+                            );
+                            assert_force_release_preserves_claim(&cx, &pool, id).await;
+                        }
+                        assert!(
+                            !cx.is_cancel_requested(),
+                            "verification context remains live"
+                        );
+                    });
+                },
+            );
+        }
     }
 
     #[test]

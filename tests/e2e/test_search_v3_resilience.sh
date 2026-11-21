@@ -34,10 +34,8 @@ e2e_init_artifacts
 sv3_init_harness
 e2e_banner "Search V3 Resilience E2E Suite (br-2tnl.7.11)"
 
-# Build binary
-e2e_ensure_binary "am" >/dev/null
-export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
-e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
+AM_BIN="$(e2e_ensure_binary am | tail -n 1)"
+e2e_log "am binary: ${AM_BIN}"
 
 # Temp workspace
 WORK="$(e2e_mktemp "e2e_sv3_resilience")"
@@ -50,109 +48,118 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 send_session() {
     local db_path="$1"
     shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_${RANDOM}.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error WORKTREES_ENABLED=true \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.5
-        done
-        sleep 1
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=25
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
-    done
-
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
+    local client_args=("$db_path")
+    if [ "${1:-}" = "--pipeline" ]; then
+        client_args=(--pipeline "$db_path")
+        shift
     fi
+    local archive="${db_path%.db}.archive"
+    mkdir -p "$archive"
+    # The response budget plus the client's five-second EOF drain fits the
+    # previous session budget.
+    E2E_STDIO_BINARY="$AM_BIN" E2E_STDIO_TIMEOUT_SECONDS=7.5 STORAGE_ROOT="$archive" \
+        SEARCH_V3_INDEX_DIR="$archive/search_index" AM_SEARCH_ENGINE="${AM_SEARCH_ENGINE:-lexical}" \
+        AM_ALLOW_EPHEMERAL_PROJECT_ROOTS=1 WORKTREES_ENABLED=true RUST_LOG=error \
+        e2e_stdio_session "${client_args[@]}" "$@"
 }
 
 extract_tool_result() {
-    local resp="$1"
-    local req_id="$2"
-    echo "$resp" | python3 -c "
-import sys, json
-target_id = int(sys.argv[1])
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        if d.get('id') == target_id and 'result' in d:
-            content = d['result'].get('content', [])
-            if content:
-                print(content[0].get('text', ''))
-                sys.exit(0)
-    except (json.JSONDecodeError, KeyError, IndexError):
-        pass
-print('')
-" "$req_id" 2>/dev/null
+    tool_reply "$1" "$2" text
 }
 
 is_error() {
-    local resp="$1"
-    local req_id="$2"
-    echo "$resp" | python3 -c "
-import sys, json
-target_id = int(sys.argv[1])
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        if d.get('id') == target_id:
-            if 'error' in d:
-                print('ERROR')
-                sys.exit(0)
-            if d.get('result', {}).get('isError', False):
-                print('ERROR')
-                sys.exit(0)
-    except (json.JSONDecodeError, KeyError, IndexError):
-        pass
-print('OK')
-" "$req_id" 2>/dev/null
+    tool_reply "$1" "$2" status
 }
 
-extract_field() {
-    local text="$1"
-    local field="$2"
-    echo "$text" | python3 -c "
-import sys, json
-try:
-    d = json.loads(sys.stdin.read())
-    v = d
-    for part in sys.argv[1].split('.'):
-        if isinstance(v, list):
-            v = v[int(part)]
-        else:
-            v = v[part]
-    print(v)
-except Exception:
-    print('')
-" "$field" 2>/dev/null
+tool_reply() {
+    printf '%s\n' "$1" | python3 -c '
+import json
+import sys
+
+target_id = int(sys.argv[1])
+replies = [json.loads(line) for line in sys.stdin if line.strip()]
+matches = [reply for reply in replies if reply.get("id") == target_id]
+if len(matches) != 1:
+    sys.exit(f"Expected one reply for request {target_id}, got {len(matches)}")
+reply, = matches
+error = reply.get("error")
+if isinstance(error, dict) and isinstance(error.get("message"), str):
+    status, body = "ERROR", error["message"]
+else:
+    result = reply.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("isError", False), bool):
+        sys.exit(f"Invalid reply for request {target_id}: {reply}")
+    content = result.get("content")
+    if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+        sys.exit(f"Missing tool content for request {target_id}: {reply}")
+    body = content[0].get("text")
+    if not isinstance(body, str) or not body:
+        sys.exit(f"Missing tool text for request {target_id}: {reply}")
+    status = "ERROR" if result.get("isError", False) else "OK"
+print(status if sys.argv[2] == "status" else body)
+' "$2" "$3"
+}
+
+require_success() {
+    local response="$1" request_id="$2"
+    if [ "$(is_error "$response" "$request_id")" != "OK" ]; then
+        printf 'Fixture request %s failed:\n%s\n' "$request_id" "$response" >&2
+        return 1
+    fi
+}
+
+search_ids() {
+    require_success "$1" "$2" || return 1
+    extract_tool_result "$1" "$2" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+rows = data.get("result") if isinstance(data, dict) else data
+if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+    sys.exit(f"Invalid search result: {data}")
+ids = [row.get("id") for row in rows]
+if any(type(value) is not int or value <= 0 for value in ids) or len(set(ids)) != len(ids):
+    sys.exit(f"Invalid search result IDs: {ids}")
+if sys.argv[1] == "sorted":
+    ids.sort()
+print(",".join(map(str, ids)))
+' "${3:-ranked}"
+}
+
+fixture_message_ids() {
+    python3 -c '
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as transcript:
+    ids = []
+    for line in transcript:
+        reply = json.loads(line)
+        content = reply["result"].get("content")
+        if content:
+            payload = json.loads(content[0]["text"])
+            if "deliveries" in payload:
+                delivery, = payload["deliveries"]
+                ids.append(delivery["payload"]["id"])
+if len(ids) != int(sys.argv[2]) or any(type(value) is not int or value <= 0 for value in ids) or len(set(ids)) != len(ids):
+    sys.exit(f"Invalid fixture message IDs: {ids}")
+print(",".join(map(str, sorted(ids))))
+' "${E2E_ARTIFACT_DIR}/setup-$(basename "$1").jsonl" "$2"
+}
+
+sent_message_id() {
+    require_success "$1" "$2" || return 1
+    extract_tool_result "$1" "$2" | python3 -c '
+import json
+import sys
+
+delivery, = json.load(sys.stdin)["deliveries"]
+message_id = delivery["payload"]["id"]
+if type(message_id) is not int or message_id <= 0:
+    sys.exit(f"Invalid send receipt ID: {message_id}")
+print(message_id)
+'
 }
 
 mk_tool_call() {
@@ -168,43 +175,30 @@ setup_project_with_data() {
     local proj_path="$2"
     local msg_count="${3:-5}"
     local requests=("$INIT_REQ")
+    local agents=(CrimsonBear GoldenHawk SilverWolf BlueHeron GreenLion)
+    local agent_count="$msg_count" i id=3 sender recipient response
+    if [ "$agent_count" -lt 2 ]; then
+        agent_count=2
+    fi
 
     requests+=("$(mk_tool_call 2 ensure_project "{\"human_key\":\"${proj_path}\"}")")
-    requests+=("$(mk_tool_call 3 register_agent "{\"project_key\":\"${proj_path}\",\"program\":\"test\",\"model\":\"test-model\",\"task_description\":\"resilience testing\"}")")
-
-    for i in $(seq 1 "$msg_count"); do
-        local agent_name
-        agent_name=$(echo "$i" | python3 -c "
-import sys
-n = int(sys.stdin.read().strip())
-names = ['CrimsonBear', 'GoldenHawk', 'SilverWolf', 'BlueHeron', 'GreenLion']
-print(names[n % len(names)])
-" 2>/dev/null)
-        requests+=("$(mk_tool_call $((3 + i)) register_agent "{\"project_key\":\"${proj_path}\",\"program\":\"test\",\"model\":\"test-model\",\"name\":\"${agent_name}\",\"task_description\":\"test agent ${i}\"}")")
+    for ((i = 0; i < agent_count; i++)); do
+        requests+=("$(mk_tool_call "$id" register_agent "{\"project_key\":\"${proj_path}\",\"program\":\"test\",\"model\":\"test-model\",\"name\":\"${agents[i]}\",\"task_description\":\"test agent ${i}\"}")")
+        id=$((id + 1))
     done
 
-    # Now send some messages
-    local next_id=$((4 + msg_count))
-    for i in $(seq 1 "$msg_count"); do
-        local sender
-        sender=$(echo "$i" | python3 -c "
-import sys
-n = int(sys.stdin.read().strip())
-names = ['CrimsonBear', 'GoldenHawk', 'SilverWolf', 'BlueHeron', 'GreenLion']
-print(names[n % len(names)])
-" 2>/dev/null)
-        local recipient
-        recipient=$(echo "$i" | python3 -c "
-import sys
-n = int(sys.stdin.read().strip())
-names = ['CrimsonBear', 'GoldenHawk', 'SilverWolf', 'BlueHeron', 'GreenLion']
-print(names[(n+1) % len(names)])
-" 2>/dev/null)
-        requests+=("$(mk_tool_call $next_id send_message "{\"project_key\":\"${proj_path}\",\"sender_name\":\"${sender}\",\"to\":[\"${recipient}\"],\"subject\":\"Test message ${i} about database migration\",\"body_md\":\"This is test message number ${i} discussing the database migration plan and API endpoints.\"}")")
-        next_id=$((next_id + 1))
+    for ((i = 0; i < msg_count; i++)); do
+        sender="${agents[i]}"
+        recipient="${agents[(i+1)%agent_count]}"
+        requests+=("$(mk_tool_call "$id" send_message "{\"project_key\":\"${proj_path}\",\"sender_name\":\"${sender}\",\"to\":[\"${recipient}\"],\"subject\":\"Test message $((i + 1)) about database migration\",\"body_md\":\"This is test message number $((i + 1)) discussing the database migration plan and API endpoints.\"}")")
+        id=$((id + 1))
     done
 
-    send_session "$db_path" "${requests[@]}"
+    response="$(send_session "$db_path" "${requests[@]}")" || return 1
+    e2e_save_artifact "setup-$(basename "$db_path").jsonl" "$response"
+    for ((i = 2; i < id; i++)); do
+        require_success "$response" "$i" || return 1
+    done
 }
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -223,12 +217,14 @@ RESP=$(send_session "$DB1" \
 )
 
 e2e_step_start "cold_start_search"
+require_success "$RESP" 2
 STATUS=$(is_error "$RESP" 3)
 RESULT=$(extract_tool_result "$RESP" 3)
+RESULT_IDS=$(search_ids "$RESP" 3)
 
 # Search should succeed (return empty results, not error)
 e2e_assert_eq "cold start search does not crash" "OK" "$STATUS"                      # 1
-e2e_assert_not_contains "cold start no internal error" "$RESULT" "internal error"     # 2
+e2e_assert_eq "cold start returns an empty result list" "" "$RESULT_IDS"              # 2
 e2e_assert_not_contains "cold start no panic" "$RESULT" "panic"                       # 3
 e2e_step_end "cold_start_search"
 
@@ -244,9 +240,9 @@ RESP=$(send_session "$DB1" \
 )
 
 e2e_step_start "empty_query_search"
-STATUS=$(is_error "$RESP" 3)
-# Empty query should either return empty results or a helpful error — not crash
-e2e_assert_not_contains "empty query no panic" "$(echo "$RESP")" "panicked"           # 4
+require_success "$RESP" 2
+RESULT_IDS=$(search_ids "$RESP" 3)
+e2e_assert_eq "empty query returns an empty result list" "" "$RESULT_IDS"             # 4
 e2e_step_end "empty_query_search"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -258,7 +254,7 @@ DB3="${WORK}/special_chars.db"
 PROJ3="${WORK}/proj-special-chars"
 
 # Set up project with data first
-setup_project_with_data "$DB3" "$PROJ3" 3 >/dev/null 2>&1
+setup_project_with_data "$DB3" "$PROJ3" 3
 
 # FTS special chars that could break SQLite FTS5
 SPECIAL_QUERIES=(
@@ -277,7 +273,7 @@ e2e_step_start "special_char_queries"
 for i in "${!SPECIAL_QUERIES[@]}"; do
     query="${SPECIAL_QUERIES[$i]}"
     # Escape for JSON
-    escaped_query=$(python3 -c "import json; print(json.dumps(${query@Q})[1:-1])" 2>/dev/null || echo "$query")
+    escaped_query=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1])[1:-1])' "$query")
 
     RESP=$(send_session "$DB3" \
         "$INIT_REQ" \
@@ -285,8 +281,9 @@ for i in "${!SPECIAL_QUERIES[@]}"; do
         "$(mk_tool_call 3 search_messages "{\"project_key\":\"${PROJ3}\",\"query\":\"${escaped_query}\"}")" \
     )
 
-    STATUS=$(is_error "$RESP" 3)
-    e2e_assert_not_contains "special query $i no crash" "$(echo "$RESP")" "panicked"  # 5-13
+    require_success "$RESP" 2
+    search_ids "$RESP" 3 >/dev/null
+    e2e_pass "special query $i returned a valid result list"                             # 5-13
 done
 e2e_step_end "special_char_queries"
 
@@ -299,7 +296,7 @@ DB4="${WORK}/happy_path.db"
 PROJ4="${WORK}/proj-happy-path"
 
 # Set up project with 5 messages about "database migration"
-setup_project_with_data "$DB4" "$PROJ4" 5 >/dev/null 2>&1
+setup_project_with_data "$DB4" "$PROJ4" 5
 
 RESP=$(send_session "$DB4" \
     "$INIT_REQ" \
@@ -308,22 +305,17 @@ RESP=$(send_session "$DB4" \
 )
 
 e2e_step_start "happy_path_search"
+require_success "$RESP" 2
 STATUS=$(is_error "$RESP" 3)
 RESULT=$(extract_tool_result "$RESP" 3)
 
 e2e_assert_eq "happy path search succeeds" "OK" "$STATUS"                             # 14
 e2e_assert_not_contains "happy path no error" "$RESULT" "error"                        # 15
 
-# Validate response is parseable JSON
-PARSE_CHECK=$(echo "$RESULT" | python3 -c "
-import sys, json
-try:
-    data = json.loads(sys.stdin.read())
-    print('VALID')
-except:
-    print('INVALID')
-" 2>/dev/null)
-e2e_assert_eq "happy path returns valid JSON" "VALID" "$PARSE_CHECK"                   # 16
+RESULT_IDS=$(search_ids "$RESP" 3 sorted)
+EXPECTED_IDS=$(fixture_message_ids "$DB4" 5)
+e2e_assert_eq "happy path returns every seeded message" "$EXPECTED_IDS" "$RESULT_IDS" # 16
+e2e_save_artifact "happy-path.jsonl" "$RESP"
 e2e_step_end "happy_path_search"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -340,9 +332,9 @@ e2e_step_start "nonexistent_project_search"
 STATUS=$(is_error "$RESP" 2)
 RESULT=$(extract_tool_result "$RESP" 2)
 
-# Server returns empty results for unknown projects (graceful degradation, not crash)
-e2e_assert_eq "nonexistent project does not crash" "OK" "$STATUS"                      # 17
-e2e_assert_not_contains "nonexistent project no panic" "$RESULT" "panicked"            # 18
+e2e_assert_eq "nonexistent project returns a tool error" "ERROR" "$STATUS"             # 17
+e2e_assert_contains "error identifies the unknown project" "$RESULT" "/nonexistent/project/path" # 18
+e2e_save_artifact "unknown-project.jsonl" "$RESP"
 e2e_step_end "nonexistent_project_search"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -354,7 +346,7 @@ DB6="${WORK}/recovery.db"
 PROJ6="${WORK}/proj-recovery"
 
 # First set up data
-setup_project_with_data "$DB6" "$PROJ6" 3 >/dev/null 2>&1
+setup_project_with_data "$DB6" "$PROJ6" 3
 
 # Session: try a bad query, then try a good one
 RESP=$(send_session "$DB6" \
@@ -365,16 +357,20 @@ RESP=$(send_session "$DB6" \
 )
 
 e2e_step_start "recovery_after_failure"
-# Request 3: unknown project returns empty results (graceful degradation)
+require_success "$RESP" 2
 STATUS_BAD=$(is_error "$RESP" 3)
-e2e_assert_eq "unknown project degrades gracefully" "OK" "$STATUS_BAD"                 # 19
+e2e_assert_eq "unknown project returns a tool error" "ERROR" "$STATUS_BAD"             # 19
+BAD_RESULT=$(extract_tool_result "$RESP" 3)
+e2e_assert_contains "recovery starts with the unknown-project error" "$BAD_RESULT" "/ghost/project"
 
 # Request 4 should succeed (good project, same session)
 STATUS_GOOD=$(is_error "$RESP" 4)
 e2e_assert_eq "good search after bad succeeds" "OK" "$STATUS_GOOD"                    # 20
 
-RESULT_GOOD=$(extract_tool_result "$RESP" 4)
-e2e_assert_not_contains "recovery search no error" "$RESULT_GOOD" "error"              # 21
+RESULT_IDS=$(search_ids "$RESP" 4 sorted)
+EXPECTED_IDS=$(fixture_message_ids "$DB6" 3)
+e2e_assert_eq "recovery returns the three seeded messages" "$EXPECTED_IDS" "$RESULT_IDS" # 21
+e2e_save_artifact "recovery.jsonl" "$RESP"
 e2e_step_end "recovery_after_failure"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -385,7 +381,7 @@ e2e_case_banner "Rapid sequential searches"
 DB7="${WORK}/rapid_search.db"
 PROJ7="${WORK}/proj-rapid-search"
 
-setup_project_with_data "$DB7" "$PROJ7" 5 >/dev/null 2>&1
+setup_project_with_data "$DB7" "$PROJ7" 5
 
 REQUESTS=("$INIT_REQ")
 REQUESTS+=("$(mk_tool_call 2 ensure_project "{\"human_key\":\"${PROJ7}\"}")")
@@ -396,9 +392,11 @@ done
 RESP=$(send_session "$DB7" "${REQUESTS[@]}")
 
 e2e_step_start "rapid_searches"
+require_success "$RESP" 2
+EXPECTED_IDS=$(fixture_message_ids "$DB7" 5)
 for i in $(seq 3 12); do
-    STATUS=$(is_error "$RESP" "$i")
-    e2e_assert_eq "rapid search $i succeeds" "OK" "$STATUS"                           # 22-31
+    RESULT_IDS=$(search_ids "$RESP" "$i" sorted)
+    e2e_assert_eq "rapid search $i returns the seeded messages" "$EXPECTED_IDS" "$RESULT_IDS" # 22-31
 done
 e2e_step_end "rapid_searches"
 
@@ -410,9 +408,9 @@ e2e_case_banner "Search with boundary limits"
 DB8="${WORK}/limits.db"
 PROJ8="${WORK}/proj-limits"
 
-setup_project_with_data "$DB8" "$PROJ8" 5 >/dev/null 2>&1
+setup_project_with_data "$DB8" "$PROJ8" 5
 
-# limit=0 (should return empty or use default, not error)
+# Limit zero uses the default.
 RESP=$(send_session "$DB8" \
     "$INIT_REQ" \
     "$(mk_tool_call 2 ensure_project "{\"human_key\":\"${PROJ8}\"}")" \
@@ -422,13 +420,15 @@ RESP=$(send_session "$DB8" \
 )
 
 e2e_step_start "boundary_limits"
-STATUS_ZERO=$(is_error "$RESP" 3)
-STATUS_ONE=$(is_error "$RESP" 4)
-STATUS_LARGE=$(is_error "$RESP" 5)
-
-e2e_assert_not_contains "limit=0 no crash" "$(echo "$RESP")" "panicked"                # 32
-e2e_assert_eq "limit=1 succeeds" "OK" "$STATUS_ONE"                                    # 33
-e2e_assert_eq "limit=1000 succeeds" "OK" "$STATUS_LARGE"                               # 34
+require_success "$RESP" 2
+EXPECTED_IDS=$(fixture_message_ids "$DB8" 5)
+RESULT_ZERO=$(search_ids "$RESP" 3)
+RESULT_DEFAULT_SET=$(search_ids "$RESP" 3 sorted)
+RESULT_ONE=$(search_ids "$RESP" 4)
+RESULT_LARGE=$(search_ids "$RESP" 5 sorted)
+e2e_assert_eq "limit=0 defaults to the full fixture" "$EXPECTED_IDS" "$RESULT_DEFAULT_SET" # 32
+e2e_assert_eq "limit=1 returns the default search's top message" "${RESULT_ZERO%%,*}" "$RESULT_ONE" # 33
+e2e_assert_eq "limit=1000 returns the full fixture" "$EXPECTED_IDS" "$RESULT_LARGE"     # 34
 e2e_step_end "boundary_limits"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -439,7 +439,7 @@ e2e_case_banner "Search config kill switches"
 DB9="${WORK}/kill_switches.db"
 PROJ9="${WORK}/proj-kill-switches"
 
-setup_project_with_data "$DB9" "$PROJ9" 3 >/dev/null 2>&1
+setup_project_with_data "$DB9" "$PROJ9" 3
 
 # Test with diversity disabled
 e2e_step_start "diversity_disabled_search"
@@ -493,17 +493,31 @@ e2e_case_banner "Database corruption resilience"
 DB10="${WORK}/corrupt_db.db"
 
 # Create a non-SQLite file as the database
-echo "THIS IS NOT A SQLITE DATABASE FILE" > "$DB10"
+printf '%s\n' "THIS IS NOT A SQLITE DATABASE FILE" > "$DB10"
+cp "$DB10" "${DB10}.original"
+CORRUPT_ARCHIVE="${DB10%.db}.archive"
+mkdir -p "$CORRUPT_ARCHIVE"
 
 e2e_step_start "corrupt_db_search"
-RESP=$(send_session "$DB10" \
-    "$INIT_REQ" \
-    "$(mk_tool_call 2 ensure_project "{\"human_key\":\"${WORK}/proj-corrupt\"}")" \
-) 2>/dev/null || true
+# A corrupt mailbox is rejected during startup, before the client can initialize.
+CORRUPT_STATUS=$(DATABASE_URL="sqlite:///$DB10" STORAGE_ROOT="$CORRUPT_ARCHIVE" \
+    SEARCH_V3_INDEX_DIR="$CORRUPT_ARCHIVE/search_index" python3 -c '
+import subprocess
+import sys
 
-# The server should not crash with a segfault — it should return an error
-e2e_assert_not_contains "corrupt DB no segfault" "$(echo "$RESP")" "segfault"          # 39
-e2e_assert_not_contains "corrupt DB no panic" "$(echo "$RESP")" "panicked"             # 40
+with open(sys.argv[2], "w", encoding="utf-8") as log:
+    result = subprocess.run([sys.argv[1], "serve-stdio"], input=sys.argv[3] + "\n",
+                            text=True, stdout=log, stderr=log, timeout=12.5, check=False)
+print(result.returncode)
+' "$AM_BIN" "${E2E_ARTIFACT_DIR}/corrupt-startup.log" "$INIT_REQ")
+e2e_assert_eq "corrupt DB exits with a startup error" 1 "$CORRUPT_STATUS"               # 39
+e2e_assert_contains "startup error identifies the corrupt mailbox" \
+    "$(cat "${E2E_ARTIFACT_DIR}/corrupt-startup.log")" "database disk image is malformed"
+if cmp -s "$DB10" "${DB10}.original"; then
+    e2e_pass "corrupt DB bytes are preserved"                                         # 40
+else
+    e2e_fail "corrupt DB was changed during startup"
+fi
 e2e_step_end "corrupt_db_search"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -514,7 +528,7 @@ e2e_case_banner "Product-level search resilience"
 DB11="${WORK}/product_search.db"
 PROJ11="${WORK}/proj-product-search"
 
-setup_project_with_data "$DB11" "$PROJ11" 3 >/dev/null 2>&1
+setup_project_with_data "$DB11" "$PROJ11" 3
 
 # Search with product-level tool on nonexistent product
 RESP=$(send_session "$DB11" \
@@ -526,7 +540,7 @@ e2e_step_start "product_search_nonexistent"
 STATUS=$(is_error "$RESP" 2)
 e2e_assert_eq "nonexistent product search fails gracefully" "ERROR" "$STATUS"          # 41
 RESULT=$(extract_tool_result "$RESP" 2)
-e2e_assert_not_contains "product search no panic" "$(echo "$RESP")" "panicked"         # 42
+e2e_assert_contains "product search identifies the missing product" "$RESULT" "Product not found: nonexistent_product" # 42
 e2e_step_end "product_search_nonexistent"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -566,15 +580,18 @@ if [ -n "$AGENT_NAME" ]; then
         "$(mk_tool_call 7 search_messages "{\"project_key\":\"${PROJ12}\",\"query\":\"Ünîcödé\"}")" \
     )
 
-    STATUS_JP=$(is_error "$RESP2" 5)
-    STATUS_EMOJI=$(is_error "$RESP2" 6)
-    STATUS_UNICODE=$(is_error "$RESP2" 7)
+    require_success "$RESP2" 2
+    require_success "$RESP2" 3
+    UNICODE_ID=$(sent_message_id "$RESP2" 4)
+    search_ids "$RESP2" 5 >/dev/null
+    EMOJI_IDS=$(search_ids "$RESP2" 6)
+    UNICODE_IDS=$(search_ids "$RESP2" 7)
 
-    e2e_assert_eq "Japanese query succeeds" "OK" "$STATUS_JP"                          # 43
-    e2e_assert_eq "emoji query succeeds" "OK" "$STATUS_EMOJI"                          # 44
-    e2e_assert_eq "accented unicode query succeeds" "OK" "$STATUS_UNICODE"             # 45
+    e2e_pass "Japanese query returns a valid result list"                             # 43
+    e2e_assert_eq "emoji query finds the seeded message" "$UNICODE_ID" "$EMOJI_IDS"    # 44
+    e2e_assert_eq "accented Unicode query finds the seeded message" "$UNICODE_ID" "$UNICODE_IDS" # 45
 else
-    e2e_log "SKIP: Could not register agent for unicode tests"
+    e2e_fail "Unicode fixture agent registration did not return a name"
 fi
 e2e_step_end "unicode_messages"
 
@@ -586,11 +603,10 @@ e2e_case_banner "Very long query strings"
 DB13="${WORK}/long_query.db"
 PROJ13="${WORK}/proj-long-query"
 
-setup_project_with_data "$DB13" "$PROJ13" 2 >/dev/null 2>&1
+setup_project_with_data "$DB13" "$PROJ13" 2
 
-# Generate a 5000-char query
-LONG_QUERY=$(python3 -c "print('database migration plan ' * 200)" 2>/dev/null)
-ESCAPED_LONG=$(python3 -c "import json; print(json.dumps('$LONG_QUERY')[1:-1][:5000])" 2>/dev/null)
+# Generate the exact 5,000-character query.
+ESCAPED_LONG=$(python3 -c 'import json; print(json.dumps(("database migration plan " * 220)[:5000])[1:-1])')
 
 RESP=$(send_session "$DB13" \
     "$INIT_REQ" \
@@ -599,8 +615,10 @@ RESP=$(send_session "$DB13" \
 )
 
 e2e_step_start "long_query_search"
-e2e_assert_not_contains "long query no panic" "$(echo "$RESP")" "panicked"             # 46
-e2e_assert_not_contains "long query no segfault" "$(echo "$RESP")" "segfault"          # 47
+require_success "$RESP" 2
+RESULT=$(extract_tool_result "$RESP" 3)
+e2e_assert_not_contains "long query no panic" "$RESULT" "panicked"                     # 46
+e2e_assert_not_contains "long query no segfault" "$RESULT" "segfault"                  # 47
 e2e_step_end "long_query_search"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -640,7 +658,7 @@ e2e_case_banner "Search determinism"
 DB15="${WORK}/determinism.db"
 PROJ15="${WORK}/proj-determinism"
 
-setup_project_with_data "$DB15" "$PROJ15" 5 >/dev/null 2>&1
+setup_project_with_data "$DB15" "$PROJ15" 5
 
 # Run same search twice
 RESP_A=$(send_session "$DB15" \
@@ -656,31 +674,14 @@ RESP_B=$(send_session "$DB15" \
 )
 
 e2e_step_start "search_determinism"
-RESULT_A=$(extract_tool_result "$RESP_A" 3)
-RESULT_B=$(extract_tool_result "$RESP_B" 3)
-
-# Extract just the IDs to compare (ignoring timing fields)
-IDS_A=$(echo "$RESULT_A" | python3 -c "
-import sys, json
-try:
-    data = json.loads(sys.stdin.read())
-    ids = [str(r.get('id', '')) for r in data if isinstance(data, list)] if isinstance(data, list) else []
-    print(','.join(ids))
-except:
-    print('')
-" 2>/dev/null)
-
-IDS_B=$(echo "$RESULT_B" | python3 -c "
-import sys, json
-try:
-    data = json.loads(sys.stdin.read())
-    ids = [str(r.get('id', '')) for r in data if isinstance(data, list)] if isinstance(data, list) else []
-    print(','.join(ids))
-except:
-    print('')
-" 2>/dev/null)
-
-e2e_assert_eq "search results deterministic" "$IDS_A" "$IDS_B"                        # 52
+require_success "$RESP_A" 2
+require_success "$RESP_B" 2
+EXPECTED_IDS=$(fixture_message_ids "$DB15" 5)
+SORTED_IDS=$(search_ids "$RESP_A" 3 sorted)
+IDS_A=$(search_ids "$RESP_A" 3)
+IDS_B=$(search_ids "$RESP_B" 3)
+e2e_assert_eq "determinism search returns the seeded set" "$EXPECTED_IDS" "$SORTED_IDS"
+e2e_assert_eq "ranked message IDs are stable after restart" "$IDS_A" "$IDS_B"          # 52
 e2e_step_end "search_determinism"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -691,7 +692,7 @@ e2e_case_banner "Search with diverse env var configs"
 DB16="${WORK}/env_configs.db"
 PROJ16="${WORK}/proj-env-configs"
 
-setup_project_with_data "$DB16" "$PROJ16" 3 >/dev/null 2>&1
+setup_project_with_data "$DB16" "$PROJ16" 3
 
 # Test with custom diversity window
 e2e_step_start "custom_diversity_window"
@@ -756,7 +757,7 @@ e2e_case_banner "Degenerate query inputs"
 DB17="${WORK}/degenerate.db"
 PROJ17="${WORK}/proj-degenerate"
 
-setup_project_with_data "$DB17" "$PROJ17" 2 >/dev/null 2>&1
+setup_project_with_data "$DB17" "$PROJ17" 2
 
 RESP=$(send_session "$DB17" \
     "$INIT_REQ" \
@@ -768,13 +769,15 @@ RESP=$(send_session "$DB17" \
 )
 
 e2e_step_start "degenerate_queries"
-e2e_assert_not_contains "whitespace query no crash" "$(echo "$RESP")" "panicked"       # 58
-e2e_assert_not_contains "escape chars query no crash" "$(echo "$RESP")" "panicked"     # 59
-
-STATUS_SINGLE=$(is_error "$RESP" 5)
-e2e_assert_eq "single char query succeeds" "OK" "$STATUS_SINGLE"                      # 60
-
-e2e_assert_not_contains "boolean keywords query no crash" "$(echo "$RESP")" "panicked" # 61
+require_success "$RESP" 2
+WHITESPACE_IDS=$(search_ids "$RESP" 3)
+ESCAPE_IDS=$(search_ids "$RESP" 4)
+e2e_assert_eq "whitespace query returns an empty list" "" "$WHITESPACE_IDS"           # 58
+e2e_assert_eq "tab and newline query returns an empty list" "" "$ESCAPE_IDS"           # 59
+search_ids "$RESP" 5 >/dev/null
+e2e_pass "single char query returns a valid result list"                              # 60
+RESULT=$(extract_tool_result "$RESP" 6)
+e2e_assert_not_contains "boolean keywords query returns without panic" "$RESULT" "panicked" # 61
 e2e_step_end "degenerate_queries"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -785,7 +788,7 @@ e2e_case_banner "Thread summary resilience"
 DB18="${WORK}/thread_ops.db"
 PROJ18="${WORK}/proj-thread-ops"
 
-setup_project_with_data "$DB18" "$PROJ18" 3 >/dev/null 2>&1
+setup_project_with_data "$DB18" "$PROJ18" 3
 
 # Try to summarize a nonexistent thread
 RESP=$(send_session "$DB18" \
@@ -795,10 +798,10 @@ RESP=$(send_session "$DB18" \
 )
 
 e2e_step_start "thread_summary_nonexistent"
-STATUS=$(is_error "$RESP" 3)
+require_success "$RESP" 2
 RESULT=$(extract_tool_result "$RESP" 3)
 # Should handle gracefully — empty summary or error, not crash
-e2e_assert_not_contains "nonexistent thread no crash" "$(echo "$RESP")" "panicked"     # 62
+e2e_assert_not_contains "nonexistent thread returns without panic" "$RESULT" "panicked" # 62
 e2e_step_end "thread_summary_nonexistent"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -827,20 +830,26 @@ RESP_SETUP_B=$(send_session "$DB19" \
     "$(mk_tool_call 5 send_message "{\"project_key\":\"${PROJ19B}\",\"sender_name\":\"GreenBear\",\"to\":[\"YellowBear\"],\"subject\":\"Beta-only keyword\",\"body_md\":\"This message contains beta-unique-term-abc only in project B.\"}")" \
 )
 
-# Search project B for project-A-only term
+# Run the same query in both projects, with a matching fixture in A.
+for i in 2 3 4 5; do
+    require_success "$RESP_SETUP_A" "$i"
+    require_success "$RESP_SETUP_B" "$i"
+done
+ALPHA_ID=$(sent_message_id "$RESP_SETUP_A" 5)
 RESP=$(send_session "$DB19" \
     "$INIT_REQ" \
     "$(mk_tool_call 2 ensure_project "{\"human_key\":\"${PROJ19B}\"}")" \
     "$(mk_tool_call 3 search_messages "{\"project_key\":\"${PROJ19B}\",\"query\":\"alpha-unique-term-xyz\"}")" \
+    "$(mk_tool_call 4 search_messages "{\"project_key\":\"${PROJ19A}\",\"query\":\"alpha-unique-term-xyz\"}")" \
 )
 
 e2e_step_start "search_isolation"
-STATUS=$(is_error "$RESP" 3)
-RESULT=$(extract_tool_result "$RESP" 3)
-
-e2e_assert_eq "cross-project search succeeds" "OK" "$STATUS"                          # 63
-# Result should be empty (term only exists in project A)
-e2e_assert_not_contains "no cross-project leakage" "$RESULT" "Alpha-only"             # 64
+require_success "$RESP" 2
+BETA_RESULTS=$(search_ids "$RESP" 3)
+ALPHA_RESULTS=$(search_ids "$RESP" 4)
+e2e_assert_eq "query returns its planted result in project A" "$ALPHA_ID" "$ALPHA_RESULTS" # 63
+e2e_assert_eq "same query returns an empty list from project B" "" "$BETA_RESULTS"    # 64
+e2e_save_artifact "project-isolation.jsonl" "$RESP"
 e2e_step_end "search_isolation"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -851,7 +860,7 @@ e2e_case_banner "Response structure invariants"
 DB20="${WORK}/structure.db"
 PROJ20="${WORK}/proj-structure"
 
-setup_project_with_data "$DB20" "$PROJ20" 5 >/dev/null 2>&1
+setup_project_with_data "$DB20" "$PROJ20" 5
 
 RESP=$(send_session "$DB20" \
     "$INIT_REQ" \
@@ -860,31 +869,10 @@ RESP=$(send_session "$DB20" \
 )
 
 e2e_step_start "response_structure"
-RESULT=$(extract_tool_result "$RESP" 3)
-
-# Response should be parseable as JSON array or object
-STRUCTURE_CHECK=$(echo "$RESULT" | python3 -c "
-import sys, json
-try:
-    data = json.loads(sys.stdin.read())
-    if isinstance(data, list):
-        # Check each item has expected fields
-        for item in data:
-            if not isinstance(item, dict):
-                print('BAD_ITEM_TYPE')
-                sys.exit(0)
-        print('VALID_LIST')
-    elif isinstance(data, dict):
-        print('VALID_OBJECT')
-    else:
-        print('UNEXPECTED_TYPE')
-except json.JSONDecodeError:
-    print('INVALID_JSON')
-except:
-    print('ERROR')
-" 2>/dev/null)
-
-e2e_assert_contains "response is valid JSON structure" "$STRUCTURE_CHECK" "VALID"      # 65
+require_success "$RESP" 2
+RESULT_IDS=$(search_ids "$RESP" 3 sorted)
+EXPECTED_IDS=$(fixture_message_ids "$DB20" 5)
+e2e_assert_eq "response has a valid result list with all five IDs" "$EXPECTED_IDS" "$RESULT_IDS" # 65
 e2e_step_end "response_structure"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -894,26 +882,40 @@ e2e_case_banner "Concurrent project operations"
 
 DB21="${WORK}/concurrent.db"
 
-# Run 5 concurrent sessions against the same DB
+# One stdio server owns the mailbox. Pipeline independent requests within that runtime.
 e2e_step_start "concurrent_sessions"
-CONCURRENT_PASS=0
+CREATE_REQUESTS=("$INIT_REQ")
+SEARCH_REQUESTS=("$INIT_REQ")
 for i in $(seq 1 5); do
     PROJ_I="${WORK}/proj-concurrent-${i}"
-    RESP_I=$(send_session "$DB21" \
-        "$INIT_REQ" \
-        "$(mk_tool_call 2 ensure_project "{\"human_key\":\"${PROJ_I}\"}")" \
-        "$(mk_tool_call 3 search_messages "{\"project_key\":\"${PROJ_I}\",\"query\":\"test\"}")" \
-    ) 2>/dev/null || true
-
-    STATUS_I=$(is_error "$RESP_I" 3 2>/dev/null || echo "UNKNOWN")
-    if [ "$STATUS_I" = "OK" ]; then
+    id=$((i + 1))
+    CREATE_REQUESTS+=("$(mk_tool_call "$id" ensure_project "{\"human_key\":\"${PROJ_I}\"}")")
+    SEARCH_REQUESTS+=("$(mk_tool_call "$id" search_messages "{\"project_key\":\"${PROJ_I}\",\"query\":\"test\"}")")
+done
+CREATE_RESP=$(send_session "$DB21" --pipeline "${CREATE_REQUESTS[@]}")
+SEARCH_RESP=$(send_session "$DB21" --pipeline "${SEARCH_REQUESTS[@]}")
+e2e_save_artifact "pipelined-create.jsonl" "$CREATE_RESP"
+e2e_save_artifact "pipelined-search.jsonl" "$SEARCH_RESP"
+CONCURRENT_PASS=0
+for id in $(seq 2 6); do
+    require_success "$CREATE_RESP" "$id"
+    RESULT_IDS=$(search_ids "$SEARCH_RESP" "$id")
+    if [ -z "$RESULT_IDS" ]; then
         CONCURRENT_PASS=$((CONCURRENT_PASS + 1))
     fi
 done
 
-# At least some should succeed (may have lock contention on concurrent DB access)
-e2e_assert_contains "concurrent sessions have successes" "$CONCURRENT_PASS" ""         # 66
-e2e_assert_not_contains "no zero concurrent successes" "${CONCURRENT_PASS}" "-1"       # 67
+e2e_assert_eq "five pipelined project searches return empty lists after reopen" 5 "$CONCURRENT_PASS" # 66
+PROJECT_COUNT=$(python3 -c '
+from pathlib import Path
+import sqlite3
+import sys
+
+with sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True) as conn:
+    keys = {row[0] for row in conn.execute("SELECT human_key FROM projects")}
+    print(sum(str(Path(sys.argv[2]) / f"proj-concurrent-{i}") in keys for i in range(1, 6)))
+' "$DB21" "$WORK")
+e2e_assert_eq "all five project rows are persisted" 5 "$PROJECT_COUNT"               # 67
 e2e_step_end "concurrent_sessions"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -924,7 +926,7 @@ e2e_case_banner "Parameter validation"
 DB22="${WORK}/param_validate.db"
 PROJ22="${WORK}/proj-param-validate"
 
-setup_project_with_data "$DB22" "$PROJ22" 2 >/dev/null 2>&1
+setup_project_with_data "$DB22" "$PROJ22" 2
 
 # Missing required query field
 RESP=$(send_session "$DB22" \
@@ -934,8 +936,11 @@ RESP=$(send_session "$DB22" \
 )
 
 e2e_step_start "missing_query_param"
+require_success "$RESP" 2
 STATUS=$(is_error "$RESP" 3)
 e2e_assert_eq "missing query param returns error" "ERROR" "$STATUS"                    # 68
+RESULT=$(extract_tool_result "$RESP" 3)
+e2e_assert_contains "missing query error identifies the argument" "$RESULT" "query"
 e2e_step_end "missing_query_param"
 
 # Missing required project_key field
@@ -947,16 +952,19 @@ RESP=$(send_session "$DB22" \
 e2e_step_start "missing_project_key"
 STATUS=$(is_error "$RESP" 2)
 e2e_assert_eq "missing project_key returns error" "ERROR" "$STATUS"                    # 69
+RESULT=$(extract_tool_result "$RESP" 2)
+e2e_assert_contains "missing project error identifies the argument" "$RESULT" "project_key"
 e2e_step_end "missing_project_key"
 
-# Invalid JSON in search params
+# Valid JSON-RPC with an invalid arguments type.
 RESP=$(send_session "$DB22" \
     "$INIT_REQ" \
     '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_messages","arguments":"not json"}}' \
 )
 
 e2e_step_start "invalid_json_args"
-e2e_assert_not_contains "invalid JSON args no crash" "$(echo "$RESP")" "panicked"      # 70
+STATUS=$(is_error "$RESP" 2)
+e2e_assert_eq "invalid arguments type returns a tool error" "ERROR" "$STATUS"          # 70
 e2e_step_end "invalid_json_args"
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -972,8 +980,12 @@ RESP=$(send_session "$DB22" \
 )
 
 e2e_step_start "invalid_limits"
-e2e_assert_not_contains "negative limit no crash" "$(echo "$RESP")" "panicked"         # 71
-e2e_assert_not_contains "huge limit no crash" "$(echo "$RESP")" "panicked"             # 72
+require_success "$RESP" 2
+NEGATIVE_IDS=$(search_ids "$RESP" 3 sorted)
+LARGE_IDS=$(search_ids "$RESP" 4 sorted)
+EXPECTED_IDS=$(fixture_message_ids "$DB22" 2)
+e2e_assert_eq "negative limit uses the default and finds both messages" "$EXPECTED_IDS" "$NEGATIVE_IDS" # 71
+e2e_assert_eq "huge limit is clamped and finds both messages" "$EXPECTED_IDS" "$LARGE_IDS" # 72
 e2e_step_end "invalid_limits"
 
 # ═════════════════════════════════════════════════════════════════════════

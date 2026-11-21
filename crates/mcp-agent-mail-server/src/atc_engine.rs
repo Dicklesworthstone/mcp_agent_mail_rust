@@ -12244,6 +12244,11 @@ pub(crate) fn planned_release_for_test(
             .expect("engine initialized")
             .lock()
             .unwrap();
+        // Exercise release authority, not host scheduling: the production 5 ms
+        // budget can make a slow test tick revoke its own planned release before
+        // the executor checks it. Keep the real controller and admission gates,
+        // with enough fixture-only slack for an overloaded CI worker.
+        engine.config.tick_budget_micros = 60_000_000;
         engine.register_agent(agent, "codex-cli", Some(project));
         engine.observe_activity(agent, Some(project), last_activity);
         let entry = engine
