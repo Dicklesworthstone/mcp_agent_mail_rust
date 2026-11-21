@@ -324,23 +324,38 @@ if [ -n "$STALE_RES_ID" ] && [ "$STALE_RES_ID" != "" ]; then
             "$(parse_json_field "$FORCE_STALE_TEXT" "reservation.agent")"
         e2e_assert_eq "previous holder was notified" "True" \
             "$(parse_json_field "$FORCE_STALE_TEXT" "reservation.notified")"
+        # The bounded activity search reports recent touches only. Verify the
+        # old tracked commit independently and require a completed negative
+        # Git scan from the tool.
+        STALE_GIT_TS="$(git -C "$PROJECT_PATH" log -1 --format=%ct -- stale_files/lease.rs)"
+        if [[ "$STALE_GIT_TS" =~ ^[0-9]+$ ]] && (( STALE_GIT_TS > 0 && $(date +%s) - STALE_GIT_TS > 1800 )); then
+            e2e_pass "the reserved path has a tracked Git touch older than 30 minutes"
+        else
+            e2e_fail "the reserved path is missing the expected old Git touch"
+        fi
         FORCE_SIGNALS_CHECK="$(echo "$FORCE_STALE_TEXT" | python3 -c '
 from datetime import datetime, timezone
 import json, sys
 reservation = json.load(sys.stdin)["reservation"]
 now = datetime.now(timezone.utc)
-for field in ["last_agent_activity_ts", "last_filesystem_activity_ts", "last_git_activity_ts"]:
+for field in ["last_agent_activity_ts", "last_filesystem_activity_ts"]:
     value = reservation.get(field)
     old = value is not None and (now - datetime.fromisoformat(value.replace("Z", "+00:00"))).total_seconds() > 1800
     print(f"{field}_old={old}")
+reasons = reservation["stale_reasons"]
+git_stale = (reservation["last_git_activity_ts"] is None
+             and "git_activity_unknown" not in reasons
+             and any(reason.startswith("no_recent_git_activity>") for reason in reasons))
+print(f"git_stale={git_stale}")
 value = reservation.get("last_mail_activity_ts")
 mail_stale = value is None or (now - datetime.fromisoformat(value.replace("Z", "+00:00"))).total_seconds() > 1800
 print(f"mail_stale={mail_stale}")
 ')"
         e2e_save_artifact "case_04_stale_signals.txt" "$FORCE_SIGNALS_CHECK"
-        for field in last_agent_activity_ts last_filesystem_activity_ts last_git_activity_ts; do
+        for field in last_agent_activity_ts last_filesystem_activity_ts; do
             e2e_assert_contains "stale release observed old $field" "$FORCE_SIGNALS_CHECK" "${field}_old=True"
         done
+        e2e_assert_contains "force release completed its Git scan without a recent touch" "$FORCE_SIGNALS_CHECK" "git_stale=True"
         e2e_assert_contains "stale release observed no recent mail" "$FORCE_SIGNALS_CHECK" "mail_stale=True"
     else
         e2e_fail "force-release must release a reservation with four stale signals: $FORCE_STALE_TEXT"

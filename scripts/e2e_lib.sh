@@ -2880,9 +2880,10 @@ e2e_ensure_binary() {
 }
 
 # ---------------------------------------------------------------------------
-# Run an initialized MCP stdio session against a real server. By default each
-# response precedes the next request. --pipeline submits the remaining batch
-# together after the handshake, retaining every response for the caller.
+# Run an initialized MCP stdio session against a real server. An explicit
+# initialized notification is sent at the position supplied by the caller.
+# By default each response precedes the next request. --pipeline submits the
+# remaining batch together after the automatic handshake.
 e2e_stdio_session() {
     local mode=ordered
     if [ "${1:-}" = "--pipeline" ]; then
@@ -2974,7 +2975,7 @@ try:
     send(first)
     if "error" in receive({first["id"]}):
         sys.exit("MCP initialize failed")
-    if not requests or requests[0].get("method") != "notifications/initialized":
+    if not any(request.get("method") == "notifications/initialized" for request in requests):
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
     pending = set()
     for request in requests:
