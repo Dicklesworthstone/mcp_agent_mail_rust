@@ -60,7 +60,10 @@ import json
 import sys
 
 request_id, kind = int(sys.argv[1]), sys.argv[2]
-matching = [frame for frame in map(json.loads, sys.stdin) if frame.get("id") == request_id]
+matching = [
+    frame for frame in map(json.loads, sys.stdin)
+    if frame.get("id") == request_id and ("result" in frame or "error" in frame)
+]
 if len(matching) != 1:
     sys.exit(f"Expected one reply for request {request_id}, got {len(matching)}")
 reply, = matching

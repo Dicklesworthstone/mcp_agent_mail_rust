@@ -183,91 +183,71 @@ e2e_save_artifact "case_07_doctor_exit.json" \
   "{\"actual_exit_code\":$DOCTOR_RC,\"expected_exit_codes\":[0,1],\"state\":\"$DOCTOR_STATE\"}"
 
 # ===========================================================================
-# Case 8: mcp-agent-mail serve-stdio responds to MCP initialize
+# Case 8: the installed launcher serves tools after MCP initialization
 # ===========================================================================
-e2e_case_banner "serve-stdio responds to MCP initialize handshake"
+e2e_case_banner "installed launcher serves tools after MCP initialization"
 
-# Create a minimal MCP initialize request (JSON-RPC 2.0)
 MCP_INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-test","version":"0.0.1"}}}'
+MCP_TOOLS_REQ='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 
-# Use FIFO pattern (like test_stdio.sh) for reliable server communication
-SRV_WORK="$(mktemp -d "${TMPDIR:-/tmp}/fresh_install_srv.XXXXXX")"
-STDIO_FIFO="${SRV_WORK}/stdin_fifo"
-STDIO_RESPONSE="${SRV_WORK}/stdout.txt"
-STDIO_STDERR="${SRV_WORK}/stderr.txt"
-mkfifo "$STDIO_FIFO"
-
-set +e
-# Select the supported CLI surface for this binary's stdio command.
-AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:////${FAKE_HOME}/fresh_test.sqlite3" RUST_LOG=error \
-  "$FAKE_DEST/mcp-agent-mail" serve-stdio < "$STDIO_FIFO" > "$STDIO_RESPONSE" 2>"$STDIO_STDERR" &
-SRV_PID=$!
-
-# Give server a moment to start
-sleep 0.3
-
-# Send the request and close the FIFO to signal EOF
-echo "$MCP_INIT_REQ" > "$STDIO_FIFO" &
-WRITE_PID=$!
-
-# Wait for response through the original five 0.3-second polling intervals.
-ELAPSED=0
-while [ "$ELAPSED" -lt 5 ]; do
-  if [ -s "$STDIO_RESPONSE" ]; then
-    sleep 0.3
-    break
+check_installed_stdio() {
+  local label="$1" interface_mode="$2" default_entrypoint="$3" artifact_prefix="$4"
+  local stdio_root="${FAKE_HOME}/stdio-${interface_mode}"
+  local output rc=0 validation
+  mkdir -p "$stdio_root"
+  # Preserve the 0.3-second startup allowance and five 0.3-second polling
+  # intervals as the reply budget. The shared client also verifies clean EOF.
+  output="$(
+    AM_INTERFACE_MODE="$interface_mode" STORAGE_ROOT="$stdio_root/archive" \
+      E2E_STDIO_BINARY="$FAKE_DEST/mcp-agent-mail" \
+      E2E_STDIO_DEFAULT_ENTRYPOINT="$default_entrypoint" E2E_STDIO_TIMEOUT_SECONDS=1.8 \
+      E2E_STDIO_STDERR_PATH="$stdio_root/stderr.txt" RUST_LOG=error \
+      e2e_stdio_session "$stdio_root/mail.sqlite3" "$MCP_INIT_REQ" "$MCP_TOOLS_REQ"
+  )" || rc=$?
+  e2e_save_artifact "${artifact_prefix}_response.txt" "$output"
+  if [ -f "$stdio_root/stderr.txt" ]; then
+    e2e_save_artifact "${artifact_prefix}_stderr.txt" "$(cat "$stdio_root/stderr.txt")"
   fi
-  sleep 0.3
-  ELAPSED=$((ELAPSED + 1))
-done
-
-wait "$WRITE_PID" 2>/dev/null || true
-kill "$SRV_PID" 2>/dev/null || true
-wait "$SRV_PID" 2>/dev/null || true
-set -e
-
-MCP_INIT_OUT=""
-if [ -f "$STDIO_RESPONSE" ]; then
-  MCP_INIT_OUT="$(cat "$STDIO_RESPONSE")"
-fi
-
-e2e_save_artifact "case_08_mcp_init_response.txt" "$MCP_INIT_OUT"
-e2e_save_artifact "case_08_mcp_init_stderr.txt" "$(cat "$STDIO_STDERR" 2>/dev/null || true)"
-
-# Require the successful response to this request, not unrelated output.
-if MCP_INIT_VALIDATION="$(python3 - "$STDIO_RESPONSE" 2>&1 <<'PY'
+  e2e_assert_exit_code "$label completes the session and exits" "0" "$rc"
+  if [ "$rc" -ne 0 ]; then
+    return
+  fi
+  if validation="$(printf '%s\n' "$output" | python3 -c '
 import json
-import pathlib
 import sys
 
-for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    try:
-        response = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    if not isinstance(response, dict) or type(response.get("id")) is not int or response["id"] != 1:
-        continue
-    result = response.get("result")
-    if response.get("jsonrpc") != "2.0" or "error" in response or not isinstance(result, dict):
-        sys.exit("initialize ID1 did not return a successful JSON-RPC result")
-    if result.get("protocolVersion") != "2024-11-05":
-        sys.exit("initialize ID1 did not negotiate the supported protocol 2024-11-05")
-    print("valid")
-    sys.exit(0)
-sys.exit("missing initialize response ID1")
-PY
-)"; then
-  e2e_pass "MCP initialize ID1 succeeds with the supported protocol"
-else
-  e2e_fail "MCP initialize ID1 succeeds with the supported protocol" "valid" "$MCP_INIT_VALIDATION"
-fi
-e2e_save_artifact "case_08_mcp_init_validation.txt" "$MCP_INIT_VALIDATION"
+def require_result(replies, request_id):
+    matching = [
+        reply for reply in replies
+        if reply.get("id") == request_id and ("result" in reply or "error" in reply)
+    ]
+    if len(matching) != 1 or not isinstance(matching[0].get("result"), dict):
+        sys.exit(f"Request {request_id} did not receive one successful object result")
+    return matching[0]["result"]
 
-if [ "$AM_E2E_KEEP_TMP" = "1" ] || [ "$AM_E2E_KEEP_TMP" = "true" ]; then
-  printf 'Preserved stdio sandbox: %s\n' "$SRV_WORK" >&2
-else
-  rm -rf "$SRV_WORK" 2>/dev/null || true
-fi
+replies = list(map(json.loads, sys.stdin))
+if require_result(replies, 1).get("protocolVersion") != "2024-11-05":
+    sys.exit("Initialize did not negotiate 2024-11-05")
+tools = require_result(replies, 2).get("tools")
+if not isinstance(tools, list):
+    sys.exit("tools/list did not return a tool list")
+names = {tool.get("name") for tool in tools if isinstance(tool, dict)}
+required = {"ensure_project", "register_agent", "send_message", "fetch_inbox", "health_check"}
+if missing := required - names:
+    sys.exit(f"tools/list is missing {sorted(missing)}")
+print("valid")
+' 2>&1)"; then
+    e2e_pass "$label negotiates MCP and lists core tools after readiness"
+  else
+    e2e_fail "$label failed MCP readiness validation ($validation)"
+  fi
+  e2e_save_artifact "${artifact_prefix}_validation.txt" "$validation"
+}
+
+# Keep the explicit CLI case. Installed MCP configuration uses the same
+# launcher without arguments.
+check_installed_stdio "Explicit serve-stdio launcher" cli 0 case_08_mcp_init
+check_installed_stdio "Default MCP launcher" mcp 1 case_08_mcp_default
 
 # ===========================================================================
 # Case 9: install.sh detect_mcp_configs works in isolated env

@@ -2882,8 +2882,9 @@ e2e_ensure_binary() {
 # ---------------------------------------------------------------------------
 # Run an initialized MCP stdio session against a real server. An explicit
 # initialized notification is sent at the position supplied by the caller.
-# By default each response precedes the next request. --pipeline submits the
-# remaining batch together after the automatic handshake.
+# By default each response precedes the next request. --pipeline sends the
+# remaining frames in order without waiting between them.
+# E2E_STDIO_DEFAULT_ENTRYPOINT=1 starts the selected launcher without args.
 e2e_stdio_session() {
     local mode=ordered
     if [ "${1:-}" = "--pipeline" ]; then
@@ -2915,9 +2916,12 @@ deadline = time.monotonic() + float(os.environ.get("E2E_STDIO_TIMEOUT_SECONDS", 
 env = dict(os.environ, DATABASE_URL="sqlite:///" + Path(db_path).absolute().as_posix())
 env.setdefault("RUST_LOG", "error")
 stderr_path = env.get("E2E_STDIO_STDERR_PATH")
+command = [env.get("E2E_STDIO_BINARY", "am")]
+if env.get("E2E_STDIO_DEFAULT_ENTRYPOINT") != "1":
+    command.append("serve-stdio")
 with (open(stderr_path, "wb") if stderr_path else
       tempfile.NamedTemporaryFile(dir=log_dir, prefix="stdio-", suffix=".log", delete=False)) as log:
-    server = subprocess.Popen([env.get("E2E_STDIO_BINARY", "am"), "serve-stdio"],
+    server = subprocess.Popen(command,
                               env=env, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=log, text=True, encoding="utf-8")
 lines = queue.Queue()
@@ -2928,6 +2932,8 @@ def read_stdout():
     try:
         for line in server.stdout:
             lines.put(line)
+    except (OSError, UnicodeError) as error:
+        lines.put(error)
     finally:
         lines.put(None)
 
@@ -2953,27 +2959,51 @@ def send(request):
     if error is not None:
         sys.exit(f"Could not write stdio {request['method']}: {error}. See {log.name}")
 
-def receive(pending):
-    while pending:
+def receive(pending, end_by, *, until_eof=False):
+    while pending or until_eof:
         try:
-            line = lines.get(timeout=max(0, deadline - time.monotonic()))
+            remaining = end_by - time.monotonic()
+            if remaining <= 0:
+                raise queue.Empty
+            line = lines.get(timeout=remaining)
         except queue.Empty:
+            if until_eof:
+                sys.exit(f"Timed out draining stdio after EOF. See {log.name}")
             print(f"Timed out waiting for stdio response ids {sorted(pending, key=str)}. See {log.name}", file=sys.stderr)
             sys.exit(124)
         if line is None:
+            if until_eof:
+                return
             sys.exit(f"Server exited before stdio response ids {sorted(pending, key=str)}. See {log.name}")
-        response = json.loads(line)
+        if isinstance(line, Exception):
+            sys.exit(f"Could not read server stdout: {line}. See {log.name}")
         print(line, end="", flush=True)
-        if "result" in response or "error" in response:
-            pending.remove(response["id"])
-    return response
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as error:
+            sys.exit(f"Invalid JSON on server stdout: {error}. See {log.name}")
+        if not isinstance(response, dict) or response.get("jsonrpc") != "2.0":
+            sys.exit(f"Invalid JSON-RPC frame on server stdout. See {log.name}")
+        has_result = "result" in response
+        has_error = "error" in response
+        if has_result or has_error:
+            if has_result == has_error or "id" not in response:
+                sys.exit(f"Invalid JSON-RPC reply on server stdout. See {log.name}")
+            response_id = response["id"]
+            if type(response_id) not in (int, str) or response_id not in pending:
+                sys.exit(f"Unexpected or duplicate stdio response id {response_id!r}. See {log.name}")
+            pending.remove(response_id)
+            if not pending:
+                return response
+        elif not isinstance(response.get("method"), str):
+            sys.exit(f"Expected a JSON-RPC reply or method on server stdout. See {log.name}")
 
 writer = threading.Thread(target=write_stdin, daemon=True)
 writer.start()
 try:
     threading.Thread(target=read_stdout, daemon=True).start()
     send(first)
-    if "error" in receive({first["id"]}):
+    if "error" in receive({first["id"]}, deadline):
         sys.exit("MCP initialize failed")
     if not any(request.get("method") == "notifications/initialized" for request in requests):
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
@@ -2983,14 +3013,16 @@ try:
         if "id" in request:
             pending.add(request["id"])
             if mode == "ordered":
-                receive(pending)
+                receive(pending, deadline)
     if pending:
-        receive(pending)
+        receive(pending, deadline)
     writes.put(None)
     # The request budget ends at the last reply. EOF also needs to drain
     # acknowledged archive work before the next session opens this mailbox.
+    shutdown_deadline = time.monotonic() + 5
+    receive(set(), shutdown_deadline, until_eof=True)
     try:
-        exit_code = server.wait(timeout=5)
+        exit_code = server.wait(timeout=max(0, shutdown_deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         sys.exit(f"stdio server did not exit within five seconds after EOF. See {log.name}")
     if exit_code:
