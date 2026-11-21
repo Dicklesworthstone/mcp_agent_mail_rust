@@ -2190,16 +2190,18 @@ else
     e2e_fail "soak: timing artifact does not contain enough soak steps"
 fi
 
-if python3 - "${TIMINGS}" "${SOAK_REPORT}" "${SOAK_MIN_STEPS}" "${SOAK_DURATION_SECONDS}" \
+if PYTHONPATH="${SCRIPT_DIR}/../tests/e2e/lib${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 - "${TIMINGS}" "${SOAK_REPORT}" "${SOAK_MIN_STEPS}" "${SOAK_DURATION_SECONDS}" \
     "${SOAK_BUDGET_FIRST_BYTE_P95_MS}" "${SOAK_BUDGET_QUIESCE_P95_MS}" "${SOAK_BUDGET_QUIESCE_P99_MS}" \
     "${SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX}" "${SOAK_BUDGET_CPU_DRIFT_PCT_MAX}" "${SOAK_BUDGET_WAKE_DRIFT_PCT_MAX}" \
     "${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}" "${SOAK_BUDGET_LOW_VISIBILITY_FRACTION}" \
     "${SOAK_BUDGET_LOW_VISIBILITY_RATIO_MAX}" "${SOAK_PROFILE_DIR}" <<'PYEOF'
 import datetime
 import json
-import re
 import sys
 from pathlib import Path
+
+from tui_pidstat import read_samples
 
 (
     timing_path,
@@ -2254,44 +2256,6 @@ def drift_pct(start, end):
         return 0.0
     return ((end - start) / start) * 100.0
 
-def parse_pidstat_process(path: Path):
-    series = []
-    if not path.exists():
-        return series
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not re.match(r"^\d{2}:\d{2}:\d{2}\s+(AM|PM)\s+", line):
-                continue
-            parts = line.split()
-            if len(parts) < 9:
-                continue
-            try:
-                series.append(float(parts[8]))
-            except ValueError:
-                continue
-    return series
-
-def parse_pidstat_wake(path: Path):
-    series = []
-    if not path.exists():
-        return series
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not re.match(r"^\d{2}:\d{2}:\d{2}\s+(AM|PM)\s+", line):
-                continue
-            parts = line.split()
-            if len(parts) < 7:
-                continue
-            try:
-                cs = float(parts[5])
-                ncs = float(parts[6])
-            except ValueError:
-                continue
-            series.append(cs + ncs)
-    return series
-
 first = [float(s["first_byte_ms"]) for s in steps if s.get("first_byte_ms") is not None]
 quiesce_raw = [float(s.get("quiesce_ms", 0) or 0) for s in steps]
 min_capture = [float(s.get("min_capture_ms", 0) or 0) for s in steps]
@@ -2313,8 +2277,9 @@ end_q = mean(quiesce[-window:]) if quiesce else 0.0
 latency_drift = drift_pct(start_q, end_q)
 latency_growth = max(0.0, latency_drift)
 
-cpu_series = parse_pidstat_process(profile_dir / "soak_pidstat_process.txt")
-wake_series = parse_pidstat_wake(profile_dir / "soak_pidstat_wake.txt")
+pid = timing_doc.get("profile", {}).get("child_pid")
+cpu_series = [values[0] for _, values in read_samples(profile_dir / "soak_pidstat_process.txt", pid, ("%CPU",))]
+wake_series = [sum(values) for _, values in read_samples(profile_dir / "soak_pidstat_wake.txt", pid, ("cswch/s", "nvcswch/s"))]
 
 cpu_start = mean(cpu_series[: max(1, len(cpu_series) // 3)])
 cpu_end = mean(cpu_series[-max(1, len(cpu_series) // 3):]) if cpu_series else 0.0
@@ -2570,12 +2535,15 @@ if [ "${CAPTURE_BASELINE_PROFILE}" = "1" ]; then
     STRACE_LOG="${PROFILE_DIR}/baseline_forward_strace.log"
     PROFILE_SUMMARY="${E2E_ARTIFACT_DIR}/baseline_profile_summary.json"
 
+    PYTHONPATH="${SCRIPT_DIR}/../tests/e2e/lib${PYTHONPATH:+:${PYTHONPATH}}" \
     python3 - "${TIMING4}" "${PROFILE_META}" "${PIDSTAT_PROCESS}" "${PIDSTAT_THREADS}" "${PIDSTAT_WAKE}" "${STRACE_LOG}" "${PROFILE_SUMMARY}" "${E2E_ARTIFACT_DIR}" <<'PYEOF'
 import datetime
 import json
 import os
 import re
 import sys
+
+from tui_pidstat import read_samples
 
 timing_path, profile_meta_path, pidstat_proc_path, pidstat_threads_path, pidstat_wake_path, strace_path, out_path, artifact_dir = sys.argv[1:9]
 
@@ -2603,25 +2571,16 @@ def load_json(path):
     except Exception:
         return {}
 
-def parse_pidstat_process(path):
+def parse_pidstat_process(path, pid):
     cpu, usr, sysc, wait = [], [], [], []
     if not os.path.exists(path):
         return {"available": False, "samples": 0}
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not re.match(r"^\d{2}:\d{2}:\d{2}\s+(AM|PM)\s+", line):
-                continue
-            parts = line.split()
-            if len(parts) < 11:
-                continue
-            try:
-                usr.append(float(parts[4]))
-                sysc.append(float(parts[5]))
-                wait.append(float(parts[7]))
-                cpu.append(float(parts[8]))
-            except ValueError:
-                continue
+    for _, sample in read_samples(path, pid, ("%usr", "%system", "%wait", "%CPU")):
+        user, system, waiting, total = sample
+        usr.append(user)
+        sysc.append(system)
+        wait.append(waiting)
+        cpu.append(total)
     return {
         "available": True,
         "cpu_percent": q(cpu),
@@ -2631,34 +2590,17 @@ def parse_pidstat_process(path):
         "samples": len(cpu),
     }
 
-def parse_pidstat_threads(path):
+def parse_pidstat_threads(path, pid):
     if not os.path.exists(path):
         return {"available": False, "samples": 0, "threads_observed": 0}
     by_tid = {}
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not re.match(r"^\d{2}:\d{2}:\d{2}\s+(AM|PM)\s+", line):
-                continue
-            parts = line.split()
-            if len(parts) < 12:
-                continue
-            tgid = parts[3]
-            tid = parts[4]
-            if tid == "-":
-                continue
-            try:
-                usr = float(parts[5])
-                sysc = float(parts[6])
-                wait = float(parts[8])
-                cpu = float(parts[9])
-            except ValueError:
-                continue
-            slot = by_tid.setdefault(tid, {"tgid": tgid, "cpu": [], "usr": [], "sys": [], "wait": []})
-            slot["cpu"].append(cpu)
-            slot["usr"].append(usr)
-            slot["sys"].append(sysc)
-            slot["wait"].append(wait)
+    for tid, sample in read_samples(path, pid, ("%usr", "%system", "%wait", "%CPU"), threads=True):
+        usr, sysc, wait, cpu = sample
+        slot = by_tid.setdefault(tid, {"tgid": str(pid), "cpu": [], "usr": [], "sys": [], "wait": []})
+        slot["cpu"].append(cpu)
+        slot["usr"].append(usr)
+        slot["sys"].append(sysc)
+        slot["wait"].append(wait)
 
     all_cpu = []
     for item in by_tid.values():
@@ -2686,31 +2628,16 @@ def parse_pidstat_threads(path):
         "top_threads": top_threads[:12],
     }
 
-def parse_pidstat_wake(path):
+def parse_pidstat_wake(path, pid):
     cswch = []
     nvcswch = []
     by_tid = {}
     if not os.path.exists(path):
         return {"available": False, "samples": 0}
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not re.match(r"^\d{2}:\d{2}:\d{2}\s+(AM|PM)\s+", line):
-                continue
-            parts = line.split()
-            if len(parts) < 8:
-                continue
-            tid = parts[4]
-            if tid == "-":
-                continue
-            try:
-                cs = float(parts[5])
-                ncs = float(parts[6])
-            except ValueError:
-                continue
-            cswch.append(cs)
-            nvcswch.append(ncs)
-            by_tid.setdefault(tid, []).append(cs + ncs)
+    for tid, (cs, ncs) in read_samples(path, pid, ("cswch/s", "nvcswch/s"), threads=True):
+        cswch.append(cs)
+        nvcswch.append(ncs)
+        by_tid.setdefault(tid, []).append(cs + ncs)
 
     top_tid = sorted(
         ({"tid": tid, "mean_switches_per_s": round(sum(v)/len(v), 4), "max_switches_per_s": round(max(v), 4), "samples": len(v)} for tid, v in by_tid.items()),
@@ -2802,9 +2729,9 @@ summary = {
         "quiesce_ms": q(quiesce),
         "render_ms": q(render),
     },
-    "process_cpu": parse_pidstat_process(pidstat_proc_path),
-    "thread_cpu": parse_pidstat_threads(pidstat_threads_path),
-    "wake_behavior": parse_pidstat_wake(pidstat_wake_path),
+    "process_cpu": parse_pidstat_process(pidstat_proc_path, profile_doc.get("child_pid")),
+    "thread_cpu": parse_pidstat_threads(pidstat_threads_path, profile_doc.get("child_pid")),
+    "wake_behavior": parse_pidstat_wake(pidstat_wake_path, profile_doc.get("child_pid")),
     "syscall_profile": parse_strace(strace_path),
     "redraw_write_churn": {
         "ansi_metrics": timing_doc.get("ansi_metrics", {}),
