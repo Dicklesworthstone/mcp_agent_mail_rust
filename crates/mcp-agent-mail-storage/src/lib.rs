@@ -14010,6 +14010,12 @@ pub fn emit_notification_signal(
         return SignalEmitOutcome::InvalidTarget;
     }
 
+    let signal_path = config
+        .notifications_signals_dir
+        .join("projects")
+        .join(project_slug)
+        .join("agents")
+        .join(format!("{agent_name}.signal"));
     let debounce_ms = u128::from(config.notifications_debounce_ms);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -14020,18 +14026,18 @@ pub fn emit_notification_signal(
     {
         let mut map = signal_debounce().lock();
         let last = map.get(&key).copied().unwrap_or(0);
+        // Another process can clear the file without touching this cache.
+        // Debounce only while an actual regular wakeup file is present.
         if debounce_ms > 0 && now_ms.saturating_sub(last) < debounce_ms {
-            return SignalEmitOutcome::Debounced;
+            // A slow filesystem must not hold up unrelated recipients.
+            drop(map);
+            if fs::symlink_metadata(&signal_path).is_ok_and(|metadata| metadata.is_file()) {
+                return SignalEmitOutcome::Debounced;
+            }
+            map = signal_debounce().lock();
         }
         map.insert(key.clone(), now_ms);
     }
-
-    let signal_path = config
-        .notifications_signals_dir
-        .join("projects")
-        .join(project_slug)
-        .join("agents")
-        .join(format!("{agent_name}.signal"));
 
     let mut signal_data = serde_json::json!({
         "timestamp": Utc::now().to_rfc3339(),
@@ -22718,6 +22724,17 @@ mod tests {
             emit_notification_signal(&config, "proj", "Agent", None),
             SignalEmitOutcome::Debounced
         );
+
+        // Move the file without notifying this process's in-memory debounce.
+        let signal_path = config
+            .notifications_signals_dir
+            .join("projects/proj/agents/Agent.signal");
+        fs::rename(&signal_path, tmp.path().join("retained.signal")).unwrap();
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::Emitted
+        );
+        assert!(signal_path.is_file());
     }
 
     #[test]
