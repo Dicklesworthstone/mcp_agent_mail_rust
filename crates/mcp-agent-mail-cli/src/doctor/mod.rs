@@ -772,12 +772,39 @@ fn proactive_backup_age_secs(path: &Path) -> std::io::Result<Option<u64>> {
             "backup is shorter than a SQLite header",
         ));
     }
-    let mut magic = [0; SQLITE_MAGIC.len()];
-    file.read_exact(&mut magic)?;
-    if &magic != SQLITE_MAGIC {
+    let mut header = [0; SQLITE_HEADER_BYTES as usize];
+    file.read_exact(&mut header)?;
+    if &header[..SQLITE_MAGIC.len()] != SQLITE_MAGIC {
         return Err(std::io::Error::other(
             "backup is missing the SQLite file signature",
         ));
+    }
+    let encoded_page_size = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = match encoded_page_size {
+        1 => 65_536,
+        size if size >= 512 && size.is_power_of_two() => u64::from(size),
+        _ => {
+            return Err(std::io::Error::other(
+                "backup has an invalid SQLite page size",
+            ));
+        }
+    };
+    let len = metadata.len();
+    if !len.is_multiple_of(page_size) {
+        return Err(std::io::Error::other(format!(
+            "backup ends within a SQLite page ({len} bytes with {page_size}-byte pages)"
+        )));
+    }
+    let physical_pages = len / page_size;
+    // Older SQLite writers may leave a stale page count. It is authoritative
+    // only when it is nonzero and the change counter matches version-valid-for.
+    let declared_pages = u64::from(u32::from_be_bytes([
+        header[28], header[29], header[30], header[31],
+    ]));
+    if header[24..28] == header[92..96] && declared_pages > physical_pages {
+        return Err(std::io::Error::other(format!(
+            "backup contains {physical_pages} SQLite pages of the declared {declared_pages}"
+        )));
     }
     metadata
         .modified()?
@@ -4388,6 +4415,44 @@ mod tests {
         fs::rename(&backup, dir.path().join("invalid-image")).unwrap();
         seed_healthy_live_mailbox(&backup);
         assert_eq!(inspect().0, "ok");
+        let image = fs::read(&backup).unwrap();
+        let page_size = match u16::from_be_bytes([image[16], image[17]]) {
+            1 => 65_536,
+            size => usize::from(size),
+        };
+        assert!(image.len() > page_size);
+        for (name, len, diagnostic) in [
+            ("header-only", 100, "ends within a SQLite page"),
+            ("partial-page", image.len() - 1, "ends within a SQLite page"),
+            ("missing-page", image.len() - page_size, "of the declared"),
+        ] {
+            let truncated = dir.path().join(name);
+            fs::write(&truncated, &image[..len]).unwrap();
+            let (status, detail) = inspect_proactive_backup_health(&truncated, true, true, settled);
+            assert_eq!(status, "fail", "{name}: {detail}");
+            assert!(detail.contains(diagnostic), "{name}: {detail}");
+            assert_eq!(fs::read(truncated).unwrap(), &image[..len]);
+        }
+
+        let old_header = dir.path().join("stale-header-count");
+        let mut image = image;
+        let counter_byte = image[92];
+        image[24] = counter_byte.wrapping_add(1);
+        image[28..32].copy_from_slice(&u32::MAX.to_be_bytes());
+        fs::write(&old_header, &image).unwrap();
+        assert_eq!(
+            inspect_proactive_backup_health(&old_header, true, true, settled).0,
+            "ok",
+            "SQLite uses physical size when the change counters disagree"
+        );
+        let invalid_page_size = dir.path().join("invalid-page-size");
+        image[16..18].copy_from_slice(&0u16.to_be_bytes());
+        fs::write(&invalid_page_size, &image).unwrap();
+        let (status, detail) =
+            inspect_proactive_backup_health(&invalid_page_size, true, true, settled);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("invalid SQLite page size"), "{detail}");
+
         let file = fs::OpenOptions::new().write(true).open(&backup).unwrap();
         let now = SystemTime::now();
         let stale_age = Duration::from_secs(STALE_PROACTIVE_BACKUP_SECS + 60);
