@@ -6,8 +6,8 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
-Scope window: [v0.3.39 → v0.3.40](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.39...v0.3.40)
-and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.40...main). Entries use git diffs, tag targets,
+Scope window: [v0.3.40 → v0.3.41](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.40...v0.3.41)
+and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.41...main). Entries use git diffs, tag targets,
 GitHub publication metadata, Beads records, and executed release receipts.
 Publication dates are UTC; post-tag installer changes are identified separately.
 
@@ -17,6 +17,7 @@ Recent releases; the earlier version history continues below.
 
 | Version | Published (UTC) | Status | Delivered capability |
 |---------|-----------------|--------|----------------------|
+| [v0.3.41](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.41) | 2026-11-21 | **Release** | FrankenSQLite 0.4.13 + `fsqlite-core` WAL-cert/archive-header fixes and `mimalloc` `no_thp` memory fix (GH#372, GH#387); bounded shared-inbox/reservation scans & paged reservation history (GH#374, GH#377, GH#385, GH#388, GH#399); backup retention & Linux reader protections (GH#373, GH#383); archive/agent reconciliation & integrity diagnostic hardening (GH#375, GH#380, GH#381, GH#384, GH#390, GH#391, GH#400); `am doctor reconstruct --yes --json` stdout purity (GH#386); `am service status --json` (GH#378); pre-commit guard plugin checks & custom-runner preservation (GH#397, GH#398); document attachments with image conversion enabled (GH#395); macOS fstat installer lock & Rosetta Apple Silicon detection (GH#376, GH#394); PowerShell installer & Windows snapshot fixes (GH#352); dependency updates (`comrak 1.1.0`, `minijinja 3.1.0`, `jsonwebtoken 12.0.0`, `nix 0.32.0`) |
 | [v0.3.40](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.40) | 2026-11-01 | **Release** | Reservation writes staged outside the archive fence with a bounded 5 s wait (GH#351, GH#362, br-9ott5); background archive repair that resumes after restarts and survives source failures; automatic deletion and a byte limit for superseded backups (GH#355, GH#359); CLI reads served by the running local server (GH#368); request cancellation in write admission (GH#353); Windows checkpoint fixes, not yet run on native Windows (GH#369); in-process `age` passphrase decryption; cold-start backup rotation bounded to 1 s; dependency security updates |
 | [v0.3.39](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.39) | 2026-10-13 | **Release** | Startup survives a small or full temp directory (GH#347); integrity guard accepts proven never-written orphan pages instead of staying red (GH#291); project-addressed shared mailboxes (GH#282, schema v33) and opt-in session-bound identity (GH#279); reservation writes staged outside the archive fence; FastMCP 0.13.0 from crates.io; share-export, pre-commit guard, search, CLI, web UI, TUI and installer fixes (GH#339, GH#346, GH#348) |
 | [v0.3.38](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.38) | 2026-10-08 | **Release** | Server descriptor-leak fix (GH #333): one shared, bounded live read pool; FrankenSQLite 0.4.10 data-integrity update; background closeout replay and archive repair; CLI/TUI/search correctness fixes |
@@ -30,9 +31,21 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
-Changes on `main` that are not in the [v0.3.40 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.40), so they are not in the v0.3.40
-binaries. They were committed to `main` while v0.3.40 was being released; `main` then merged the
-release commit in 3fdda50c.
+No unreleased changes yet.
+
+---
+
+## v0.3.41 — 2026-11-21 [Release]
+
+Changes after the [v0.3.40 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.40).
+
+### Release highlights (post-v0.3.40)
+
+- **Mailbox engine, memory, and WAL recovery (GH#372, GH#387).** Advances the runtime mailbox engine to FrankenSQLite 0.4.13 (plus a core-only backport for transaction-bound archive headers and bounded zero-filled WAL certificate tail recovery), enables `mimalloc`'s `no_thp` feature to prevent transparent huge-page RSS amplification, and drops embedded Beads storage in favor of the external `br` CLI (GH#350).
+- **Bounded inbox, thread, and reservation reads (GH#374, GH#377, GH#385, GH#388, GH#399).** Seeks shared-mailbox header pages by timestamp and bounds sparse unread/ack scans; admits healthy `summarize_thread` and product reads while writers are active; pages immutable reservation history snapshots for projects exceeding 10,000 reservations; bounds and cancels Git activity scans for `resource://file_reservations`; adopts cancel-correct SQLModel pool waiter cleanup and synchronous pooled connection retirement.
+- **Reconciliation, integrity diagnostics, and CLI/doctor fixes (GH#375, GH#378, GH#380, GH#381, GH#384, GH#386, GH#390, GH#391, GH#400).** Suppresses repeated identical non-transient agent-profile reconcile conflicts; separates the agent-lifecycle archive repair toggle from message repair; reports archive agent lifecycle mismatches in `am doctor archive-verify`; tolerates legacy schemas without `reaper_exempt` during Python mailbox migration and defers client config takeover until migration verifies; isolates message-recovery identity scan budgets in >33k-message projects; requires exact orphan-page diagnostics so `NULL` in `NOT NULL` columns stays classified as structural; retries busy startup inventory for nightly `am agents reap`; adds machine-readable `--json` output to `am service status`; keeps `am doctor reconstruct --yes --json` stdout to a single JSON object (routing progress lines to stderr).
+- **Guard, attachments, and installer fixes (GH#352, GH#376, GH#394, GH#395, GH#397, GH#398).** Preserves customized chain-runner pre-commit hooks during `am guard install` and requires the runnable `hooks.d` plugin in `am guard status`; allows non-image document attachments (e.g., `.md`) even when image conversion is enabled; verifies Unix installer lock identity with native `fstat` on macOS; detects Apple Silicon hardware (`hw.optional.arm64=1`) under Rosetta 2 in `install.sh`; hardens `install.ps1` interrupt/recovery and duplicate-checksum checks.
+- **Dependencies.** Updated `comrak` to `1.1.0`, `minijinja` to `3.1.0`, `jsonwebtoken` to `12.0.0`, and `nix` to `0.32.0`.
 
 ### Persisted tool metrics: index growth and offline recovery (GH#372)
 
