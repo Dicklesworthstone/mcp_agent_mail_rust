@@ -116,6 +116,9 @@ hybrid = [
 ]
 # Enable loom model-checking tests (run with `cargo test --features loom-tests`)
 loom-tests = []
+# Run the existing integration-test binary with the production allocator.
+# Keep the system-allocator lane as the default for memory comparisons.
+test-mimalloc = []
 # Use S3-FIFO eviction in ReadCache (replaces IndexMap LRU)
 s3fifo = []
 
@@ -129,6 +132,7 @@ asupersync = { workspace = true, features = ["test-internals"] }
 criterion.workspace = true
 loom.workspace = true
 mcp-agent-mail-test-helpers.workspace = true
+mimalloc.workspace = true
 proptest.workspace = true
 
 [[bench]]
