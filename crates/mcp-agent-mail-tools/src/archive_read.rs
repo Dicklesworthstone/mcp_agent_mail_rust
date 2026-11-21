@@ -2832,13 +2832,32 @@ mod tests {
         )
         .expect("write recipient-bearing message");
         let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        let signals = directory.path().join("signals");
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
                 ("DATABASE_URL", database_url.as_str()),
                 ("STORAGE_ROOT", storage_root.to_str().expect("storage path")),
+                ("NOTIFICATIONS_ENABLED", "1"),
+                ("NOTIFICATIONS_DEBOUNCE_MS", "0"),
+                (
+                    "NOTIFICATIONS_SIGNALS_DIR",
+                    signals.to_str().expect("signals path"),
+                ),
             ],
             || {
                 mcp_agent_mail_core::Config::reset_cached();
+                let config = mcp_agent_mail_core::Config::get();
+                assert_eq!(
+                    mcp_agent_mail_storage::emit_notification_signal(
+                        &config,
+                        "single-flight-project",
+                        "Alice",
+                        None,
+                    ),
+                    mcp_agent_mail_storage::SignalEmitOutcome::Emitted
+                );
+                let signal = signals.join("projects/single-flight-project/agents/Alice.signal");
+                let signal_before = fs::read(&signal).expect("seeded wakeup");
                 let cx = Cx::for_testing();
                 let snapshot = acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
                     .expect("acquire snapshot")
@@ -2849,16 +2868,21 @@ mod tests {
                     .expect("build runtime");
                 runtime.block_on(async {
                     let ctx = fastmcp::prelude::McpContext::new(cx.clone(), 1);
-                    for mark_read in [Some(false), None, Some(true)] {
+                    for (mark_read, limit, unread_only) in [
+                        (Some(false), Some(10), Some(true)),
+                        (None, Some(10), Some(true)),
+                        (Some(true), Some(10), Some(true)),
+                        (None, None, None),
+                    ] {
                         let response = crate::fetch_inbox(
                             &ctx,
                             "/single-flight-project".to_string(),
                             "Alice".to_string(),
                             None,
                             None,
-                            Some(10),
+                            limit,
                             Some(true),
-                            Some(true),
+                            unread_only,
                             None,
                             None,
                             mark_read,
@@ -2881,6 +2905,10 @@ mod tests {
                             "snapshot reads must not invent durable read receipts: {response}"
                         );
                         assert!(messages[0]["ack_ts"].is_null());
+                        assert_eq!(
+                            fs::read(&signal).expect("archive read preserves the wakeup"),
+                            signal_before
+                        );
                         assert_eq!(
                             snapshot_family(snapshot.path()),
                             family_before,

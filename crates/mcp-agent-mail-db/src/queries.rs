@@ -11944,6 +11944,46 @@ pub async fn fetch_inbox_unread_metadata(
     .await
 }
 
+/// Acquire the live connection before the caller locks the notification.
+///
+/// The returned callback checks both inbox lanes synchronously, without
+/// retries, and authorizes clearing only after a successful empty read.
+pub async fn prepare_inbox_drain_check<'a>(
+    cx: &'a Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+) -> Outcome<impl Fn() -> bool + use<'a>, DbError> {
+    acquire_conn(cx, pool).await.map(|conn| {
+        move || {
+            // Failed or interrupted snapshot cleanup must retire the checkout.
+            conn.retire_on_drop.store(true, Ordering::Release);
+            let result = crate::sync::fetch_inbox_filtered_rows_with_cx(
+                cx,
+                &**conn,
+                project_id,
+                agent_id,
+                None,
+                1,
+                crate::sync::InboxFetchOptions {
+                    urgent_only: false,
+                    unread_only: true,
+                    ack_required_only: false,
+                    ack_overdue_before: None,
+                    topic: None,
+                    body_policy: crate::sync::InboxBodyPolicy::MetadataOnly,
+                },
+            );
+            if let Outcome::Ok(rows) = result {
+                conn.retire_on_drop.store(false, Ordering::Release);
+                rows.is_empty() && !cx.is_cancel_requested()
+            } else {
+                false
+            }
+        }
+    })
+}
+
 pub async fn fetch_inbox_ack_overdue(
     cx: &Cx,
     pool: &DbPool,

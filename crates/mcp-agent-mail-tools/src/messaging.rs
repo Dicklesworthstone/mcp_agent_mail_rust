@@ -5339,20 +5339,23 @@ pub async fn fetch_inbox(
         && topic.is_none()
         && limit.is_none()
         && messages.iter().all(|message| message.read_ts.is_some())
-        // A full page may leave unread mail outside the page. Check without
-        // filters or offsets so older already-read mail doesn't keep a signal
-        // pending forever. Any query error or cancellation keeps the signal.
-        && (messages.len() < msg_limit
-            || matches!(
-                mcp_agent_mail_db::queries::fetch_inbox_unread_metadata(
-                    ctx.cx(), &read_pool, project_id, agent_id, false, None, 1,
-                )
-                .await,
-                Outcome::Ok(rows) if rows.is_empty()
-            ))
+        && mcp_agent_mail_storage::notification_signal_may_exist(config, &project.slug, &agent.name)
+        && let Outcome::Ok(can_clear) = mcp_agent_mail_db::queries::prepare_inbox_drain_check(
+            ctx.cx(),
+            &read_pool,
+            project_id,
+            agent_id,
+        )
+        .await
     {
-        match mcp_agent_mail_storage::clear_notification_signal(config, &project.slug, &agent.name)
-        {
+        // Even a short page can race a later committed delivery. Check both
+        // inbox lanes while the recipient's signal is locked against emit.
+        match mcp_agent_mail_storage::clear_notification_signal_if(
+            config,
+            &project.slug,
+            &agent.name,
+            &can_clear,
+        ) {
             mcp_agent_mail_storage::SignalClearOutcome::RemoveFailed => tracing::warn!(
                 project = %project.slug,
                 agent = %agent.name,

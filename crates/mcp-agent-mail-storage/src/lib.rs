@@ -147,6 +147,7 @@ pub enum SignalClearOutcome {
     Disabled,
     InvalidTarget,
     Missing,
+    Retained,
     RemoveFailed,
 }
 
@@ -5064,7 +5065,7 @@ fn wbq_execute_op_inner(op: &WriteOp) -> Result<()> {
             | SignalClearOutcome::Disabled
             | SignalClearOutcome::InvalidTarget
             | SignalClearOutcome::Missing => Ok(()),
-            SignalClearOutcome::RemoveFailed => {
+            SignalClearOutcome::Retained | SignalClearOutcome::RemoveFailed => {
                 Err(StorageError::Io(std::io::Error::other(format!(
                     "failed to clear notification signal for project={project_slug} agent={agent_name}"
                 ))))
@@ -13963,35 +13964,14 @@ fn resolve_source_attachment_path_opt(
 // Notification signals (legacy parity)
 // ---------------------------------------------------------------------------
 
-type SignalDebounceKey = (PathBuf, String, String);
+const SIGNAL_CLEAR_BUDGET: Duration = Duration::from_millis(100);
+const SIGNAL_EMIT_LOCK_WAIT: Duration = Duration::from_millis(500);
 
-static SIGNAL_DEBOUNCE: OnceLock<OrderedMutex<HashMap<SignalDebounceKey, u128>>> = OnceLock::new();
-
-fn signal_debounce() -> &'static OrderedMutex<HashMap<SignalDebounceKey, u128>> {
-    SIGNAL_DEBOUNCE
-        .get_or_init(|| OrderedMutex::new(LockLevel::StorageSignalDebounce, HashMap::new()))
-}
-
-fn signal_debounce_key(config: &Config, project_slug: &str, agent_name: &str) -> SignalDebounceKey {
-    (
-        config.notifications_signals_dir.clone(),
-        project_slug.to_string(),
-        agent_name.to_string(),
-    )
-}
-
-/// Emit a notification signal file for a project/agent.
-#[must_use]
-pub fn emit_notification_signal(
+fn notification_signal_path(
     config: &Config,
     project_slug: &str,
     agent_name: &str,
-    message_metadata: Option<&NotificationMessage>,
-) -> SignalEmitOutcome {
-    if !config.notifications_enabled {
-        return SignalEmitOutcome::Disabled;
-    }
-
+) -> Option<PathBuf> {
     // Reject empty, whitespace-only, or path-traversal values to prevent writing
     // outside the signals directory.
     if project_slug.trim().is_empty()
@@ -14007,36 +13987,116 @@ pub fn emit_notification_signal(
         || agent_name == "."
         || agent_name.starts_with('.')
     {
-        return SignalEmitOutcome::InvalidTarget;
+        return None;
     }
 
-    let signal_path = config
-        .notifications_signals_dir
-        .join("projects")
-        .join(project_slug)
-        .join("agents")
-        .join(format!("{agent_name}.signal"));
-    let debounce_ms = u128::from(config.notifications_debounce_ms);
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+    Some(
+        config
+            .notifications_signals_dir
+            .join("projects")
+            .join(project_slug)
+            .join("agents")
+            .join(format!("{agent_name}.signal")),
+    )
+}
 
-    let key = signal_debounce_key(config, project_slug, agent_name);
-    {
-        let mut map = signal_debounce().lock();
-        let last = map.get(&key).copied().unwrap_or(0);
-        // Another process can clear the file without touching this cache.
-        // Debounce only while an actual regular wakeup file is present.
-        if debounce_ms > 0 && now_ms.saturating_sub(last) < debounce_ms {
-            // A slow filesystem must not hold up unrelated recipients.
-            drop(map);
-            if fs::symlink_metadata(&signal_path).is_ok_and(|metadata| metadata.is_file()) {
-                return SignalEmitOutcome::Debounced;
+// The signal inode changes on every publish. The adjacent lock stays in place
+// across publish, debounce and clear so all processes synchronize on one inode.
+fn lock_notification_signal(path: &Path, wait: Duration) -> std::io::Result<fs::File> {
+    use mcp_agent_mail_core::disk::{
+        create_new_private_file_no_follow, open_regular_file_read_write_no_follow,
+    };
+
+    let lock_path = path.with_extension("signal.lock");
+    let lock = match open_regular_file_read_write_no_follow(&lock_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match create_new_private_file_no_follow(&lock_path) {
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    open_regular_file_read_write_no_follow(&lock_path)
+                }
+                result => result,
             }
-            map = signal_debounce().lock();
         }
-        map.insert(key.clone(), now_ms);
+        result => result,
+    }?;
+
+    let started = Instant::now();
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => return Ok(lock),
+            Err(err) if signal_lock_contended(&err) && started.elapsed() < wait => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn signal_lock_contended(err: &std::io::Error) -> bool {
+    err.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
+fn notification_signal_metadata(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(Some(meta)),
+        Ok(_) => Err(std::io::Error::other(
+            "notification signal is not a regular file",
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// A cheap preflight before acquiring a database connection for a clear.
+/// Leave filesystem diagnostics and the authoritative check to the clear.
+#[must_use]
+pub fn notification_signal_may_exist(
+    config: &Config,
+    project_slug: &str,
+    agent_name: &str,
+) -> bool {
+    config.notifications_enabled
+        && notification_signal_path(config, project_slug, agent_name).is_some_and(|path| {
+            !matches!(fs::symlink_metadata(path), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+        })
+}
+
+/// Emit a notification signal file for a project/agent.
+#[must_use]
+pub fn emit_notification_signal(
+    config: &Config,
+    project_slug: &str,
+    agent_name: &str,
+    message_metadata: Option<&NotificationMessage>,
+) -> SignalEmitOutcome {
+    if !config.notifications_enabled {
+        return SignalEmitOutcome::Disabled;
+    }
+    let Some(signal_path) = notification_signal_path(config, project_slug, agent_name) else {
+        return SignalEmitOutcome::InvalidTarget;
+    };
+    let parent = signal_path.parent().unwrap_or(Path::new("."));
+    if path_existing_prefix_has_symlink(parent).unwrap_or(true)
+        || fs::create_dir_all(parent).is_err()
+    {
+        return SignalEmitOutcome::WriteFailed;
+    }
+    let Ok(_guard) = lock_notification_signal(&signal_path, SIGNAL_EMIT_LOCK_WAIT) else {
+        return SignalEmitOutcome::WriteFailed;
+    };
+    let Ok(signal) = notification_signal_metadata(&signal_path) else {
+        return SignalEmitOutcome::WriteFailed;
+    };
+    // The file is the debounce state, including across processes. A missing
+    // file always permits the next committed delivery to publish.
+    let debounce = Duration::from_millis(config.notifications_debounce_ms);
+    if !debounce.is_zero()
+        && signal
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < debounce)
+    {
+        return SignalEmitOutcome::Debounced;
     }
 
     let mut signal_data = serde_json::json!({
@@ -14068,13 +14128,15 @@ pub fn emit_notification_signal(
         });
     }
 
-    if let Ok(()) = write_json(&signal_path, &signal_data, false) {
+    // These files are outside archive publication. Reuse the atomic staging
+    // and rename without taking the archive mutation fence.
+    let result = (|| {
+        let content = serde_json::to_vec_pretty(&signal_data)?;
+        publish_atomic_write(&signal_path, &content, false)
+    })();
+    if result.is_ok() {
         SignalEmitOutcome::Emitted
     } else {
-        let mut map = signal_debounce().lock();
-        if map.get(&key).copied() == Some(now_ms) {
-            map.remove(&key);
-        }
         SignalEmitOutcome::WriteFailed
     }
 }
@@ -14086,59 +14148,56 @@ pub fn clear_notification_signal(
     project_slug: &str,
     agent_name: &str,
 ) -> SignalClearOutcome {
-    // No archive mutation guard: a signal file is a wake-up hint outside the
-    // Git archive, and fetch_inbox calls this on every read. Holding the global
-    // publication fence here queued inbox reads behind whole write-behind
-    // batches, 25-30 s under load (br-kp1in.13).
+    clear_notification_signal_if(config, project_slug, agent_name, || true)
+}
+
+/// Clear an existing signal only if the caller confirms it is safe while
+/// publication is excluded. The callback must run synchronously and should
+/// return false if it cannot establish that the inbox is drained.
+#[must_use]
+pub fn clear_notification_signal_if(
+    config: &Config,
+    project_slug: &str,
+    agent_name: &str,
+    can_clear: impl FnOnce() -> bool,
+) -> SignalClearOutcome {
     if !config.notifications_enabled {
         return SignalClearOutcome::Disabled;
     }
 
-    // Reject path-traversal characters and dot-prefix names.
-    if project_slug.trim().is_empty()
-        || agent_name.trim().is_empty()
-        || project_slug.contains('/')
-        || project_slug.contains('\\')
-        || project_slug.contains("..")
-        || project_slug == "."
-        || project_slug.starts_with('.')
-        || agent_name.contains('/')
-        || agent_name.contains('\\')
-        || agent_name.contains("..")
-        || agent_name == "."
-        || agent_name.starts_with('.')
-    {
+    let Some(signal_path) = notification_signal_path(config, project_slug, agent_name) else {
         return SignalClearOutcome::InvalidTarget;
-    }
-
-    let signal_path = config
-        .notifications_signals_dir
-        .join("projects")
-        .join(project_slug)
-        .join("agents")
-        .join(format!("{agent_name}.signal"));
-    let signal_key = signal_debounce_key(config, project_slug, agent_name);
+    };
     let parent = signal_path.parent().unwrap_or(Path::new("."));
 
     if path_existing_prefix_has_symlink(parent).unwrap_or(true) {
         return SignalClearOutcome::RemoveFailed;
     }
-    if let Ok(meta) = fs::symlink_metadata(&signal_path)
-        && meta.file_type().is_symlink()
-    {
-        return SignalClearOutcome::RemoveFailed;
+    match notification_signal_metadata(&signal_path) {
+        Ok(None) => return SignalClearOutcome::Missing,
+        Err(_) => return SignalClearOutcome::RemoveFailed,
+        Ok(Some(_)) => {}
     }
-
-    if !signal_path.exists() {
-        signal_debounce().lock().remove(&signal_key);
-        return SignalClearOutcome::Missing;
+    let started = Instant::now();
+    let _guard = match lock_notification_signal(&signal_path, Duration::ZERO) {
+        Ok(guard) => guard,
+        Err(err) if signal_lock_contended(&err) => return SignalClearOutcome::Retained,
+        Err(_) => return SignalClearOutcome::RemoveFailed,
+    };
+    match notification_signal_metadata(&signal_path) {
+        Ok(None) => return SignalClearOutcome::Missing,
+        Err(_) => return SignalClearOutcome::RemoveFailed,
+        Ok(Some(_)) => {}
+    }
+    // A slow probe should leave the wakeup in place, including for writers
+    // that may have exhausted their lock wait while it ran.
+    if !can_clear() || started.elapsed() >= SIGNAL_CLEAR_BUDGET {
+        return SignalClearOutcome::Retained;
     }
 
     match fs::remove_file(&signal_path) {
-        Ok(()) => {
-            signal_debounce().lock().remove(&signal_key);
-            SignalClearOutcome::Cleared
-        }
+        Ok(()) => SignalClearOutcome::Cleared,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => SignalClearOutcome::Missing,
         Err(_) => SignalClearOutcome::RemoveFailed,
     }
 }
@@ -17116,6 +17175,10 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     #[cfg(test)]
     let _test_guard = atomic_write_test_guard();
 
+    publish_atomic_write(path, data, sync)
+}
+
+fn publish_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     let tmp_path = stage_atomic_write(path, data, sync)?;
     if let Err(err) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
@@ -18557,10 +18620,6 @@ mod tests {
         assert!(unknown.contains("an unrecorded holder"), "{unknown}");
     }
 
-    /// br-kp1in.13: fetch_inbox clears a notification signal on every read, and
-    /// a cached directory is no mutation. Neither may queue behind the global
-    /// publication fence that a draining write-behind batch holds (observed:
-    /// inbox reads waiting 25-30 s); a real archive mutation still waits.
     #[test]
     fn oldest_fence_wait_is_the_earliest_start_not_the_lowest_sequence() {
         assert_eq!(oldest_fence_wait_start(&BTreeMap::new()), 0);
@@ -18605,7 +18664,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_clears_and_cached_dirs_do_not_wait_for_a_held_fence() {
+    fn signal_io_and_cached_dirs_do_not_wait_for_a_held_fence() {
         let tmp = TempDir::new().unwrap();
         let cached_dir = tmp.path().join("cached");
         ensure_dir(&cached_dir).expect("create and cache the directory");
@@ -18636,8 +18695,10 @@ mod tests {
                 config.notifications_enabled = enabled;
                 outcomes.push(clear_notification_signal(&config, "proj", "BlueLake"));
             }
+            // First delivery creates an uncached directory under a new project.
+            let emitted = emit_notification_signal(&config, "cold-project", "BlueLake", None);
             ensure_dir(&cached_dir).expect("cached directory");
-            done_tx.send(outcomes).expect("report outcomes");
+            done_tx.send((outcomes, emitted)).expect("report outcomes");
         });
         let outcomes = done_rx.recv_timeout(Duration::from_secs(5));
 
@@ -18656,10 +18717,13 @@ mod tests {
         mutator.join().expect("mutator thread");
         probe.join().expect("probe thread");
 
+        let (clears, emitted) =
+            outcomes.expect("signal I/O and a cached ensure_dir must finish under the fence");
         assert_eq!(
-            outcomes.expect("signal clears and a cached ensure_dir must not wait for the fence"),
+            clears,
             vec![SignalClearOutcome::Disabled, SignalClearOutcome::Cleared]
         );
+        assert_eq!(emitted, SignalEmitOutcome::Emitted);
         assert!(!signal.exists(), "the enabled clear removed the signal");
         assert!(
             mutation_waited,
@@ -22725,7 +22789,7 @@ mod tests {
             SignalEmitOutcome::Debounced
         );
 
-        // Move the file without notifying this process's in-memory debounce.
+        // Simulate an external consumer removing the wakeup within the debounce window.
         let signal_path = config
             .notifications_signals_dir
             .join("projects/proj/agents/Agent.signal");
@@ -22735,6 +22799,180 @@ mod tests {
             SignalEmitOutcome::Emitted
         );
         assert!(signal_path.is_file());
+    }
+
+    #[test]
+    fn concurrent_signal_delivery_after_drain_check_survives_across_processes() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::process::{Command, Stdio};
+
+        const ROOT_VAR: &str = "AM_TEST_SIGNAL_RACE_ROOT";
+        const DEBOUNCE_VAR: &str = "AM_TEST_SIGNAL_RACE_DEBOUNCE";
+        const TEST: &str =
+            "tests::concurrent_signal_delivery_after_drain_check_survives_across_processes";
+        let delivery = |id| NotificationMessage {
+            id: Some(id),
+            from: None,
+            subject: None,
+            importance: None,
+        };
+
+        if let Some(root) = std::env::var_os(ROOT_VAR) {
+            let root = PathBuf::from(root);
+            let config = Config {
+                notifications_enabled: true,
+                notifications_signals_dir: root,
+                notifications_debounce_ms: std::env::var(DEBOUNCE_VAR).unwrap().parse().unwrap(),
+                ..Config::default()
+            };
+            assert_eq!(
+                emit_notification_signal(&config, "proj", "Agent", Some(&delivery(1))),
+                SignalEmitOutcome::Emitted
+            );
+            eprintln!("signal-ready");
+            std::io::stdin().read_exact(&mut [0]).unwrap();
+            let path = notification_signal_path(&config, "proj", "Agent").unwrap();
+            let err = lock_notification_signal(&path, Duration::ZERO).unwrap_err();
+            assert!(signal_lock_contended(&err));
+            eprintln!("signal-contended");
+            assert_eq!(
+                emit_notification_signal(&config, "proj", "Agent", Some(&delivery(2))),
+                SignalEmitOutcome::Emitted
+            );
+            return;
+        }
+
+        for debounce in [0, 60_000] {
+            let tmp = TempDir::new().unwrap();
+            let config = Config {
+                notifications_enabled: true,
+                notifications_signals_dir: tmp.path().join("signals"),
+                notifications_debounce_ms: debounce,
+                ..Config::default()
+            };
+            let mut writer = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(ROOT_VAR, &config.notifications_signals_dir)
+                .env(DEBOUNCE_VAR, debounce.to_string())
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut start_delivery = writer.stdin.take().unwrap();
+            let stderr = writer.stderr.take().unwrap();
+            let (events_tx, events_rx) = std::sync::mpsc::channel();
+            let drain_stderr = std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stderr)
+                    .lines()
+                    .map_while(|line| line.ok())
+                {
+                    if line.starts_with("signal-") {
+                        let _ = events_tx.send(line);
+                    } else {
+                        eprintln!("{line}");
+                    }
+                }
+            });
+            assert_eq!(
+                events_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                "signal-ready"
+            );
+            let path = notification_signal_path(&config, "proj", "Agent").unwrap();
+            let original: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(original["message_id"], 1);
+            assert_eq!(
+                clear_notification_signal_if(&config, "proj", "Agent", || {
+                    // Simulate delivery after the live inbox check saw it drained.
+                    start_delivery.write_all(&[1]).unwrap();
+                    assert_eq!(
+                        events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                        "signal-contended"
+                    );
+                    true
+                }),
+                SignalClearOutcome::Cleared
+            );
+            assert!(writer.wait().unwrap().success());
+            drain_stderr.join().unwrap();
+            let signal: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(signal["message_id"], 2, "debounce {debounce} ms");
+            assert_eq!(
+                clear_notification_signal(&config, "proj", "Agent"),
+                SignalClearOutcome::Cleared
+            );
+            assert!(!path.exists());
+            assert!(path.with_extension("signal.lock").is_file());
+        }
+    }
+
+    #[test]
+    fn uncertain_or_contended_signal_clear_preserves_file_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            notifications_enabled: true,
+            notifications_signals_dir: tmp.path().join("signals"),
+            ..Config::default()
+        };
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::Emitted
+        );
+        let path = notification_signal_path(&config, "proj", "Agent").unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            clear_notification_signal_if(&config, "proj", "Agent", || false),
+            SignalClearOutcome::Retained
+        );
+        assert_eq!(
+            clear_notification_signal_if(&config, "proj", "Agent", || {
+                std::thread::sleep(SIGNAL_CLEAR_BUDGET);
+                true
+            }),
+            SignalClearOutcome::Retained
+        );
+        let lock = lock_notification_signal(&path, Duration::ZERO).unwrap();
+        assert_eq!(
+            clear_notification_signal_if(&config, "proj", "Agent", || {
+                panic!("a contended clear must skip the unread check");
+            }),
+            SignalClearOutcome::Retained
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        drop(lock);
+        assert_eq!(
+            clear_notification_signal(&config, "proj", "Agent"),
+            SignalClearOutcome::Cleared
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_lock_refuses_symlinks_without_touching_signal_or_target() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            notifications_enabled: true,
+            notifications_signals_dir: tmp.path().join("signals"),
+            ..Config::default()
+        };
+        let path = notification_signal_path(&config, "proj", "Agent").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "existing wakeup").unwrap();
+        let outside = tmp.path().join("outside");
+        fs::write(&outside, "untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, path.with_extension("signal.lock")).unwrap();
+
+        assert_eq!(
+            clear_notification_signal(&config, "proj", "Agent"),
+            SignalClearOutcome::RemoveFailed
+        );
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::WriteFailed
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "existing wakeup");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "untouched");
     }
 
     #[test]
