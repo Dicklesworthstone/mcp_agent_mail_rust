@@ -2452,7 +2452,8 @@ Common pitfalls
 | [ROLLOUT_PLAYBOOK.md](docs/ROLLOUT_PLAYBOOK.md) | Staged rollout strategy |
 | [SPEC-browser-parity-contract-deferred.md](docs/SPEC-browser-parity-contract-deferred.md) | Shipped public WASM replay boundary and deferred live browser-parity contract |
 | [SPEC-threat-model.md](docs/SPEC-threat-model.md) | Consolidated threat model covering assets, adversaries, attack surfaces, and mitigations |
-| [SPEC-search-v3-query-contract.md](docs/SPEC-search-v3-query-contract.md) | Query grammar, filters, and Search V3 contract |
+| [Search Architecture](#search-architecture) and [Search Pages](#search-pages) | Current routing, shadow exclusions, and robot pagination |
+| [SPEC-search-v3-query-contract.md](docs/SPEC-search-v3-query-contract.md) | Historical Search V3 design proposal |
 | [SPEC-web-ui-parity-contract.md](docs/SPEC-web-ui-parity-contract.md) | Web UI parity and route contract |
 | [SPEC-verify-live-contract.md](docs/SPEC-verify-live-contract.md) | Static bundle live-verification rules |
 | [TUI_V2_CONTRACT.md](docs/TUI_V2_CONTRACT.md) | TUI surface contract and parity expectations |

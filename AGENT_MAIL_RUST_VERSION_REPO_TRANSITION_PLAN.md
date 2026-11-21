@@ -1,6 +1,7 @@
 # AGENT_MAIL_RUST_VERSION_REPO_TRANSITION_PLAN
 
-Status: Active (initial Rust-side implementation completed in this repo on 2026-02-17)  
+**Status** — Historical proposal (initial Rust-side implementation completed in this repo on 2026-02-17)
+
 Date: 2026-02-17  
 Primary objective: convert `mcp_agent_mail` (Python, high-star canonical repo) into the Rust implementation while preserving user trust, install paths, and existing mailbox data.
 
@@ -14,7 +15,7 @@ The following transition-critical pieces are now implemented in this Rust repo:
 4. `am upgrade` orchestration flow (detect -> import-or-setup-refresh -> summary).
 5. Setup refresh invocation wired into import/upgrade flows.
 
-Remaining cutover work happens in the old canonical repo (`mcp_agent_mail`) using the templates and rollout phases in this document.
+The [original Python repository](https://github.com/Dicklesworthstone/mcp_agent_mail) now directs users to this maintained Rust repository. The in-place cutover described below is a historical proposal. Track any decision to convert the old repository under `br-ajiq8` and use the [migration runbook](docs/RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md) for mailbox migration today.
 
 ## 1. Problem Statement
 

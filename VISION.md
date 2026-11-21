@@ -7,7 +7,7 @@
 
 ## The One-Sentence Vision
 
-**Typing `am` from anywhere on the machine launches a showcase-quality full-screen TUI that simultaneously starts the MCP server, auto-detects every installed coding agent, configures their MCP connections, and presents a real-time operational dashboard — with zero manual setup, zero config files, and zero user prompts.**
+**Typing `am` in an interactive terminal opens the operations console and starts or attaches to the local MCP server. Setup discovers coding agents and configures their connections during installation or on explicit request.**
 
 ---
 
@@ -15,9 +15,9 @@
 
 These principles are non-negotiable and override all other design considerations:
 
-1. **Total Auto** — If something can be detected, configured, or resolved automatically, it must be. Never ask the user to do something the system can do itself.
-2. **Just Works** — Running `am` with no arguments must do everything: kill stale processes on the port, start the server, detect agents, configure MCP, launch the TUI. No manual exports, no env files, no `--flags`.
-3. **No Scripts** — Everything is baked into the `am` binary. No shell wrappers, no `scripts/am`. The binary IS the product.
+1. **Automatic discovery** — Discover supported clients, machine settings, and mailbox state wherever their authority is clear. Register individual agent identities through MCP or the CLI.
+2. **Predictable startup** — Bare `am` keeps the existing client configuration and uses the configured endpoint. When stdout is non-interactive it reports robot status.
+3. **Native operator interface** — The `am` binary owns setup, runtime, migration, and diagnostics commands. The distribution installers authenticate and install the released binary pair.
 4. **Showcase Quality** — The TUI must match the frankentui demo showcase in every way: visual polish, rounded borders, focus-aware panels, gradient text, rich charts, mouse support, semantic color tokens. "Same level of quality and attention to detail."
 5. **Zero Garbling** — ANSI escape codes must never appear as visible characters. Emoji widths must "just work" automatically without library users thinking about it.
 
@@ -27,17 +27,7 @@ These principles are non-negotiable and override all other design considerations
 
 ### What Happens When You Type `am`
 
-```
-$ am
-  1. Detect if port 8765 is in use → kill stale process (notify user)
-  2. Auto-discover all installed coding agents (Claude Code, Cursor, Codex, etc.)
-  3. Generate/update MCP config files for each detected agent
-  4. Start HTTP MCP server on 127.0.0.1:8765
-  5. Launch full-screen TUI (alt-screen mode)
-  6. Begin accepting MCP tool calls immediately
-```
-
-No subcommands needed for the default flow. Subcommands exist for targeted operations (`am setup --dry-run`, `am serve-http --no-tui`, `am robot inbox`, etc.) but the bare `am` command does everything.
+Interactive `am` uses the loopback HTTP endpoint `127.0.0.1:8765` by default. It can attach to an existing Agent Mail endpoint. An unrelated listener is a startup error. Use `am serve-http --no-tui` for an intentional headless launch and `am serve-stdio` for stdio transport. See the [operator cookbook](docs/OPERATOR_COOKBOOK.md).
 
 ### Two Audiences, One Binary
 
@@ -52,7 +42,7 @@ No subcommands needed for the default flow. Subcommands exist for targeted opera
 
 The TUI must be visually indistinguishable in quality from the frankentui demo showcase. Every screen must use frankentui's rich widget library natively — no ANSI string building, no manual cell rendering, no Paragraph widgets where Table/Sparkline/MiniBar should be used.
 
-### 16 Screens (All Fully Implemented)
+### 16 Registered Screens
 
 | # | Screen | What It Shows | Key Widgets |
 |---|--------|---------------|-------------|
@@ -129,37 +119,11 @@ am robot thread br-123 --include-bodies --format md
 
 ---
 
-## Auto-Setup: Agent Discovery & MCP Configuration
+## Agent Discovery and MCP Configuration
 
-Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
+`am setup status` shows discovered clients and their configuration. Use `am setup run --dry-run` to preview the writes, `am setup run` to apply them, or `am serve-http --setup` to apply them for the requested server endpoint. Native setup uses `franken-agent-detection` and the configured home directories. Environment overrides and client-specific locations are covered in the [operator cookbook](docs/OPERATOR_COOKBOOK.md).
 
-### What `am` Does on Startup (and `am setup` explicitly)
-
-1. **Detect installed agents** via `coding_agent_session_search`:
-   - Claude Code (check `~/.claude/`)
-   - Cursor (check `~/.cursor/`)
-   - Codex CLI (check `~/.codex/`)
-   - Windsurf, Cline, Roo Code, Aider, Continue, Amazon Q
-
-2. **Generate MCP config** for each detected agent:
-   - Write to agent-specific config locations (e.g., `~/.claude/claude_desktop_config.json`)
-   - Include bearer token, host, port, path
-   - Non-destructive: merge with existing config, don't overwrite unrelated entries
-
-3. **Token management**:
-   - Auto-generate if none exists
-   - Save to `~/.mcp_agent_mail/.env`
-   - Read from env file on startup
-
-4. **Claude Code hooks**:
-   - Install notification hooks for inbox check
-   - Wire up pre-commit guard
-
-5. **`am setup status`** — Show what's configured, what's detected, what's missing
-
-### Conflict: Scripts vs Binary
-
-**Resolution (later wins):** No `scripts/am` wrapper. The `am` binary handles everything directly. If a `scripts/am` exists, it should be removed. The binary reads `.env` files, manages tokens, detects agents — all natively in Rust.
+Setup merges Agent Mail entries with existing client configuration. It keeps the bearer token in the private canonical config, normally `${XDG_CONFIG_HOME:-$HOME/.config}/mcp-agent-mail/config.env`. Agent registration and transport policy remain explicit. Any move toward automatic client rewrites at bare startup would require deciding when those writes have operator authorization.
 
 ---
 
@@ -172,9 +136,7 @@ Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
 
 ### frankensqlite Integration (Implemented, Hardening Ongoing)
 
-**Current state:** `DbConn` and canonical verification/recovery paths now use `sqlmodel-frankensqlite`, and the Rust binaries no longer link `libsqlite3`.
-
-> **Reality note (2026-09-01; configuration updated 2026-09-20):** the runtime mailbox path is FrankenSQLite only (`DbConn`, test-enforced), but the binaries still statically bundle C SQLite through `sqlmodel-sqlite` (a non-optional dependency of the db and cli crates) for verification and recovery cross-checks (`CanonicalDbConn`: doctor double-probe, reconstruct, legacy import). `BEGIN CONCURRENT` is implemented but opt-in (`FSQLITE_CONCURRENT_MODE`, default off; 85 `BEGIN IMMEDIATE` sites remain) pending the upstream MVCC snapshot-drift fix. Agent Mail exposes no erasure-coded WAL self-healing setting; the unused option was removed in `br-of0ra`.
+**Current state.** Live mailbox queries use `DbConn` through `sqlmodel-frankensqlite`. The binaries also statically bundle C SQLite through `sqlmodel-sqlite` for independent checks in doctor, reconstruction, and legacy import (`CanonicalDbConn`). `FSQLITE_CONCURRENT_MODE` remains opt-in while MVCC hardening continues.
 
 **Next hardening work:**
 - Keep closing any remaining engine feature gaps directly in FrankenSQLite rather than reintroducing C SQLite
@@ -185,7 +147,7 @@ Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
 
 ### asupersync Everywhere
 
-Zero tokio in source code. All async via `Cx` + structured concurrency. HTTP via `asupersync::http::h1::HttpClient`. The only transitive tokio dependency is optional via `coding-agent-search` feature.
+The workspace uses Asupersync for async work and HTTP. Its structured-concurrency context flows from callers. The [workspace rules](AGENTS.md) describe the dependency boundary and production feature checks.
 
 ---
 
@@ -237,13 +199,13 @@ VS16 (U+FE0F) variation selectors must be stripped before width calculation in `
 
 ## Priority Stack (What to Fix/Build First)
 
-1. **`am` just works** — Bare `am` command launches server + TUI + auto-setup. Kill stale port. No manual steps.
+1. **Reliable `am` startup** — Keep interactive launch, live attach, explicit setup, and headless operation reliable across supported platforms.
 2. **Fix ANSI garbling** — Zero garbled output anywhere in the TUI. Ever.
 3. **Search-as-you-type** — The most-requested missing feature. Must work like frankentui showcase search.
 4. **Visual polish to showcase quality** — Theme system, semantic colors, focus states, rounded borders, mouse support.
 5. **All 16 screens fully implemented** — No placeholder stubs. Every screen uses real widgets with real data.
 6. **Robot mode CLI** — Agent-optimized `am robot` subcommands with JSON/TOON/Markdown output.
-7. **frankensqlite full migration** — Once triggers land, switch DbConn and unlock MVCC concurrent writes.
+7. **FrankenSQLite hardening** — Keep the live path on FrankenSQLite and qualify opt-in concurrent writes under realistic workloads.
 
 ---
 

@@ -31,13 +31,13 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
-No unreleased changes yet.
+- Reservation paths containing a NUL byte are rejected before any mailbox write. This landed after the v0.3.41 tag (`dab8ab6b`).
 
 ---
 
 ## v0.3.41 — 2026-11-21 [Release]
 
-Changes after the [v0.3.40 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.40).
+The [v0.3.41 release](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.41) points to `6eca1c4d` and publishes six platform archives with a signed checksum manifest. The versioned GHCR image has Linux amd64 and arm64 variants. The changes below cover the range from v0.3.40 through that tag.
 
 ### Release highlights (post-v0.3.40)
 
@@ -51,8 +51,10 @@ Changes after the [v0.3.40 tag](https://github.com/Dicklesworthstone/mcp_agent_m
 
 - **The mailbox engine moves to registry FrankenSQLite 0.4.13.** Both direct
   pins (`fsqlite` and `fsqlite-types`) and the runtime engine family in
-  `Cargo.lock` advance together. SQLModel 0.5.0 and Asupersync 0.5.0 remain
-  compatible; embedded Beads retains its independent patched 0.3.18 engine.
+  `Cargo.lock` advance together, with `fsqlite-core` patched to revision
+  `e7ffeff4`. SQLModel is 0.5.1 with core, pool, and the FrankenSQLite driver
+  patched to `ca959f89`. The locked Asupersync 0.5.0 revision is `2946438a`.
+  The Beads integration uses the external `br` command.
   The published release contains the divider-aware B-tree sibling balancing
   fixes for descending index insertions ([upstream #521](https://github.com/Dicklesworthstone/frankensqlite/issues/521)).
   These prevent the sparse-leaf amplification of
