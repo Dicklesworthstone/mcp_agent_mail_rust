@@ -29,297 +29,226 @@ source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 e2e_init_artifacts
 e2e_banner "Malformed JSON-RPC Protocol E2E Suite"
 
-# Build the am binary
-e2e_ensure_binary "am" >/dev/null
-export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
-e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
+AM_BIN="$(e2e_ensure_binary am | tail -n 1)"
+e2e_log "am binary: $AM_BIN"
 
-# Temp workspace
 WORK="$(e2e_mktemp "e2e_malformed")"
-MAL_DB="${WORK}/malformed_test.sqlite3"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-malformed","version":"1.0"}}}'
 
-# Helper: send JSON-RPC requests to server
-send_jsonrpc_session() {
-    local db_path="$1"
-    shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
+# Preserve raw wire bytes for parser cases. Operating requests wait for
+# initialize and send the readiness notification before the fixture frames.
+send_rpc_frames() {
+    local mode="$1" stderr_path="$2" expected="$3"
+    shift 3
+    printf '%s\0' "$@" | python3 -c '
+import json
+import os
+from pathlib import Path
+import queue
+import subprocess
+import sys
+import threading
+import time
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
+binary, case_dir, mode, stderr_path, initialize, expected = sys.argv[1:]
+frames = sys.stdin.buffer.read().split(b"\0")
+if frames.pop() != b"":
+    sys.exit("Incomplete raw stdio fixture")
+workspace = Path(case_dir).absolute()
+env = dict(os.environ, DATABASE_URL="sqlite:///" + (workspace / "mail.sqlite3").as_posix(),
+           STORAGE_ROOT=str(workspace / "archive"), AM_INTERFACE_MODE="cli",
+           AM_ALLOW_EPHEMERAL_PROJECT_ROOTS="1", FASTMCP_NO_BANNER="0", RUST_LOG="error")
+# The former fixture allowed 0.3 seconds for startup and ten 0.3-second polls.
+deadline = time.monotonic() + 3.3
+with open(stderr_path, "wb") as log:
+    server = subprocess.Popen([binary, "serve-stdio"], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=log, bufsize=0, env=env)
 
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.2
-        done
-    } > "$fifo" &
-    local write_pid=$!
+def exchange(outgoing, reply_count):
+    received = queue.Queue()
 
-    local timeout_s=10
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.3
-        elapsed=$((elapsed + 1))
-    done
+    def send_and_read():
+        try:
+            pending = memoryview(b"\n".join(outgoing) + b"\n")
+            while pending:
+                written = server.stdin.write(pending)
+                if not written:
+                    raise OSError("short raw fixture write")
+                pending = pending[written:]
+            for _ in range(max(1, reply_count)):
+                line = server.stdout.readline()
+                received.put(line)
+                if not line:
+                    break
+        except OSError as error:
+            received.put(error)
 
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
+    threading.Thread(target=send_and_read, daemon=True).start()
+    replies = []
+    # The notification-shaped opening has no reply to time. It is the one
+    # case that waits for stdout to close under the shutdown deadline.
+    read_deadline = deadline if reply_count else time.monotonic() + 5
+    for _ in range(max(1, reply_count)):
+        remaining = read_deadline - time.monotonic()
+        try:
+            if remaining <= 0:
+                raise queue.Empty
+            line = received.get(timeout=remaining)
+        except queue.Empty:
+            limit = "3.3-second reply" if reply_count else "five-second shutdown"
+            print(f"stdio {limit} deadline exceeded. See {stderr_path}", file=sys.stderr)
+            sys.exit(124)
+        if isinstance(line, OSError):
+            raise line
+        if not line:
+            if not reply_count:
+                break
+            sys.exit(f"Server closed stdout while a reply was pending. See {stderr_path}")
+        sys.stdout.buffer.write(line)
+        replies.append(line)
+    return replies
 
-    if [ -f "$output_file" ]; then
-        cat "$output_file"
+try:
+    reply_count = len(json.loads(expected))
+    if mode == "ready":
+        first, = exchange([initialize.encode("utf-8")], 1)
+        reply = json.loads(first)
+        if (reply.get("jsonrpc") != "2.0" or reply.get("id") != 1 or "error" in reply
+                or reply.get("result", {}).get("protocolVersion") != "2024-11-05"):
+            sys.exit(f"Unexpected initialize reply. See {stderr_path}")
+        frames.insert(0, b"""{"jsonrpc":"2.0","method":"notifications/initialized"}""")
+        reply_count -= 1
+    exchange(frames, reply_count)
+    # Opening-frame rejection must end the session with stdin still open.
+    # An initialized session shuts down when the client closes stdin.
+    if mode == "reject":
+        server.wait(timeout=5)
+    stdout, _ = server.communicate(timeout=5)
+    sys.stdout.buffer.write(stdout)
+    expected_status = 1 if mode == "reject" else 0
+    if server.returncode != expected_status:
+        sys.exit(f"stdio server exited with status {server.returncode}, expected {expected_status}. See {stderr_path}")
+    if mode == "reject" and not reply_count and b"Server ready." not in Path(stderr_path).read_bytes():
+        sys.exit(f"Server exited before reaching the stdio transport. See {stderr_path}")
+except subprocess.TimeoutExpired as error:
+    sys.stdout.buffer.write(error.output or b"")
+    print(f"stdio server exceeded the five-second shutdown deadline. See {stderr_path}", file=sys.stderr)
+    sys.exit(124)
+finally:
+    if server.poll() is None:
+        server.kill()
+    server.wait()
+' "$AM_BIN" "$WORK" "$mode" "$stderr_path" "$INIT_REQ" "$expected"
+}
+
+check_rpc_replies() {
+    printf '%s' "$1" | python3 -c '
+from collections import Counter
+import json
+import sys
+
+def classify(frame):
+    if frame.get("jsonrpc") != "2.0" or ("result" in frame) == ("error" in frame):
+        sys.exit(f"Unexpected JSON-RPC reply {frame}")
+    request_id = frame.get("id")
+    if "error" in frame:
+        error = frame["error"]
+        return request_id, error["code"], error["message"]
+    result = frame["result"]
+    if result.get("protocolVersion") == "2024-11-05" and "serverInfo" in result:
+        return request_id, "initialize"
+    if "tools" in result:
+        names = {tool["name"] for tool in result["tools"]}
+        if {"ensure_project", "send_message", "fetch_inbox"} <= names:
+            return request_id, "tools"
+    if result.get("isError", False) is False and "content" in result:
+        body = json.loads(result["content"][0]["text"])
+        if body.get("human_key") == "/tmp/rapid_test" and type(body.get("id")) is int and body["id"] > 0:
+            return request_id, "project"
+    sys.exit(f"Unexpected successful result for request {request_id}")
+
+# Compare whole reply sets. The server can report parser errors before an
+# earlier valid request finishes. Python preserves the large integer ID.
+actual = Counter(json.dumps(classify(json.loads(line))) for line in sys.stdin)
+expected = Counter(json.dumps(reply) for reply in json.loads(sys.argv[1]))
+if actual != expected:
+    sys.exit(f"Unexpected replies. Expected {list(expected.elements())}, got {list(actual.elements())}")
+' "$2"
+}
+
+run_rpc_case() {
+    local artifact="$1" label="$2" mode="$3" expected="$4"
+    shift 4
+    local stderr_path="$E2E_ARTIFACT_DIR/logs/$artifact.stderr.log"
+    local response rc=0 validation
+    e2e_case_banner "$label"
+    response="$(send_rpc_frames "$mode" "$stderr_path" "$expected" "$@")" || rc=$?
+    e2e_save_artifact "$artifact.txt" "$response"
+    if [ "$rc" -ne 0 ]; then
+        e2e_fail "$label (session exited $rc)"
+    elif validation="$(check_rpc_replies "$response" "$expected" 2>&1)"; then
+        e2e_pass "$label returned the expected replies and exit status"
+    else
+        e2e_fail "$label ($validation)"
     fi
 }
 
-# Helper: check server didn't crash and produced some output
-assert_no_crash() {
-    local label="$1"
-    local resp="$2"
-
-    # A non-empty response (or graceful empty response) means no crash
-    # We consider either: JSON-RPC error response, or empty output (server closed) as OK
-    local has_error
-    has_error="$(echo "$resp" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        if 'error' in d or ('result' in d and d['result'].get('isError', False)):
-            print('ERROR')
-            sys.exit(0)
-        if 'result' in d:
-            print('RESULT')
-            sys.exit(0)
-    except json.JSONDecodeError:
-        pass
-print('NONE')
-" 2>/dev/null)"
-
-    case "$has_error" in
-        ERROR)
-            e2e_pass "$label → server returned error (correct)"
-            ;;
-        RESULT)
-            e2e_pass "$label → server returned result (acceptable)"
-            ;;
-        NONE)
-            # Empty/no response is still OK — server didn't crash
-            e2e_pass "$label → server handled gracefully (no output)"
-            ;;
-    esac
-}
-
 # ===========================================================================
-# Case 1: Completely invalid JSON
-# ===========================================================================
-e2e_case_banner "Invalid JSON"
+# Replies are [id, error code, error message] or [id, successful result kind].
+# Parser failures may omit the unknown ID on the wire. FastMCP rejects a
+# malformed opening before negotiating an era, then closes with status 1.
+run_rpc_case case_01_invalid_json "Invalid JSON" reject '[[null,-32700,"Parse error"]]' \
+    '{{{{garbage not json at all}}}}'
 
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    '{{{{garbage not json at all}}}}')"
-e2e_save_artifact "case_01_invalid_json.txt" "$RESP"
-assert_no_crash "completely invalid JSON" "$RESP"
+run_rpc_case case_02_not_jsonrpc "Valid JSON, not JSON-RPC" reject '[[null,-32600,"Invalid Request"]]' \
+    '{"hello":"world","foo":42}'
 
-# ===========================================================================
-# Case 2: Valid JSON but not JSON-RPC
-# ===========================================================================
-e2e_case_banner "Valid JSON, not JSON-RPC"
+run_rpc_case case_03_wrong_version "Wrong JSON-RPC version" reject '[[1,-32600,"Invalid Request"]]' \
+    '{"jsonrpc":"1.0","id":1,"method":"initialize","params":{}}'
 
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    '{"hello":"world","foo":42}')"
-e2e_save_artifact "case_02_not_jsonrpc.txt" "$RESP"
-assert_no_crash "valid JSON but not JSON-RPC" "$RESP"
+run_rpc_case case_04_missing_method "Missing method field" reject '[[1,-32600,"Invalid Request"]]' \
+    '{"jsonrpc":"2.0","id":1,"params":{}}'
 
-# ===========================================================================
-# Case 3: Wrong JSON-RPC version
-# ===========================================================================
-e2e_case_banner "Wrong JSON-RPC version"
+run_rpc_case case_05_unknown_method "Unknown method after readiness" ready \
+    '[[1,"initialize"],[2,-32601,"method is not part of exact MCP 2024-11-05"]]' \
+    '{"jsonrpc":"2.0","id":2,"method":"totally/unknown/method","params":{}}'
 
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    '{"jsonrpc":"1.0","id":1,"method":"initialize","params":{}}')"
-e2e_save_artifact "case_03_wrong_version.txt" "$RESP"
-assert_no_crash "wrong jsonrpc version" "$RESP"
+run_rpc_case case_06_missing_id "Missing id field" reject '[]' \
+    '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
-# ===========================================================================
-# Case 4: Missing method field
-# ===========================================================================
-e2e_case_banner "Missing method field"
+run_rpc_case case_07_extra_fields "Extra fields in initialize envelope" reject '[[1,-32600,"Invalid Request"]]' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"extra_field":"surprise","another":42,"nested":{"deep":true}}'
 
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    '{"jsonrpc":"2.0","id":1,"params":{}}')"
-e2e_save_artifact "case_04_missing_method.txt" "$RESP"
-assert_no_crash "missing method field" "$RESP"
+run_rpc_case case_08_array_batch "Array batch request" reject '[[null,-32600,"Invalid Request"]]' \
+    '[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]'
 
-# ===========================================================================
-# Case 5: Unknown method
-# ===========================================================================
-e2e_case_banner "Unknown method name"
+run_rpc_case case_09_empty_object "Empty JSON object" reject '[[null,-32600,"Invalid Request"]]' \
+    '{}'
 
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":2,"method":"totally/unknown/method","params":{}}')"
-e2e_save_artifact "case_05_unknown_method.txt" "$RESP"
-assert_no_crash "unknown method name" "$RESP"
+run_rpc_case case_10_null_params "Null params after readiness" ready '[[1,"initialize"],[2,"tools"]]' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":null}'
 
-# ===========================================================================
-# Case 6: Missing id (notification-style)
-# ===========================================================================
-e2e_case_banner "Missing id field"
+run_rpc_case case_11_params_array "Array params after readiness" ready \
+    '[[1,"initialize"],[2,-32600,"invalid exact MCP 2024-11-05 envelope"]]' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":["ensure_project","/tmp/test"]}'
 
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}')"
-e2e_save_artifact "case_06_missing_id.txt" "$RESP"
-assert_no_crash "missing id field (notification)" "$RESP"
+run_rpc_case case_12_large_id "Large numeric id" raw '[[99999999999999999,"initialize"]]' \
+    '{"jsonrpc":"2.0","id":99999999999999999,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
-# ===========================================================================
-# Case 7: Extra unexpected fields
-# ===========================================================================
-e2e_case_banner "Extra unexpected fields"
+run_rpc_case case_13_negative_id "Negative id" raw '[[-1,"initialize"]]' \
+    '{"jsonrpc":"2.0","id":-1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"extra_field":"surprise","another":42,"nested":{"deep":true}}')"
-e2e_save_artifact "case_07_extra_fields.txt" "$RESP"
+run_rpc_case case_14_string_id "String id" raw '[["string-id-123","initialize"]]' \
+    '{"jsonrpc":"2.0","id":"string-id-123","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 
-# Extra fields should be ignored, server should still work
-INIT_OK="$(echo "$RESP" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        if 'result' in d and 'serverInfo' in d.get('result', {}):
-            print('OK')
-            sys.exit(0)
-    except Exception: pass
-print('FAIL')
-" 2>/dev/null)"
-
-if [ "$INIT_OK" = "OK" ]; then
-    e2e_pass "extra fields ignored, initialize still works"
-else
-    e2e_pass "extra fields handled (may have returned error)"
-fi
-
-# ===========================================================================
-# Case 8: Array batch request
-# ===========================================================================
-e2e_case_banner "Array batch request"
-
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    '[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]')"
-e2e_save_artifact "case_08_array_batch.txt" "$RESP"
-assert_no_crash "array batch request" "$RESP"
-
-# ===========================================================================
-# Case 9: Empty object
-# ===========================================================================
-e2e_case_banner "Empty object"
-
-RESP="$(send_jsonrpc_session "$MAL_DB" '{}')"
-e2e_save_artifact "case_09_empty_object.txt" "$RESP"
-assert_no_crash "empty JSON object" "$RESP"
-
-# ===========================================================================
-# Case 10: Null params
-# ===========================================================================
-e2e_case_banner "Null params"
-
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":null}')"
-e2e_save_artifact "case_10_null_params.txt" "$RESP"
-assert_no_crash "null params" "$RESP"
-
-# ===========================================================================
-# Case 11: Params as array instead of object
-# ===========================================================================
-e2e_case_banner "Params as array"
-
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    "$INIT_REQ" \
-    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":["ensure_project","/tmp/test"]}')"
-e2e_save_artifact "case_11_params_array.txt" "$RESP"
-assert_no_crash "params as array" "$RESP"
-
-# ===========================================================================
-# Case 12: Extremely large id
-# ===========================================================================
-e2e_case_banner "Large numeric id"
-
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    '{"jsonrpc":"2.0","id":99999999999999999,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}')"
-e2e_save_artifact "case_12_large_id.txt" "$RESP"
-assert_no_crash "extremely large numeric id" "$RESP"
-
-# ===========================================================================
-# Case 13: Negative id
-# ===========================================================================
-e2e_case_banner "Negative id"
-
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    '{"jsonrpc":"2.0","id":-1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}')"
-e2e_save_artifact "case_13_negative_id.txt" "$RESP"
-assert_no_crash "negative id" "$RESP"
-
-# ===========================================================================
-# Case 14: String id
-# ===========================================================================
-e2e_case_banner "String id"
-
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    '{"jsonrpc":"2.0","id":"string-id-123","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}')"
-e2e_save_artifact "case_14_string_id.txt" "$RESP"
-assert_no_crash "string id" "$RESP"
-
-# ===========================================================================
-# Case 15: Rapid-fire mixed valid + invalid
-# ===========================================================================
-e2e_case_banner "Rapid-fire mixed valid/invalid"
-
-RESP="$(send_jsonrpc_session "$MAL_DB" \
-    "$INIT_REQ" \
+run_rpc_case case_15_rapid_fire "Rapid-fire mixed valid/invalid" ready \
+    '[[1,"initialize"],[2,"tools"],[3,"project"],[null,-32700,"Parse error"],[null,-32600,"Invalid Request"],[null,-32700,"Parse error"]]' \
     'not json' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
     '{}' \
     '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ensure_project","arguments":{"human_key":"/tmp/rapid_test"}}}' \
-    'also not json' \
-)"
-e2e_save_artifact "case_15_rapid_fire.txt" "$RESP"
-
-# Check that at least the valid requests got responses
-VALID_COUNT="$(echo "$RESP" | python3 -c "
-import sys, json
-count = 0
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        if 'result' in d or 'error' in d:
-            count += 1
-    except Exception: pass
-print(count)
-" 2>/dev/null)"
-
-if [ "$VALID_COUNT" -ge 2 ] 2>/dev/null; then
-    e2e_pass "rapid-fire: $VALID_COUNT valid responses returned"
-else
-    e2e_pass "rapid-fire: server handled mixed input ($VALID_COUNT responses)"
-fi
+    'also not json'
 
 # ===========================================================================
 # Summary
