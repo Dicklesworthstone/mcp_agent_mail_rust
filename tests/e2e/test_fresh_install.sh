@@ -1716,6 +1716,12 @@ if [ "${1:-}" = "setup" ] && [ "${2:-}" = "run" ]; then
     missing) exit 0 ;;
     wrong) durable_token='wrong-old-token' ;;
     exact) durable_token="${HTTP_BEARER_TOKEN:?}" ;;
+    explicit)
+      # Automatic detection has no installed agents in this control.
+      [ "${3:-}" = "--agent" ] || exit 0
+      [ "${4:-}" = "codex,omp" ] || exit 8
+      durable_token="${HTTP_BEARER_TOKEN:?}"
+      ;;
     *) exit 9 ;;
   esac
   mkdir -p "$(dirname "${OMP_DURABILITY_ENV:?}")"
@@ -1821,6 +1827,31 @@ EOF
     )"
     e2e_assert_eq "installer persists the exact mode-600 token before any fallback writer" \
       "valid" "${OMP_DURABILITY_ORDER_CONTRACT}"
+
+    OMP_EXPLICIT_TARGET_CONTRACT="$(
+      source "${OMP_UPDATE_LIBRARY}"
+      remote_http_client_target_tools() { printf '%s\n' codex omp; }
+      resolve_setup_http_bearer_token() { :; }
+      generate_bearer_token() { printf '%s' 'new-target-token'; }
+      rust_config_env_path() { printf '%s' "${OMP_DURABILITY_ENV}"; }
+      token_env_targets_outside_git_worktrees() { return 0; }
+      read_env_assignment_value() { sed -n "s/^${2}=//p" "$1"; }
+      setup_mcp_configs() { [ "${HTTP_BEARER_TOKEN:-}" = new-target-token ]; }
+      sync_codex_http_configs() { [ "${HTTP_BEARER_TOKEN:-}" = new-target-token ]; }
+      err() { printf '%s\n' "$*" >&2; }
+      warn() { printf '%s\n' "$*" >&2; }
+      verbose() { :; }
+      ok() { :; }
+      export OMP_DURABILITY_MODE=explicit
+      export OMP_DURABILITY_ENV="${OMP_INSTALLER_DIR}/explicit-xdg/mcp-agent-mail/config.env"
+      if configure_mcp_clients_for_install "/unused/mcp-agent-mail" "${OMP_DURABILITY_FAKE_CLI}"; then
+        printf '%s' valid
+      else
+        printf '%s' invalid
+      fi
+    )"
+    e2e_assert_eq "installer configures shell-detected targets missed by native auto-detection" \
+      "valid" "${OMP_EXPLICIT_TARGET_CONTRACT}"
 
     # The deferral asserts above run with native setup failing, which skips the
     # shell writers altogether, so they would pass with the containment check
