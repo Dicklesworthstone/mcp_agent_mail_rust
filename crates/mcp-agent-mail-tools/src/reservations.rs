@@ -2236,6 +2236,16 @@ pub async fn file_reservation_paths(
             json!({ "count": paths.len(), "max": MAX_PATHS_PER_CALL }),
         ));
     }
+    // A lease must be representable in its Git archive. Reject the entire
+    // batch before normalization, replay lookup, or any mailbox write.
+    if paths.iter().any(|path| path.contains('\0')) {
+        return Err(legacy_tool_error(
+            "INVALID_PATH",
+            "Path contains a NUL byte",
+            true,
+            json!({ "reason": "nul_in_path" }),
+        ));
+    }
 
     let request = ReservationAcquireRequest {
         project_key,
