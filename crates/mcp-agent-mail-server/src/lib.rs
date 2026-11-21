@@ -13709,7 +13709,7 @@ to skip auth for local requests.</p>
             .as_deref()
             .filter(|s| !s.is_empty())
         {
-            Ok(DecodingKey::from_secret(secret.as_bytes()))
+            DecodingKey::from_secret(secret.as_bytes()).map_err(|_| ())
         } else {
             Err(())
         }
@@ -24008,7 +24008,7 @@ first body
         jsonwebtoken::encode(
             &header,
             claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret),
+            &jsonwebtoken::EncodingKey::from_secret(secret).expect("hmac key"),
         )
         .expect("encode token")
     }
@@ -32144,7 +32144,7 @@ first body
                 let token = jsonwebtoken::encode(
                     &header,
                     &claims,
-                    &jsonwebtoken::EncodingKey::from_secret(secret),
+                    &jsonwebtoken::EncodingKey::from_secret(secret).expect("hmac key"),
                 )
                 .expect("encode token");
                 let auth = format!("Bearer {token}");
@@ -32202,7 +32202,7 @@ first body
                 let token = jsonwebtoken::encode(
                     &header,
                     &claims,
-                    &jsonwebtoken::EncodingKey::from_secret(secret),
+                    &jsonwebtoken::EncodingKey::from_secret(secret).expect("hmac key"),
                 )
                 .expect("encode token");
                 let auth = format!("Bearer {token}");
@@ -32266,7 +32266,7 @@ first body
                 let token = jsonwebtoken::encode(
                     &header,
                     &claims,
-                    &jsonwebtoken::EncodingKey::from_secret(secret),
+                    &jsonwebtoken::EncodingKey::from_secret(secret).expect("hmac key"),
                 )
                 .expect("encode token");
                 let auth = format!("Bearer {token}");
@@ -40825,12 +40825,12 @@ first body
         let valid_token = jsonwebtoken::encode(
             &header,
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret),
+            &jsonwebtoken::EncodingKey::from_secret(secret).expect("hmac key"),
         )
         .unwrap();
 
         // Verify with the cached (stale) key.
-        let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret);
+        let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret).expect("hmac key");
         let validation = HttpState::jwt_validation(vec![jsonwebtoken::Algorithm::HS256]);
         let decoded =
             jsonwebtoken::decode::<serde_json::Value>(&valid_token, &decoding_key, &validation); // ubs:ignore — test uses the production HS256 validation and actual correct signing key; wrong-key rejection follows
@@ -40840,7 +40840,7 @@ first body
         let wrong_token = jsonwebtoken::encode(
             &header,
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(b"wrong-secret"),
+            &jsonwebtoken::EncodingKey::from_secret(b"wrong-secret").expect("hmac key"),
         )
         .unwrap();
         let decoded =
