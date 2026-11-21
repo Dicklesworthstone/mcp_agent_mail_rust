@@ -2,6 +2,9 @@
 
 ## Current operational reliability improvements
 
+- [x] Bind ATC write mode and kill-switch authority to each server lifetime;
+  prevent delayed observations or controls from reusing another mailbox policy
+  and fail closed when the current marker authority cannot be inspected.
 - [x] Make archive flushes honor FIFO persistence barriers and report unresolved
   write failures; retain failure status across unrelated successful writes,
   shutdown, and restart until the existing repair ledger verifies recovery.
