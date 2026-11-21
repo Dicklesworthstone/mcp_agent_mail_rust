@@ -161,7 +161,7 @@ fn seeded_single_connection_pool_commits_autocommit_ddl() {
     })
     .expect("start the single-connection pool");
 
-    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+    let reservation_id = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
         &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
         || {
             let pool = &pool;
@@ -206,6 +206,7 @@ fn seeded_single_connection_pool_commits_autocommit_ddl() {
                     "create reservation",
                 );
                 assert_eq!(reservations.len(), 1);
+                let reservation_id = reservations[0].id.expect("created reservation ID");
 
                 let conn = match pool.acquire(&cx).await {
                     Outcome::Ok(conn) => conn,
@@ -214,15 +215,15 @@ fn seeded_single_connection_pool_commits_autocommit_ddl() {
                 };
                 conn.execute_raw("ALTER TABLE messages RENAME TO retained_messages")
                     .expect("commit pooled autocommit ALTER after seeding");
-                assert_eq!(
-                    conn.query_sync("SELECT id FROM file_reservations", &[])
-                        .expect("read after commit")
-                        .len(),
-                    1
-                );
+                let rows = conn
+                    .query_sync("SELECT id FROM file_reservations", &[])
+                    .expect("read after commit");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get_as::<i64>(0).unwrap(), reservation_id);
                 conn.execute_raw("ALTER TABLE retained_messages RENAME TO restored_messages")
                     .expect("commit pooled autocommit ALTER after SELECT");
-            });
+                reservation_id
+            })
         },
     );
     let reopened = fresh_conn(&pool);
@@ -236,13 +237,12 @@ fn seeded_single_connection_pool_commits_autocommit_ddl() {
             .len(),
         1
     );
-    assert_eq!(
-        reopened
-            .query_sync("SELECT id FROM file_reservations", &[])
-            .expect("reopen must see the reservation")
-            .len(),
-        1
-    );
+    let rows = reopened
+        .query_sync("SELECT id, path_pattern FROM file_reservations", &[])
+        .expect("reopen must see the reservation");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get_as::<i64>(0).unwrap(), reservation_id);
+    assert_eq!(rows[0].get_as::<String>(1).unwrap(), "src/sample.rs");
 }
 
 fn setup_project(pool: &DbPool, seed: u64, idx: usize) -> i64 {

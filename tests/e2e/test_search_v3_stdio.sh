@@ -46,16 +46,17 @@ search_v3_init
 
 search_v3_banner "Search V3 Stdio E2E Test Suite (br-2tnl.7.8)"
 
-# Ensure binary is built
-e2e_ensure_binary "am" >/dev/null
-export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
-search_v3_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
+AM_BIN="$(e2e_ensure_binary am | tail -n 1)"
+search_v3_log "am binary: ${AM_BIN}"
 
 # Create workspace
 WORK="$(e2e_mktemp "e2e_search_v3")"
 SEARCH_DB="${WORK}/search_v3_test.sqlite3"
-PROJECT_PATH="/tmp/e2e_search_v3_$$"
-PROJECT_BETA="/tmp/e2e_search_v3_beta_$$"
+PROJECT_PATH="${WORK}/alpha"
+PROJECT_BETA="${WORK}/beta"
+export STORAGE_ROOT="${WORK}/archive"
+export SEARCH_V3_INDEX_DIR="${WORK}/tantivy"
+mkdir -p "$PROJECT_PATH" "$PROJECT_BETA" "$STORAGE_ROOT"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-search-v3","version":"1.0"}}}'
 
@@ -65,48 +66,11 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 
 send_jsonrpc_session() {
     local db_path="$1"; shift
-    local requests=("$@")
-    local output_file="${WORK}/session_response_$RANDOM.txt"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
-
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error WORKTREES_ENABLED=true \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
-
-    {
-        echo "$INIT_REQ"
-        sleep 0.1
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.05
-        done
-        sleep 0.2
-    } > "$fifo"
-
-    wait "$srv_pid" 2>/dev/null || true
-    cat "$output_file"
-}
-
-extract_result() {
-    local response="$1"
-    local req_id="$2"
-    echo "$response" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        if d.get('id') == $req_id:
-            print(json.dumps(d))
-            sys.exit(0)
-    except:
-        pass
-" 2>/dev/null
+    E2E_STDIO_BINARY="$AM_BIN" E2E_STDIO_TIMEOUT_SECONDS=15 \
+        AM_SEARCH_ENGINE=lexical AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES=lexical \
+        AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES_PRODUCT=lexical \
+        AM_ALLOW_EPHEMERAL_PROJECT_ROOTS=1 WORKTREES_ENABLED=true RUST_LOG=error \
+        e2e_stdio_session "$db_path" "$INIT_REQ" "$@"
 }
 
 extract_content_text() {
@@ -132,58 +96,87 @@ for line in sys.stdin:
 is_error_result() {
     local response="$1"
     local req_id="$2"
-    echo "$response" | python3 -c "
-import sys, json
+    printf '%s\n' "$response" | python3 -c '
+import json
+import sys
+
+request_id = int(sys.argv[1])
 for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        d = json.loads(line)
-        if d.get('id') == $req_id:
-            if 'error' in d:
-                print('true')
-                sys.exit(0)
-            if 'result' in d and d['result'].get('isError', False):
-                print('true')
-                sys.exit(0)
-    except:
-        pass
-print('false')
-" 2>/dev/null
+    if not line.strip():
+        continue
+    reply = json.loads(line)
+    if reply.get("id") != request_id:
+        continue
+    if isinstance(reply.get("error"), dict):
+        print("true")
+        break
+    result = reply.get("result")
+    if isinstance(result, dict) and isinstance(result.get("isError", False), bool):
+        print("true" if result.get("isError", False) else "false")
+        break
+    sys.exit(f"Invalid tool reply for request {request_id}: {reply}")
+else:
+    sys.exit(f"Missing tool reply for request {request_id}")
+' "$req_id"
 }
 
-# Parse search response text → {count, first_subject, first_id, ids, first_from, first_importance, first_ack_required, first_thread_id, has_assistance}
+# Parse and validate the search tool's result list before checking individual rows.
 parse_search() {
     local text="$1"
-    echo "$text" | python3 -c "
-import sys, json
-try:
-    d = json.loads(sys.stdin.read())
-    if isinstance(d, dict) and 'result' in d:
-        items = d['result']
-    elif isinstance(d, list):
-        items = d
-    else:
-        items = []
-    if not isinstance(items, list):
-        items = []
-    first = items[0] if items else {}
-    print(json.dumps({
-        'count': len(items),
-        'first_subject': first.get('subject', ''),
-        'first_id': first.get('id', 0),
-        'first_from': first.get('from', ''),
-        'first_importance': first.get('importance', ''),
-        'first_ack_required': first.get('ack_required', 0),
-        'first_thread_id': first.get('thread_id'),
-        'first_created_ts': first.get('created_ts'),
-        'has_assistance': 'assistance' in d if isinstance(d, dict) else False,
-        'ids': [i.get('id', 0) for i in items],
-        'subjects': [i.get('subject', '') for i in items],
-    }))
-except Exception as e:
-    print(json.dumps({'error': str(e), 'count': 0, 'ids': [], 'subjects': []}))
-" 2>/dev/null
+    printf '%s\n' "$text" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+items = data.get("result") if isinstance(data, dict) else data
+if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+    sys.exit(f"Expected a search result list: {data}")
+ids = [item.get("id") for item in items]
+if any(type(value) is not int or value <= 0 for value in ids) or len(set(ids)) != len(ids):
+    sys.exit(f"Expected distinct positive search result IDs: {ids}")
+first = items[0] if items else {}
+assistance = data.get("assistance") if isinstance(data, dict) else None
+print(json.dumps({
+    "count": len(items),
+    "first_subject": first.get("subject", ""),
+    "first_id": first.get("id", 0),
+    "first_from": first.get("from", ""),
+    "first_importance": first.get("importance", ""),
+    "first_ack_required": first.get("ack_required"),
+    "first_thread_id": first.get("thread_id"),
+    "first_created_ts": first.get("created_ts"),
+    "assistance_type": "null" if assistance is None else type(assistance).__name__,
+    "ids": ids,
+    "subjects": [item.get("subject", "") for item in items],
+}))
+'
+}
+
+sent_message_id() {
+    extract_content_text "$1" "$2" | python3 -c '
+import json
+import sys
+
+delivery, = json.load(sys.stdin)["deliveries"]
+message_id = delivery["payload"]["id"]
+if type(message_id) is not int or message_id <= 0:
+    sys.exit(f"Invalid message ID in send receipt: {message_id}")
+print(message_id)
+'
+}
+
+assert_search_ids() {
+    local label="$1" parsed="$2"
+    shift 2
+    local expected actual
+    expected="$(printf '%s\n' "$@" | sort -n | paste -sd, -)"
+    actual="$(printf '%s\n' "$parsed" | python3 -c '
+import json
+import sys
+
+print(",".join(map(str, sorted(json.load(sys.stdin)["ids"]))))
+')"
+    e2e_assert_eq "$label" "$expected" "$actual"
 }
 
 # Extract a field from parsed JSON
@@ -253,7 +246,15 @@ if [ "$SETUP_FAIL" -eq 0 ]; then
 else
     e2e_fail "setup: $SETUP_FAIL of 14 requests failed"
     search_v3_case_summary "setup" "fail" --message "$SETUP_FAIL failed"
+    e2e_summary
+    exit 1
 fi
+
+DEPLOYMENT_ID="$(sent_message_id "$SETUP_RESP" 6)"
+UNICODE_ID="$(sent_message_id "$SETUP_RESP" 10)"
+CHECKLIST_ID="$(sent_message_id "$SETUP_RESP" 13)"
+PERFORMANCE_ID="$(sent_message_id "$SETUP_RESP" 14)"
+ACK_REQUIRED_ID="$(sent_message_id "$SETUP_RESP" 15)"
 
 search_v3_capture_index_meta "initial_index" \
     --doc-count 10 \
@@ -264,6 +265,7 @@ search_v3_capture_index_meta "initial_index" \
 # Case 2: Basic exact-match query
 # ===========================================================================
 e2e_case_banner "Basic exact-match query: deployment"
+failures_before="$_E2E_FAIL"
 
 search_v3_capture_params "basic_exact" --mode "lexical" --query "deployment" --limit 20 --project "$PROJECT_PATH"
 
@@ -282,19 +284,19 @@ else
 fi
 
 BASIC_COUNT="$(jget "$BASIC_P" count)"
-if [ "$BASIC_COUNT" -ge 2 ]; then
-    e2e_pass "basic search: found >= 2 results for 'deployment' (got $BASIC_COUNT)"
-    search_v3_case_summary "basic_exact" "pass" --message "count=$BASIC_COUNT"
-else
-    e2e_fail "basic search: expected >= 2 for 'deployment' (got $BASIC_COUNT)"
-    search_v3_case_summary "basic_exact" "fail" --message "count=$BASIC_COUNT"
-fi
+assert_search_ids "basic search returns both planted deployment messages" "$BASIC_P" "$DEPLOYMENT_ID" "$CHECKLIST_ID"
 
 BASIC_SUBJ="$(jget "$BASIC_P" first_subject)"
 if [ -n "$BASIC_SUBJ" ]; then
     e2e_pass "basic search: first result has subject ($BASIC_SUBJ)"
 else
     e2e_fail "basic search: first result has empty subject"
+fi
+
+if [ "$_E2E_FAIL" -eq "$failures_before" ]; then
+    search_v3_case_summary "basic_exact" "pass" --message "count=$BASIC_COUNT"
+else
+    search_v3_case_summary "basic_exact" "fail" --message "count=$BASIC_COUNT"
 fi
 
 # Capture ranking for comparison
@@ -345,6 +347,7 @@ import sys, json; d = json.loads(sys.stdin.read()); print(json.dumps(d.get('resu
 # Case 4: Prefix search (wildcard*)
 # ===========================================================================
 e2e_case_banner "Prefix search: deploy*"
+failures_before="$_E2E_FAIL"
 
 search_v3_capture_params "prefix" --mode "lexical" --query "deploy*" --limit 10 --project "$PROJECT_PATH"
 
@@ -362,16 +365,7 @@ else
     e2e_fail "prefix search: returned error"
 fi
 
-PREFIX_COUNT="$(jget "$PREFIX_P" count)"
-if [ "$PREFIX_COUNT" -ge 1 ]; then
-    e2e_pass "prefix search: found >= 1 for 'deploy*' (got $PREFIX_COUNT)"
-else
-    # FTS5 porter stemmer may cause deploy* to not match "deployment" as a prefix
-    # since porter stems "deployment" → "deploy" (exact match, not prefix).
-    # In that case, use the unstemmed word for prefix testing.
-    e2e_pass "prefix search: returned $PREFIX_COUNT results (porter stemmer may affect prefix matching)"
-fi
-search_v3_case_summary "prefix" "pass" --message "count=$PREFIX_COUNT"
+assert_search_ids "deploy prefix returns both planted deployment messages" "$PREFIX_P" "$DEPLOYMENT_ID" "$CHECKLIST_ID"
 
 # Also test a prefix that definitively works: "perform*" → "performance"
 PREFIX2_RESP="$(send_jsonrpc_session "$SEARCH_DB" \
@@ -382,14 +376,15 @@ PREFIX2_ERR="$(is_error_result "$PREFIX2_RESP" 2)"
 PREFIX2_P="$(parse_search "$PREFIX2_TEXT")"
 
 if [ "$PREFIX2_ERR" = "false" ]; then
-    PREFIX2_COUNT="$(jget "$PREFIX2_P" count)"
-    if [ "$PREFIX2_COUNT" -ge 1 ]; then
-        e2e_pass "prefix search 'perform*': found >= 1 (got $PREFIX2_COUNT)"
-    else
-        e2e_pass "prefix search 'perform*': returned $PREFIX2_COUNT (porter stem behavior)"
-    fi
+    assert_search_ids "perform prefix returns the planted performance message" "$PREFIX2_P" "$PERFORMANCE_ID"
 else
     e2e_fail "prefix search 'perform*': returned error"
+fi
+
+if [ "$_E2E_FAIL" -eq "$failures_before" ]; then
+    search_v3_case_summary "prefix" "pass"
+else
+    search_v3_case_summary "prefix" "fail"
 fi
 
 # ===========================================================================
@@ -802,12 +797,7 @@ else
     e2e_fail "unicode query: returned error"
 fi
 
-UNI_COUNT="$(jget "$UNI_P" count)"
-if [ "$UNI_COUNT" -ge 0 ]; then
-    e2e_pass "unicode query: returned valid count ($UNI_COUNT)"
-else
-    e2e_fail "unicode query: invalid count"
-fi
+assert_search_ids "unicode query returns the planted localization message" "$UNI_P" "$UNICODE_ID"
 
 search_v3_case_summary "unicode" "pass"
 
@@ -873,39 +863,14 @@ search_v3_case_summary "large_limit" "pass"
 # ===========================================================================
 e2e_case_banner "Assistance field presence"
 
-ASSIST_ZERO="$(jget "$ZERO_P" has_assistance)"
-ASSIST_BASIC="$(jget "$BASIC_P" has_assistance)"
-
-if [ "$ASSIST_ZERO" = "true" ] || [ "$ASSIST_ZERO" = "false" ]; then
-    e2e_pass "assistance: zero-result response has valid assistance check ($ASSIST_ZERO)"
-else
-    e2e_fail "assistance: unexpected value ($ASSIST_ZERO)"
-fi
-
-if [ "$ASSIST_BASIC" = "true" ] || [ "$ASSIST_BASIC" = "false" ]; then
-    e2e_pass "assistance: basic response has valid assistance check ($ASSIST_BASIC)"
-else
-    e2e_fail "assistance: unexpected value ($ASSIST_BASIC)"
-fi
-
-# Verify structure if present
-ASSIST_STRUCT="$(echo "$ZERO_TEXT" | python3 -c "
-import sys, json
-d = json.loads(sys.stdin.read())
-a = d.get('assistance')
-if a is None:
-    print('null')
-elif isinstance(a, dict):
-    print('dict')
-else:
-    print('other')
-" 2>/dev/null)"
-
-if [ "$ASSIST_STRUCT" = "dict" ] || [ "$ASSIST_STRUCT" = "null" ]; then
-    e2e_pass "assistance: field is dict or null ($ASSIST_STRUCT)"
-else
-    e2e_fail "assistance: unexpected type ($ASSIST_STRUCT)"
-fi
+for parsed in "$ZERO_P" "$BASIC_P"; do
+    ASSIST_TYPE="$(jget "$parsed" assistance_type)"
+    if [ "$ASSIST_TYPE" = "dict" ] || [ "$ASSIST_TYPE" = "null" ]; then
+        e2e_pass "assistance: field is an object, null, or omitted"
+    else
+        e2e_fail "assistance: unexpected type ($ASSIST_TYPE)"
+    fi
+done
 
 search_v3_case_summary "assistance" "pass"
 
@@ -924,6 +889,7 @@ PROD_RESP="$(send_jsonrpc_session "$SEARCH_DB" \
     "$(mcp_tool 8 products_link "{\"product_key\":\"test-search-v3-product\",\"project_key\":\"$PROJECT_BETA\"}")" \
     "$(mcp_tool 9 search_messages_product "{\"product_key\":\"test-search-v3-product\",\"query\":\"deployment\"}")" \
 )"
+e2e_save_artifact "case19_product_rpc.jsonl" "$PROD_RESP"
 
 for i in 2 3 4 5 6 7 8; do
     PERR="$(is_error_result "$PROD_RESP" "$i")"
@@ -945,12 +911,9 @@ else
     e2e_fail "product search: returned error"
 fi
 
-PROD_COUNT="$(jget "$PROD_P" count)"
-if [ "$PROD_COUNT" -ge 3 ]; then
-    e2e_pass "product search: found >= 3 across projects (got $PROD_COUNT)"
-else
-    e2e_fail "product search: expected >= 3 cross-project (got $PROD_COUNT)"
-fi
+BETA_DEPLOYMENT_ID="$(sent_message_id "$PROD_RESP" 4)"
+assert_search_ids "product search returns deployment messages from both linked projects" \
+    "$PROD_P" "$DEPLOYMENT_ID" "$CHECKLIST_ID" "$BETA_DEPLOYMENT_ID"
 
 search_v3_case_summary "product_search" "pass"
 
@@ -1091,21 +1054,9 @@ else
     e2e_fail "ack query: returned error"
 fi
 
-ACK_COUNT="$(jget "$ACK_P" count)"
-if [ "$ACK_COUNT" -ge 1 ]; then
-    e2e_pass "ack query: found >= 1 for 'remediation' (got $ACK_COUNT)"
-else
-    e2e_fail "ack query: expected >= 1 (got $ACK_COUNT)"
-fi
-
-# Verify ack_required field is 1 for this message
+assert_search_ids "ack query returns the planted remediation message" "$ACK_P" "$ACK_REQUIRED_ID"
 ACK_VAL="$(jget "$ACK_P" first_ack_required)"
-if [ "$ACK_VAL" = "1" ]; then
-    e2e_pass "ack query: first result has ack_required=1"
-else
-    # May return a different msg first depending on ranking
-    e2e_pass "ack query: ack_required field present ($ACK_VAL)"
-fi
+e2e_assert_eq "remediation message requires acknowledgment" 1 "$ACK_VAL"
 
 search_v3_case_summary "ack_query" "pass"
 
@@ -1190,22 +1141,7 @@ else
     e2e_fail "NOT search: returned error"
 fi
 
-NOT_COUNT="$(jget "$NOT_P" count)"
-if [ "$NOT_COUNT" -ge 1 ]; then
-    e2e_pass "NOT search: found results excluding 'checklist' (got $NOT_COUNT)"
-else
-    e2e_pass "NOT search: returned $NOT_COUNT (FTS5 NOT may vary)"
-fi
-
-# Verify "checklist" not in first result subject (if results exist)
-if [ "$NOT_COUNT" -ge 1 ]; then
-    NOT_SUBJ="$(jget "$NOT_P" first_subject)"
-    if echo "$NOT_SUBJ" | grep -qi "checklist"; then
-        e2e_fail "NOT search: first result should not contain 'checklist' (got: $NOT_SUBJ)"
-    else
-        e2e_pass "NOT search: first result doesn't contain excluded term ($NOT_SUBJ)"
-    fi
-fi
+assert_search_ids "NOT search keeps pipeline and excludes checklist" "$NOT_P" "$DEPLOYMENT_ID"
 
 search_v3_case_summary "not_operator" "pass"
 
