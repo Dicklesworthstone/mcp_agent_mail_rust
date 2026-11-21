@@ -68,6 +68,9 @@ fn lock_message_write_serializer(
 }
 
 #[cfg(test)]
+type StaleReleaseBeforeCommitHook = Box<dyn FnOnce(&crate::DbConn) + Send>;
+
+#[cfg(test)]
 thread_local! {
     /// Whether the message write serializer was held when each post-commit
     /// visibility probe on this thread started (br-kp1in.32 regression test).
@@ -78,6 +81,9 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     /// Fresh durability-probe connections opened on this thread (br-v0ucm).
     static DURABILITY_PROBE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Inspect staged release writes and revoke request authority before commit.
+    static BEFORE_STALE_RELEASE_COMMIT: std::cell::RefCell<Option<StaleReleaseBeforeCommitHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 // =============================================================================
@@ -16682,6 +16688,18 @@ struct StaleReservationReleaseGuard<'a> {
     inactivity_us: i64,
     grace_us: i64,
     respect_reaper_exemption: bool,
+    request_live: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
+fn stale_release_request_cancellation(
+    cx: &Cx,
+    guard: Option<&StaleReservationReleaseGuard<'_>>,
+) -> Option<CancelReason> {
+    let request_live = guard?.request_live?;
+    (!request_live()).then(|| {
+        cx.cancel_reason()
+            .unwrap_or_else(|| CancelReason::user("reservation release request is no longer live"))
+    })
 }
 
 fn release_reservation_chunk_plan(
@@ -17068,22 +17086,37 @@ async fn release_reservations_by_ids_with_constraints(
     scope: Option<ReleaseReservationScope>,
     stale_guard: Option<&StaleReservationReleaseGuard<'_>>,
 ) -> Outcome<Vec<ReleasedReservationMarker>, DbError> {
+    if let Some(reason) = stale_release_request_cancellation(cx, stale_guard) {
+        return Outcome::Cancelled(reason);
+    }
     if ids.is_empty() {
         return Outcome::Ok(Vec::new());
     }
 
     run_with_mvcc_retry(cx, "release_reservations_by_ids", || async {
+        // Request-local cancellation and deadlines need not cancel the ambient
+        // Cx. Recheck every attempt instead of inheriting earlier permission.
+        if let Some(reason) = stale_release_request_cancellation(cx, stale_guard) {
+            return Outcome::Cancelled(reason);
+        }
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
+        if let Some(reason) = stale_release_request_cancellation(cx, stale_guard) {
+            return Outcome::Cancelled(reason);
+        }
         let tracked = tracked(&*conn);
         // The release ledger is part of the schema (base schema and migration
         // v14), and every active-reservation read already depends on it, so
         // the release transaction runs no DDL of its own.
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        if let Some(reason) = stale_release_request_cancellation(cx, stale_guard) {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Cancelled(reason);
+        }
 
         if let Some(scope) = scope
             && let Some(cutoff) = scope.agent_last_active_at_or_before
@@ -17232,6 +17265,13 @@ async fn release_reservations_by_ids_with_constraints(
                 }
             }
 
+            // Activity/lease reads can also yield after writer admission.
+            // Cancellation rolls back this whole batch, including earlier IDs.
+            if let Some(reason) = stale_release_request_cancellation(cx, stale_guard) {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(reason);
+            }
+
             // Step 2: Update the base reservation row first.
             let update_params = [Value::BigInt(released_ts), Value::BigInt(*id)];
             try_in_tx!(
@@ -17255,6 +17295,16 @@ async fn release_reservations_by_ids_with_constraints(
             });
         }
 
+        #[cfg(test)]
+        if stale_guard.is_some()
+            && let Some(hook) = BEFORE_STALE_RELEASE_COMMIT.with_borrow_mut(Option::take)
+        {
+            hook(tracked.inner);
+        }
+        if let Some(reason) = stale_release_request_cancellation(cx, stale_guard) {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Cancelled(reason);
+        }
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
         Outcome::Ok(released)
     })
@@ -17359,6 +17409,40 @@ pub async fn release_stale_reservations(
         inactivity_us,
         grace_us,
         true,
+        None,
+    )
+    .await
+}
+
+/// Release stale candidates while the owning request remains live.
+///
+/// The predicate carries request-local cancellation, deadlines or lease scope
+/// that are separate from the ambient [`Cx`]. It is rechecked after checkout,
+/// after writer admission, on retries and before commit. Refusal rolls back the
+/// entire attempt and returns [`Outcome::Cancelled`]. A successful commit is
+/// retained even if the request is cancelled afterward. The predicate must be
+/// cheap and must not acquire another database connection.
+#[allow(clippy::too_many_arguments)]
+pub async fn release_stale_reservations_if_live(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    candidates: &[StaleReservationCandidate],
+    observed_at: i64,
+    inactivity_us: i64,
+    grace_us: i64,
+    request_live: &(dyn Fn() -> bool + Sync),
+) -> Outcome<Vec<i64>, DbError> {
+    release_observed_stale_reservations(
+        cx,
+        pool,
+        project_id,
+        candidates,
+        observed_at,
+        inactivity_us,
+        grace_us,
+        true,
+        Some(request_live),
     )
     .await
 }
@@ -17386,6 +17470,7 @@ pub async fn force_release_stale_reservation(
         inactivity_us,
         grace_us,
         false,
+        None,
     )
     .await
     {
@@ -17406,6 +17491,7 @@ async fn release_observed_stale_reservations(
     inactivity_us: i64,
     grace_us: i64,
     respect_reaper_exemption: bool,
+    request_live: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Outcome<Vec<i64>, DbError> {
     if inactivity_us < 0 || grace_us < 0 {
         return Outcome::Err(DbError::InvalidArgument {
@@ -17419,6 +17505,7 @@ async fn release_observed_stale_reservations(
         inactivity_us,
         grace_us,
         respect_reaper_exemption,
+        request_live,
     };
     let mut ids = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -35200,6 +35287,66 @@ mod tests {
             agent_last_active_ts: agent.last_active_ts,
             last_mail_activity_ts,
         }
+    }
+
+    #[test]
+    fn stale_release_request_cancellation_before_commit_rolls_back_rows_and_ledger() {
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                BEFORE_STALE_RELEASE_COMMIT.with_borrow_mut(|hook| *hook = None);
+            }
+        }
+        let _clear_hook = ClearHook;
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("stale-release-cancel-before-commit.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project_id = ensure_project(&cx, &pool, "/tmp/stale-release-cancel-before-commit")
+                .await.into_result().expect("project").id.expect("project id");
+            let candidate = stale_release_candidate_for_test(&cx, &pool, project_id, "BlueLake")
+                .await;
+            let id = candidate.reservation.id.expect("reservation id");
+            let original = candidate.reservation.clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancelled_at_commit = Arc::clone(&cancelled);
+            BEFORE_STALE_RELEASE_COMMIT.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move |conn| {
+                    // This reads the writer's own uncommitted transaction:
+                    // both mutations really happened before cancellation.
+                    let base = conn.query_sync(
+                        "SELECT released_ts FROM file_reservations WHERE id = ?",
+                        &[Value::BigInt(id)],
+                    ).expect("staged base release");
+                    assert!(base[0].get_named::<i64>("released_ts").unwrap() > 0);
+                    let ledger = conn.query_sync(
+                        "SELECT reservation_id FROM file_reservation_releases WHERE reservation_id = ?",
+                        &[Value::BigInt(id)],
+                    ).expect("staged release ledger");
+                    assert_eq!(ledger.len(), 1);
+                    cancelled_at_commit.store(true, Ordering::SeqCst);
+                }));
+            });
+            let outcome = release_stale_reservations_if_live(
+                &cx, &pool, project_id, &[candidate], now_micros(), 0, 0,
+                &|| !cancelled.load(Ordering::SeqCst),
+            ).await;
+            assert!(matches!(outcome, Outcome::Cancelled(_)), "{outcome:?}");
+            assert!(cancelled.load(Ordering::SeqCst), "reached the real pre-commit boundary");
+            assert!(BEFORE_STALE_RELEASE_COMMIT.with_borrow(Option::is_none));
+            assert!(!cx.is_cancel_requested(), "request refusal does not cancel ambient work");
+            let rows = get_reservations_by_ids(&cx, &pool, &[id])
+                .await.into_result().expect("base row after rollback");
+            assert_eq!(serde_json::to_value(&rows[0]).unwrap(), serde_json::to_value(&original).unwrap());
+            let conn = pool.acquire(&cx).await.into_result().expect("verification connection");
+            let ledger = conn.query_sync(
+                "SELECT reservation_id FROM file_reservation_releases WHERE reservation_id = ?",
+                &[Value::BigInt(id)],
+            ).expect("ledger after rollback");
+            assert!(ledger.is_empty(), "request refusal rolls back both release writes");
+        });
     }
 
     #[test]
