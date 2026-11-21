@@ -600,6 +600,7 @@ fn descending_metrics_insertions_keep_index_pages_dense() {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn memory_field_kib(text: &str, field: &str) -> Option<u64> {
     text.lines().find_map(|line| {
         line.strip_prefix(field)

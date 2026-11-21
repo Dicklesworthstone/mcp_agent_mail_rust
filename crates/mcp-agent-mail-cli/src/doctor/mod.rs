@@ -4403,6 +4403,12 @@ mod tests {
         assert!(detail.contains("future"), "{detail}");
         let (status, detail) = inspect_proactive_backup_health(dir.path(), true, true, settled);
         assert_eq!(status, "fail", "{detail}");
+        assert!(
+            detail.contains(&dir.path().display().to_string()),
+            "{detail}"
+        );
+        // Windows may reject the directory open before its type can be read.
+        #[cfg(unix)]
         assert!(detail.contains("regular"), "{detail}");
 
         #[cfg(unix)]
