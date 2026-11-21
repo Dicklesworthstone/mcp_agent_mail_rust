@@ -2,6 +2,9 @@
 
 ## Current operational reliability improvements
 
+- [x] Reject invalid or unresolved query filters before search routing and caching;
+  preserve explicit facet precedence and propagate project lookup failures and
+  cancellation without broadening the search.
 - [x] Publish archive epoch and index-sync control markers through private,
   exclusively created staging files; preserve foreign staging entries and reject
   symlinked control paths and nonregular destinations.
