@@ -2,6 +2,9 @@
 
 ## Current operational reliability improvements
 
+- [x] Make archive flushes honor FIFO persistence barriers and report unresolved
+  write failures; retain failure status across unrelated successful writes,
+  shutdown, and restart until the existing repair ledger verifies recovery.
 - [x] Reject invalid or unresolved query filters before search routing and caching;
   preserve explicit facet precedence and propagate project lookup failures and
   cancellation without broadening the search.
