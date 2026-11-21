@@ -736,7 +736,7 @@ const MEMORY_CHILD_TEST: &str =
 const MEMORY_CHILD_ACK: &str = "gh372-memory-probe-complete";
 
 #[cfg(target_os = "linux")]
-fn process_memory_kib(field: &str) -> u64 {
+fn process_status_field_kib(field: &str) -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .expect("Linux memory accounting is required for the memory regression")
         .lines()
@@ -750,11 +750,11 @@ fn process_memory_kib(field: &str) -> u64 {
 
 #[cfg(target_os = "linux")]
 fn log_connection_memory(stage: &str, connection: usize) {
-    let rss_kib = process_memory_kib("VmRSS:");
-    let peak_kib = process_memory_kib("VmHWM:");
-    let rss_anon_kib = process_memory_kib("RssAnon:");
-    let rss_file_kib = process_memory_kib("RssFile:");
-    let rss_shmem_kib = process_memory_kib("RssShmem:");
+    let rss_kib = process_status_field_kib("VmRSS:");
+    let peak_kib = process_status_field_kib("VmHWM:");
+    let rss_anon_kib = process_status_field_kib("RssAnon:");
+    let rss_file_kib = process_status_field_kib("RssFile:");
+    let rss_shmem_kib = process_status_field_kib("RssShmem:");
     eprintln!(
         "GH372 stage={stage} connection={connection} rss_kib={rss_kib} peak_kib={peak_kib} \
          rss_anon_kib={rss_anon_kib} rss_file_kib={rss_file_kib} rss_shmem_kib={rss_shmem_kib}"
@@ -1105,6 +1105,8 @@ fn existing_mailbox_reads_have_bounded_connection_memory() {
         // and the baseline_kib summary. The paired probe always sets the
         // connection count and uses the 64 MiB / 32 MiB incremental contract.
         if std::env::var_os(CONNECTIONS_ENV).is_none() {
+            use mcp_agent_mail_db::sqlmodel_core::Value;
+
             assert!(path.is_absolute());
             assert_eq!(std::fs::canonicalize(&path).unwrap(), path);
             assert!(
@@ -1113,7 +1115,7 @@ fn existing_mailbox_reads_have_bounded_connection_memory() {
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with("am-gh372-memory-"))
             );
-            let baseline_kib = process_memory_kib("VmRSS:");
+            let baseline_kib = process_status_field_kib("VmRSS:");
             log_connection_memory("baseline", 0);
             let writer = DbConn::open_file(path.to_str().unwrap()).expect("open existing mailbox");
             log_connection_memory("writer_open", 0);
@@ -1152,7 +1154,7 @@ fn existing_mailbox_reads_have_bounded_connection_memory() {
                 drop(row);
                 log_connection_memory("point_read_complete", index + 1);
             }
-            let peak_kib = process_memory_kib("VmHWM:");
+            let peak_kib = process_status_field_kib("VmHWM:");
             let delta_kib = peak_kib.saturating_sub(baseline_kib);
             eprintln!(
                 "GH372 baseline_kib={baseline_kib} peak_kib={peak_kib} delta_kib={delta_kib}"

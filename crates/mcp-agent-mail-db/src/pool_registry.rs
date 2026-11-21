@@ -20,6 +20,16 @@ use crate::error::{DbError, DbResult};
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
+pub(crate) const SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED: &str =
+    "mailbox database inventory busy retry budget exhausted";
+
+/// Keep the original busy cause actionable without allowing outer checkout
+/// and query retry loops to restart an already-spent startup phase budget.
+#[must_use]
+pub(crate) fn is_mailbox_inventory_retry_exhausted(message: &str) -> bool {
+    message.contains(SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED)
+}
+
 // A normal server has a request pool and a smaller maintenance pool. Bound
 // idle ownership across mailbox/config churn instead of pinning every engine
 // ever opened by a long-lived process. Active, evicted pools remain findable

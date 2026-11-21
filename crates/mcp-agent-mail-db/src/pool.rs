@@ -11,6 +11,7 @@ use crate::DbConn;
 use crate::error::{DbError, DbResult, is_lock_error};
 use crate::integrity;
 use crate::never_written_pages::{self, NeverWrittenOrphanPages};
+use crate::pool::{SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED, is_mailbox_inventory_retry_exhausted};
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::schema;
 use asupersync::{Cx, Outcome};
@@ -8322,16 +8323,6 @@ fn should_retry_sqlite_init_error(error: &SqlError) -> bool {
 /// process recovers or migrates the same file (br-wp4am, GH#400).
 const SQLITE_INIT_BUSY_RETRY_BUDGET: Duration = Duration::from_secs(30);
 const SQLITE_INIT_BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
-
-pub(crate) const SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED: &str =
-    "mailbox database inventory busy retry budget exhausted";
-
-/// Keep the original busy cause actionable without allowing outer checkout
-/// and query retry loops to restart an already-spent startup phase budget.
-#[must_use]
-pub(crate) fn is_mailbox_inventory_retry_exhausted(message: &str) -> bool {
-    message.contains(SQLITE_INVENTORY_BUSY_RETRY_EXHAUSTED)
-}
 
 #[cfg(test)]
 thread_local! {

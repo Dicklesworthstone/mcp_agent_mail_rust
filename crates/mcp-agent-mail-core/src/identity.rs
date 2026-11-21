@@ -1341,7 +1341,9 @@ mod tests {
         cache.insert("/old", &identity, start);
         cache.insert("/also-old", &identity, start);
 
-        let before_expiry = start + IDENTITY_CACHE_FRESHNESS - Duration::from_nanos(1);
+        let before_expiry = (start + IDENTITY_CACHE_FRESHNESS)
+            .checked_sub(Duration::from_nanos(1))
+            .expect("the cache lifetime exceeds one nanosecond");
         assert!(cache.get("/old", before_expiry).is_some());
         // A hit does not extend the existing five-second validation lifetime.
         assert!(
