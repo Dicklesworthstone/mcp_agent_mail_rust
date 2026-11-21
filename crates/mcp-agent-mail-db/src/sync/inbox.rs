@@ -743,6 +743,10 @@ pub(super) fn hydrate_priority_rows(
 }
 
 const SHARED_PAGE_SIZE: usize = 128;
+/// Limit speculative project-header work independently of mailbox history
+/// and the requested window. Sparse shared inboxes must eventually switch
+/// to their actual deliveries, including reads without receipt-state filters.
+const SHARED_HEADER_MAX_PAGES: usize = 8;
 
 #[derive(Clone, Copy)]
 struct SharedViewer {
@@ -876,16 +880,23 @@ pub fn fetch_shared_with_policy(
         agent_id,
         inception: viewer.get_named::<i64>("inception_ts").map_err(db_error)?,
     };
-    // Read/ACK filters may reject every recent message (GH#399). Allow one
-    // header page to satisfy a dense or recent window, then fall back to the
-    // project's actual deliveries instead of scanning unrelated mail.
+    // Every shared inbox can be sparse, even without read/ACK filters. Bound
+    // header speculation, but allow moderately interleaved recent deliveries
+    // to fill their window before falling back to delivery history. Keep the
+    // GH#399 one-page bound for receipt-state filters, which can reject every
+    // recent delivery. Neither budget grows with project history or limit.
     let max_pages =
-        (options.unread_only || options.ack_required_only || options.ack_overdue_before.is_some())
-            .then_some(1);
-    let newest = match shared_header_window(conn, viewer, since_ts, limit, options, max_pages)? {
-        Some(newest) => newest,
-        None => shared_delivery_window(conn, viewer, since_ts, limit, options)?,
-    };
+        if options.unread_only || options.ack_required_only || options.ack_overdue_before.is_some()
+        {
+            1
+        } else {
+            SHARED_HEADER_MAX_PAGES
+        };
+    let newest =
+        match shared_header_window(conn, viewer, since_ts, limit, options, Some(max_pages))? {
+            Some(newest) => newest,
+            None => shared_delivery_window(conn, viewer, since_ts, limit, options)?,
+        };
     hydrate(
         conn,
         project_id,
@@ -2331,6 +2342,217 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn gh399_sparse_shared_header_filters_bound_unrelated_history() {
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 2_000), i64::MAX, |id| id * 1000, |_| "normal");
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             VALUES(2,1,'to',9223372036854775807),(4,1,'to',0), \
+             (8,1,'to',-9223372036854775808),(2000,1,'to',-1); \
+             UPDATE messages SET importance='urgent' WHERE id IN (4,8,2000); \
+             UPDATE messages SET created_ts=8000 WHERE id=4",
+        )
+        .unwrap();
+        let metadata = InboxFetchOptions {
+            body_policy: InboxBodyPolicy::MetadataOnly,
+            ..options()
+        };
+        let mut previous_last = 2_000;
+        for message_count in [2_000, 10_000] {
+            if message_count > previous_last {
+                seed_walk(
+                    &conn,
+                    (previous_last + 1, message_count),
+                    i64::MAX,
+                    |id| id * 1000,
+                    |_| "normal",
+                );
+                previous_last = message_count;
+            }
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            for (case, filters, expected_ids) in [
+                ("unfiltered", metadata, vec![2000, 8, 4, 2]),
+                (
+                    "urgent",
+                    InboxFetchOptions {
+                        urgent_only: true,
+                        ..metadata
+                    },
+                    vec![2000, 8, 4],
+                ),
+                (
+                    "topic",
+                    InboxFetchOptions {
+                        topic: Some("HANDOFFS"),
+                        ..metadata
+                    },
+                    vec![2000, 8, 4],
+                ),
+                (
+                    "absent_topic",
+                    InboxFetchOptions {
+                        topic: Some("absent"),
+                        ..metadata
+                    },
+                    vec![],
+                ),
+            ] {
+                let original = Recording {
+                    conn: &conn,
+                    calls: RefCell::new(Vec::new()),
+                };
+                let expected = unbounded_shared_merge(&original, None, 20, filters);
+                let candidate = Recording {
+                    conn: &conn,
+                    calls: RefCell::new(Vec::new()),
+                };
+                let actual =
+                    fetch_inbox_rows_from_conn_impl(&candidate, 1, 2, None, 20, filters).unwrap();
+                same_rows(&actual, &expected);
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|row| row.message.id.unwrap())
+                        .collect::<Vec<_>>(),
+                    expected_ids,
+                    "{case}: preserve old mail, timestamp ties and a speculative partial window"
+                );
+                let original_pages = query_counts(&original.calls.borrow()).0;
+                assert!(
+                    original_pages >= usize::try_from(message_count).unwrap() / SHARED_PAGE_SIZE,
+                    "{case}: the incumbent must exercise the project-history scan"
+                );
+                let calls = candidate.calls.borrow();
+                let header_pages = query_counts(&calls).0;
+                assert_eq!(
+                    header_pages, 8,
+                    "{case}: project history must not set the budget"
+                );
+                let delivery_rows: usize = calls
+                    .iter()
+                    .filter(|(sql, _, _)| sql == crate::project_mailbox::DELIVERY_PAGE_SQL)
+                    .map(|(_, _, rows)| *rows)
+                    .sum();
+                assert_eq!(
+                    delivery_rows, 4,
+                    "{case}: fallback visits actual deliveries"
+                );
+                assert!(calls.iter().all(|(sql, binds, rows)| !sql.contains("JOIN")
+                    && *binds <= PAGE_SIZE
+                    && *rows <= PAGE_SIZE));
+                assert!(actual.iter().all(|row| row.message.body_md.is_empty()));
+                println!(
+                    "{{\"case\":\"gh399_header_{case}\",\"messages\":{message_count},\"shared_deliveries\":4,\"original_header_pages\":{original_pages},\"candidate_header_pages\":{header_pages},\"delivery_rows\":{delivery_rows}}}"
+                );
+            }
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+        }
+    }
+
+    #[test]
+    fn gh399_interleaved_shared_windows_keep_the_short_header_path() {
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 4_096), i64::MAX, |id| id * 1000, |_| "high");
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             SELECT id,project_id,'to',-id FROM messages WHERE id % 16 = 0; \
+             PRAGMA query_only = ON",
+        )
+        .unwrap();
+        for filters in [
+            options(),
+            InboxFetchOptions {
+                urgent_only: true,
+                ..options()
+            },
+            InboxFetchOptions {
+                topic: Some("HANDOFFS"),
+                ..options()
+            },
+        ] {
+            let observed = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            let actual =
+                fetch_inbox_rows_from_conn_impl(&observed, 1, 2, None, 20, filters).unwrap();
+            same_rows(&actual, &unbounded_shared_merge(&conn, None, 20, filters));
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|row| row.message.id.unwrap())
+                    .collect::<Vec<_>>(),
+                (0..20).map(|offset| 4096 - offset * 16).collect::<Vec<_>>()
+            );
+            assert_eq!(query_counts(&observed.calls.borrow()).0, 3);
+            assert!(
+                observed
+                    .calls
+                    .borrow()
+                    .iter()
+                    .all(|(sql, _, _)| sql != crate::project_mailbox::DELIVERY_PAGE_SQL),
+                "moderately interleaved recent mail must not scan delivery history"
+            );
+            assert!(
+                actual
+                    .iter()
+                    .all(|row| row.message.body_md.starts_with("body-"))
+            );
+        }
+    }
+
+    #[test]
+    fn gh399_shared_header_budget_preserves_large_windows_and_timestamp_boundaries() {
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 1_400), i64::MAX, |id| id * 1000, |_| "high");
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             SELECT id,project_id,'to',-id FROM messages; PRAGMA query_only = ON",
+        )
+        .unwrap();
+        let filters = InboxFetchOptions {
+            body_policy: InboxBodyPolicy::MetadataOnly,
+            ..options()
+        };
+        for (limit, expected_pages, fallback) in [
+            (20, 1, false),
+            (128, 2, false),
+            (129, 2, false),
+            (256, 3, false),
+            (897, 8, false),
+            (1024, 8, true),
+            (2000, 8, true),
+        ] {
+            let observed = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            let actual =
+                fetch_inbox_rows_from_conn_impl(&observed, 1, 2, None, limit, filters).unwrap();
+            same_rows(
+                &actual,
+                &unbounded_shared_merge(&conn, None, limit, filters),
+            );
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|row| row.message.id.unwrap())
+                    .collect::<Vec<_>>(),
+                (1..=1400).rev().take(limit).collect::<Vec<_>>()
+            );
+            let calls = observed.calls.borrow();
+            assert_eq!(query_counts(&calls).0, expected_pages, "limit={limit}");
+            assert_eq!(
+                calls
+                    .iter()
+                    .any(|(sql, _, _)| sql == crate::project_mailbox::DELIVERY_PAGE_SQL),
+                fallback,
+                "limit={limit}: exhaust speculation without publishing a partial window"
+            );
+        }
     }
 
     #[test]
