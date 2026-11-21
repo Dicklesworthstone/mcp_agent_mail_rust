@@ -4497,6 +4497,8 @@ mod tests {
 
         #[cfg(unix)]
         {
+            file.set_modified(now).unwrap();
+            assert_eq!(inspect().0, "ok", "the symlink target must be usable");
             let link = dir.path().join("linked.bak");
             std::os::unix::fs::symlink(&backup, &link).unwrap();
             let (status, detail) = inspect_proactive_backup_health(&link, true, true, settled);
