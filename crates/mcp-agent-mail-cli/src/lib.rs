@@ -3222,6 +3222,47 @@ pub enum AgentsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Replace an existing agent's sender token without changing its profile.
+    /// The current token is required and the replacement is saved privately.
+    RotateToken {
+        /// Existing project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Existing agent name (case-insensitive).
+        #[arg(long)]
+        agent: String,
+        /// Read the current token from this file; otherwise use AGENT_MAIL_SENDER_TOKEN or private identity state.
+        #[arg(long = "sender-token-file", value_name = "PATH")]
+        sender_token_file: Option<PathBuf>,
+        /// Include the replacement token in output instead of only saving it privately.
+        #[arg(long, default_value_t = false)]
+        show_token: bool,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Revoke an existing sender token without retiring the agent or deleting mail.
+    /// Existing MCP session bindings and trusted-local access are unchanged.
+    RevokeToken {
+        /// Existing project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Existing agent name (case-insensitive).
+        #[arg(long)]
+        agent: String,
+        /// Read the current token from this file; otherwise use AGENT_MAIL_SENDER_TOKEN or private identity state.
+        #[arg(long = "sender-token-file", value_name = "PATH")]
+        sender_token_file: Option<PathBuf>,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// List agents registered in a project.
     List {
         /// Project key (slug or human_key / absolute path). Positional
@@ -9581,6 +9622,20 @@ fn persist_sender_identity_token(
     if sender_token.is_empty() || project_key.is_empty() || agent_name.is_empty() {
         return Ok(());
     }
+    write_sender_identity_token_record(config, project_key, agent_name, sender_token)
+        .map_err(|error| CliError::Other(format!(
+            "Agent registration completed, but its sender credential could not be saved privately: {error}. Fix the identity-state path and re-register. The credential was not printed."
+        )))
+}
+
+/// Write private credential state, including a tokenless record after revocation.
+/// Keeping the record avoids deleting files and prevents reuse of the old secret.
+fn write_sender_identity_token_record(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    sender_token: &str,
+) -> CliResult<()> {
     let (project, agent) = sender_identity_key(project_key, agent_name);
     let path = sender_identity_state_path(config, &project, &agent);
     let record = SenderIdentityState {
@@ -9595,10 +9650,13 @@ fn persist_sender_identity_token(
     // pairs only with a 64-bit hash collision; guard against a stale record for
     // a *different* pair by writing the canonical identity inside the file and
     // verifying it on read.
-    write_cache_file_atomically_if_safe(&path, content.as_bytes(), "sender identity state")
-        .map_err(|error| CliError::Other(format!(
-            "Agent registration completed, but its sender credential could not be saved privately: {error}. Fix the identity-state path and re-register. The credential was not printed."
-        )))
+    write_cache_file_atomically_if_safe(&path, content.as_bytes(), "sender identity state").map_err(
+        |error| {
+            CliError::Other(format!(
+                "could not save private sender identity state: {error}"
+            ))
+        },
+    )
 }
 
 /// Load a previously-persisted sender token for `(project_key, agent_name)`.
@@ -42329,6 +42387,43 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             Ok(())
         }
 
+        AgentsCommand::RotateToken {
+            project_key,
+            agent,
+            sender_token_file,
+            show_token,
+            format,
+            json,
+        } => {
+            handle_agent_token_change(
+                &server_config,
+                &project_key,
+                &agent,
+                sender_token_file.as_deref(),
+                AgentTokenChange::Rotate { show_token },
+                output::CliOutputFormat::resolve(format, json),
+            )
+            .await
+        }
+
+        AgentsCommand::RevokeToken {
+            project_key,
+            agent,
+            sender_token_file,
+            format,
+            json,
+        } => {
+            handle_agent_token_change(
+                &server_config,
+                &project_key,
+                &agent,
+                sender_token_file.as_deref(),
+                AgentTokenChange::Revoke,
+                output::CliOutputFormat::resolve(format, json),
+            )
+            .await
+        }
+
         AgentsCommand::List {
             positional_project,
             project_key,
@@ -42628,6 +42723,192 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             json,
         } => handle_agents_reap(stale_days, project_key.as_deref(), dry_run, format, json).await,
     }
+}
+
+#[derive(Clone, Copy)]
+enum AgentTokenChange {
+    Rotate { show_token: bool },
+    Revoke,
+}
+
+impl AgentTokenChange {
+    const fn tool_name(self) -> &'static str {
+        match self {
+            Self::Rotate { .. } => "rotate_agent_token",
+            Self::Revoke => "revoke_agent_token",
+        }
+    }
+
+    const fn command_name(self) -> &'static str {
+        match self {
+            Self::Rotate { .. } => "agents rotate-token",
+            Self::Revoke => "agents revoke-token",
+        }
+    }
+}
+
+async fn call_agent_token_tool(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    registration_token: &str,
+    change: AgentTokenChange,
+) -> CliResult<serde_json::Value> {
+    let tool_name = change.tool_name();
+    let server_url = local_server_url(config)?;
+    let bearer = local_server_bearer_token(config);
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    let mut arguments = serde_json::json!({
+        "project_key": project_key,
+        "agent_name": agent_name,
+        "registration_token": registration_token,
+    });
+    if matches!(change, AgentTokenChange::Rotate { .. }) {
+        // Obtain the replacement for private storage; output is separately opt-in.
+        arguments["return_registration_token"] = serde_json::Value::Bool(true);
+    }
+    match try_call_server_tool(&server_url, bearer.as_deref(), tool_name, arguments).await {
+        ServerToolCall::Success(result) => {
+            return coerce_tool_result_json_or_error(tool_name, result);
+        }
+        ServerToolCall::Unavailable(message) => {
+            reject_local_fallback_if_mailbox_owned(
+                change.command_name(),
+                &server_url,
+                &message,
+                &database_url,
+                &config.storage_root,
+            )?;
+        }
+        ServerToolCall::Rejected(message) => {
+            return Err(CliError::Other(format!(
+                "{tool_name} via server failed: {message}"
+            )));
+        }
+    }
+
+    let _mailbox_mutation_locks =
+        acquire_cli_mailbox_mutation_locks(&database_url, Some(&config.storage_root))?;
+    if !read_verb_mailbox_is_initialized(&database_url) {
+        return Err(CliError::InvalidArgument(format!(
+            "{} requires an existing, initialized mailbox",
+            change.command_name()
+        )));
+    }
+    let cx = asupersync::Cx::current().ok_or_else(|| {
+        CliError::Other(format!(
+            "{} requires an active async context",
+            change.command_name()
+        ))
+    })?;
+    let ctx = McpContext::new(cx, 1);
+    let result = match change {
+        AgentTokenChange::Rotate { .. } => {
+            mcp_agent_mail_tools::identity::rotate_agent_token(
+                &ctx,
+                project_key.to_string(),
+                agent_name.to_string(),
+                registration_token.to_string(),
+                Some(true),
+            )
+            .await
+        }
+        AgentTokenChange::Revoke => {
+            mcp_agent_mail_tools::identity::revoke_agent_token(
+                &ctx,
+                project_key.to_string(),
+                agent_name.to_string(),
+                registration_token.to_string(),
+            )
+            .await
+        }
+    }
+    .map_err(mcp_error_to_cli_error)?;
+    parse_tool_json_payload(tool_name, &result)
+}
+
+async fn handle_agent_token_change(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    token_file: Option<&Path>,
+    change: AgentTokenChange,
+    format: output::CliOutputFormat,
+) -> CliResult<()> {
+    let project_key = project_key.trim();
+    let agent_name = agent_name.trim();
+    if project_key.is_empty() || agent_name.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "--project and --agent cannot be empty".into(),
+        ));
+    }
+    let token = resolve_sender_token(config, project_key, agent_name, None, token_file)?
+        .ok_or_else(|| CliError::InvalidArgument(format!(
+            "{} requires the current sender token. Use --sender-token-file, {AGENT_MAIL_SENDER_TOKEN_ENV}, or the credential saved by agents register. If the token was lost or revoked, re-register the agent to issue a replacement.",
+            change.command_name()
+        )))?;
+    let mut payload =
+        call_agent_token_tool(config, project_key, agent_name, &token, change).await?;
+    let canonical_name = payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| CliError::Other(
+            "The credential change completed, but the response omitted its agent name. Private identity state was not updated; re-register the agent to recover.".into()
+        ))?
+        .to_string();
+    let rotating = matches!(change, AgentTokenChange::Rotate { .. });
+    let expected_status = if rotating { "rotated" } else { "revoked" };
+    if !canonical_name.eq_ignore_ascii_case(agent_name)
+        || payload
+            .get("token_status")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_status)
+        || payload
+            .get("registration_token_returned")
+            .and_then(serde_json::Value::as_bool)
+            != Some(rotating)
+    {
+        return Err(CliError::Other(
+            "The credential response did not match the requested identity and operation. Private identity state was not changed. Inspect the agent's state before retrying; no token was printed.".into(),
+        ));
+    }
+    let (replacement, status, show_token) = match change {
+        AgentTokenChange::Rotate { show_token } => {
+            let replacement = payload
+                .get("registration_token")
+                .and_then(serde_json::Value::as_str)
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| CliError::Other(
+                    "Token rotation completed, but the response omitted the replacement credential. Re-register the agent to recover; no token was printed.".into()
+                ))?;
+            (replacement, "rotated", show_token)
+        }
+        AgentTokenChange::Revoke => ("", "revoked", false),
+    };
+    write_sender_identity_token_record(config, project_key, &canonical_name, replacement)
+        .map_err(|error| CliError::Other(format!(
+            "The sender token was {status}, but private identity state could not be updated: {error}. The previous token no longer authorizes requests. Fix the identity-state path and re-register if a new token is needed. No token was printed."
+        )))?;
+    if !show_token && let Some(fields) = payload.as_object_mut() {
+        fields.remove("registration_token");
+        fields.insert(
+            "registration_token_returned".into(),
+            serde_json::Value::Bool(false),
+        );
+    }
+    output::emit_output(&payload, format, || {
+        output::success(&format!("Sender token {status} for agent {canonical_name}"));
+        output::kv("Project", project_key);
+        if show_token
+            && let Some(replacement) = payload
+                .get("registration_token")
+                .and_then(serde_json::Value::as_str)
+        {
+            output::kv("Registration Token", replacement);
+        }
+    });
+    Ok(())
 }
 
 /// Change one operator-owned metadata flag without refreshing agent activity,

@@ -667,12 +667,35 @@ credential without printing either token. The previous token stops authorizing
 sends. This CLI output policy does not change MCP tool responses or the
 `am macros start-session` response.
 
+Use the explicit lifecycle commands to replace or revoke only an existing
+agent's sender credential, preserving its profile, activity timestamps, and mail:
+
+```bash
+am agents rotate-token --project /abs/path --agent BlueLake --json
+am agents revoke-token --project /abs/path --agent BlueLake --json
+```
+
+Both commands require the current token. They reuse private identity state,
+or accept `--sender-token-file /private/path` or `AGENT_MAIL_SENDER_TOKEN`.
+Rotation saves the replacement privately before reporting success; add
+`--show-token` only for intentional export in table, JSON, or TOON output.
+Revocation clears the saved token without deleting the identity record. A
+private-state write failure reports that the server-side change already happened
+and prints no credential. Repair the private-state path and re-register under
+the existing registration policy when a replacement is needed.
+
+The commands delegate to the running server; offline execution retains mailbox
+ownership checks. Existing MCP session bindings and trusted-local tokenless
+access retain their configured behavior. Supplied stale or revoked credentials
+are rejected even when tokenless sending is permitted.
+
 For CLI deployments that require an explicitly supplied sending credential, set
 `AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN=1`. `am mail send` then requires
 `--sender-token`, `--sender-token-file`, or `AGENT_MAIL_SENDER_TOKEN`; it refuses
 to borrow a token from persisted agent identity state. The same resolver applies
-to queued-send replay and contact handshakes (use the environment variable where
-the command has no token flag). The default retains automatic token reuse.
+to queued-send replay, token rotation/revocation, and contact handshakes (use the
+environment variable where the command has no token flag). The default retains
+automatic token reuse.
 This controls CLI token selection; it does not establish MCP session ownership
 or isolate hostile processes sharing the same OS account. Server-side verified
 send enforcement remains `MESSAGING_FAIL_CLOSED_SEND_PROFILE=true`.

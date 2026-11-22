@@ -4003,6 +4003,447 @@ fn stored_registration_token(env: &TestEnv, agent: &str) -> String {
 }
 
 #[test]
+fn agent_token_lifecycle_offline_preserves_identity_and_rejects_revoked_credentials() {
+    let env = TestEnv::new();
+    let project = env.hostile_repo().to_str().unwrap();
+    let vars = env.isolated_env();
+    let run = |args: &[&str]| run_am_hermetic(&vars, Some(env.hostile_repo()), args);
+    let registered = run(&[
+        "agents",
+        "register",
+        "--project",
+        project,
+        "--name",
+        "token-worker",
+        "--program",
+        "codex-cli",
+        "--model",
+        "test",
+        "--task",
+        "preserve profile",
+        "--json",
+    ]);
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let original_token = stored_registration_token(&env, "token-worker");
+    let original_file = env.tmp.path().join("original-token.txt");
+    std::fs::write(&original_file, &original_token).unwrap();
+    let show_args = [
+        "agents",
+        "show",
+        "token-worker",
+        "--project",
+        project,
+        "--json",
+    ];
+    let before = run(&show_args);
+    assert!(
+        before.status.success(),
+        "{}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+    let before: Value = serde_json::from_slice(&before.stdout).unwrap();
+
+    let rotated = run(&[
+        "agents",
+        "rotate-token",
+        "--project",
+        project,
+        "--agent",
+        "TOKEN-WORKER",
+        "--json",
+    ]);
+    assert!(
+        rotated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rotated.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&rotated.stdout).unwrap();
+    assert_eq!(receipt["token_status"], "rotated");
+    assert_eq!(receipt["registration_token_returned"], false);
+    assert!(receipt.get("registration_token").is_none());
+    let replacement = stored_registration_token(&env, "token-worker");
+    assert_ne!(replacement, original_token);
+    for bytes in [&rotated.stdout, &rotated.stderr] {
+        let output = String::from_utf8_lossy(bytes);
+        assert!(!output.contains(&replacement));
+        assert!(!output.contains(&original_token));
+    }
+    let after = run(&show_args);
+    assert!(
+        after.status.success(),
+        "{}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let after: Value = serde_json::from_slice(&after.stdout).unwrap();
+    for field in [
+        "id",
+        "name",
+        "program",
+        "model",
+        "task_description",
+        "inception_ts",
+        "last_active_ts",
+        "attachments_policy",
+    ] {
+        assert_eq!(
+            after[field], before[field],
+            "rotation must preserve {field}"
+        );
+    }
+
+    // A stale explicit token cannot win a second mutation or fall back to the
+    // current private credential, even though that valid credential exists.
+    for command in ["rotate-token", "revoke-token"] {
+        let refused = run(&[
+            "agents",
+            command,
+            "--project",
+            project,
+            "--agent",
+            "token-worker",
+            "--sender-token-file",
+            original_file.to_str().unwrap(),
+            "--json",
+        ]);
+        assert!(!refused.status.success());
+        assert!(refused.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&refused.stderr).contains(&original_token));
+        assert_eq!(stored_registration_token(&env, "token-worker"), replacement);
+    }
+    let send_args = [
+        "mail",
+        "send",
+        "--project",
+        project,
+        "--from",
+        "token-worker",
+        "--to",
+        "token-worker",
+        "--subject",
+        "lifecycle history",
+        "--body",
+        "keep this message",
+        "--json",
+    ];
+    let sent = run(&send_args);
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let sent: Value = serde_json::from_slice(&sent.stdout).unwrap();
+    assert_eq!(sent["verified_sender"], true);
+    let replacement_file = env.tmp.path().join("replacement-token.txt");
+    std::fs::write(&replacement_file, &replacement).unwrap();
+    let identity_files: Vec<_> = std::fs::read_dir(env.storage_root.join(".identity"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(identity_files.len(), 1);
+
+    let revoked = run(&[
+        "agents",
+        "revoke-token",
+        "--project",
+        project,
+        "--agent",
+        "token-worker",
+        "--json",
+    ]);
+    assert!(
+        revoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&revoked.stdout).unwrap();
+    assert_eq!(receipt["token_status"], "revoked");
+    assert!(receipt.get("registration_token").is_none());
+    assert_eq!(receipt["registration_token_returned"], false);
+    assert!(
+        identity_files[0].is_file(),
+        "revocation preserves the identity file"
+    );
+    let private: Value =
+        serde_json::from_slice(&std::fs::read(&identity_files[0]).unwrap()).unwrap();
+    assert_eq!(private["sender_token"], "");
+    assert_eq!(private["agent_name"], "token-worker");
+
+    // The default profile permits tokenless sends; explicitly presenting the
+    // revoked bearer must still fail and must not insert another message.
+    let mut stale_send = send_args.to_vec();
+    stale_send.extend(["--sender-token-file", replacement_file.to_str().unwrap()]);
+    let refused = run(&stale_send);
+    assert!(!refused.status.success());
+    assert!(!String::from_utf8_lossy(&refused.stderr).contains(&replacement));
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    let rows = conn.query_sync(
+        "SELECT COUNT(*) AS n FROM agents WHERE name = ? AND registration_token IS NULL AND retired_at IS NULL",
+        &[SqlValue::Text("token-worker".into())],
+    ).unwrap();
+    assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
+    let rows = conn
+        .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+        .unwrap();
+    assert_eq!(
+        rows[0].get_named::<i64>("n").unwrap(),
+        1,
+        "revocation preserves history and rejected sends write nothing"
+    );
+    conn.close_sync().unwrap();
+
+    let mut fail_closed_vars = vars.clone();
+    fail_closed_vars.push(("MESSAGING_FAIL_CLOSED_SEND_PROFILE".into(), "true".into()));
+    let refused = run_am_hermetic(&fail_closed_vars, Some(env.hostile_repo()), &send_args);
+    assert!(
+        !refused.status.success(),
+        "tokenless private state cannot satisfy fail-closed sending"
+    );
+    let unverified = run(&send_args);
+    assert!(
+        unverified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unverified.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&unverified.stdout).unwrap();
+    assert_eq!(
+        receipt["verified_sender"], false,
+        "trusted-local tokenless behavior stays available"
+    );
+}
+
+#[test]
+fn agent_token_lifecycle_real_server_keeps_rotation_private_and_clears_saved_token() {
+    let env = TestEnv::new();
+    let project = env.hostile_repo().to_str().unwrap();
+    let registered = run_am_hermetic(
+        &env.isolated_env(),
+        Some(env.hostile_repo()),
+        &[
+            "agents",
+            "register",
+            "--project",
+            project,
+            "--name",
+            "remote-token-worker",
+            "--program",
+            "codex-cli",
+            "--model",
+            "test",
+            "--json",
+        ],
+    );
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let mut previous = stored_registration_token(&env, "remote-token-worker");
+    let stale_file = env.tmp.path().join("stale-remote-token.txt");
+    std::fs::write(&stale_file, &previous).unwrap();
+    let port = unused_loopback_port();
+    let _server = reservation_read_start_server(&env, port);
+    let forbidden_local_db = env.tmp.path().join("token-client-must-not-open.sqlite3");
+    let client_env = reservation_read_env(
+        &env,
+        port,
+        &format!("sqlite:///{}", forbidden_local_db.display()),
+    );
+    let run = |args: &[&str]| run_am_hermetic(&client_env, Some(env.hostile_repo()), args);
+    for format in ["table", "json", "toon"] {
+        for show_token in [false, true] {
+            let mut args = vec![
+                "agents",
+                "rotate-token",
+                "--project",
+                project,
+                "--agent",
+                "remote-token-worker",
+                "--format",
+                format,
+            ];
+            if show_token {
+                args.push("--show-token");
+            }
+            let rotated = run(&args);
+            assert!(
+                rotated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&rotated.stderr)
+            );
+            let records: Vec<Value> = std::fs::read_dir(env.storage_root.join(".identity"))
+                .unwrap()
+                .map(|entry| {
+                    serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap()
+                })
+                .collect();
+            assert_eq!(records.len(), 1);
+            let replacement = records[0]["sender_token"].as_str().unwrap();
+            assert!(!replacement.is_empty());
+            assert_ne!(replacement, previous);
+            let stdout = String::from_utf8_lossy(&rotated.stdout);
+            assert_eq!(stdout.contains(replacement), show_token, "{format}");
+            assert!(!stdout.contains(&previous));
+            assert!(!String::from_utf8_lossy(&rotated.stderr).contains(replacement));
+            if format == "json" {
+                let receipt: Value = serde_json::from_slice(&rotated.stdout).unwrap();
+                assert_eq!(receipt["registration_token_returned"], show_token);
+                assert_eq!(receipt.get("registration_token").is_some(), show_token);
+            }
+            previous = replacement.to_string();
+        }
+    }
+    let rejected = run(&[
+        "agents",
+        "revoke-token",
+        "--project",
+        project,
+        "--agent",
+        "remote-token-worker",
+        "--sender-token-file",
+        stale_file.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let send = [
+        "mail",
+        "send",
+        "--project",
+        project,
+        "--from",
+        "remote-token-worker",
+        "--to",
+        "remote-token-worker",
+        "--subject",
+        "HTTP token rotation",
+        "--body",
+        "private replacement works",
+        "--json",
+    ];
+    let sent = run(&send);
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&sent.stdout).unwrap();
+    assert_eq!(receipt["verified_sender"], true);
+    let revoked_file = env.tmp.path().join("revoked-remote-token.txt");
+    std::fs::write(&revoked_file, &previous).unwrap();
+    let revoked = run(&[
+        "agents",
+        "revoke-token",
+        "--project",
+        project,
+        "--agent",
+        "remote-token-worker",
+        "--json",
+    ]);
+    assert!(
+        revoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&revoked.stdout).contains(&previous));
+    assert!(!String::from_utf8_lossy(&revoked.stderr).contains(&previous));
+    let mut stale_send = send.to_vec();
+    stale_send.extend(["--sender-token-file", revoked_file.to_str().unwrap()]);
+    let refused = run(&stale_send);
+    assert!(
+        !refused.status.success(),
+        "HTTP must reject an explicitly revoked bearer"
+    );
+    assert!(
+        !forbidden_local_db.exists(),
+        "live lifecycle requests must never open the local fallback"
+    );
+}
+
+#[test]
+fn agent_token_lifecycle_reports_private_state_failure_after_server_mutation() {
+    for command in ["rotate-token", "revoke-token"] {
+        let env = TestEnv::new();
+        let project = env.hostile_repo().to_str().unwrap();
+        let run =
+            |args: &[&str]| run_am_hermetic(&env.isolated_env(), Some(env.hostile_repo()), args);
+        let registered = run(&[
+            "agents",
+            "register",
+            "--project",
+            project,
+            "--name",
+            "save-failure-worker",
+            "--program",
+            "codex-cli",
+            "--model",
+            "test",
+            "--json",
+        ]);
+        assert!(
+            registered.status.success(),
+            "{}",
+            String::from_utf8_lossy(&registered.stderr)
+        );
+        let token = stored_registration_token(&env, "save-failure-worker");
+        let token_file = env.tmp.path().join("current-token.txt");
+        std::fs::write(&token_file, &token).unwrap();
+        let private_path = env.storage_root.join(".identity");
+        std::fs::rename(
+            &private_path,
+            env.storage_root.join("saved-private-identity"),
+        )
+        .unwrap();
+        std::fs::write(&private_path, b"preserve obstruction").unwrap();
+        let failed = run(&[
+            "agents",
+            command,
+            "--project",
+            project,
+            "--agent",
+            "save-failure-worker",
+            "--sender-token-file",
+            token_file.to_str().unwrap(),
+            "--json",
+        ]);
+        assert!(!failed.status.success());
+        assert!(failed.stdout.is_empty());
+        let error = String::from_utf8_lossy(&failed.stderr);
+        assert!(
+            error.contains("private identity state could not be updated"),
+            "{error}"
+        );
+        assert!(
+            error.contains("previous token no longer authorizes"),
+            "{error}"
+        );
+        assert!(!error.contains(&token));
+        assert_eq!(
+            std::fs::read(&private_path).unwrap(),
+            b"preserve obstruction"
+        );
+        if command == "rotate-token" {
+            let replacement = stored_registration_token(&env, "save-failure-worker");
+            assert_ne!(replacement, token);
+            assert!(!error.contains(&replacement));
+        } else {
+            let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS n FROM agents WHERE registration_token IS NULL",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
+            conn.close_sync().unwrap();
+        }
+    }
+}
+
+#[test]
 fn agent_registration_reports_private_token_save_failure_without_echoing_the_secret() {
     for command in ["register", "create"] {
         let env = TestEnv::new();
