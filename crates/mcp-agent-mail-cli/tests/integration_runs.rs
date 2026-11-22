@@ -3903,7 +3903,7 @@ fn agents_create_offline_validates_policy_and_mints_a_sender_token() {
             "--json",
         ];
         args.extend_from_slice(extra);
-        run_am(&env.base_env(), Some(env.tmp.path()), &args, None)
+        run_am_hermetic(&env.isolated_env(), Some(env.tmp.path()), &args)
     };
 
     // No daemon answers (HTTP_PORT=1), so this is the local path; it must
@@ -3925,11 +3925,289 @@ fn agents_create_offline_validates_policy_and_mints_a_sender_token() {
     );
     let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     assert_eq!(value["name"], "BlueLake", "{value}");
+    assert!(value.get("registration_token").is_none(), "{value}");
+    assert_eq!(value["registration_token_returned"], false);
+    let token = stored_registration_token(&env, "BlueLake");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(&token));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(&token));
+
+    // The secret is saved even though it never appeared in the command output.
+    // A separate fail-closed send proves it can still be used by the CLI.
+    let sent = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true")
+        .current_dir(env.tmp.path())
+        .args([
+            "mail",
+            "send",
+            "--project",
+            &project_key,
+            "--from",
+            "BlueLake",
+            "--to",
+            "BlueLake",
+            "--subject",
+            "private identity",
+            "--body",
+            "sender credential remains usable",
+            "--json",
+        ])
+        .output()
+        .expect("send with privately saved create token");
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&sent.stdout).unwrap();
+    assert_eq!(receipt["verified_sender"], true);
+
+    let shown = create(&["-n", "RedPeak", "--show-token"]);
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let value: Value = serde_json::from_slice(&shown.stdout).expect("valid JSON");
     assert!(
         value["registration_token"]
             .as_str()
             .is_some_and(|token| !token.is_empty()),
-        "an offline-created agent gets a sender token: {value}"
+        "--show-token explicitly exports an offline-created agent's token: {value}"
+    );
+    assert_eq!(
+        value["registration_token"],
+        stored_registration_token(&env, "RedPeak")
+    );
+}
+
+fn stored_registration_token(env: &TestEnv, agent: &str) -> String {
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap())
+        .expect("open isolated mailbox to inspect persisted token");
+    let rows = conn
+        .query_sync(
+            "SELECT registration_token FROM agents WHERE name = ?",
+            &[SqlValue::Text(agent.to_string())],
+        )
+        .expect("read registration token");
+    assert_eq!(rows.len(), 1, "fixture has exactly one matching agent");
+    let token = rows[0].get_named::<String>("registration_token").unwrap();
+    assert!(
+        !token.is_empty(),
+        "persisted registration token must be usable"
+    );
+    conn.close_sync()
+        .expect("close token inspection connection");
+    token
+}
+
+#[test]
+fn agent_registration_reports_private_token_save_failure_without_echoing_the_secret() {
+    for command in ["register", "create"] {
+        let env = TestEnv::new();
+        let project = env.hostile_repo().to_str().unwrap();
+        let identity_path = env.storage_root.join(".identity");
+        std::fs::write(&identity_path, b"preserve this obstruction").unwrap();
+        let mut args = vec![
+            "agents",
+            command,
+            "--project",
+            project,
+            "-n",
+            "private-worker",
+            "--program",
+            "codex-cli",
+            "--model",
+            "test",
+            "--json",
+        ];
+        let failed = run_am_hermetic(&env.isolated_env(), Some(env.hostile_repo()), &args);
+        assert!(!failed.status.success());
+        assert!(
+            failed.stdout.is_empty(),
+            "failed save must not emit success JSON"
+        );
+        let error = String::from_utf8_lossy(&failed.stderr);
+        assert!(
+            error.contains("sender credential could not be saved privately"),
+            "{error}"
+        );
+        assert!(
+            error.contains("registration completed"),
+            "partial effect must be explicit: {error}"
+        );
+        let token = stored_registration_token(&env, "private-worker");
+        assert!(!error.contains(&token));
+        assert_eq!(
+            std::fs::read(&identity_path).unwrap(),
+            b"preserve this obstruction"
+        );
+
+        // Repair the fixture without removing the obstruction, then follow the
+        // command's recovery guidance. Re-registration replaces the stranded
+        // credential with a new one and persists it privately.
+        std::fs::rename(
+            &identity_path,
+            env.storage_root.join("identity-obstruction.saved"),
+        )
+        .unwrap();
+        args[1] = "register";
+        let retried = run_am_hermetic(&env.isolated_env(), Some(env.hostile_repo()), &args);
+        assert!(
+            retried.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retried.stderr)
+        );
+        let payload: Value = serde_json::from_slice(&retried.stdout).unwrap();
+        assert!(payload.get("registration_token").is_none());
+        assert_eq!(payload["registration_token_returned"], false);
+        let replacement = stored_registration_token(&env, "private-worker");
+        assert_ne!(token, replacement);
+        for output in [&retried.stdout, &retried.stderr] {
+            let text = String::from_utf8_lossy(output);
+            assert!(!text.contains(&token));
+            assert!(!text.contains(&replacement));
+        }
+    }
+}
+
+#[test]
+fn agent_registration_real_server_keeps_tokens_private_in_all_output_formats() {
+    let env = TestEnv::new();
+    let project = env.hostile_repo().to_str().unwrap();
+    let seed = run_am_hermetic(
+        &env.isolated_env(),
+        Some(env.hostile_repo()),
+        &[
+            "agents",
+            "register",
+            "--project",
+            project,
+            "-n",
+            "seed-worker",
+            "--program",
+            "codex-cli",
+            "--model",
+            "test",
+            "--json",
+        ],
+    );
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let port = unused_loopback_port();
+    let _server = reservation_read_start_server(&env, port);
+    // The daemon owns the real mailbox. A distinct, absent client database
+    // proves these CLI requests used HTTP rather than a local fallback.
+    let forbidden_local_db = env
+        .tmp
+        .path()
+        .join("registration-client-must-not-open.sqlite3");
+    let client_env = reservation_read_env(
+        &env,
+        port,
+        &format!("sqlite:///{}", forbidden_local_db.display()),
+    );
+
+    for command in ["register", "create"] {
+        for format in ["table", "json", "toon"] {
+            for show_token in [false, true] {
+                let name = format!("output-{command}-{format}-{show_token}");
+                let mut args = vec![
+                    "agents",
+                    command,
+                    "--project",
+                    project,
+                    "-n",
+                    &name,
+                    "--program",
+                    "codex-cli",
+                    "--model",
+                    "test",
+                    "--format",
+                    format,
+                ];
+                if show_token {
+                    args.push("--show-token");
+                }
+                let out = run_am_hermetic(&client_env, Some(env.hostile_repo()), &args);
+                assert!(
+                    out.status.success(),
+                    "{args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let records: Vec<_> = std::fs::read_dir(env.storage_root.join(".identity"))
+                    .expect("private sender state directory")
+                    .map(|entry| entry.unwrap().path())
+                    .filter_map(|path| {
+                        let state: Value =
+                            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                        (state["agent_name"] == name).then_some((path, state))
+                    })
+                    .collect();
+                assert_eq!(records.len(), 1, "the CLI persisted this exact identity");
+                let (path, state) = &records[0];
+                let token = state["sender_token"].as_str().expect("saved sender token");
+                assert!(!token.is_empty());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                        0
+                    );
+                }
+                #[cfg(not(unix))]
+                let _ = path;
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert_eq!(stdout.contains(token), show_token, "{args:?}");
+                assert!(!String::from_utf8_lossy(&out.stderr).contains(token));
+                if format == "json" {
+                    let payload: Value = serde_json::from_slice(&out.stdout).unwrap();
+                    if show_token {
+                        assert_eq!(payload["registration_token"], token);
+                    } else {
+                        assert!(payload.get("registration_token").is_none());
+                        assert_eq!(payload["registration_token_returned"], false);
+                    }
+                }
+                if !show_token && format == "json" {
+                    let sent = run_am_hermetic(
+                        &client_env,
+                        Some(env.hostile_repo()),
+                        &[
+                            "mail",
+                            "send",
+                            "--project",
+                            project,
+                            "--from",
+                            &name,
+                            "--to",
+                            &name,
+                            "--subject",
+                            "private HTTP credential",
+                            "--body",
+                            "saved token survives output redaction",
+                            "--json",
+                        ],
+                    );
+                    assert!(
+                        sent.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&sent.stderr)
+                    );
+                    let receipt: Value = serde_json::from_slice(&sent.stdout).unwrap();
+                    assert_eq!(receipt["verified_sender"], true);
+                }
+            }
+        }
+    }
+    assert!(
+        !forbidden_local_db.exists(),
+        "HTTP success must never open the local fallback"
     );
 }
 
@@ -9470,9 +9748,20 @@ fn check_explicit_sender_token_mode(direct_registration: bool) {
     } else {
         &identity["agent"]
     };
-    let token = agent["registration_token"]
-        .as_str()
-        .expect("real registration token");
+    let registration_token = if direct_registration {
+        assert!(agent.get("registration_token").is_none());
+        assert_eq!(agent["registration_token_returned"], false);
+        let token = stored_registration_token(&env, "BlueLake");
+        assert!(!String::from_utf8_lossy(&registration.stdout).contains(&token));
+        assert!(!String::from_utf8_lossy(&registration.stderr).contains(&token));
+        token
+    } else {
+        agent["registration_token"]
+            .as_str()
+            .expect("real registration token")
+            .to_string()
+    };
+    let token = registration_token.as_str();
     let send = [
         "mail",
         "send",
@@ -9559,11 +9848,21 @@ fn check_explicit_sender_token_mode(direct_registration: bool) {
         );
         let refreshed: Value = serde_json::from_slice(&registered_again.stdout).unwrap();
         assert_eq!(refreshed["id"], agent["id"]);
+        assert!(refreshed.get("registration_token").is_none());
+        assert_eq!(refreshed["registration_token_returned"], false);
+        let fresh_token = stored_registration_token(&env, "BlueLake");
+        assert_ne!(fresh_token, token);
+        for output in [&registered_again.stdout, &registered_again.stderr] {
+            let text = String::from_utf8_lossy(output);
+            assert!(!text.contains(token));
+            assert!(!text.contains(&fresh_token));
+        }
+        let stale = run(&send, true, Some(token));
         assert!(
-            refreshed["registration_token"]
-                .as_str()
-                .is_some_and(|fresh| !fresh.is_empty() && fresh != token)
+            !stale.status.success(),
+            "rotation must invalidate the old token"
         );
+        assert!(!String::from_utf8_lossy(&stale.stderr).contains(token));
         let sent = run(&send, false, None);
         assert!(
             sent.status.success(),
@@ -9590,7 +9889,34 @@ fn check_explicit_sender_token_mode(direct_registration: bool) {
         assert_eq!(archived["name"], "BlueLake");
         assert!(archived.get("registration_token").is_none());
         assert!(!profile.contains(token));
-        assert!(!profile.contains(refreshed["registration_token"].as_str().unwrap()));
+        assert!(!profile.contains(&fresh_token));
+
+        // Credential export is an explicit choice, still backed by the same
+        // persisted token and private sender state as the default path.
+        let mut show_args = registration_args.to_vec();
+        show_args.push("--show-token");
+        let shown = run(&show_args, false, None);
+        assert!(
+            shown.status.success(),
+            "{}",
+            String::from_utf8_lossy(&shown.stderr)
+        );
+        let exported: Value = serde_json::from_slice(&shown.stdout).unwrap();
+        let exported_token = exported["registration_token"].as_str().unwrap();
+        assert!(!exported_token.is_empty());
+        assert_ne!(exported_token, fresh_token);
+        assert_eq!(exported_token, stored_registration_token(&env, "BlueLake"));
+        assert!(!String::from_utf8_lossy(&shown.stderr).contains(exported_token));
+        let sent = run(&send, false, None);
+        assert!(
+            sent.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sent.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&sent.stdout).unwrap()["verified_sender"],
+            true
+        );
 
         let before_db = file_snapshot(&env.db_path);
         let before_archive = snapshot_tree(&env.storage_root);

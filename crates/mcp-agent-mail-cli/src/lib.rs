@@ -3182,6 +3182,9 @@ pub enum AgentsCommand {
         /// Attachments policy: auto, inline, file, none.
         #[arg(long, default_value = "auto")]
         attachments_policy: String,
+        /// Include the registration token in output. By default it is stored privately for mail send.
+        #[arg(long, default_value_t = false)]
+        show_token: bool,
         /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -3209,6 +3212,9 @@ pub enum AgentsCommand {
         /// Attachments policy: auto, inline, file, none.
         #[arg(long, default_value = "auto")]
         attachments_policy: String,
+        /// Include the registration token in output. By default it is stored privately for mail send.
+        #[arg(long, default_value_t = false)]
+        show_token: bool,
         /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -9564,15 +9570,16 @@ fn sender_identity_key(project_key: &str, agent_name: &str) -> (String, String) 
 }
 
 /// Persist a registered agent's sender token so `mail send` can reuse it without
-/// the operator re-supplying it. Best-effort: failures are logged, not fatal.
+/// the operator re-supplying it. Report save failures before any success output:
+/// a transcript-safe registration must not silently discard its credential.
 fn persist_sender_identity_token(
     config: &Config,
     project_key: &str,
     agent_name: &str,
     sender_token: &str,
-) {
+) -> CliResult<()> {
     if sender_token.is_empty() || project_key.is_empty() || agent_name.is_empty() {
-        return;
+        return Ok(());
     }
     let (project, agent) = sender_identity_key(project_key, agent_name);
     let path = sender_identity_state_path(config, &project, &agent);
@@ -9581,14 +9588,17 @@ fn persist_sender_identity_token(
         agent_name: agent,
         sender_token: sender_token.to_string(),
     };
-    let Ok(content) = serde_json::to_string(&record) else {
-        return;
-    };
+    let content = serde_json::to_string(&record).map_err(|error| {
+        CliError::Format(format!("could not encode sender identity state: {error}"))
+    })?;
     // The fingerprinted filename can collide across distinct (project, agent)
     // pairs only with a 64-bit hash collision; guard against a stale record for
     // a *different* pair by writing the canonical identity inside the file and
     // verifying it on read.
-    write_cache_file_if_safe(&path, &content, "sender identity state");
+    write_cache_file_atomically_if_safe(&path, content.as_bytes(), "sender identity state")
+        .map_err(|error| CliError::Other(format!(
+            "Agent registration completed, but its sender credential could not be saved privately: {error}. Fix the identity-state path and re-register. The credential was not printed."
+        )))
 }
 
 /// Load a previously-persisted sender token for `(project_key, agent_name)`.
@@ -9612,7 +9622,7 @@ fn persist_sender_identity_token_from_agent_payload(
     config: &Config,
     project_key: &str,
     payload: &serde_json::Value,
-) {
+) -> CliResult<()> {
     // The agent object may be the payload itself or under an `agent` key.
     let agent = payload.get("agent").unwrap_or(payload);
     let name = agent
@@ -9624,8 +9634,9 @@ fn persist_sender_identity_token_from_agent_payload(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     if !name.is_empty() && !token.is_empty() {
-        persist_sender_identity_token(config, project_key, name, token);
+        persist_sender_identity_token(config, project_key, name, token)?;
     }
+    Ok(())
 }
 
 /// Resolve the `mail send` sender token without ever requiring it to be echoed
@@ -42099,6 +42110,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             name,
             task,
             attachments_policy,
+            show_token,
             format,
             json,
         } => {
@@ -42135,8 +42147,8 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                         &server_config,
                         &project_key,
                         &payload,
-                    );
-                    render_agent_payload(&payload, fmt);
+                    )?;
+                    render_agent_registration_payload(payload, fmt, show_token);
                     return Ok(());
                 }
                 ServerToolCall::Unavailable(message) => {
@@ -42194,8 +42206,8 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 &server_config,
                 &project_key,
                 &payload,
-            );
-            render_agent_payload(&payload, fmt);
+            )?;
+            render_agent_registration_payload(payload, fmt, show_token);
             Ok(())
         }
 
@@ -42206,6 +42218,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             name_hint,
             task,
             attachments_policy,
+            show_token,
             format,
             json,
         } => {
@@ -42241,8 +42254,8 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                         &server_config,
                         &project_key,
                         &payload,
-                    );
-                    render_agent_payload(&payload, fmt);
+                    )?;
+                    render_agent_registration_payload(payload, fmt, show_token);
                     return Ok(());
                 }
                 ServerToolCall::Unavailable(message) => {
@@ -42301,8 +42314,8 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 &server_config,
                 &project_key,
                 &payload,
-            );
-            render_agent_payload(&payload, fmt);
+            )?;
+            render_agent_registration_payload(payload, fmt, show_token);
             Ok(())
         }
 
@@ -43129,6 +43142,33 @@ fn agent_payload_i64(payload: &serde_json::Value, key: &str) -> i64 {
         .unwrap_or_default()
 }
 
+/// The native tool's token has already been saved to private sender state.
+/// Redact before selecting the output format so JSON and TOON are just as
+/// safe to log as the human-readable table (GH#396).
+fn render_agent_registration_payload(
+    mut payload: serde_json::Value,
+    format: output::CliOutputFormat,
+    show_token: bool,
+) {
+    if !show_token && let Some(agent) = payload.as_object_mut() {
+        agent.remove("registration_token");
+        agent.insert(
+            "registration_token_returned".into(),
+            serde_json::Value::Bool(false),
+        );
+    }
+    render_agent_payload(&payload, format);
+    if show_token
+        && format == output::CliOutputFormat::Table
+        && let Some(token) = payload
+            .get("registration_token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty())
+    {
+        output::kv("Registration Token", token);
+    }
+}
+
 fn render_agent_payload(payload: &serde_json::Value, format: output::CliOutputFormat) {
     output::emit_output(payload, format, || {
         output::success(&format!("Agent: {}", agent_payload_string(payload, "name")));
@@ -43382,7 +43422,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                         &server_config,
                         &human_key,
                         &payload,
-                    );
+                    )?;
                     render_macro_start_session_payload(&payload, fmt, &program, &model);
                     return Ok(());
                 }
@@ -43432,7 +43472,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             .await
             .map_err(mcp_error_to_cli_error)?;
             let payload = parse_tool_json_payload("macro_start_session", &result)?;
-            persist_sender_identity_token_from_agent_payload(&server_config, &human_key, &payload);
+            persist_sender_identity_token_from_agent_payload(&server_config, &human_key, &payload)?;
             render_macro_start_session_payload(&payload, fmt, &program, &model);
             Ok(())
         }
@@ -43502,7 +43542,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     &server_config,
                     &project_key,
                     &payload,
-                );
+                )?;
                 render_macro_prepare_thread_payload(&payload, fmt);
                 return Ok(());
             }
@@ -43541,7 +43581,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 &server_config,
                 &project_key,
                 &payload,
-            );
+            )?;
             render_macro_prepare_thread_payload(&payload, fmt);
             Ok(())
         }
@@ -44597,8 +44637,8 @@ mod mail_server_cli_bridge_tests {
     fn persist_and_load_sender_identity_round_trip_is_scoped_to_pair() {
         let td = tempfile::tempdir().unwrap();
         let config = config_with_storage_root(td.path());
-        persist_sender_identity_token(&config, "/proj-a", "Agent1", "tok-a");
-        persist_sender_identity_token(&config, "/proj-b", "Agent2", "tok-b");
+        persist_sender_identity_token(&config, "/proj-a", "Agent1", "tok-a").unwrap();
+        persist_sender_identity_token(&config, "/proj-b", "Agent2", "tok-b").unwrap();
         assert_eq!(
             load_sender_identity_token(&config, "/proj-a", "Agent1").as_deref(),
             Some("tok-a")
@@ -44613,7 +44653,7 @@ mod mail_server_cli_bridge_tests {
             None
         );
         // Empty token is never persisted.
-        persist_sender_identity_token(&config, "/proj-c", "Agent3", "");
+        persist_sender_identity_token(&config, "/proj-c", "Agent3", "").unwrap();
         assert_eq!(
             load_sender_identity_token(&config, "/proj-c", "Agent3"),
             None
@@ -44630,7 +44670,7 @@ mod mail_server_cli_bridge_tests {
         let slug = mcp_agent_mail_core::resolve_project_identity(&path_key).slug;
 
         // `am macros start-session --project /abs/...` persists the token...
-        persist_sender_identity_token(&config, &path_key, "BlueLake", "tok-path");
+        persist_sender_identity_token(&config, &path_key, "BlueLake", "tok-path").unwrap();
         // ...and `am mail send --project <slug> --from bluelake` reuses it.
         assert_eq!(
             load_sender_identity_token(&config, &slug, "bluelake").as_deref(),
@@ -44653,7 +44693,7 @@ mod mail_server_cli_bridge_tests {
         let config = config_with_storage_root(td.path());
         // Flat agent object (register_agent shape).
         let flat = serde_json::json!({ "name": "FlatAgent", "registration_token": "flat-tok" });
-        persist_sender_identity_token_from_agent_payload(&config, "/flat", &flat);
+        persist_sender_identity_token_from_agent_payload(&config, "/flat", &flat).unwrap();
         assert_eq!(
             load_sender_identity_token(&config, "/flat", "FlatAgent").as_deref(),
             Some("flat-tok")
@@ -44663,14 +44703,14 @@ mod mail_server_cli_bridge_tests {
             "agent": { "name": "NestedAgent", "registration_token": "nested-tok" },
             "project": { "slug": "x" }
         });
-        persist_sender_identity_token_from_agent_payload(&config, "/nested", &nested);
+        persist_sender_identity_token_from_agent_payload(&config, "/nested", &nested).unwrap();
         assert_eq!(
             load_sender_identity_token(&config, "/nested", "NestedAgent").as_deref(),
             Some("nested-tok")
         );
         // Payload without a token persists nothing.
         let no_tok = serde_json::json!({ "name": "NoTok" });
-        persist_sender_identity_token_from_agent_payload(&config, "/notok", &no_tok);
+        persist_sender_identity_token_from_agent_payload(&config, "/notok", &no_tok).unwrap();
         assert_eq!(load_sender_identity_token(&config, "/notok", "NoTok"), None);
     }
 

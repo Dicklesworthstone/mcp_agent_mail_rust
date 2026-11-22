@@ -657,6 +657,16 @@ project and user-level URLs. Use `am setup run` to configure clients separately,
 or `am serve-http --setup` to update detected clients to that launch's endpoint.
 The setup flag can rewrite existing entries; omit it for temporary test servers.
 
+`am agents register` and `am agents create` save the registration token privately
+for subsequent `am mail send` calls. Their table, JSON, and TOON output omits the
+token by default; structured output includes `registration_token_returned: false`.
+Use `--show-token` only when intentionally exporting the credential, for example
+`am agents register --project /abs/path --name BlueLake --program codex-cli --model gpt-5 --json --show-token`.
+Re-registering the same identity rotates its token and updates the CLI's saved
+credential without printing either token. The previous token stops authorizing
+sends. This CLI output policy does not change MCP tool responses or the
+`am macros start-session` response.
+
 For CLI deployments that require an explicitly supplied sending credential, set
 `AGENT_MAIL_REQUIRE_EXPLICIT_SENDER_TOKEN=1`. `am mail send` then requires
 `--sender-token`, `--sender-token-file`, or `AGENT_MAIL_SENDER_TOKEN`; it refuses
