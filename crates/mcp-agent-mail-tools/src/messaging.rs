@@ -2587,22 +2587,23 @@ fn verify_sender_identity(
         return Ok(false);
     };
 
-    let Some(registration_token) = registration_token else {
-        if require_verified_sender {
-            return Err(legacy_tool_error(
-                "SENDER_TOKEN_UNAVAILABLE",
-                format!(
-                    "Agent '{sender_name}' has no stored registration token, so sender proof cannot be verified while the fail-closed send profile is enabled. Re-register the agent before sending."
-                ),
-                false,
-                json!({
-                    "sender_name": sender_name,
-                    "profile": "fail_closed",
-                    "hint": "Re-register the agent to obtain a registration_token before sending",
-                }),
-            ));
-        }
-        return Ok(false);
+    // An explicit credential is an authentication attempt in every profile.
+    // Revoked tokens reload as None (the DB decoder normalizes empty strings),
+    // so accepting an unverified send here would make revocation ineffective
+    // after cache eviction or a server restart.
+    let Some(registration_token) = registration_token.filter(|token| !token.is_empty()) else {
+        return Err(legacy_tool_error(
+            "SENDER_TOKEN_UNAVAILABLE",
+            format!(
+                "Agent '{sender_name}' has no active registration token, so the supplied sender_token cannot be verified. Re-register the agent or rotate its token before sending."
+            ),
+            false,
+            json!({
+                "sender_name": sender_name,
+                "profile": if require_verified_sender { "fail_closed" } else { "trusted_local" },
+                "hint": "Request return_registration_token: true when registering, or use am agents rotate-token",
+            }),
+        ));
     };
 
     if mcp_agent_mail_core::setup::constant_time_str_eq(sender_token, registration_token) {
@@ -6911,6 +6912,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -6923,6 +6925,7 @@ mod tests {
                     Some("GreenStone".to_string()),
                     Some("recipient".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7275,6 +7278,7 @@ mod tests {
                                     None,
                                     None,
                                     None,
+                                    None,
                                 )
                                 .await
                             }
@@ -7482,6 +7486,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -7493,6 +7498,7 @@ mod tests {
                     Some("GreenStone".to_string()),
                     Some("stable recipient".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7515,6 +7521,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register replaceable recipient");
@@ -7532,6 +7539,7 @@ mod tests {
                     Some("AzureCanyon".to_string()),
                     Some("recipient activity refresh".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7577,6 +7585,7 @@ mod tests {
                     Some("AzureCanyon".to_string()),
                     Some("replacement recipient".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7665,6 +7674,7 @@ mod tests {
                         "gpt-5".to_string(),
                         Some(name.to_string()),
                         Some("contact lookup".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -7943,6 +7953,7 @@ mod tests {
                         "gpt-5".to_string(),
                         Some(name.to_string()),
                         Some("repeated request".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -11588,6 +11599,41 @@ mod tests {
             mismatch.data.as_ref().expect("structured error")["error"]["type"],
             "SENDER_TOKEN_MISMATCH"
         );
+    }
+
+    #[test]
+    fn supplied_sender_token_is_rejected_after_revocation_in_every_profile() {
+        for require_verified_sender in [false, true] {
+            for stored_token in [None, Some("")] {
+                let error = verify_sender_identity(
+                    "BlueLake",
+                    Some("revoked-test-token"),
+                    stored_token,
+                    require_verified_sender,
+                )
+                .expect_err("revoked credentials must never downgrade to unverified sends");
+                assert_eq!(error.code, McpErrorCode::ToolExecutionError);
+                assert_eq!(
+                    error.data.as_ref().expect("structured error")["error"]["type"],
+                    "SENDER_TOKEN_UNAVAILABLE"
+                );
+                assert!(!error.message.contains("revoked-test-token"));
+                assert!(
+                    !error
+                        .data
+                        .as_ref()
+                        .expect("structured error")
+                        .to_string()
+                        .contains("revoked-test-token")
+                );
+            }
+        }
+
+        // Token revocation does not change the trusted-local omitted-token
+        // contract; the fail-closed profile still requires a credential.
+        assert!(!verify_sender_identity("BlueLake", None, None, false).unwrap());
+        assert!(!verify_sender_identity("BlueLake", Some(""), None, false).unwrap());
+        assert!(verify_sender_identity("BlueLake", None, None, true).is_err());
     }
 
     #[test]

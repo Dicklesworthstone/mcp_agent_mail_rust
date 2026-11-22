@@ -667,6 +667,48 @@ This controls CLI token selection; it does not establish MCP session ownership
 or isolate hostile processes sharing the same OS account. Server-side verified
 send enforcement remains `MESSAGING_FAIL_CLOSED_SEND_PROFILE=true`.
 
+#### Registration tokens and output
+
+`register_agent` and `macro_start_session` omit `registration_token` from their
+MCP responses by default, including on repeated registration. Set
+`return_registration_token: true` only when a caller needs to capture the
+credential. Omitting the field, passing `null`, or passing `false` suppresses it.
+Registration still generates, persists, and rotates the token; suppression does
+not disable sender verification. `macro_prepare_thread` also omits a new token
+unless explicitly requested, and never rotates or returns an existing token.
+`create_agent_identity` retains its existing
+`return_registration_token` option and default of `true`; pass `false` when
+using that create-only tool in a transcript-visible session.
+
+The CLI commands `am agents register`, `am agents create`, and
+`am macros start-session` save the credential in private local identity state
+for later sends and omit it from displayed output by default. This applies to
+JSON, TOON, and table output. Add `--show-token` only when secret-bearing output
+is intentional. The normal register-then-send workflow does not need that flag.
+`am macros prepare-thread` privately caches a newly created identity's token
+and keeps it out of displayed output.
+
+Operators can replace or clear a credential without re-registering the agent:
+
+```bash
+am agents rotate-token --project /abs/path/project --agent BlueLake --json
+am agents revoke-token --project /abs/path/project --agent BlueLake --json
+```
+
+These local administrative commands require exclusive mailbox ownership. Stop
+any server using the configured mailbox through its supervisor before running
+them; a live owner causes a refusal. They require an existing, unambiguous
+project and agent and preserve the agent's profile, activity, history, and pane
+binding. Rotation saves the new credential privately and omits it from output
+unless `--show-token` is requested. Revocation clears the stored credential and
+its local cached copy. Previously issued tokens are rejected after either
+operation, including after a database reload.
+
+These operations revoke a token's authority. They do not end an MCP session's
+bound identity or change trusted-local sending without a token. Set
+`MESSAGING_FAIL_CLOSED_SEND_PROFILE=true` when sends must carry valid proof;
+session-bound proof remains available as described below.
+
 #### Session-bound agent identity (opt-in)
 
 Available since v0.3.39 (see [CHANGELOG.md](CHANGELOG.md)).

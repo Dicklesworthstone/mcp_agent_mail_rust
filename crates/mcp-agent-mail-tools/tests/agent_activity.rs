@@ -75,6 +75,7 @@ async fn register(ctx: &McpContext, project: &str, name: &str) {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("register agent");

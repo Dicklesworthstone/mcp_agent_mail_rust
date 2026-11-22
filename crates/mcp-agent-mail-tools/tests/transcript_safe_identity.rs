@@ -1,7 +1,6 @@
-//! Transcript-safe identity contract tests (GH#255).
+//! Transcript-safe identity contract tests (GH#255, GH#396).
 //!
-//! Covers the two well-bounded contract deltas reported against the Python
-//! server:
+//! Covers registration output hygiene and retained Python messaging contracts:
 //!
 //! 1. `create_agent_identity(return_registration_token=false)` must succeed,
 //!    omit the registration token from the tool result, mark the omission with
@@ -13,6 +12,9 @@
 //!    params and treats explicit `null` as omitted at extraction, so both
 //!    spellings are equivalent end-to-end — completing the parity this suite
 //!    originally pinned as a loud rejection.
+//! 3. Reusable registration and session macros omit tokens by default, while
+//!    explicit opt-in still returns the persisted credential. Hidden rotation
+//!    invalidates the old credential without exposing the replacement.
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
@@ -20,9 +22,11 @@ use fastmcp::prelude::McpContext;
 use fastmcp::{CallToolParams, Router};
 use fastmcp_core::SessionState;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
+use mcp_agent_mail_db::queries;
 use mcp_agent_mail_tools::{
-    CreateAgentIdentity, EnsureProject, SendMessage, create_agent_identity, ensure_project,
-    register_agent, send_message, tool_util::get_db_pool,
+    CreateAgentIdentity, EnsureProject, MacroPrepareThread, MacroStartSession, RegisterAgent,
+    SendMessage, create_agent_identity, ensure_project, list_agents, register_agent, send_message,
+    tool_util::get_db_pool, whois,
 };
 use serde_json::{Value, json};
 use std::sync::Mutex;
@@ -58,6 +62,9 @@ where
     let env: Vec<(&str, &str)> = vec![
         ("DATABASE_URL", database_url.as_str()),
         ("STORAGE_ROOT", storage_root.as_str()),
+        ("MESSAGING_SESSION_IDENTITY", "false"),
+        ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
+        ("AM_REGISTRATION_PROOF_GATE_ENABLED", "false"),
     ];
     with_process_env_overrides_for_test(&env, || {
         Config::reset_cached();
@@ -71,6 +78,377 @@ where
 
 fn parse(json_text: &str) -> Value {
     serde_json::from_str(json_text).expect("tool responses are valid JSON")
+}
+
+async fn dispatch_tool(router: &Router, cx: &Cx, name: &str, arguments: Value) -> Value {
+    let ctx = McpContext::new(cx.clone(), 1);
+    let result = router
+        .handle_tools_call(
+            &ctx,
+            CallToolParams {
+                name: name.to_string(),
+                arguments: Some(arguments),
+                meta: None,
+            },
+            SessionState::new(),
+            None,
+            None,
+        )
+        .await
+        .expect("tool dispatch");
+    parse(&tool_result_text(&result.content))
+}
+
+fn registration_arguments(project_key: &str, name: &str) -> Value {
+    json!({
+        "project_key": project_key,
+        "program": "codex-cli",
+        "model": "gpt-5",
+        "name": name,
+    })
+}
+
+async fn stored_registration_token(ctx: &McpContext, project_key: &str, name: &str) -> String {
+    let pool = get_db_pool().expect("db pool");
+    let project = queries::get_project_by_human_key(ctx.cx(), &pool, project_key)
+        .await
+        .into_result()
+        .expect("project exists");
+    queries::get_agent(ctx.cx(), &pool, project.id.expect("project id"), name)
+    .await
+    .into_result()
+    .expect("registered agent exists")
+    .registration_token
+    .filter(|token| !token.is_empty())
+    .expect("registration persists a nonempty token")
+}
+
+async fn send_with_token(
+    ctx: &McpContext,
+    project: &str,
+    token: Option<&str>,
+) -> Result<String, fastmcp::McpError> {
+    send_message(
+        ctx,
+        project.to_string(),
+        "BlueLake".to_string(),
+        vec!["GreenCastle".to_string()],
+        "Registration token verification".to_string(),
+        "Only the current persisted token may verify this sender.".to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        token.map(str::to_string),
+        None,
+    )
+    .await
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn register_dispatch_returns_tokens_only_on_explicit_opt_in() {
+    run_isolated(|cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_key = format!("/tmp/transcript-register-{}", unique_suffix());
+        let project = parse(
+            &ensure_project(&ctx, project_key.clone(), None)
+                .await
+                .expect("ensure project"),
+        );
+        let router: Router = fastmcp_server::ServerBuilder::new("register-token-test", "0")
+            .tool(RegisterAgent)
+            .build()
+            .into_router();
+
+        for (name, setting) in [
+            ("BlueLake", None),
+            ("GreenCastle", Some(Value::Bool(false))),
+            ("RedStone", Some(Value::Bool(true))),
+            ("SilverLake", Some(Value::Null)),
+        ] {
+            let expect_token = setting == Some(Value::Bool(true));
+            let mut arguments = registration_arguments(&project_key, name);
+            if let Some(setting) = setting {
+                arguments["return_registration_token"] = setting;
+            }
+            let registered = dispatch_tool(&router, &cx, "register_agent", arguments).await;
+            assert_eq!(registered["name"], name);
+            let token = stored_registration_token(&ctx, &project_key, name).await;
+            if expect_token {
+                assert_eq!(registered["registration_token"].as_str(), Some(token.as_str()));
+            } else {
+                assert!(registered.get("registration_token").is_none());
+                assert!(!registered.to_string().contains(&token));
+            }
+
+            let profile = whois(
+                &ctx,
+                project_key.clone(),
+                name.to_string(),
+                Some(false),
+                None,
+            )
+            .await
+            .expect("whois");
+            assert!(parse(&profile).get("registration_token").is_none());
+            assert!(!profile.contains(&token));
+            let roster = list_agents(&ctx, project_key.clone(), None, None)
+                .await
+                .expect("list agents");
+            assert!(!roster.contains("registration_token"));
+            assert!(!roster.contains(&token));
+
+            mcp_agent_mail_storage::wbq_flush();
+            let profile_path = Config::get()
+                .storage_root
+                .join("projects")
+                .join(project["slug"].as_str().expect("project slug"))
+                .join("agents")
+                .join(name)
+                .join("profile.json");
+            let archived = std::fs::read_to_string(profile_path).expect("archived agent profile");
+            assert!(parse(&archived).get("registration_token").is_none());
+            assert!(!archived.contains(&token));
+        }
+    });
+}
+
+#[test]
+fn hidden_reregistration_rotates_the_persisted_token_and_refreshes_sender_cache() {
+    run_isolated(|cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_key = format!("/tmp/transcript-reregister-{}", unique_suffix());
+        ensure_project(&ctx, project_key.clone(), None)
+            .await
+            .expect("ensure project");
+        let router: Router = fastmcp_server::ServerBuilder::new("reregister-token-test", "0")
+            .tool(RegisterAgent)
+            .build()
+            .into_router();
+        let mut arguments = registration_arguments(&project_key, "BlueLake");
+        arguments["return_registration_token"] = Value::Bool(true);
+        let first = dispatch_tool(&router, &cx, "register_agent", arguments).await;
+        let old_token = first["registration_token"].as_str().expect("explicit token");
+        dispatch_tool(
+            &router,
+            &cx,
+            "register_agent",
+            registration_arguments(&project_key, "GreenCastle"),
+        )
+        .await;
+        mcp_agent_mail_tools::set_contact_policy(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            "open".to_string(),
+        )
+        .await
+        .expect("open recipient contacts");
+        let before = send_with_token(&ctx, &project_key, Some(old_token))
+            .await
+            .expect("initial token verifies and primes the sender cache");
+        assert_eq!(parse(&before)["verified_sender"], true);
+
+        let refreshed = dispatch_tool(
+            &router,
+            &cx,
+            "register_agent",
+            registration_arguments(&project_key, "BlueLake"),
+        )
+        .await;
+        assert_eq!(refreshed["id"], first["id"]);
+        assert!(refreshed.get("registration_token").is_none());
+        let replacement = stored_registration_token(&ctx, &project_key, "BlueLake").await;
+        assert_ne!(replacement, old_token);
+        assert!(!refreshed.to_string().contains(&replacement));
+        let error = send_with_token(&ctx, &project_key, Some(old_token))
+            .await
+            .expect_err("the previous credential must stop authenticating");
+        assert_eq!(
+            mcp_agent_mail_tools::tool_error_code(&error),
+            Some("SENDER_TOKEN_MISMATCH")
+        );
+        let after = send_with_token(&ctx, &project_key, Some(&replacement))
+            .await
+            .expect("the hidden persisted replacement verifies");
+        assert_eq!(parse(&after)["verified_sender"], true);
+    });
+}
+
+#[test]
+fn revoked_database_token_is_rejected_after_cache_reload_in_trusted_local_mode() {
+    run_isolated(|cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_key = format!("/tmp/transcript-revoked-token-{}", unique_suffix());
+        ensure_project(&ctx, project_key.clone(), None)
+            .await
+            .expect("ensure project");
+        let router: Router = fastmcp_server::ServerBuilder::new("revoked-token-test", "0")
+            .tool(RegisterAgent)
+            .build()
+            .into_router();
+        let sender = dispatch_tool(
+            &router,
+            &cx,
+            "register_agent",
+            registration_arguments(&project_key, "BlueLake"),
+        )
+        .await;
+        dispatch_tool(
+            &router,
+            &cx,
+            "register_agent",
+            registration_arguments(&project_key, "GreenCastle"),
+        )
+        .await;
+        mcp_agent_mail_tools::set_contact_policy(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            "open".to_string(),
+        )
+        .await
+        .expect("open recipient contacts");
+        let token = stored_registration_token(&ctx, &project_key, "BlueLake").await;
+        let verified = send_with_token(&ctx, &project_key, Some(&token))
+            .await
+            .expect("original token verifies and primes the cache");
+        assert_eq!(parse(&verified)["verified_sender"], true);
+
+        let pool = get_db_pool().expect("db pool");
+        let agent_id = sender["id"].as_i64().expect("sender id");
+        let project_id = sender["project_id"].as_i64().expect("project id");
+        queries::update_agent_registration_token(ctx.cx(), &pool, agent_id, "")
+        .await
+        .into_result()
+        .expect("revoke persisted credential");
+        mcp_agent_mail_db::read_cache().invalidate_agent_scoped(
+            &pool.sqlite_identity_key(),
+            project_id,
+            "BlueLake",
+            Some(agent_id),
+        );
+        let reloaded = queries::get_agent(ctx.cx(), &pool, project_id, "BlueLake")
+        .await
+        .into_result()
+        .expect("reload revoked identity from the database");
+        assert!(reloaded.registration_token.is_none());
+        drop(pool);
+
+        let error = send_with_token(&ctx, &project_key, Some(&token))
+            .await
+            .expect_err("a revoked credential must not become an unverified success");
+        assert_eq!(
+            mcp_agent_mail_tools::tool_error_code(&error),
+            Some("SENDER_TOKEN_UNAVAILABLE")
+        );
+        let trusted_local = send_with_token(&ctx, &project_key, None)
+            .await
+            .expect("omitted-token trusted-local sending remains available");
+        assert_eq!(parse(&trusted_local)["verified_sender"], false);
+    });
+}
+
+#[test]
+fn session_macro_returns_tokens_only_on_explicit_opt_in() {
+    run_isolated(|cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_key = format!("/tmp/transcript-session-{}", unique_suffix());
+        let router: Router = fastmcp_server::ServerBuilder::new("session-token-test", "0")
+            .tool(MacroStartSession)
+            .tool(MacroPrepareThread)
+            .build()
+            .into_router();
+        for (name, setting) in [
+            ("BlueLake", None),
+            ("GreenCastle", Some(false)),
+            ("RedStone", Some(true)),
+        ] {
+            let mut arguments = json!({
+                "human_key": &project_key,
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "agent_name": name,
+                "inbox_limit": 1,
+            });
+            if let Some(setting) = setting {
+                arguments["return_registration_token"] = Value::Bool(setting);
+            }
+            let session = dispatch_tool(&router, &cx, "macro_start_session", arguments).await;
+            assert_eq!(session["agent"]["name"], name);
+            let token = stored_registration_token(&ctx, &project_key, name).await;
+            if setting == Some(true) {
+                assert_eq!(session["agent"]["registration_token"].as_str(), Some(token.as_str()));
+            } else {
+                assert!(session["agent"].get("registration_token").is_none());
+                assert!(!session.to_string().contains(&token));
+            }
+        }
+
+        let prepared = dispatch_tool(
+            &router,
+            &cx,
+            "macro_prepare_thread",
+            json!({
+                "project_key": &project_key,
+                "thread_id": "transcript-safe-thread",
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "agent_name": "SilverLake",
+                "llm_mode": false,
+                "inbox_limit": 1,
+            }),
+        )
+        .await;
+        assert_eq!(prepared["agent"]["name"], "SilverLake");
+        assert!(prepared["agent"]["registration_token"].is_null());
+        let token = stored_registration_token(&ctx, &project_key, "SilverLake").await;
+        assert!(!prepared.to_string().contains(&token));
+    });
+}
+
+#[test]
+fn thread_macro_returns_only_new_tokens_on_explicit_opt_in() {
+    run_isolated(|cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_key = format!("/tmp/transcript-thread-token-{}", unique_suffix());
+        ensure_project(&ctx, project_key.clone(), None)
+            .await
+            .expect("ensure project");
+        let router: Router = fastmcp_server::ServerBuilder::new("thread-token-test", "0")
+            .tool(MacroPrepareThread)
+            .build()
+            .into_router();
+        let arguments = json!({
+            "project_key": &project_key,
+            "thread_id": "transcript-safe-thread",
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "agent_name": "AmberRiver",
+            "llm_mode": false,
+            "inbox_limit": 1,
+            "return_registration_token": true,
+        });
+        let created = dispatch_tool(&router, &cx, "macro_prepare_thread", arguments.clone()).await;
+        assert_eq!(created["agent"]["name"], "AmberRiver");
+        let token = created["agent"]["registration_token"]
+            .as_str()
+            .expect("explicit opt-in returns a new credential");
+        assert_eq!(stored_registration_token(&ctx, &project_key, "AmberRiver").await, token);
+
+        let prepared = dispatch_tool(&router, &cx, "macro_prepare_thread", arguments).await;
+        assert_eq!(prepared["agent"]["id"], created["agent"]["id"]);
+        assert!(prepared["agent"]["registration_token"].is_null());
+        assert!(!prepared.to_string().contains(token));
+        assert_eq!(stored_registration_token(&ctx, &project_key, "AmberRiver").await, token);
+    });
 }
 
 /// Default behavior is unchanged: the token is echoed and no opt-out marker
@@ -237,6 +615,7 @@ fn send_message_null_auto_contact_contract() {
                 "claude-code".to_string(),
                 "opus-4.5".to_string(),
                 Some(name.to_string()),
+                None,
                 None,
                 None,
                 None,

@@ -1613,9 +1613,30 @@ fn run_fixtures_against_rust_server_router() {
         }
 
         for case in &tool_fixture.cases {
+            let mut arguments = args_from_case(case, &env.tokens);
+            // GH#396: these captured compatibility cases describe token-bearing
+            // registration responses. Request that legacy shape explicitly;
+            // transcript_safe_identity tests cover the secret-free default.
+            let token_pointer = match tool_name.as_str() {
+                "register_agent" => Some("/registration_token"),
+                "macro_start_session" => Some("/agent/registration_token"),
+                _ => None,
+            };
+            if token_pointer.is_some_and(|pointer| {
+                case.expect
+                    .ok
+                    .as_ref()
+                    .is_some_and(|expected| expected.pointer(pointer).is_some())
+            }) {
+                arguments
+                    .as_mut()
+                    .and_then(Value::as_object_mut)
+                    .expect("captured registration fixture must have object arguments")
+                    .insert("return_registration_token".to_string(), Value::Bool(true));
+            }
             let params = CallToolParams {
                 name: tool_name.clone(),
-                arguments: args_from_case(case, &env.tokens),
+                arguments,
                 meta: None,
             };
 
@@ -3019,7 +3040,8 @@ fn lifecycle_tools_preserve_authorization_roster_and_permanent_deregistration_co
             "program": "codex-cli",
             "model": "gpt-5",
             "name": "SilverLake",
-            "task_description": "lifecycle conformance"
+            "task_description": "lifecycle conformance",
+            "return_registration_token": true
         }),
         &mut req_id,
     )
@@ -3164,7 +3186,8 @@ fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
             "program": "codex-cli",
             "model": "gpt-5",
             "name": "GreenStone",
-            "task_description": "topic sender"
+            "task_description": "topic sender",
+            "return_registration_token": true
         }),
         &mut req_id,
     )
@@ -3180,7 +3203,8 @@ fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
             "program": "codex-cli",
             "model": "gpt-5",
             "name": "BlueLake",
-            "task_description": "topic recipient"
+            "task_description": "topic recipient",
+            "return_registration_token": true
         }),
         &mut req_id,
     )

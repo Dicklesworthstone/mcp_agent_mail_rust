@@ -212,6 +212,7 @@ fn disabled_gate_registers_without_proof() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("register_agent should succeed with gate disabled");
@@ -241,6 +242,7 @@ fn disabled_gate_registers_without_proof() {
             "opus-4.1".to_string(),
             Some("RedStone".to_string()),
             Some("proof gate disabled".to_string()),
+            None,
             None,
             None,
             None,
@@ -279,6 +281,7 @@ fn enabled_gate_blocks_every_entry_point_without_proof() {
                 "opus-4.1".to_string(),
                 Some("BlueLake".to_string()),
                 Some("no proof".to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -323,6 +326,7 @@ fn enabled_gate_blocks_every_entry_point_without_proof() {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect_err("macro_start_session must fail closed without proof");
@@ -337,6 +341,7 @@ fn enabled_gate_blocks_every_entry_point_without_proof() {
                 "opus-4.1".to_string(),
                 Some("AmberRiver".to_string()),
                 Some("no proof".to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -394,6 +399,7 @@ fn enabled_gate_allows_valid_proof_through_tool_and_macro() {
                 None,
                 None,
                 Some(proof),
+                None,
             )
             .await
             .expect("register_agent should succeed with a valid proof");
@@ -425,6 +431,7 @@ fn enabled_gate_allows_valid_proof_through_tool_and_macro() {
                 None,
                 None,
                 Some(macro_proof),
+                None,
             )
             .await
             .expect("macro_start_session should succeed with a valid proof");
@@ -475,6 +482,7 @@ fn enabled_gate_rejects_replayed_nonce_durably() {
                 None,
                 None,
                 Some(proof1),
+                None,
             )
             .await
             .expect("first registration with a fresh nonce succeeds");
@@ -509,6 +517,7 @@ fn enabled_gate_rejects_replayed_nonce_durably() {
                 None,
                 None,
                 Some(proof2),
+                None,
             )
             .await
             .expect_err("reusing a consumed nonce must fail closed");
@@ -562,6 +571,7 @@ async fn register_with_proof(
         None,
         None,
         Some(proof),
+        None,
     )
     .await
     .unwrap_or_else(|e| panic!("register {name} with proof: {e:?}"));
@@ -712,6 +722,7 @@ fn disabled_gate_auto_registers_via_send_message_and_request_contact() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("register sender");
@@ -756,6 +767,7 @@ fn disabled_gate_auto_registers_via_send_message_and_request_contact() {
             "opus-4.1".to_string(),
             Some("RedStone".to_string()),
             Some("gate off".to_string()),
+            None,
             None,
             None,
             None,
@@ -839,6 +851,7 @@ fn scope_tampering_neither_registers_an_agent_nor_consumes_its_nonce() {
                 None,
                 None,
                 Some(tampered.to_string()),
+                None,
             )
             .await
             .expect_err("changing capability boundaries invalidates the signature");

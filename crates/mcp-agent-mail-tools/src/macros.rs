@@ -147,12 +147,13 @@ fn parse_macro_inbox_limit(inbox_limit: Option<i32>) -> McpResult<i32> {
 /// - `file_reservation_reason`: Reason for reservations
 /// - `file_reservation_ttl_seconds`: TTL for reservations
 /// - `inbox_limit`: Max inbox messages to fetch
+/// - `return_registration_token`: Include the new token only when explicitly true
 ///
 /// # Conformance
 /// Python-parity.
 #[allow(clippy::too_many_arguments)]
 #[tool(
-    description = "Macro helper that boots a project session: ensure project, register agent,\noptionally file_reservation paths, and fetch the latest inbox snapshot."
+    description = "Macro helper that boots a project session: ensure project, register agent,\noptionally file_reservation paths, and fetch the latest inbox snapshot.\n\nThe registration token is omitted by default. Set return_registration_token=true\nonly when the caller needs to capture the token in a secure credential store."
 )]
 pub async fn macro_start_session(
     ctx: &McpContext,
@@ -173,6 +174,7 @@ pub async fn macro_start_session(
     // header and ignores any body value. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
+    return_registration_token: Option<bool>,
 ) -> McpResult<String> {
     let tmux_socket_path =
         crate::identity::validated_tmux_socket_path(tmux_socket_path.as_deref())?;
@@ -229,6 +231,7 @@ pub async fn macro_start_session(
         pane_id,
         tmux_socket_path,
         registration_proof,
+        return_registration_token,
     )
     .await?;
     let agent: AgentResponse = parse_json(agent_json, "agent")?;
@@ -319,12 +322,14 @@ pub async fn macro_start_session(
 /// - `llm_mode`: Use LLM for summary refinement
 /// - `llm_model`: Override LLM model
 /// - `inbox_limit`: Max inbox messages
+/// - `return_registration_token`: Return a newly minted token only when explicitly true;
+///   an existing agent's token is preserved and never echoed
 ///
 /// # Conformance
 /// Python-parity.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[tool(
-    description = "Macro helper that aligns an agent with an existing thread by ensuring registration,\nsummarising the thread, and fetching recent inbox context."
+    description = "Macro helper that aligns an agent with an existing thread by ensuring registration,\nsummarising the thread, and fetching recent inbox context.\n\nRegistration tokens are hidden by default. Set return_registration_token=true to\ncapture a newly minted token in a secure credential store. An existing token is\npreserved and is never returned, even with explicit opt-in."
 )]
 pub async fn macro_prepare_thread(
     ctx: &McpContext,
@@ -341,6 +346,7 @@ pub async fn macro_prepare_thread(
     llm_model: Option<String>,
     inbox_limit: Option<i32>,
     registration_proof: Option<String>,
+    return_registration_token: Option<bool>,
 ) -> McpResult<String> {
     let thread_id_trimmed = thread_id.trim();
     if thread_id_trimmed.is_empty() {
@@ -402,6 +408,7 @@ pub async fn macro_prepare_thread(
             None,
             None,
             registration_proof,
+            return_registration_token.unwrap_or(false),
             crate::identity::TokenPolicy::KeepExisting,
         )
         .await?;

@@ -1380,7 +1380,7 @@ try:
         "clientInfo": {"name": "concurrent-ring-" + actor, "version": "1"}})
     rpc("notifications/initialized", {}, notification=True)
     identity = tool("register_agent", {"project_key": project, "program": "codex",
-        "model": "workflow-fixture", "name": actor})
+        "model": "workflow-fixture", "name": actor, "return_registration_token": True})
     tool("set_contact_policy", {"project_key": project, "agent_name": actor, "policy": "open"})
     barrier("ready")
     arguments = {"project_key": project, "sender_name": actor, "to": [recipient],

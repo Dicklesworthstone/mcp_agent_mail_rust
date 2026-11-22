@@ -10960,6 +10960,7 @@ mod resource_shape_tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register_agent"),
@@ -11044,6 +11045,7 @@ mod resource_shape_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -11054,6 +11056,7 @@ mod resource_shape_tests {
                     "gpt-5".to_string(),
                     Some("RedPeak".to_string()),
                     Some("resource visibility regression".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -12944,6 +12947,7 @@ mod resource_shape_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register_agent GreenLake");
@@ -12955,6 +12959,7 @@ mod resource_shape_tests {
                     "sonnet-4.5".to_string(),
                     Some("BlueDog".to_string()),
                     Some("frontend work".to_string()),
+                    None,
                     None,
                     None,
                     None,

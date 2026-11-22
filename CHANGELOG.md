@@ -31,6 +31,7 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
+- Registration tokens are omitted by default from `register_agent` and registration-macro MCP responses; `return_registration_token: true` explicitly includes newly issued credentials. `macro_prepare_thread` preserves and never discloses an existing token. CLI registration and session startup retain private token caching and require `--show-token` for secret-bearing output. New local `am agents rotate-token` and `am agents revoke-token` commands manage existing credentials without rewriting agent profiles. Explicit stale credentials fail after revocation and database reload, including in trusted-local mode (GH#396).
 - Reservation paths containing a NUL byte are rejected before any mailbox write. This landed after the v0.3.41 tag (`dab8ab6b`).
 
 ---

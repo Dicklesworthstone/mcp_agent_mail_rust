@@ -3182,6 +3182,9 @@ pub enum AgentsCommand {
         /// Attachments policy: auto, inline, file, none.
         #[arg(long, default_value = "auto")]
         attachments_policy: String,
+        /// Include the secret registration token in output (normally cached privately).
+        #[arg(long)]
+        show_token: bool,
         /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -3209,7 +3212,47 @@ pub enum AgentsCommand {
         /// Attachments policy: auto, inline, file, none.
         #[arg(long, default_value = "auto")]
         attachments_policy: String,
+        /// Include the secret registration token in output (normally cached privately).
+        #[arg(long)]
+        show_token: bool,
         /// Output format: table, json, or toon (default: table, piped or not).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Rotate an existing agent's token without re-registering its identity.
+    /// Requires exclusive local mailbox ownership; stop the server first.
+    #[command(name = "rotate-token")]
+    RotateToken {
+        /// Existing project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Existing agent name (case-insensitive; ambiguous names are refused).
+        #[arg(long)]
+        agent: String,
+        /// Include the new secret token in output (normally cached privately).
+        #[arg(long)]
+        show_token: bool,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Revoke an existing agent's token without issuing a replacement.
+    /// Requires exclusive local mailbox ownership; stop the server first.
+    #[command(name = "revoke-token")]
+    RevokeToken {
+        /// Existing project key (slug or human_key / absolute path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Existing agent name (case-insensitive; ambiguous names are refused).
+        #[arg(long)]
+        agent: String,
+        /// Output format: table, json, or toon (default: table).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3374,6 +3417,9 @@ pub enum MacroCommand {
         /// Max inbox messages to fetch.
         #[arg(long, default_value_t = 10)]
         inbox_limit: i32,
+        /// Include the secret registration token in output (normally cached privately).
+        #[arg(long)]
+        show_token: bool,
         /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -9558,22 +9604,33 @@ fn sender_identity_key(project_key: &str, agent_name: &str) -> (String, String) 
     let project = if Path::new(project_key).is_absolute() {
         mcp_agent_mail_core::resolve_project_identity(project_key).slug
     } else {
-        project_key.to_string()
+        project_key.to_ascii_lowercase()
     };
     (project, agent_name.trim().to_ascii_lowercase())
 }
 
 /// Persist a registered agent's sender token so `mail send` can reuse it without
-/// the operator re-supplying it. Best-effort: failures are logged, not fatal.
+/// the operator re-supplying it. Report failure without including the credential.
 fn persist_sender_identity_token(
     config: &Config,
     project_key: &str,
     agent_name: &str,
     sender_token: &str,
-) {
+) -> bool {
     if sender_token.is_empty() || project_key.is_empty() || agent_name.is_empty() {
-        return;
+        return false;
     }
+    write_sender_identity_token(config, project_key, agent_name, sender_token).is_ok()
+}
+
+/// A checked write for operator token changes. An empty token replaces an old
+/// credential with a revocation marker; the loader never returns that marker.
+fn write_sender_identity_token(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    sender_token: &str,
+) -> CliResult<()> {
     let (project, agent) = sender_identity_key(project_key, agent_name);
     let path = sender_identity_state_path(config, &project, &agent);
     let record = SenderIdentityState {
@@ -9581,14 +9638,13 @@ fn persist_sender_identity_token(
         agent_name: agent,
         sender_token: sender_token.to_string(),
     };
-    let Ok(content) = serde_json::to_string(&record) else {
-        return;
-    };
+    let content = serde_json::to_vec(&record)
+        .map_err(|_| CliError::Other("could not serialize sender identity state".into()))?;
     // The fingerprinted filename can collide across distinct (project, agent)
     // pairs only with a 64-bit hash collision; guard against a stale record for
     // a *different* pair by writing the canonical identity inside the file and
     // verifying it on read.
-    write_cache_file_if_safe(&path, &content, "sender identity state");
+    write_cache_file_atomically_if_safe(&path, &content, "sender identity state")
 }
 
 /// Load a previously-persisted sender token for `(project_key, agent_name)`.
@@ -9612,7 +9668,7 @@ fn persist_sender_identity_token_from_agent_payload(
     config: &Config,
     project_key: &str,
     payload: &serde_json::Value,
-) {
+) -> CliResult<()> {
     // The agent object may be the payload itself or under an `agent` key.
     let agent = payload.get("agent").unwrap_or(payload);
     let name = agent
@@ -9623,8 +9679,47 @@ fn persist_sender_identity_token_from_agent_payload(
         .get("registration_token")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if !name.is_empty() && !token.is_empty() {
-        persist_sender_identity_token(config, project_key, name, token);
+    if !token.is_empty()
+        && !persist_sender_identity_token(config, project_key, name, token)
+    {
+        return Err(CliError::Other(
+            "agent registration completed, but its credential could not be saved privately; \
+             check STORAGE_ROOT/.identity permissions and retry registration".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Cache a registration credential before preparing any human or machine output.
+/// Filtering here also protects clients connected to an older daemon that
+/// ignores the tool's opt-in parameter and always returns a token.
+fn registration_payload_for_output(
+    config: &Config,
+    project_key: &str,
+    mut payload: serde_json::Value,
+    show_token: bool,
+) -> CliResult<serde_json::Value> {
+    persist_sender_identity_token_from_agent_payload(config, project_key, &payload)?;
+    if !show_token {
+        suppress_registration_tokens(&mut payload);
+    }
+    Ok(payload)
+}
+
+fn suppress_registration_tokens(payload: &mut serde_json::Value) {
+    match payload {
+        serde_json::Value::Object(object) => {
+            object.remove("registration_token");
+            for value in object.values_mut() {
+                suppress_registration_tokens(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                suppress_registration_tokens(value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -41711,6 +41806,8 @@ fn build_server_register_agent_arguments(
     attachments_policy: &str,
 ) -> serde_json::Value {
     let mut arguments = serde_json::Map::from_iter([
+        // The CLI caches this credential privately, then filters its output.
+        ("return_registration_token".to_string(), serde_json::json!(true)),
         ("project_key".to_string(), serde_json::json!(project_key)),
         ("program".to_string(), serde_json::json!(program)),
         ("model".to_string(), serde_json::json!(model)),
@@ -41737,6 +41834,7 @@ fn build_server_create_agent_identity_arguments(
     attachments_policy: &str,
 ) -> serde_json::Value {
     let mut arguments = serde_json::Map::from_iter([
+        ("return_registration_token".to_string(), serde_json::json!(true)),
         ("project_key".to_string(), serde_json::json!(project_key)),
         ("program".to_string(), serde_json::json!(program)),
         ("model".to_string(), serde_json::json!(model)),
@@ -41822,6 +41920,7 @@ fn build_server_macro_start_session_arguments(
         ("program".to_string(), serde_json::json!(program)),
         ("model".to_string(), serde_json::json!(model)),
         ("inbox_limit".to_string(), serde_json::json!(inbox_limit)),
+        ("return_registration_token".to_string(), serde_json::json!(true)),
     ]);
     if let Some(agent_name) = agent_name {
         arguments.insert("agent_name".to_string(), serde_json::json!(agent_name));
@@ -42099,6 +42198,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             name,
             task,
             attachments_policy,
+            show_token,
             format,
             json,
         } => {
@@ -42129,13 +42229,12 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             {
                 ServerToolCall::Success(result) => {
                     let payload = coerce_tool_result_json_or_error("register_agent", result)?;
-                    // Persist the sender token (#147) so `mail send` can reuse the
-                    // registered identity without re-supplying it.
-                    persist_sender_identity_token_from_agent_payload(
+                    let payload = registration_payload_for_output(
                         &server_config,
                         &project_key,
-                        &payload,
-                    );
+                        payload,
+                        show_token,
+                    )?;
                     render_agent_payload(&payload, fmt);
                     return Ok(());
                 }
@@ -42186,15 +42285,17 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 None,
                 None,
                 None,
+                Some(true),
             )
             .await
             .map_err(mcp_error_to_cli_error)?;
             let payload = parse_tool_json_payload("register_agent", &result)?;
-            persist_sender_identity_token_from_agent_payload(
+            let payload = registration_payload_for_output(
                 &server_config,
                 &project_key,
-                &payload,
-            );
+                payload,
+                show_token,
+            )?;
             render_agent_payload(&payload, fmt);
             Ok(())
         }
@@ -42206,6 +42307,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             name_hint,
             task,
             attachments_policy,
+            show_token,
             format,
             json,
         } => {
@@ -42237,11 +42339,12 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 ServerToolCall::Success(result) => {
                     let payload =
                         coerce_tool_result_json_or_error("create_agent_identity", result)?;
-                    persist_sender_identity_token_from_agent_payload(
+                    let payload = registration_payload_for_output(
                         &server_config,
                         &project_key,
-                        &payload,
-                    );
+                        payload,
+                        show_token,
+                    )?;
                     render_agent_payload(&payload, fmt);
                     return Ok(());
                 }
@@ -42292,16 +42395,17 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 None,
                 None,
                 None,
-                None,
+                Some(true),
             )
             .await
             .map_err(mcp_error_to_cli_error)?;
             let payload = parse_tool_json_payload("create_agent_identity", &result)?;
-            persist_sender_identity_token_from_agent_payload(
+            let payload = registration_payload_for_output(
                 &server_config,
                 &project_key,
-                &payload,
-            );
+                payload,
+                show_token,
+            )?;
             render_agent_payload(&payload, fmt);
             Ok(())
         }
@@ -42585,6 +42689,41 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             }
         }
 
+        AgentsCommand::RotateToken {
+            project_key,
+            agent,
+            show_token,
+            format,
+            json,
+        } => {
+            handle_agents_token_change(
+                &project_key,
+                &agent,
+                AgentTokenAction::Rotate,
+                show_token,
+                format,
+                json,
+            )
+            .await
+        }
+
+        AgentsCommand::RevokeToken {
+            project_key,
+            agent,
+            format,
+            json,
+        } => {
+            handle_agents_token_change(
+                &project_key,
+                &agent,
+                AgentTokenAction::Revoke,
+                false,
+                format,
+                json,
+            )
+            .await
+        }
+
         AgentsCommand::SetReaperExempt {
             project_key,
             agent,
@@ -42605,6 +42744,200 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             json,
         } => handle_agents_reap(stale_days, project_key.as_deref(), dry_run, format, json).await,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentTokenAction {
+    Rotate,
+    Revoke,
+}
+
+/// This is a host-level operator path, not an unauthenticated remote mutation.
+/// Keep the existing exclusive mailbox locks for the entire database/cache
+/// update; a live daemon must be stopped through its supervisor first.
+async fn handle_agents_token_change(
+    project_key: &str,
+    agent_name: &str,
+    action: AgentTokenAction,
+    show_token: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
+    if project_key.trim().is_empty() || agent_name.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "--project and --agent cannot be empty".into(),
+        ));
+    }
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    let require_initialized_mailbox = || {
+        if read_verb_mailbox_is_initialized(&database_url) {
+            Ok(())
+        } else {
+            Err(CliError::InvalidArgument(
+                "agent token changes require an existing, initialized mailbox".into(),
+            ))
+        }
+    };
+    require_initialized_mailbox()?;
+    let config = Config::from_env();
+    let _mailbox_mutation_locks =
+        acquire_cli_mailbox_mutation_locks(&database_url, Some(&config.storage_root))?;
+    require_initialized_mailbox()?;
+    let ctx = context::AsyncCliContext::open()?;
+    let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
+    let payload = agents_token_change_payload(
+        &cx,
+        &ctx.pool,
+        &ctx.config,
+        project_key,
+        agent_name,
+        action,
+        show_token,
+    )
+    .await?;
+    output::emit_output(&payload, output::CliOutputFormat::resolve(format, json), || {
+        output::section("Agent Registration Token");
+        output::kv("Project", &agent_payload_string(&payload, "project_slug"));
+        output::kv("Agent", &agent_payload_string(&payload, "agent_name"));
+        output::kv(
+            "Result",
+            if action == AgentTokenAction::Rotate {
+                "rotated; replacement cached privately"
+            } else {
+                "revoked; no replacement issued"
+            },
+        );
+        if let Some(token) = payload
+            .get("registration_token")
+            .and_then(serde_json::Value::as_str)
+        {
+            output::kv("Registration token", token);
+        }
+    });
+    Ok(())
+}
+
+/// Resolve existing records without creating a project, changing profile
+/// metadata, reviving an agent, or publishing credentials to the Git archive.
+#[allow(clippy::too_many_lines)]
+async fn agents_token_change_payload(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    action: AgentTokenAction,
+    show_token: bool,
+) -> CliResult<serde_json::Value> {
+    if project_key.trim().is_empty() || agent_name.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "--project and --agent cannot be empty".into(),
+        ));
+    }
+    let projects =
+        outcome_to_result(mcp_agent_mail_db::queries::list_project_rows(cx, pool).await)?;
+    let mut matches = projects.into_iter().filter(|project| {
+        project.slug.eq_ignore_ascii_case(project_key) || project.human_key == project_key
+    });
+    let project = matches
+        .next()
+        .ok_or_else(|| CliError::InvalidArgument(format!("project not found: {project_key}")))?;
+    if matches.next().is_some() {
+        return Err(CliError::InvalidArgument(format!(
+            "project key is ambiguous: {project_key}; use an exact, unique project key"
+        )));
+    }
+    let project_id = project
+        .id
+        .ok_or_else(|| CliError::Other("existing project has no database id".into()))?;
+    let (agent, deregistered_at) = outcome_to_result(
+        mcp_agent_mail_db::queries::get_agent_for_operator(cx, pool, project_id, agent_name)
+            .await,
+    )?;
+    if deregistered_at.is_some() {
+        return Err(CliError::InvalidArgument(
+            "cannot change the token of a deregistered agent".into(),
+        ));
+    }
+    let agent_id = agent
+        .id
+        .ok_or_else(|| CliError::Other("existing agent has no database id".into()))?;
+    let had_active_token = agent
+        .registration_token
+        .as_deref()
+        .is_some_and(|token| !token.is_empty());
+    let token = match action {
+        AgentTokenAction::Rotate => mcp_agent_mail_core::setup::generate_registration_token()
+            .map_err(|_| CliError::Other("could not generate a registration token".into()))?,
+        // The database decoder represents an empty stored token as None.
+        // Sender authentication must reject any supplied credential in that
+        // state; absence of a token does not validate a revoked credential.
+        AgentTokenAction::Revoke => String::new(),
+    };
+    outcome_to_result(
+        mcp_agent_mail_db::queries::update_agent_registration_token(cx, pool, agent_id, &token)
+            .await,
+    )
+    .map_err(|_| CliError::Other("agent token database update failed".into()))?;
+
+    let pool_scope = pool.sqlite_identity_key();
+    mcp_agent_mail_db::read_cache().invalidate_agent_scoped(
+        &pool_scope,
+        project_id,
+        &agent.name,
+        agent.id,
+    );
+    let (updated, _) = outcome_to_result(
+        mcp_agent_mail_db::queries::get_agent_for_operator(cx, pool, project_id, &agent.name)
+            .await,
+    )
+    .map_err(|_| {
+        CliError::Other(
+            "agent token update committed (db_committed=true), but verification failed".into(),
+        )
+    })?;
+    let active_token = updated
+        .registration_token
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let verified = match action {
+        AgentTokenAction::Rotate => active_token.is_some_and(|stored| {
+            mcp_agent_mail_core::setup::constant_time_str_eq(stored, &token)
+        }),
+        AgentTokenAction::Revoke => active_token.is_none(),
+    };
+    if !verified {
+        return Err(CliError::Other(
+            "agent token update could not be verified; no credential was returned".into(),
+        ));
+    }
+    mcp_agent_mail_db::read_cache().put_agent_scoped(&pool_scope, &updated);
+
+    // Replace cached credentials only after verifying the durable database.
+    // Include both canonical identifiers and the supplied alias so a retry
+    // also repairs older cache entries. Empty records revoke without deletion.
+    for key in [project.slug.as_str(), project.human_key.as_str(), project_key] {
+        write_sender_identity_token(config, key, &updated.name, &token).map_err(|error| {
+            CliError::Other(format!(
+                "agent token update committed (db_committed=true), but the private sender \
+                 cache could not be synchronized: {error}. Retry the same command."
+            ))
+        })?;
+    }
+    let mut payload = serde_json::json!({
+        "schema_version": "am.agents.token.v1",
+        "project_key": project_key,
+        "project_slug": project.slug,
+        "agent_id": agent_id,
+        "agent_name": updated.name,
+        "operation": if action == AgentTokenAction::Rotate { "rotate" } else { "revoke" },
+        "token_active": action == AgentTokenAction::Rotate,
+        "changed": action == AgentTokenAction::Rotate || had_active_token,
+    });
+    if action == AgentTokenAction::Rotate && show_token {
+        payload["registration_token"] = serde_json::Value::String(token);
+    }
+    Ok(payload)
 }
 
 /// Change one operator-owned metadata flag without refreshing agent activity,
@@ -43140,6 +43473,12 @@ fn render_agent_payload(payload: &serde_json::Value, format: output::CliOutputFo
             "Attachments",
             &agent_payload_string(payload, "attachments_policy"),
         );
+        if let Some(token) = payload
+            .get("registration_token")
+            .and_then(serde_json::Value::as_str)
+        {
+            output::kv("Registration token", token);
+        }
         output::kv("Inception", &agent_payload_string(payload, "inception_ts"));
         output::kv(
             "Last Active",
@@ -43197,6 +43536,12 @@ fn render_macro_start_session_payload(
             json_path_string(payload, &["project", "slug"])
         ));
         output::kv("Agent", json_path_string(payload, &["agent", "name"]));
+        if let Some(token) = payload
+            .pointer("/agent/registration_token")
+            .and_then(serde_json::Value::as_str)
+        {
+            output::kv("Registration token", token);
+        }
         output::kv("Program", program);
         output::kv("Model", model);
         let reservation_count = json_path_array_len(payload, &["file_reservations", "granted"]);
@@ -43337,6 +43682,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             reserve_reason,
             reserve_ttl,
             inbox_limit,
+            show_token,
             format,
             json,
         } => {
@@ -43376,13 +43722,12 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             {
                 ServerToolCall::Success(result) => {
                     let payload = coerce_tool_result_json_or_error("macro_start_session", result)?;
-                    // Persist the sender token (#147) so `mail send` can reuse the
-                    // session identity without re-supplying it.
-                    persist_sender_identity_token_from_agent_payload(
+                    let payload = registration_payload_for_output(
                         &server_config,
                         &human_key,
-                        &payload,
-                    );
+                        payload,
+                        show_token,
+                    )?;
                     render_macro_start_session_payload(&payload, fmt, &program, &model);
                     return Ok(());
                 }
@@ -43428,11 +43773,17 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 None,
                 None,
                 None,
+                Some(true),
             )
             .await
             .map_err(mcp_error_to_cli_error)?;
             let payload = parse_tool_json_payload("macro_start_session", &result)?;
-            persist_sender_identity_token_from_agent_payload(&server_config, &human_key, &payload);
+            let payload = registration_payload_for_output(
+                &server_config,
+                &human_key,
+                payload,
+                show_token,
+            )?;
             render_macro_start_session_payload(&payload, fmt, &program, &model);
             Ok(())
         }
@@ -43490,6 +43841,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     "agent_name": agent_name,
                     "task_description": task,
                     "register_if_missing": should_register,
+                    "return_registration_token": true,
                     "include_examples": include_examples,
                     "include_inbox_bodies": inbox_bodies,
                     "llm_mode": false,
@@ -43498,11 +43850,12 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             )
             .await?
             {
-                persist_sender_identity_token_from_agent_payload(
+                let payload = registration_payload_for_output(
                     &server_config,
                     &project_key,
-                    &payload,
-                );
+                    payload,
+                    false,
+                )?;
                 render_macro_prepare_thread_payload(&payload, fmt);
                 return Ok(());
             }
@@ -43533,15 +43886,13 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     CliError::InvalidArgument("inbox limit exceeds supported range".into())
                 })?),
                 None,
+                Some(true),
             )
             .await
             .map_err(mcp_error_to_cli_error)?;
             let payload = parse_tool_json_payload("macro_prepare_thread", &result)?;
-            persist_sender_identity_token_from_agent_payload(
-                &server_config,
-                &project_key,
-                &payload,
-            );
+            let payload =
+                registration_payload_for_output(&server_config, &project_key, payload, false)?;
             render_macro_prepare_thread_payload(&payload, fmt);
             Ok(())
         }
@@ -44024,8 +44375,9 @@ mod mail_server_cli_bridge_tests {
         pending_send_is_consumed, pending_send_queued_age_seconds, pending_send_receipt_path,
         persist_sender_identity_token, persist_sender_identity_token_from_agent_payload,
         post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
-        reject_local_fallback_with_ownership_probe, reject_local_registration_when_gate,
-        resolve_mailbox_activity_sqlite_path, resolve_pending_send_discard_actor,
+        registration_payload_for_output, reject_local_fallback_with_ownership_probe,
+        reject_local_registration_when_gate, resolve_mailbox_activity_sqlite_path,
+        resolve_pending_send_discard_actor,
         resolve_sender_token, server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
         validate_pending_send_artifact, validate_pending_send_discard_receipt,
@@ -44653,7 +45005,8 @@ mod mail_server_cli_bridge_tests {
         let config = config_with_storage_root(td.path());
         // Flat agent object (register_agent shape).
         let flat = serde_json::json!({ "name": "FlatAgent", "registration_token": "flat-tok" });
-        persist_sender_identity_token_from_agent_payload(&config, "/flat", &flat);
+        persist_sender_identity_token_from_agent_payload(&config, "/flat", &flat)
+            .expect("persist flat token");
         assert_eq!(
             load_sender_identity_token(&config, "/flat", "FlatAgent").as_deref(),
             Some("flat-tok")
@@ -44663,15 +45016,113 @@ mod mail_server_cli_bridge_tests {
             "agent": { "name": "NestedAgent", "registration_token": "nested-tok" },
             "project": { "slug": "x" }
         });
-        persist_sender_identity_token_from_agent_payload(&config, "/nested", &nested);
+        persist_sender_identity_token_from_agent_payload(&config, "/nested", &nested)
+            .expect("persist nested token");
         assert_eq!(
             load_sender_identity_token(&config, "/nested", "NestedAgent").as_deref(),
             Some("nested-tok")
         );
         // Payload without a token persists nothing.
         let no_tok = serde_json::json!({ "name": "NoTok" });
-        persist_sender_identity_token_from_agent_payload(&config, "/notok", &no_tok);
+        persist_sender_identity_token_from_agent_payload(&config, "/notok", &no_tok)
+            .expect("token-free payload");
         assert_eq!(load_sender_identity_token(&config, "/notok", "NoTok"), None);
+    }
+
+    #[test]
+    fn registration_output_requires_opt_in_but_always_caches_the_latest_token() {
+        for nested in [false, true] {
+            for show_token in [false, true] {
+                let td = tempfile::tempdir().expect("tempdir");
+                let config = config_with_storage_root(td.path());
+                for token in ["first-test-credential", "replacement-test-credential"] {
+                    let agent = serde_json::json!({
+                        "id": 1,
+                        "name": "BlueLake",
+                        "registration_token": token,
+                    });
+                    let payload = if nested {
+                        serde_json::json!({ "agent": agent, "inbox": [] })
+                    } else {
+                        agent
+                    };
+                    let output = registration_payload_for_output(
+                        &config,
+                        "output-project",
+                        payload,
+                        show_token,
+                    )
+                    .expect("private credential saved");
+                    let agent_output = output.get("agent").unwrap_or(&output);
+                    assert_eq!(
+                        agent_output.get("registration_token").is_some(),
+                        show_token,
+                    );
+                    assert_eq!(output.to_string().contains(token), show_token);
+                    assert_eq!(agent_output["name"], "BlueLake");
+                    assert_eq!(
+                        load_sender_identity_token(&config, "output-project", "bluelake")
+                            .as_deref(),
+                        Some(token),
+                        "suppressed stdout must not break subsequent authenticated sends",
+                    );
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let path = super::sender_identity_state_path(
+                            &config,
+                            "output-project",
+                            "bluelake",
+                        );
+                        assert_eq!(
+                            std::fs::metadata(path).expect("identity state").permissions().mode()
+                                & 0o777,
+                            0o600,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registration_output_reports_private_cache_failure_without_the_secret() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(td.path());
+        std::fs::write(td.path().join(".identity"), b"occupied").expect("block cache directory");
+        for show_token in [false, true] {
+            let error = registration_payload_for_output(
+                &config,
+                "output-project",
+                serde_json::json!({
+                    "name": "BlueLake",
+                    "registration_token": "uncacheable-test-credential",
+                }),
+                show_token,
+            )
+            .expect_err("registration must report that its credential could not be saved");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("could not be saved privately"));
+            assert!(!diagnostic.contains("uncacheable-test-credential"));
+        }
+    }
+
+    #[test]
+    fn registration_bridge_requests_token_for_private_cache() {
+        let requests = [
+            build_server_register_agent_arguments(
+                "/tmp/token-output", "probe", "probe", None, None, "auto",
+            ),
+            build_server_create_agent_identity_arguments(
+                "/tmp/token-output", "probe", "probe", None, None, "auto",
+            ),
+            build_server_macro_start_session_arguments(
+                "/tmp/token-output", "probe", "probe", None, None, &[], None, 3600, 10,
+            ),
+        ];
+        for request in requests {
+            assert_eq!(request["return_registration_token"], true);
+        }
     }
 
     #[test]
@@ -51396,6 +51847,238 @@ http_headers = { Authorization = "Bearer secret" }
                     "both paths must leave exactly the fresh message unread"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn registration_cli_requires_show_token_opt_in() {
+        for (family, verb) in [
+            ("agents", "register"),
+            ("agents", "create"),
+            ("macros", "start-session"),
+        ] {
+            for show_token in [false, true] {
+                let mut args = vec![
+                    "am", family, verb, "--project", "/tmp/token-output",
+                    "--program", "probe", "--model", "probe", "--json",
+                ];
+                if show_token {
+                    args.push("--show-token");
+                }
+                let command = Cli::try_parse_from(args)
+                    .expect("registration flags")
+                    .command
+                    .expect("command");
+                let parsed_show_token = match command {
+                    Commands::Agents {
+                        action: AgentsCommand::Register { show_token, .. }
+                            | AgentsCommand::Create { show_token, .. },
+                    }
+                    | Commands::Macros {
+                        action: MacroCommand::StartSession { show_token, .. },
+                    } => show_token,
+                    other => panic!("unexpected command: {other:?}"),
+                };
+                assert_eq!(parsed_show_token, show_token);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_token_commands_require_existing_identity_arguments_and_are_mutations() {
+        for verb in ["rotate-token", "revoke-token"] {
+            assert!(Cli::try_parse_from(["am", "agents", verb]).is_err());
+            assert!(Cli::try_parse_from([
+                "am", "agents", verb, "--project", "token-project",
+            ]).is_err());
+            let command = Cli::try_parse_from([
+                "am", "agents", verb, "--project", "token-project",
+                "--agent", "BlueLake", "--json",
+            ])
+            .expect("token command")
+            .command
+            .expect("command");
+            assert!(!command_is_read_only(&command));
+            match command {
+                Commands::Agents {
+                    action: AgentsCommand::RotateToken { show_token, .. },
+                } => assert!(!show_token),
+                Commands::Agents { action: AgentsCommand::RevokeToken { .. } } => {}
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
+        assert!(Cli::try_parse_from([
+            "am", "agents", "rotate-token", "--project", "token-project",
+            "--agent", "BlueLake", "--show-token", "--json",
+        ]).is_ok());
+        assert!(Cli::try_parse_from([
+            "am", "agents", "revoke-token", "--project", "token-project",
+            "--agent", "BlueLake", "--show-token",
+        ]).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn agent_token_changes_preserve_identity_and_update_private_and_read_caches() {
+        use asupersync::runtime::RuntimeBuilder;
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("token-lifecycle.sqlite3");
+        let db_path_string = db_path.display().to_string();
+        init_schema_sqlite_canonical(&db_path_string).expect("init canonical schema");
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_string)
+            .expect("open database");
+        for (id, slug, human_key) in [
+            (1i64, "token-project", "/tmp/token-project"),
+            (2, "ambiguous-key", "/tmp/second-project"),
+            (3, "third-project", "ambiguous-key"),
+        ] {
+            conn.execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, 1)",
+                &[
+                    Value::BigInt(id),
+                    Value::Text(slug.into()),
+                    Value::Text(human_key.into()),
+                ],
+            )
+            .expect("seed project");
+        }
+        for (id, name) in [(1i64, "BlueLake"), (2, "RedFox")] {
+            conn.execute_sync(
+                "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+                 inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                 reaper_exempt, registration_token, retired_at) \
+                 VALUES (?, 1, ?, 'original-program', 'original-model', 'unchanged task', \
+                 1000000, 2000000, 'file', 'contacts_only', 1, 'old-test-credential', 3000000)",
+                &[Value::BigInt(id), Value::Text(name.into())],
+            )
+            .expect("seed identity");
+        }
+        conn.execute_sync(
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (2, 4000000)",
+            &[],
+        )
+        .expect("seed deregistration");
+        drop(conn);
+
+        let config = Config {
+            storage_root: dir.path().join("archive"),
+            ..Default::default()
+        };
+        let pool_config = mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{db_path_string}"),
+            storage_root: Some(config.storage_root.clone()),
+            ..Default::default()
+        };
+        let pool = mcp_agent_mail_db::get_or_create_pool(&pool_config).expect("pool");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = asupersync::Cx::for_testing();
+        runtime.block_on(async {
+            let (initial, _) = outcome_to_result(
+                mcp_agent_mail_db::queries::get_agent_for_operator(
+                    &cx, &pool, 1, "BlueLake",
+                ).await,
+            ).expect("initial identity");
+            let mut profile_before = serde_json::to_value(&initial).expect("snapshot");
+            profile_before.as_object_mut().unwrap().remove("registration_token");
+            mcp_agent_mail_db::read_cache()
+                .put_agent_scoped(&pool.sqlite_identity_key(), &initial);
+            assert!(persist_sender_identity_token(
+                &config, "token-project", "BlueLake", "old-test-credential",
+            ));
+
+            for (project, agent) in [
+                ("missing-project", "BlueLake"),
+                ("ambiguous-key", "BlueLake"),
+                ("token-project", "MissingAgent"),
+                ("token-project", "RedFox"),
+                ("", "BlueLake"),
+                ("token-project", ""),
+            ] {
+                assert!(agents_token_change_payload(
+                    &cx, &pool, &config, project, agent, AgentTokenAction::Rotate, false,
+                ).await.is_err());
+            }
+            assert_eq!(
+                outcome_to_result(mcp_agent_mail_db::queries::list_project_rows(&cx, &pool).await)
+                    .expect("projects").len(),
+                3,
+                "invalid token commands must not create placeholder projects",
+            );
+
+            let hidden = agents_token_change_payload(
+                &cx, &pool, &config, "TOKEN-PROJECT", "bluelake",
+                AgentTokenAction::Rotate, false,
+            ).await.expect("rotate without echoing");
+            assert_eq!(hidden["token_active"], true);
+            assert_eq!(hidden["changed"], true);
+            assert!(hidden.get("registration_token").is_none());
+            let rotated = outcome_to_result(
+                mcp_agent_mail_db::queries::get_agent(&cx, &pool, 1, "BlueLake").await,
+            ).expect("cached row after rotation");
+            let first_token = rotated.registration_token.as_deref().expect("new token");
+            assert!(!first_token.is_empty());
+            assert_ne!(first_token, "old-test-credential");
+            assert!(!hidden.to_string().contains(first_token));
+            assert_eq!(
+                load_sender_identity_token(&config, "token-project", "BLUELAKE").as_deref(),
+                Some(first_token),
+            );
+            assert_eq!(
+                load_sender_identity_token(&config, "/tmp/token-project", "BlueLake").as_deref(),
+                Some(first_token),
+            );
+            let mut profile_after = serde_json::to_value(&rotated).expect("snapshot");
+            profile_after.as_object_mut().unwrap().remove("registration_token");
+            assert_eq!(profile_after, profile_before, "only credentials may change");
+
+            let shown = agents_token_change_payload(
+                &cx, &pool, &config, "token-project", "BlueLake",
+                AgentTokenAction::Rotate, true,
+            ).await.expect("explicit token opt-in");
+            let shown_token = shown["registration_token"].as_str().expect("shown token");
+            assert_ne!(shown_token, first_token);
+            assert_eq!(
+                load_sender_identity_token(&config, "token-project", "BlueLake").as_deref(),
+                Some(shown_token),
+            );
+
+            for (attempt, show_token) in [false, true].into_iter().enumerate() {
+                let revoked = agents_token_change_payload(
+                    &cx, &pool, &config, "token-project", "BlueLake",
+                    AgentTokenAction::Revoke, show_token,
+                ).await.expect("revoke and idempotent retry");
+                assert_eq!(revoked["token_active"], false);
+                assert_eq!(revoked["changed"], attempt == 0);
+                assert!(revoked.get("registration_token").is_none());
+                assert!(!revoked.to_string().contains(shown_token));
+                assert_eq!(load_sender_identity_token(&config, "token-project", "BlueLake"), None);
+                assert_eq!(load_sender_identity_token(&config, "TOKEN-PROJECT", "BlueLake"), None);
+                let current = outcome_to_result(
+                    mcp_agent_mail_db::queries::get_agent(&cx, &pool, 1, "BlueLake").await,
+                ).expect("cached row after revocation");
+                assert!(
+                    current.registration_token.as_deref().is_none_or(str::is_empty),
+                    "cached credential must be invalidated as well as the stored token",
+                );
+            }
+            let private_state = sender_identity_state_path(&config, "token-project", "bluelake");
+            let saved = std::fs::read_to_string(private_state).expect("revocation marker");
+            assert!(!saved.contains(shown_token));
+            assert!(!saved.contains("old-test-credential"));
+            assert!(
+                !config.storage_root.join("projects").exists(),
+                "token lifecycle must not publish credentials or modify archive profiles",
+            );
+
+            let (other, deregistered_at) = outcome_to_result(
+                mcp_agent_mail_db::queries::get_agent_for_operator(
+                    &cx, &pool, 1, "RedFox",
+                ).await,
+            ).expect("unmodified deregistered identity");
+            assert_eq!(other.registration_token.as_deref(), Some("old-test-credential"));
+            assert_eq!(deregistered_at, Some(4_000_000));
         });
     }
 

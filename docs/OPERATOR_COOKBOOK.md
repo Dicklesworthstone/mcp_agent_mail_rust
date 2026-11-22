@@ -227,6 +227,59 @@ metadata for that exact agent name.
 or omit `--name` and let the CLI generate one. If the project key is wrong, the
 agent will be registered in the wrong archive namespace.
 
+### Keep registration output free of tokens
+
+`am agents register`, `am agents create`, and `am macros start-session`
+privately save their sender credential for subsequent CLI sends. Their normal
+JSON, TOON, and table output omits `registration_token`. Add `--show-token`
+only when you intentionally need to capture the credential in the output:
+
+```bash
+am agents register --project "$PROJECT" --program codex-cli --model gpt-5 \\
+  --name "$AGENT" --json
+
+# Explicit opt-in: this output contains a secret.
+am agents register --project "$PROJECT" --program codex-cli --model gpt-5 \\
+  --name "$AGENT" --show-token --json
+```
+
+Every re-registration rotates the credential, including when its output is
+suppressed. For MCP calls, `register_agent` and `macro_start_session` accept
+`return_registration_token: true` to include it; omitted, `null`, and `false`
+all suppress it. `macro_prepare_thread` accepts the same opt-in for a newly
+created identity, while an existing identity's token is preserved and never
+returned. The CLI caches a new prepare-thread credential privately and omits it
+from output. The create-only `create_agent_identity` tool keeps its existing
+default of returning the token; pass `return_registration_token: false` there
+for transcript-safe creation.
+
+### Rotate or revoke an existing agent's token
+
+These are local operator commands and require exclusive mailbox ownership. Stop
+the server through its normal supervisor first, using the same `STORAGE_ROOT`
+and `DATABASE_URL` as the mailbox to administer. A running owner causes a
+refusal; do not remove its lock files.
+
+```bash
+# Replace the credential and save the replacement privately for CLI sends.
+am agents rotate-token --project "$PROJECT" --agent "$AGENT" --json
+
+# Clear a compromised credential without issuing a replacement.
+am agents revoke-token --project "$PROJECT" --agent "$AGENT" --json
+```
+
+The commands require an existing, unambiguous project and agent. They leave
+profile metadata, activity, retirement state, message history, and pane
+bindings unchanged. Rotation omits the replacement from output unless you add
+`--show-token`; revocation never prints a token and clears the CLI's saved
+credential. Explicit use of an old token fails after rotation or revocation,
+including after cache eviction or restart. Run `rotate-token` or register again
+when you need a new credential after revocation.
+
+Revocation affects the credential, not the separate trusted-local or
+session-bound identity policies. Tokenless trusted-local sends remain possible;
+use `MESSAGING_FAIL_CLOSED_SEND_PROFILE=true` to require verified sending.
+
 ### Change an existing identity's reaper exemption
 
 Preview the metadata change before applying it:

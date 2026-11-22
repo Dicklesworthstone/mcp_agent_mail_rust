@@ -777,3 +777,183 @@ fn native_security_privacy_gate() {
     write_case_artifact(&run_root, "12_nonexistent_agent", &nonexistent);
     assert_tool_error(&nonexistent.responses, 1200, "non-existent agent inbox");
 }
+
+/// GH#396: exercise actual CLI parsing, local registration, private cache reuse,
+/// operator locks, token rotation and revoked-token rejection in isolated storage.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cli_registration_token_lifecycle_is_private_and_authenticated() {
+    use std::net::TcpListener;
+    use std::process::Output;
+
+    let work = tempfile::tempdir().expect("isolated workspace");
+    let project = work.path().join("project");
+    let storage = work.path().join("storage");
+    let database = storage.join("storage.sqlite3");
+    for path in [
+        project.clone(),
+        storage.clone(),
+        work.path().join("home"),
+        work.path().join("tmp"),
+    ] {
+        fs::create_dir_all(path).expect("create isolated directory");
+    }
+    let project_key = project.display().to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve unused port");
+    let port = listener.local_addr().expect("bound address").port();
+    drop(listener);
+
+    let run = |args: &[&str], require_verified_sender: bool| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_am"))
+            .args(args)
+            .current_dir(&project)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", work.path().join("home"))
+            .env("XDG_CONFIG_HOME", work.path().join("home/config"))
+            .env("XDG_DATA_HOME", work.path().join("home/data"))
+            .env("XDG_CACHE_HOME", work.path().join("home/cache"))
+            .env("TMPDIR", work.path().join("tmp"))
+            .env("DATABASE_URL", format!("sqlite:///{}", database.display()))
+            .env("STORAGE_ROOT", &storage)
+            .env("HTTP_HOST", "127.0.0.1")
+            .env("HTTP_PORT", port.to_string())
+            .env("HTTP_BEARER_TOKEN", "")
+            .env("AM_INTERFACE_MODE", "cli")
+            .env("TUI_ENABLED", "false")
+            .env("LLM_ENABLED", "false")
+            .env("CONTACT_ENFORCEMENT_ENABLED", "false")
+            .env("MESSAGING_SESSION_IDENTITY", "false")
+            .env(
+                "MESSAGING_FAIL_CLOSED_SEND_PROFILE",
+                if require_verified_sender { "true" } else { "false" },
+            )
+            .env("RUST_LOG", "error")
+            .output()
+            .expect("run isolated CLI")
+    };
+    let cached_token = || -> Option<String> {
+        fs::read_dir(storage.join(".identity"))
+            .expect("private identity directory")
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .find(|record| record["agent_name"] == "bluelake")
+            .and_then(|record| {
+                record["sender_token"]
+                    .as_str()
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_owned)
+            })
+    };
+    let expect_success = |output: &Output| {
+        assert!(
+            output.status.success(),
+            "CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    };
+
+    let register = [
+        "agents", "register", "--project", &project_key,
+        "--program", "probe", "--model", "probe", "--name", "BlueLake",
+    ];
+    let mut previous = None;
+    for format in ["json", "toon", "table"] {
+        let mut args = register.to_vec();
+        args.extend(["--format", format]);
+        let output = run(&args, false);
+        expect_success(&output);
+        let token = cached_token().expect("token saved despite suppressed output");
+        assert_ne!(previous.as_deref(), Some(token.as_str()));
+        for bytes in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(!text.contains(&token));
+            assert!(!text.contains("registration_token"));
+        }
+        if format == "json" {
+            let payload: Value = serde_json::from_slice(&output.stdout).expect("registration JSON");
+            assert_eq!(payload["name"], "BlueLake");
+            assert!(payload.get("registration_token").is_none());
+        }
+        previous = Some(token);
+    }
+
+    let mut show_args = register.to_vec();
+    show_args.extend(["--show-token", "--json"]);
+    let output = run(&show_args, false);
+    expect_success(&output);
+    let shown: Value = serde_json::from_slice(&output.stdout).expect("opt-in JSON");
+    let old_token = shown["registration_token"].as_str().expect("explicit token").to_owned();
+    assert_eq!(cached_token().as_deref(), Some(old_token.as_str()));
+
+    let output = run(&[
+        "agents", "register", "--project", &project_key,
+        "--program", "probe", "--model", "probe", "--name", "RedFox", "--json",
+    ], false);
+    expect_success(&output);
+
+    let send = [
+        "mail", "send", "--project", &project_key, "--from", "BlueLake",
+        "--to", "RedFox", "--subject", "credential regression", "--body", "hello", "--json",
+    ];
+    let output = run(&send, true);
+    expect_success(&output);
+    let sent: Value = serde_json::from_slice(&output.stdout).expect("send receipt");
+    assert_eq!(sent["verified_sender"], true, "private cache authenticates the send");
+
+    let rotate = [
+        "agents", "rotate-token", "--project", &project_key, "--agent", "BlueLake", "--json",
+    ];
+    {
+        let _owner = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            &storage,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        ).expect("hold live mailbox ownership");
+        let refused = run(&rotate, false);
+        assert!(!refused.status.success(), "operator changes must refuse a live owner");
+        assert_eq!(cached_token().as_deref(), Some(old_token.as_str()));
+    }
+
+    let output = run(&rotate, false);
+    expect_success(&output);
+    let rotated: Value = serde_json::from_slice(&output.stdout).expect("rotation JSON");
+    assert!(rotated.get("registration_token").is_none());
+    assert_eq!(rotated["token_active"], true);
+    let replacement = cached_token().expect("replacement cached");
+    assert_ne!(replacement, old_token);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(&replacement));
+    let output = run(&send, true);
+    expect_success(&output);
+
+    let token_file = work.path().join("supplied-token.txt");
+    let token_file_arg = token_file.display().to_string();
+    let mut explicit_send = send.to_vec();
+    explicit_send.extend(["--sender-token-file", &token_file_arg]);
+    fs::write(&token_file, &old_token).expect("supply old test token");
+    let refused = run(&explicit_send, false);
+    assert!(!refused.status.success(), "rotated credentials must be rejected");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("SENDER_TOKEN_MISMATCH"));
+    assert!(!String::from_utf8_lossy(&refused.stderr).contains(&old_token));
+
+    let revoke = [
+        "agents", "revoke-token", "--project", &project_key, "--agent", "BlueLake", "--json",
+    ];
+    let output = run(&revoke, false);
+    expect_success(&output);
+    let revoked: Value = serde_json::from_slice(&output.stdout).expect("revocation JSON");
+    assert_eq!(revoked["token_active"], false);
+    assert!(revoked.get("registration_token").is_none());
+    assert!(cached_token().is_none(), "revocation clears the private credential");
+
+    fs::write(&token_file, &replacement).expect("supply revoked test token");
+    let refused = run(&explicit_send, false);
+    assert!(!refused.status.success(), "revoked tokens must fail even in trusted-local mode");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("SENDER_TOKEN_UNAVAILABLE"));
+    assert!(!String::from_utf8_lossy(&refused.stderr).contains(&replacement));
+
+    let output = run(&revoke, false);
+    expect_success(&output);
+    let again: Value = serde_json::from_slice(&output.stdout).expect("repeat revocation JSON");
+    assert_eq!(again["changed"], false);
+}

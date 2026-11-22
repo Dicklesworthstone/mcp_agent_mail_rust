@@ -175,6 +175,7 @@ async fn register_actor(ctx: &McpContext, project: &str, name: &str) -> String {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("agent");

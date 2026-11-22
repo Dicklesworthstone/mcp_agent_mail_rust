@@ -89,6 +89,7 @@ async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &st
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("register_agent");
@@ -704,6 +705,7 @@ async fn register_agent_with_token(ctx: &McpContext, project_key: &str, agent: &
         None,
         None,
         None,
+        Some(true),
     )
     .await
     .expect("register_agent");
