@@ -313,6 +313,7 @@ fn session_bound_identity_sends_without_a_token_and_cannot_be_borrowed() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("borrowed re-registration");
@@ -364,6 +365,7 @@ fn unbound_sessions_keep_the_trusted_local_contract() {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("register new agent"),
@@ -409,6 +411,7 @@ fn registration_refresh_preserves_canonical_session_ownership() {
                 Some("updated task".to_string()),
                 None,
                 Some(true),
+                None,
                 None,
                 None,
                 None,
@@ -853,6 +856,7 @@ async fn register_named(ctx: &McpContext, project: &str, name: &str) {
         "codex-cli".to_string(),
         "gpt-5".to_string(),
         Some(name.to_string()),
+        None,
         None,
         None,
         None,

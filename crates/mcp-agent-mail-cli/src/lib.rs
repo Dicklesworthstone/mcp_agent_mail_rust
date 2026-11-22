@@ -41725,6 +41725,11 @@ fn build_server_register_agent_arguments(
         ("project_key".to_string(), serde_json::json!(project_key)),
         ("program".to_string(), serde_json::json!(program)),
         ("model".to_string(), serde_json::json!(model)),
+        // The CLI saves this privately before applying its output policy.
+        (
+            "return_registration_token".to_string(),
+            serde_json::json!(true),
+        ),
         (
             "attachments_policy".to_string(),
             serde_json::json!(attachments_policy),
@@ -41751,6 +41756,10 @@ fn build_server_create_agent_identity_arguments(
         ("project_key".to_string(), serde_json::json!(project_key)),
         ("program".to_string(), serde_json::json!(program)),
         ("model".to_string(), serde_json::json!(model)),
+        (
+            "return_registration_token".to_string(),
+            serde_json::json!(true),
+        ),
         (
             "attachments_policy".to_string(),
             serde_json::json!(attachments_policy),
@@ -42198,6 +42207,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 None,
                 None,
                 None,
+                Some(true),
             )
             .await
             .map_err(mcp_error_to_cli_error)?;

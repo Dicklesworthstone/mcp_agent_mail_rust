@@ -89,6 +89,7 @@ async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &st
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("register_agent");
@@ -699,6 +700,7 @@ async fn register_agent_with_token(ctx: &McpContext, project_key: &str, agent: &
         "gpt-5".to_string(),
         Some(agent.to_string()),
         Some("fail-closed reply test".to_string()),
+        None,
         None,
         None,
         None,

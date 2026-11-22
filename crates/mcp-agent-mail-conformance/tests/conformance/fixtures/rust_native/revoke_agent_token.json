@@ -1,0 +1,55 @@
+{
+  "version": "rust-native@2026-11-22",
+  "generated_at": "2026-11-22T00:00:00Z",
+  "tool": "revoke_agent_token",
+  "classification": "rust_native",
+  "cases": [
+    {
+      "name": "empty_credential_is_rejected",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/revoke-empty",
+        "agent_name": "BlueLake",
+        "registration_token": ""
+      },
+      "expect": {
+        "err": {
+          "error_type": "AUTHENTICATION_REQUIRED",
+          "message_contains": "current non-empty registration_token"
+        }
+      }
+    },
+    {
+      "name": "unissued_credential_cannot_revoke_existing_identity",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/revoke-unissued",
+        "agent_name": "BlueLake",
+        "registration_token": "unissued-fixture-credential"
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/revoke-unissued"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/revoke-unissued",
+              "program": "codex-cli",
+              "model": "gpt-5",
+              "name": "BlueLake"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "err": {
+          "error_type": "AUTHENTICATION_REQUIRED",
+          "message_contains": "current non-empty registration_token"
+        }
+      }
+    }
+  ]
+}

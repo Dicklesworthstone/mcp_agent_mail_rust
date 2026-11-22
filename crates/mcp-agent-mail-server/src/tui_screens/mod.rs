@@ -244,6 +244,7 @@ pub(crate) fn seed_operator_test_project(project_key: &str, agents: &[&str]) -> 
             None,
             None,
             None,
+            None,
         ))
         .expect("register_agent");
         block_on(mcp_agent_mail_tools::set_contact_policy(

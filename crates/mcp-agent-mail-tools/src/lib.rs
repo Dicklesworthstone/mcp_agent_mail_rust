@@ -4060,6 +4060,8 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     // Identity
     ("register_agent", clusters::IDENTITY),
     ("create_agent_identity", clusters::IDENTITY),
+    ("rotate_agent_token", clusters::IDENTITY),
+    ("revoke_agent_token", clusters::IDENTITY),
     ("retire_agent", clusters::IDENTITY),
     ("unretire_agent", clusters::IDENTITY),
     ("deregister_agent", clusters::IDENTITY),

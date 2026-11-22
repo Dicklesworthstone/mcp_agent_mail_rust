@@ -128,6 +128,7 @@ fn explicit_task_identities_keep_canonical_registration_and_archive() {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("resume using a differently cased task name"),
@@ -319,6 +320,7 @@ fn auto_registered_recipient_gets_an_archived_profile() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("register sender");
@@ -392,6 +394,7 @@ fn send_to_cross_project_contact_is_refused_instead_of_misdelivered() {
                 "codex-cli".to_string(),
                 "gpt-5".to_string(),
                 Some(name.to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -605,6 +608,7 @@ async fn register_open_agent(ctx: &McpContext, project: &str, name: &str) -> i64
         "codex-cli".to_string(),
         "gpt-5".to_string(),
         Some(name.to_string()),
+        None,
         None,
         None,
         None,
@@ -1739,6 +1743,7 @@ async fn register_for_token(ctx: &McpContext, project: &str, name: &str) -> Stri
         "codex-cli".to_string(),
         "gpt-5".to_string(),
         Some(name.to_string()),
+        None,
         None,
         None,
         None,

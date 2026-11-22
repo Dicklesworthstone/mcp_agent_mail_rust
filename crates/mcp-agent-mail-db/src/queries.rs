@@ -6484,6 +6484,123 @@ pub async fn update_agent_registration_token(
     }
 }
 
+/// Replace or revoke a bearer credential only while the caller still owns it.
+///
+/// The canonical identity and credential are checked in the same transaction
+/// as the write. A stale token, a renamed/replaced identity, or a concurrent
+/// rotation returns `None` and cannot overwrite the current credential. This
+/// changes no profile, activity, retirement, or session-identity state.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn compare_and_swap_agent_registration_token(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    agent_name: &str,
+    expected_token: &str,
+    replacement_token: Option<&str>,
+) -> Outcome<Option<AgentRow>, DbError> {
+    if expected_token.is_empty() {
+        return Outcome::Ok(None);
+    }
+    if replacement_token.is_some_and(str::is_empty) {
+        return Outcome::Err(DbError::invalid(
+            "registration_token",
+            "A replacement credential must be non-empty; use None to revoke",
+        ));
+    }
+
+    let changed = match run_with_mvcc_retry(cx, "compare_and_swap_agent_registration_token", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+        let select_sql = "SELECT id, project_id, name, program, model, task_description, \
+                          inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                          registration_token, retired_at FROM agents WHERE id = ? AND project_id = ? LIMIT 1";
+        let identity_params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, select_sql, &identity_params).await)
+        );
+        let Some(current) = rows.first().map(decode_agent_row_indexed) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Ok(None);
+        };
+        if current.name != agent_name
+            || !current.registration_token.as_deref().is_some_and(|token| {
+                mcp_agent_mail_core::setup::constant_time_str_eq(expected_token, token)
+            })
+        {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Ok(None);
+        }
+
+        let replacement = replacement_token.map_or(Value::Null, |token| Value::Text(token.to_string()));
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(
+                cx,
+                &tracked,
+                "UPDATE agents SET registration_token = ? \
+                 WHERE id = ? AND project_id = ? AND name = ? COLLATE BINARY AND registration_token = ?",
+                &[
+                    replacement,
+                    Value::BigInt(agent_id),
+                    Value::BigInt(project_id),
+                    Value::Text(agent_name.to_string()),
+                    Value::Text(expected_token.to_string()),
+                ],
+            ).await)
+        );
+        // Some native backends under-report rows_affected. Check the actual
+        // stored value in this transaction before acknowledging the mutation.
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, select_sql, &identity_params).await)
+        );
+        let Some(updated) = rows.first().map(decode_agent_row_indexed) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(
+                "Credential update lost its canonical agent row".to_string(),
+            ));
+        };
+        if updated.name != agent_name || updated.registration_token.as_deref() != replacement_token {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(
+                "Credential update was not stored".to_string(),
+            ));
+        }
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(Some(updated))
+    }).await {
+        Outcome::Ok(changed) => changed,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    if let Some(agent) = &changed {
+        // Invalidate rather than repopulate: another credential operation may
+        // already have committed after ours. Never install an older secret.
+        crate::cache::read_cache().invalidate_agent_scoped(
+            &cache_scope_for_pool(pool),
+            agent.project_id,
+            &agent.name,
+            agent.id,
+        );
+    }
+    Outcome::Ok(changed)
+}
+
 /// Create a new agent identity, failing if the name is already taken.
 ///
 /// Unlike `register_agent` (which does an upsert), this function enforces
@@ -24884,6 +25001,166 @@ mod tests {
             Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
         }
         (cx, pool, dir)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn credential_compare_and_swap_has_one_winner_and_preserves_profile() {
+        let (cx, pool, _dir) = setup_test_pool("credential-compare-and-swap.db");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("credential runtime");
+        let original = runtime.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/credential-cas")
+                .await
+                .into_result()
+                .unwrap();
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("retain this task"),
+                Some("file"),
+                Some(true),
+            )
+            .await
+            .into_result()
+            .unwrap();
+            update_agent_registration_token(&cx, &pool, agent.id.unwrap(), "original-token")
+                .await
+                .into_result()
+                .unwrap();
+            get_agent_by_id_fresh(&cx, &pool, agent.id.unwrap())
+                .await
+                .into_result()
+                .unwrap()
+        });
+        let agent_id = original.id.unwrap();
+        let project_id = original.project_id;
+        // Both workers present the same credential against the real native DB.
+        // The second transaction must observe the first winner's replacement.
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let winners: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = ["replacement-one", "replacement-two"]
+                .into_iter()
+                .map(|token| {
+                    let pool = pool.clone();
+                    let start = start.clone();
+                    scope.spawn(move || {
+                        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                            .build()
+                            .unwrap();
+                        start.wait();
+                        runtime.block_on(async {
+                            compare_and_swap_agent_registration_token(
+                                &Cx::for_testing(),
+                                &pool,
+                                project_id,
+                                agent_id,
+                                "BlueLake",
+                                "original-token",
+                                Some(token),
+                            )
+                            .await
+                            .into_result()
+                            .unwrap()
+                            .map(|_| token)
+                        })
+                    })
+                })
+                .collect();
+            start.wait();
+            workers
+                .into_iter()
+                .filter_map(|worker| worker.join().unwrap())
+                .collect()
+        });
+        assert_eq!(
+            winners.len(),
+            1,
+            "only one owner of the old token may rotate it"
+        );
+        let winner = winners[0];
+        runtime.block_on(async {
+            let current = get_agent_by_id_fresh(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(current.registration_token.as_deref(), Some(winner));
+            let mut expected_profile = original.clone();
+            expected_profile.registration_token = Some(winner.to_string());
+            assert_eq!(
+                serde_json::to_value(&current).unwrap(),
+                serde_json::to_value(&expected_profile).unwrap()
+            );
+
+            for (project, id, name, token) in [
+                (project_id, agent_id, "BlueLake", "original-token"),
+                (project_id + 1, agent_id, "BlueLake", winner),
+                (project_id, agent_id + 1, "BlueLake", winner),
+                (project_id, agent_id, "RedStone", winner),
+                (project_id, agent_id, "bluelake", winner),
+                (project_id, agent_id, "BlueLake", ""),
+            ] {
+                assert!(
+                    compare_and_swap_agent_registration_token(
+                        &cx, &pool, project, id, name, token, None,
+                    )
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .is_none()
+                );
+            }
+            let cancelled = Cx::for_testing();
+            cancelled.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel credential change"),
+            );
+            assert!(matches!(
+                compare_and_swap_agent_registration_token(
+                    &cancelled, &pool, project_id, agent_id, "BlueLake", winner, None,
+                )
+                .await,
+                Outcome::Cancelled(_)
+            ));
+
+            let revoked = compare_and_swap_agent_registration_token(
+                &cx, &pool, project_id, agent_id, "BlueLake", winner, None,
+            )
+            .await
+            .into_result()
+            .unwrap()
+            .expect("current owner can revoke");
+            expected_profile.registration_token = None;
+            assert_eq!(
+                serde_json::to_value(&revoked).unwrap(),
+                serde_json::to_value(&expected_profile).unwrap()
+            );
+            assert!(
+                compare_and_swap_agent_registration_token(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    "BlueLake",
+                    winner,
+                    Some("stale-replacement"),
+                )
+                .await
+                .into_result()
+                .unwrap()
+                .is_none()
+            );
+            let durable = get_agent_by_id_fresh(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(durable.registration_token.is_none());
+        });
     }
 
     #[test]

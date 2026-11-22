@@ -1235,6 +1235,28 @@ fn build_tool_directory() -> ToolDirectory {
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
+                    name: "rotate_agent_token".to_string(),
+                    summary: "Replace a bearer credential while preserving the agent profile, history, and sessions.".to_string(),
+                    use_when: "Replacing an exposed or aging credential while holding its current value.".to_string(),
+                    related: vec!["revoke_agent_token".to_string(), "register_agent".to_string()],
+                    expected_frequency: "When a bearer credential needs replacement.".to_string(),
+                    required_capabilities: vec!["identity".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Replace credential".to_string(), sample: "rotate_agent_token(project_key='backend', agent_name='BlueLake', registration_token='<current-token>', return_registration_token=true)".to_string() }],
+                    capabilities: vec!["identity".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "revoke_agent_token".to_string(),
+                    summary: "Clear a bearer credential without retiring the agent or changing existing sessions.".to_string(),
+                    use_when: "Disabling bearer-token access while holding the current credential.".to_string(),
+                    related: vec!["rotate_agent_token".to_string(), "register_agent".to_string()],
+                    expected_frequency: "When a bearer credential should stop authorizing requests.".to_string(),
+                    required_capabilities: vec!["identity".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Revoke credential".to_string(), sample: "revoke_agent_token(project_key='backend', agent_name='BlueLake', registration_token='<current-token>')".to_string() }],
+                    capabilities: vec!["identity".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
                     name: "retire_agent".to_string(),
                     summary: "Temporarily remove an identity from active routing without deleting history.".to_string(),
                     use_when: "Pausing an identity that may resume later.".to_string(),
@@ -10960,6 +10982,7 @@ mod resource_shape_tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register_agent"),
@@ -11044,6 +11067,7 @@ mod resource_shape_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -11054,6 +11078,7 @@ mod resource_shape_tests {
                     "gpt-5".to_string(),
                     Some("RedPeak".to_string()),
                     Some("resource visibility regression".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -12944,6 +12969,7 @@ mod resource_shape_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register_agent GreenLake");
@@ -12955,6 +12981,7 @@ mod resource_shape_tests {
                     "sonnet-4.5".to_string(),
                     Some("BlueDog".to_string()),
                     Some("frontend work".to_string()),
+                    None,
                     None,
                     None,
                     None,

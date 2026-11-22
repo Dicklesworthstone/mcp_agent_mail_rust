@@ -49,6 +49,8 @@ const TOOLS_WITHOUT_SHARED_DESCRIPTION_FIXTURE: &[&str] = &[
     "list_agents",
     "mark_all_read",
     "resolve_pane_identity",
+    "revoke_agent_token",
+    "rotate_agent_token",
 ];
 
 /// Load the Python reference fixture.
@@ -572,6 +574,8 @@ fn cluster_identity_descriptions() {
     check_cluster_descriptions(&[
         "register_agent",
         "create_agent_identity",
+        "rotate_agent_token",
+        "revoke_agent_token",
         "retire_agent",
         "unretire_agent",
         "deregister_agent",

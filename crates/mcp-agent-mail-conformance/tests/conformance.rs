@@ -2474,6 +2474,8 @@ fn rust_native_fixture_coverage_matches_classification() {
         "list_agents",
         "mark_all_read",
         "resolve_pane_identity",
+        "revoke_agent_token",
+        "rotate_agent_token",
     ]
     .into_iter()
     .map(str::to_string)

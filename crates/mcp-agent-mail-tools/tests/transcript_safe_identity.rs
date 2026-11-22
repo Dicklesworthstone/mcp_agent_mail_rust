@@ -21,8 +21,10 @@ use fastmcp::{CallToolParams, Router};
 use fastmcp_core::SessionState;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
-    CreateAgentIdentity, EnsureProject, SendMessage, create_agent_identity, ensure_project,
-    register_agent, send_message, tool_util::get_db_pool,
+    CreateAgentIdentity, EnsureProject, RegisterAgent, RevokeAgentToken, RotateAgentToken,
+    SendMessage, create_agent_identity, ensure_project, register_agent, reply_message,
+    retire_agent, revoke_agent_token, rotate_agent_token, send_message, tool_error_code,
+    tool_util::get_db_pool,
 };
 use serde_json::{Value, json};
 use std::sync::Mutex;
@@ -49,16 +51,25 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    run_isolated_with_env(&[], f)
+}
+
+fn run_isolated_with_env<F, Fut, T>(overrides: &[(&str, &str)], f: F) -> T
+where
+    F: FnOnce(Cx) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let suffix = unique_suffix();
     let database_url = format!("sqlite:///tmp/transcript-safe-{suffix}.sqlite3");
     let storage_root = format!("/tmp/transcript-safe-storage-{suffix}");
-    let env: Vec<(&str, &str)> = vec![
+    let mut env: Vec<(&str, &str)> = vec![
         ("DATABASE_URL", database_url.as_str()),
         ("STORAGE_ROOT", storage_root.as_str()),
     ];
+    env.extend_from_slice(overrides);
     with_process_env_overrides_for_test(&env, || {
         Config::reset_cached();
         let cx = Cx::for_testing();
@@ -243,6 +254,7 @@ fn send_message_null_auto_contact_contract() {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("register_agent");
@@ -340,6 +352,393 @@ fn send_message_null_auto_contact_contract() {
         .expect("direct send with None auto_contact_if_blocked");
         let direct_payload = parse(&direct);
         assert_eq!(direct_payload["count"].as_i64(), Some(1));
+    });
+}
+
+#[test]
+fn register_dispatch_can_suppress_token_on_creation_and_update() {
+    run_isolated(|cx| async move {
+        let ctx = McpContext::new(cx, 1);
+        let project = "/tmp/transcript-safe-register";
+        ensure_project(&ctx, project.to_string(), None)
+            .await
+            .unwrap();
+        let router = fastmcp_server::ServerBuilder::new("register-echo-test", "0")
+            .tool(RegisterAgent)
+            .build()
+            .into_router();
+        let mut previous = None;
+        for echo in [false, false, true] {
+            let result = router
+                .handle_tools_call(
+                    &ctx,
+                    CallToolParams {
+                        name: "register_agent".to_string(),
+                        arguments: Some(json!({
+                            "project_key": project, "name": "BlueLake",
+                            "program": "codex-cli", "model": "gpt-5",
+                            "return_registration_token": echo,
+                        })),
+                        meta: None,
+                    },
+                    SessionState::new(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("register dispatch");
+            let text = tool_result_text(&result.content);
+            let payload = parse(&text);
+            let pool = get_db_pool().unwrap();
+            let stored = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                ctx.cx(),
+                &pool,
+                payload["id"].as_i64().unwrap(),
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let token = stored.registration_token.expect("credential persists");
+            assert!(!token.is_empty());
+            assert_ne!(
+                previous.as_ref(),
+                Some(&token),
+                "registration still rotates"
+            );
+            if echo {
+                assert_eq!(payload["registration_token"].as_str(), Some(token.as_str()));
+            } else {
+                assert!(payload.get("registration_token").is_none());
+                assert!(!text.contains(&token));
+                assert_eq!(payload["registration_token_returned"], false);
+            }
+            previous = Some(token);
+        }
+    });
+}
+
+async fn register_credential_fixture(ctx: &McpContext, project: &str, name: &str) -> Value {
+    parse(
+        &register_agent(
+            ctx,
+            project.to_string(),
+            "codex-cli".to_string(),
+            "gpt-5".to_string(),
+            Some(name.to_string()),
+            Some("preserve credential fixture metadata".to_string()),
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            Some(true),
+        )
+        .await
+        .unwrap(),
+    )
+}
+
+async fn credential_test_send(
+    ctx: &McpContext,
+    project: &str,
+    token: Option<&str>,
+    key: Option<&str>,
+) -> Result<Value, String> {
+    send_message(
+        ctx,
+        project.to_string(),
+        "BlueLake".to_string(),
+        vec!["GreenCastle".to_string()],
+        "Credential lifecycle".to_string(),
+        "Bearer proof must be current.".to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        token.map(str::to_string),
+        key.map(str::to_string),
+    )
+    .await
+    .map(|response| parse(&response))
+    .map_err(|error| tool_error_code(&error).unwrap_or("UNKNOWN").to_string())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn bearer_rotation_and_revocation_reject_stale_cache_without_revoking_sessions() {
+    run_isolated_with_env(
+        &[
+            ("MESSAGING_SESSION_IDENTITY", "true"),
+            ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
+            ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+            ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+        ],
+        |cx| async move {
+            let owner = McpContext::with_state(cx.clone(), 1, SessionState::new());
+            let plain = McpContext::new(cx, 2);
+            let project = "/tmp/bearer-lifecycle";
+            ensure_project(&plain, project.to_string(), None)
+                .await
+                .unwrap();
+            let registered = register_credential_fixture(&owner, project, "BlueLake").await;
+            let recipient = register_credential_fixture(&plain, project, "GreenCastle").await;
+            let original_token = registered["registration_token"].as_str().unwrap();
+            let pool = get_db_pool().unwrap();
+            let original = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                owner.cx(),
+                &pool,
+                registered["id"].as_i64().unwrap(),
+            )
+            .await
+            .into_result()
+            .unwrap();
+
+            // Rotation with no echo is useful without changing any public profile.
+            let hidden = rotate_agent_token(
+                &owner,
+                project.to_string(),
+                "BlueLake".to_string(),
+                original_token.to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+            let hidden_payload = parse(&hidden);
+            assert_eq!(hidden_payload["token_status"], "rotated");
+            assert_eq!(hidden_payload["registration_token_returned"], false);
+            assert!(hidden_payload.get("registration_token").is_none());
+            let rotated = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                owner.cx(),
+                &pool,
+                original.id.unwrap(),
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let rotated_token = rotated.registration_token.as_deref().unwrap();
+            assert_ne!(rotated_token, original_token);
+            assert!(!hidden.contains(rotated_token));
+            let mut expected = original.clone();
+            expected.registration_token = rotated.registration_token.clone();
+            assert_eq!(
+                serde_json::to_value(&rotated).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+
+            // Reinstalling an old cache entry must not restore bearer authority.
+            mcp_agent_mail_db::cache::read_cache()
+                .put_agent_scoped(&pool.sqlite_identity_key(), &original);
+            assert_eq!(
+                credential_test_send(&owner, project, Some(original_token), None).await,
+                Err("SENDER_TOKEN_MISMATCH".to_string())
+            );
+            let explicit = parse(
+                &rotate_agent_token(
+                    &owner,
+                    project.to_string(),
+                    "BlueLake".to_string(),
+                    rotated_token.to_string(),
+                    Some(true),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(explicit["registration_token_returned"], true);
+            let active_token = explicit["registration_token"].as_str().unwrap();
+            assert_ne!(active_token, rotated_token);
+            let sent = credential_test_send(
+                &owner,
+                project,
+                Some(active_token),
+                Some("credential-replay"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(sent["verified_sender"], true);
+            let message_id = sent["deliveries"][0]["payload"]["id"].as_i64().unwrap();
+            let before_revoke = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                owner.cx(),
+                &pool,
+                original.id.unwrap(),
+            )
+            .await
+            .into_result()
+            .unwrap();
+
+            let revoked_text = revoke_agent_token(
+                &owner,
+                project.to_string(),
+                "BlueLake".to_string(),
+                active_token.to_string(),
+            )
+            .await
+            .unwrap();
+            let revoked = parse(&revoked_text);
+            assert_eq!(revoked["token_status"], "revoked");
+            assert_eq!(revoked["registration_token_returned"], false);
+            assert!(revoked.get("registration_token").is_none());
+            assert!(!revoked_text.contains(active_token));
+            mcp_agent_mail_db::cache::read_cache()
+                .put_agent_scoped(&pool.sqlite_identity_key(), &before_revoke);
+
+            for key in [None, Some("credential-replay")] {
+                assert_eq!(
+                    credential_test_send(&owner, project, Some(active_token), key).await,
+                    Err("SENDER_TOKEN_UNAVAILABLE".to_string())
+                );
+            }
+            let reply_error = reply_message(
+                &owner,
+                project.to_string(),
+                message_id,
+                "BlueLake".to_string(),
+                "Revoked bearer must not reply.".to_string(),
+                Some(vec!["GreenCastle".to_string()]),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(active_token.to_string()),
+                None,
+            )
+            .await
+            .expect_err("revoked bearer cannot reply despite session ownership");
+            assert_eq!(
+                tool_error_code(&reply_error),
+                Some("SENDER_TOKEN_UNAVAILABLE")
+            );
+            let retire_error = retire_agent(
+                &owner,
+                project.to_string(),
+                "BlueLake".to_string(),
+                Some(active_token.to_string()),
+                None,
+                None,
+                Some("http".to_string()),
+            )
+            .await
+            .expect_err("revoked bearer cannot retire through a stale cache");
+            assert_eq!(
+                tool_error_code(&retire_error),
+                Some("AUTHENTICATION_REQUIRED")
+            );
+            let rotate_error = rotate_agent_token(
+                &owner,
+                project.to_string(),
+                "BlueLake".to_string(),
+                active_token.to_string(),
+                Some(true),
+            )
+            .await
+            .expect_err("revoked bearer cannot mint another token");
+            assert_eq!(
+                tool_error_code(&rotate_error),
+                Some("AUTHENTICATION_REQUIRED")
+            );
+            assert!(!format!("{rotate_error:?}").contains(active_token));
+            let inbox = mcp_agent_mail_db::queries::fetch_inbox(
+                owner.cx(),
+                &pool,
+                original.project_id,
+                recipient["id"].as_i64().unwrap(),
+                false,
+                None,
+                50,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(inbox.len(), 1, "refused sends and replies must not persist");
+
+            let session_send = credential_test_send(&owner, project, None, None)
+                .await
+                .unwrap();
+            assert_eq!(session_send["verified_sender"], true);
+            assert_eq!(session_send["sender_verification"], "session");
+            let trusted_local = credential_test_send(&plain, project, None, None)
+                .await
+                .unwrap();
+            assert_eq!(trusted_local["verified_sender"], false);
+            let durable = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                owner.cx(),
+                &pool,
+                original.id.unwrap(),
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert!(durable.registration_token.is_none());
+            assert!(durable.retired_at.is_none());
+        },
+    );
+}
+
+#[test]
+fn credential_tools_dispatch_require_current_token_and_hide_replacements() {
+    run_isolated(|cx| async move {
+        let ctx = McpContext::new(cx, 1);
+        let project = "/tmp/credential-tool-dispatch";
+        ensure_project(&ctx, project.to_string(), None)
+            .await
+            .unwrap();
+        let registered = register_credential_fixture(&ctx, project, "BlueLake").await;
+        let token = registered["registration_token"].as_str().unwrap();
+        let router = fastmcp_server::ServerBuilder::new("credential-tool-test", "0")
+            .tool(RotateAgentToken)
+            .tool(RevokeAgentToken)
+            .build()
+            .into_router();
+        let result = router.handle_tools_call(
+            &ctx,
+            CallToolParams { name: "rotate_agent_token".to_string(), arguments: Some(json!({
+                "project_key": project, "agent_name": "BlueLake", "registration_token": token,
+            })), meta: None }, SessionState::new(), None, None,
+        ).await.unwrap();
+        let text = tool_result_text(&result.content);
+        let result = parse(&text);
+        assert_eq!(result["token_status"], "rotated");
+        assert!(result.get("registration_token").is_none());
+        assert!(!text.contains(token));
+        let pool = get_db_pool().unwrap();
+        let fresh = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+            ctx.cx(),
+            &pool,
+            registered["id"].as_i64().unwrap(),
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let replacement = fresh.registration_token.unwrap();
+        assert!(!text.contains(&replacement));
+        for invalid in ["", "wrong-token", token] {
+            let error = revoke_agent_token(
+                &ctx,
+                project.to_string(),
+                "BlueLake".to_string(),
+                invalid.to_string(),
+            )
+            .await
+            .expect_err("only the current credential authorizes");
+            assert_eq!(tool_error_code(&error), Some("AUTHENTICATION_REQUIRED"));
+        }
+        let result = router.handle_tools_call(
+            &ctx,
+            CallToolParams { name: "revoke_agent_token".to_string(), arguments: Some(json!({
+                "project_key": project, "agent_name": "BlueLake", "registration_token": replacement,
+            })), meta: None }, SessionState::new(), None, None,
+        ).await.unwrap();
+        let result = parse(&tool_result_text(&result.content));
+        assert_eq!(result["token_status"], "revoked");
+        assert!(result.get("registration_token").is_none());
     });
 }
 

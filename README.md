@@ -12,7 +12,7 @@
 
 > "It's like Gmail for your coding agents!"
 
-A mail-like coordination layer for AI coding agents, exposed as an MCP server with 45 tools and 25 resources, Git-backed archive, SQLite indexing, an interactive 16-screen TUI, a server-rendered web UI, and an agent-first robot CLI. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
+A mail-like coordination layer for AI coding agents, exposed as an MCP server with 47 tools and 25 resources, Git-backed archive, SQLite indexing, an interactive 16-screen TUI, a server-rendered web UI, and an agent-first robot CLI. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
 
 **Supported agents:** [Claude Code](https://claude.ai/code), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Oh My Pi (OMP)](https://omp.sh), [GitHub Copilot CLI](https://docs.github.com/en/copilot), and any MCP-compatible client.
 
@@ -43,7 +43,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 - [Agent Configuration](#agent-configuration)
 - [Server Modes](#server-modes)
 - [Operator CLI Surface](#operator-cli-surface)
-- [The 45 MCP Tools](#the-45-mcp-tools)
+- [The 47 MCP Tools](#the-47-mcp-tools)
 - [TUI Operations Console](#tui-operations-console)
 - [Robot Mode (`am robot`)](#robot-mode-am-robot)
 - [File Reservations](#file-reservations-for-multi-agent-editing)
@@ -87,7 +87,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **Asynchronous Messaging** | Threaded inbox/outbox with subjects, CC/BCC, acknowledgments, and importance levels |
 | **Token-Efficient** | Messages stored in a per-project archive, not in agent context windows |
 | **25 MCP Resources** | Read-only inbox, thread, reservation, tooling, identity, and attention views for cheap lookups |
-| **45 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
+| **47 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
 | **16-Screen TUI** | Live operator cockpit for messages, threads, agents, search, reservations, metrics, health, analytics, attachments, archive browsing, and ATC |
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
 | **Robot Mode** | 19 agent-optimized CLI subcommands with `toon`/`json` output (`md` for thread and message views) for non-interactive workflows |
@@ -179,7 +179,7 @@ Agent Mail has been available since October 2025 and was designed around real mu
 
 **No "broadcast to all" mode.** Given the option, many agents will overuse broadcast-style messaging. That is the equivalent of default reply-all in email: lots of irrelevant noise and wasted context.
 
-**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 45 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
+**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
 
 **No git worktrees.** Worktrees can slow development velocity and create reconciliation debt when agents diverge. Agent Mail takes the opposite approach: keep agents in one shared space, surface conflicts quickly, and give them tools to coordinate through them.
 
@@ -850,14 +850,14 @@ which recipients lost events before durable retention markers were introduced.
 
 ---
 
-## The 45 MCP Tools
+## The 47 MCP Tools
 
 ### 9 Clusters
 
 | Cluster | Count | Tools |
 |---------|-------|-------|
 | Infrastructure | 4 | `health_check`, `ensure_project`, `install_precommit_guard`, `uninstall_precommit_guard` |
-| Identity | 9 | `register_agent`, `create_agent_identity`, `retire_agent`, `unretire_agent`, `deregister_agent`, `whois`, `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents` |
+| Identity | 11 | `register_agent`, `create_agent_identity`, `rotate_agent_token`, `revoke_agent_token`, `retire_agent`, `unretire_agent`, `deregister_agent`, `whois`, `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents` |
 | Messaging | 9 | `send_message`, `reply_message`, `fetch_inbox`, `fetch_topic`, `fetch_inbox_events`, `get_message_delivery_receipt`, `acknowledge_message`, `mark_message_read`, `mark_all_read` |
 | Contacts | 4 | `request_contact`, `respond_contact`, `list_contacts`, `set_contact_policy` |
 | File Reservations | 5 | `check_file_reservation_conflicts`, `file_reservation_paths`, `renew_file_reservations`, `release_file_reservations`, `force_release_file_reservation` |
@@ -902,6 +902,28 @@ names still normalize to PascalCase. Both forms are unique within a project
 without regard to case: registering `APP-X-REFACTOR` after `app-x-refactor`
 updates the same identity and returns its original canonical spelling.
 `create_agent_identity` instead rejects a name that is already in use.
+
+Both `register_agent` and `create_agent_identity` accept
+`return_registration_token: false` to omit the credential from the MCP result
+and return `registration_token_returned: false`. The default remains `true`.
+The token is still issued and stored; session-bound identities can send without
+echoing it when `MESSAGING_SESSION_IDENTITY=true`.
+
+`rotate_agent_token` and `revoke_agent_token` operate on an existing identity
+without changing its profile or activity timestamps. Both require `project_key`,
+`agent_name`, and the current `registration_token` on every transport. Rotation
+atomically replaces the credential; revocation clears it without issuing a new
+one. Stale or concurrent requests cannot overwrite a newer token. Rotation
+omits the replacement from its MCP result unless
+`return_registration_token: true` is explicitly requested. Revocation never
+returns a token. A lost or revoked credential can be replaced by re-registering
+under the existing registration policy.
+
+These operations govern the registration token, not the agent's lifetime:
+message history, existing MCP session bindings, and trusted-local tokenless
+access remain unchanged. Explicitly supplied old tokens are rejected even when
+tokenless sends are permitted. Use retirement/deregistration or end the MCP
+session when the identity or session itself must stop acting.
 
 Path separators, address delimiters, consecutive or trailing dots, template
 placeholders, Windows device names, and reserved program/model/operator
@@ -1650,7 +1672,7 @@ MCP Client / Operator / Browser
                      │
         ┌────────────┼────────────┬─────────────┐
         ▼            ▼            ▼             ▼
-   45 MCP Tools  25 Resources   TUI         Web UI
+   47 MCP Tools  25 Resources   TUI         Web UI
         │            │            │             │
         └────────────┴──────┬─────┴─────────────┘
                             ▼
@@ -1677,7 +1699,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-search-core/         # Pluggable search traits
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 45 MCP tool implementations (9 clusters)
+│   ├── mcp-agent-mail-tools/               # 47 MCP tool implementations (9 clusters)
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (16 screens)
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am) with robot mode

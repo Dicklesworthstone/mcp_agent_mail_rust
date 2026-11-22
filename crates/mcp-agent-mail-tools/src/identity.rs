@@ -3116,6 +3116,9 @@ Check that all parameters have valid values."
 /// - `tmux_socket_path`: Optional absolute socket path of the tmux server
 ///   `pane_id` lives on (GH#310). The HTTP daemon derives it from the
 ///   `X-Tmux-Socket` header the `am` CLI sends and ignores body values.
+/// - `return_registration_token`: Defaults to `true` for compatibility with
+///   existing MCP clients. Pass `false` to omit the bearer credential from
+///   transcript-visible results; the token is still rotated and persisted.
 ///
 /// # Returns
 /// Agent profile with all fields
@@ -3148,8 +3151,9 @@ pub async fn register_agent(
     // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
+    return_registration_token: Option<bool>,
 ) -> McpResult<String> {
-    register_agent_with_token_policy(
+    let response = register_agent_with_token_policy(
         ctx,
         project_key,
         program,
@@ -3163,7 +3167,18 @@ pub async fn register_agent(
         registration_proof,
         TokenPolicy::Rotate,
     )
-    .await
+    .await?;
+    if return_registration_token.unwrap_or(true) {
+        return Ok(response);
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|error| McpError::internal_error(format!("JSON error: {error}")))?;
+    if let Some(agent) = value.as_object_mut() {
+        agent.remove("registration_token");
+        agent.insert("registration_token_returned".to_string(), json!(false));
+    }
+    serde_json::to_string(&value)
+        .map_err(|error| McpError::internal_error(format!("JSON error: {error}")))
 }
 
 /// What a registration does to an existing agent's registration token.
@@ -3952,6 +3967,146 @@ Choose a different name (or omit the name to auto-generate one)."
     }
 }
 
+fn credential_authentication_error(agent_name: &str) -> McpError {
+    legacy_tool_error(
+        "AUTHENTICATION_REQUIRED",
+        format!(
+            "Changing the bearer credential for agent '{agent_name}' requires its current non-empty registration_token. The credential may already have been rotated or revoked."
+        ),
+        false,
+        json!({
+            "agent_name": agent_name,
+            "token_param": "registration_token",
+            "reason": "current_token_required",
+        }),
+    )
+}
+
+/// A cache entry can resolve an identity, but cannot authorize a bearer token:
+/// concurrent readers may repopulate it after a rotation invalidates it.
+pub(crate) async fn refresh_credential_agent(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    agent: &mcp_agent_mail_db::AgentRow,
+) -> McpResult<mcp_agent_mail_db::AgentRow> {
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    let current = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent_by_id_fresh(ctx.cx(), pool, agent_id).await,
+    )?;
+    if current.project_id != agent.project_id || current.name != agent.name {
+        return Err(credential_authentication_error(&agent.name));
+    }
+    Ok(current)
+}
+
+async fn change_agent_token(
+    ctx: &McpContext,
+    project_key: &str,
+    agent_name: &str,
+    registration_token: &str,
+    replacement_token: Option<String>,
+    return_registration_token: bool,
+) -> McpResult<String> {
+    if registration_token.is_empty() {
+        return Err(credential_authentication_error(agent_name));
+    }
+    let pool = get_db_pool_for_request(ctx)?;
+    let project = resolve_existing_project(ctx, &pool, project_key).await?;
+    let project_id = project
+        .id
+        .ok_or_else(|| McpError::internal_error("Project row missing id"))?;
+    let agent = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, agent_name).await,
+    )?;
+    let agent_id = agent
+        .id
+        .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
+    // The cache is only a name-to-canonical-ID hint. Authentication and the
+    // mutation happen together against authoritative state in the DB helper.
+    let updated = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::compare_and_swap_agent_registration_token(
+            ctx.cx(),
+            &pool,
+            project_id,
+            agent_id,
+            &agent.name,
+            registration_token,
+            replacement_token.as_deref(),
+        )
+        .await,
+    )?
+    .ok_or_else(|| credential_authentication_error(&agent.name))?;
+
+    let rotated = replacement_token.is_some();
+    let echo_token = rotated && return_registration_token;
+    let mut response = json!({
+        "project_id": project_id,
+        "agent_id": agent_id,
+        "name": updated.name,
+        "token_status": if rotated { "rotated" } else { "revoked" },
+        "registration_token_returned": echo_token,
+    });
+    if echo_token {
+        response["registration_token"] = json!(updated.registration_token);
+    }
+    // Credentials are private DB state: no archive profile or session binding
+    // is changed, and neither the previous nor replacement token is logged.
+    serde_json::to_string(&response)
+        .map_err(|error| McpError::internal_error(format!("JSON error: {error}")))
+}
+
+/// Replace an agent's bearer credential without changing its public profile.
+#[tool(
+    description = "Rotate an agent's bearer credential without changing its profile, activity, retirement status, or session bindings. Requires the current non-empty registration_token on every transport; neither a pane nor an existing session substitutes for the token. Concurrent use of a stale credential fails closed. The previous token stops authorizing sends, replies, and credential changes. return_registration_token defaults to false: the replacement is persisted but omitted from the result unless explicitly requested. Returns {project_id, agent_id, name, token_status: 'rotated', registration_token_returned}, plus registration_token only when requested. This changes bearer credentials only; existing session ownership and trusted-local tokenless behavior are unchanged. If the replacement is not returned, recovery uses the existing authorized registration/operator path."
+)]
+pub async fn rotate_agent_token(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: String,
+    return_registration_token: Option<bool>,
+) -> McpResult<String> {
+    if registration_token.is_empty() {
+        return Err(credential_authentication_error(&agent_name));
+    }
+    let replacement =
+        mcp_agent_mail_core::setup::generate_registration_token().map_err(|error| {
+            McpError::internal_error(format!("Credential generation failed: {error}"))
+        })?;
+    change_agent_token(
+        ctx,
+        &project_key,
+        &agent_name,
+        &registration_token,
+        Some(replacement),
+        return_registration_token.unwrap_or(false),
+    )
+    .await
+}
+
+/// Revoke only the bearer credential, preserving agent history and sessions.
+#[tool(
+    description = "Revoke an agent's bearer credential without deleting or retiring the identity. Requires its current non-empty registration_token on every transport; neither pane nor session ownership substitutes for that token. The token is cleared atomically, and stale credentials cannot overwrite a concurrent rotation or authorize sends, replies, or further credential changes. Returns {project_id, agent_id, name, token_status: 'revoked', registration_token_returned: false}; no secret is returned. Existing MCP session ownership and the trusted-local tokenless messaging default remain unchanged. Use the existing authorized registration/operator path to issue a new credential after revocation."
+)]
+pub async fn revoke_agent_token(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    registration_token: String,
+) -> McpResult<String> {
+    change_agent_token(
+        ctx,
+        &project_key,
+        &agent_name,
+        &registration_token,
+        None,
+        false,
+    )
+    .await
+}
+
 /// Temporarily remove an agent from active routing while preserving history.
 #[tool(
     description = "Soft-delete an agent: mark it as retired so it stops accepting new messages while preserving message history. Retired agents are hidden from active agent lists but visible in 'all agents' views.\n\nRust authorization extension: over stdio, authorization requires either the agent registration_token or a tmux pane bound to the agent; over HTTP (am serve-http) the registration_token is required and pane context does not authorize. The token is the `registration_token` field returned by register_agent / create_agent_identity / macro_start_session."
@@ -3988,6 +4143,7 @@ pub async fn retire_agent(
         )
         .await,
     )?;
+    let agent = refresh_credential_agent(ctx, &pool, &agent).await?;
     authenticate_lifecycle_agent(
         &project,
         &agent,
@@ -4062,6 +4218,7 @@ pub async fn unretire_agent(
         )
         .await,
     )?;
+    let agent = refresh_credential_agent(ctx, &pool, &agent).await?;
     authenticate_lifecycle_agent(
         &project,
         &agent,
@@ -4123,6 +4280,7 @@ pub async fn deregister_agent(
         )
         .await,
     )?;
+    let agent = refresh_credential_agent(ctx, &pool, &agent).await?;
     authenticate_lifecycle_agent(
         &project,
         &agent,

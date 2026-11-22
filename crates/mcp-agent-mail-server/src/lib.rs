@@ -179,15 +179,15 @@ use mcp_agent_mail_tools::{
     MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
     ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
     ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage,
-    RequestContact, ResolvePaneIdentity, RespondContact, RetireAgent, SearchMessages,
-    SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread, SummarizeThreadProduct,
-    ThreadDetailsResource, ToolingCapabilitiesResource, ToolingDiagnosticsQueryResource,
-    ToolingDiagnosticsResource, ToolingDirectoryQueryResource, ToolingDirectoryResource,
-    ToolingLocksQueryResource, ToolingLocksResource, ToolingMetricsCoreQueryResource,
-    ToolingMetricsCoreResource, ToolingMetricsQueryResource, ToolingMetricsResource,
-    ToolingRecentResource, ToolingSchemasQueryResource, ToolingSchemasResource,
-    UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource, ViewsAckRequiredResource,
-    ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
+    RequestContact, ResolvePaneIdentity, RespondContact, RetireAgent, RevokeAgentToken,
+    RotateAgentToken, SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy,
+    SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
+    ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
+    ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
+    ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
+    ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
+    ToolingSchemasResource, UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource,
+    ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -711,6 +711,20 @@ fn build_server_with_startup_workers(
         "create_agent_identity",
         clusters::IDENTITY,
         CreateAgentIdentity,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "rotate_agent_token",
+        clusters::IDENTITY,
+        RotateAgentToken,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "revoke_agent_token",
+        clusters::IDENTITY,
+        RevokeAgentToken,
     );
     let server = add_tool(
         server,

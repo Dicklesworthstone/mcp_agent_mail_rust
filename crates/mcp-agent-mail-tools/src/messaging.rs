@@ -2545,6 +2545,33 @@ fn verify_sender(
     })
 }
 
+/// Bearer proof must use current durable state, including for idempotent
+/// replays. Cache invalidation alone cannot revoke a credential: an overlapping
+/// reader can repopulate an old row after the invalidation.
+async fn verify_current_sender(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    sender: &mcp_agent_mail_db::AgentRow,
+    sender_name: &str,
+    sender_token: Option<&str>,
+    require_verified_sender: bool,
+) -> McpResult<SenderProof> {
+    let current;
+    let sender = if sender_token.is_some_and(|token| !token.is_empty()) {
+        current = crate::identity::refresh_credential_agent(ctx, pool, sender).await?;
+        &current
+    } else {
+        sender
+    };
+    verify_sender(
+        ctx,
+        sender,
+        sender_name,
+        sender_token,
+        require_verified_sender,
+    )
+}
+
 /// Mark a session-verified send so audit and diagnostics can tell it from a
 /// token-verified one (`"sender_verification": "session"`).
 fn with_sender_proof_marker(response_json: String, proof: SenderProof) -> String {
@@ -2587,22 +2614,21 @@ fn verify_sender_identity(
         return Ok(false);
     };
 
-    let Some(registration_token) = registration_token else {
-        if require_verified_sender {
-            return Err(legacy_tool_error(
-                "SENDER_TOKEN_UNAVAILABLE",
-                format!(
-                    "Agent '{sender_name}' has no stored registration token, so sender proof cannot be verified while the fail-closed send profile is enabled. Re-register the agent before sending."
-                ),
-                false,
-                json!({
-                    "sender_name": sender_name,
-                    "profile": "fail_closed",
-                    "hint": "Re-register the agent to obtain a registration_token before sending",
-                }),
-            ));
-        }
-        return Ok(false);
+    let Some(registration_token) = registration_token.filter(|token| !token.is_empty()) else {
+        // An explicit credential is never downgraded to trusted-local access.
+        // In particular, clearing a revoked token must reject its old value
+        // even when tokenless trusted-local sends are still permitted.
+        return Err(legacy_tool_error(
+            "SENDER_TOKEN_UNAVAILABLE",
+            format!(
+                "Agent '{sender_name}' has no active registration token. The supplied sender_token cannot authorize this send. Re-register the agent before using bearer proof."
+            ),
+            false,
+            json!({
+                "sender_name": sender_name,
+                "hint": "Re-register the agent to obtain a registration_token before sending",
+            }),
+        ));
     };
 
     if mcp_agent_mail_core::setup::constant_time_str_eq(sender_token, registration_token) {
@@ -2923,13 +2949,15 @@ async fn try_replay_message(
         &project.human_key,
     )
     .await?;
-    let sender_proof = verify_sender(
+    let sender_proof = verify_current_sender(
         ctx,
+        &pool,
         &sender,
         sender_name,
         sender_token,
         config.messaging_fail_closed_send_profile,
-    )?;
+    )
+    .await?;
     let verified_sender = sender_proof.verified();
     let claim = mcp_agent_mail_db::IdempotencyClaim {
         project_id: project.id.unwrap_or(0),
@@ -3322,13 +3350,15 @@ effective_free_bytes={free}"
     // The opt-in fail-closed profile rejects missing/unavailable proof before
     // recipient resolution, auto-registration, contact handshakes, DB writes,
     // notifications, or archive dispatch can occur.
-    let sender_proof = verify_sender(
+    let sender_proof = verify_current_sender(
         ctx,
+        &pool,
         &sender,
         &sender_name,
         sender_token.as_deref(),
         config.messaging_fail_closed_send_profile,
-    )?;
+    )
+    .await?;
     let verified_sender = sender_proof.verified();
     crate::tool_util::touch_acting_agent(ctx, &pool, sender.id).await;
 
@@ -4309,13 +4339,15 @@ effective_free_bytes={free}"
     // missing/unverifiable token REFUSES before any thread resolution or
     // write. Reply is a message-creation path — it must not be the token-free
     // way to speak as another agent.
-    let sender_proof = verify_sender(
+    let sender_proof = verify_current_sender(
         ctx,
+        &pool,
         &sender,
         &sender_name,
         sender_token.as_deref(),
         config.messaging_fail_closed_send_profile,
-    )?;
+    )
+    .await?;
     let verified_sender = sender_proof.verified();
     crate::tool_util::touch_acting_agent(ctx, &pool, sender.id).await;
 
@@ -6911,6 +6943,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -6923,6 +6956,7 @@ mod tests {
                     Some("GreenStone".to_string()),
                     Some("recipient".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7275,6 +7309,7 @@ mod tests {
                                     None,
                                     None,
                                     None,
+                                    None,
                                 )
                                 .await
                             }
@@ -7482,6 +7517,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -7493,6 +7529,7 @@ mod tests {
                     Some("GreenStone".to_string()),
                     Some("stable recipient".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7515,6 +7552,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register replaceable recipient");
@@ -7532,6 +7570,7 @@ mod tests {
                     Some("AzureCanyon".to_string()),
                     Some("recipient activity refresh".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7577,6 +7616,7 @@ mod tests {
                     Some("AzureCanyon".to_string()),
                     Some("replacement recipient".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7665,6 +7705,7 @@ mod tests {
                         "gpt-5".to_string(),
                         Some(name.to_string()),
                         Some("contact lookup".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -7943,6 +7984,7 @@ mod tests {
                         "gpt-5".to_string(),
                         Some(name.to_string()),
                         Some("repeated request".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -11575,12 +11617,17 @@ mod tests {
             "SENDER_TOKEN_REQUIRED"
         );
 
-        let unavailable = verify_sender_identity("BlueLake", Some("token"), None, true)
-            .expect_err("fail-closed sends require a stored token");
-        assert_eq!(
-            unavailable.data.as_ref().expect("structured error")["error"]["type"],
-            "SENDER_TOKEN_UNAVAILABLE"
-        );
+        for require_verified in [false, true] {
+            for stored in [None, Some("")] {
+                let unavailable =
+                    verify_sender_identity("BlueLake", Some("token"), stored, require_verified)
+                        .expect_err("supplied bearer proof must never downgrade when revoked");
+                assert_eq!(
+                    unavailable.data.as_ref().expect("structured error")["error"]["type"],
+                    "SENDER_TOKEN_UNAVAILABLE"
+                );
+            }
+        }
 
         let mismatch = verify_sender_identity("BlueLake", Some("wrong"), Some("token"), true)
             .expect_err("mismatched token must be rejected");

@@ -229,6 +229,7 @@ pub async fn macro_start_session(
         pane_id,
         tmux_socket_path,
         registration_proof,
+        None,
     )
     .await?;
     let agent: AgentResponse = parse_json(agent_json, "agent")?;

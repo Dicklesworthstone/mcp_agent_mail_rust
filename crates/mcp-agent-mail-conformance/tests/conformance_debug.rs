@@ -265,13 +265,13 @@ fn audit_doc_matches_live_inventory() {
         .iter()
         .map(|(name, _cluster)| (*name).to_string())
         .collect();
-    // Audit baseline: 45 = 38 compatibility (37 captured + fetch_topic) + 7
-    // Rust-native (`mark_all_read`, GH#273, landed 2026-08-31). Bumping this
+    // Audit baseline: 47 = 38 compatibility (37 captured + fetch_topic) + 9
+    // Rust-native (including credential rotation/revocation, GH#396). Bumping this
     // number is a reviewed contract change: update the audit doc table and the
     // README/AGENTS counts in the same commit.
     assert_eq!(
         runtime_tools.len(),
-        45,
+        47,
         "tool count drifted from audit baseline"
     );
 
