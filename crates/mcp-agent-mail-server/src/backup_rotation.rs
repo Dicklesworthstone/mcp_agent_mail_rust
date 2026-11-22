@@ -60,6 +60,9 @@ const MAX_QUARANTINE_LEAF_ATTEMPTS: u32 = 128;
 struct RotationWorkBudget {
     deadline: Option<Instant>,
     finish_first_unit: bool,
+    inventory_entries: usize,
+    #[cfg(unix)]
+    empty_directories: usize,
 }
 
 impl RotationWorkBudget {
@@ -67,13 +70,16 @@ impl RotationWorkBudget {
         Self {
             deadline,
             finish_first_unit: false,
+            inventory_entries: MAX_INVENTORY_ENTRIES,
+            #[cfg(unix)]
+            empty_directories: MAX_RECLAIM_DIRECTORIES_PER_PASS,
         }
     }
 
     fn background(budget: Duration) -> Self {
         Self {
-            deadline: Instant::now().checked_add(budget),
             finish_first_unit: cfg!(unix),
+            ..Self::strict(Instant::now().checked_add(budget))
         }
     }
 
@@ -696,7 +702,11 @@ impl HistoricalBackups {
 /// Native rotation directories supply candidates, not deletion authority. The
 /// snapshot guard must prove each candidate's mailbox lineage or exact byte
 /// duplication. Recorded doctor/script operations retain undo/resume in full.
-fn inspect_historical_backups(storage_root: &Path, primary: &Path) -> HistoricalBackups {
+fn inspect_historical_backups(
+    storage_root: &Path,
+    primary: &Path,
+    inventory_entries: usize,
+) -> HistoricalBackups {
     let mut result = HistoricalBackups::default();
     let root = storage_root.join("doctor/reclaimable");
     for ancestor in [storage_root.join("doctor"), root.clone()] {
@@ -730,7 +740,7 @@ fn inspect_historical_backups(storage_root: &Path, primary: &Path) -> Historical
         let mut directory_complete = true;
         for entry in entries {
             visited = visited.saturating_add(1);
-            if visited > MAX_INVENTORY_ENTRIES {
+            if visited > inventory_entries {
                 result.fail(
                     &directory,
                     &std::io::Error::other("reclaimable inventory entry budget exhausted"),
@@ -812,6 +822,7 @@ fn inspect_historical_backups(storage_root: &Path, primary: &Path) -> Historical
 #[cfg(unix)]
 fn reclaim_empty_rotation_directories(
     storage_root: &Path,
+    inventory_entries: usize,
     remaining: &mut usize,
     deadline: Option<Instant>,
     first_unit_admitted_at: &mut Option<Instant>,
@@ -831,7 +842,7 @@ fn reclaim_empty_rotation_directories(
             Err(error) => return Err(error),
         }
     }
-    for entry in fs::read_dir(&root)?.take(MAX_INVENTORY_ENTRIES) {
+    for entry in fs::read_dir(&root)?.take(inventory_entries) {
         if *remaining == 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             // The lookahead is unfinished, not evidence that every remaining
             // directory is protected. Resume with a fresh attempt budget;
@@ -894,7 +905,7 @@ pub(crate) fn admit_periodic_publication(
     primary: &Path,
     keep: usize,
 ) -> std::io::Result<()> {
-    periodic_publication_budget(storage_root, primary, keep)?.admit()
+    periodic_publication_budget(storage_root, primary, keep, MAX_INVENTORY_ENTRIES)?.admit()
 }
 
 /// The automatic producer's retained footprint, computed exactly as
@@ -935,7 +946,7 @@ pub fn periodic_backup_footprint(
     primary: &Path,
     keep: usize,
 ) -> std::io::Result<PeriodicBackupFootprint> {
-    let budget = periodic_publication_budget(storage_root, primary, keep)?;
+    let budget = periodic_publication_budget(storage_root, primary, keep, MAX_INVENTORY_ENTRIES)?;
     Ok(PeriodicBackupFootprint {
         images: budget.count,
         retained_bytes: budget.bytes,
@@ -949,6 +960,7 @@ fn periodic_publication_budget(
     storage_root: &Path,
     primary: &Path,
     keep: usize,
+    inventory_entries: usize,
 ) -> std::io::Result<PeriodicPublicationBudget> {
     let mut count = 0_usize;
     let mut bytes = 0_u64;
@@ -961,7 +973,7 @@ fn periodic_publication_budget(
     match fs::read_dir(database_parent) {
         Ok(entries) => {
             for (index, entry) in entries.enumerate() {
-                if index >= MAX_INVENTORY_ENTRIES {
+                if index >= inventory_entries {
                     return Err(std::io::Error::other(
                         "resident backup inventory entry budget exhausted",
                     ));
@@ -984,7 +996,7 @@ fn periodic_publication_budget(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let history = inspect_historical_backups(storage_root, primary);
+    let history = inspect_historical_backups(storage_root, primary, inventory_entries);
     if history.incomplete {
         return Err(std::io::Error::other(format!(
             "retained backup inventory unavailable; at least {} bytes retained: {}",
@@ -1645,7 +1657,7 @@ where
             .push(RotationFailure::from_error(database_parent, error));
     }
     #[cfg(unix)]
-    let mut empty_directory_budget = MAX_RECLAIM_DIRECTORIES_PER_PASS;
+    let mut empty_directory_budget = budget.empty_directories;
     #[cfg(unix)]
     let mut early_snapshot_guard = None;
     #[cfg(unix)]
@@ -1653,6 +1665,7 @@ where
         && periodic_reclamation_enabled()
         && let Err(error) = reclaim_empty_rotation_directories(
             &storage_root,
+            budget.inventory_entries,
             &mut empty_directory_budget,
             deadline,
             &mut first_unit_admitted_at,
@@ -1682,7 +1695,8 @@ where
             &error,
         );
     }
-    let mut history = inspect_historical_backups(&storage_root, &database_path);
+    let mut history =
+        inspect_historical_backups(&storage_root, &database_path, budget.inventory_entries);
     report.inventory_incomplete |= history.incomplete;
     report.admission_refused |= history.incomplete;
     report.failures.append(&mut history.failures);
@@ -1710,7 +1724,7 @@ where
     let mut by_kind: BTreeMap<BackupKind, Vec<(PathBuf, SystemTime, fs::Metadata)>> =
         BTreeMap::new();
     for (index, entry) in entries.enumerate() {
-        if index >= MAX_INVENTORY_ENTRIES {
+        if index >= budget.inventory_entries {
             report.inventory_incomplete = true;
             report.admission_refused = true;
             report.failures.push(RotationFailure::from_error(
@@ -2238,6 +2252,7 @@ where
         && periodic_reclamation_enabled()
         && let Err(error) = reclaim_empty_rotation_directories(
             &storage_root,
+            budget.inventory_entries,
             &mut empty_directory_budget,
             deadline,
             &mut first_unit_admitted_at,
@@ -2990,7 +3005,7 @@ mod tests {
         assert!(staged.failures.is_empty(), "{:?}", staged.failures);
         assert!(!staged.admission_refused);
         assert_eq!((staged.staged, staged.deleted, staged.kept), (3, 0, 2));
-        let history = inspect_historical_backups(tmp.path(), &primary);
+        let history = inspect_historical_backups(tmp.path(), &primary, MAX_INVENTORY_ENTRIES);
         assert!(!history.incomplete);
         assert_eq!(history.eligible.len(), 3);
         assert!(admit_periodic_publication(tmp.path(), &primary, 2).is_err());
@@ -3180,6 +3195,7 @@ mod tests {
         let mut admissions = 0;
         reclaim_empty_rotation_directories(
             tmp.path(),
+            MAX_INVENTORY_ENTRIES,
             &mut remaining,
             Some(deadline),
             &mut first_unit,
@@ -3577,7 +3593,8 @@ mod tests {
                     let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
                     assert!(report.failures.is_empty(), "{:?}", report.failures);
                     let inventory = inspect_storage_backups(&primary).unwrap();
-                    let history = inspect_historical_backups(tmp.path(), &primary);
+                    let history =
+                        inspect_historical_backups(tmp.path(), &primary, MAX_INVENTORY_ENTRIES);
                     assert!(!history.incomplete);
                     // The window spans both locations, including initial
                     // cycles before the parked generation is superseded.
@@ -4191,7 +4208,7 @@ mod tests {
         let backup = directory.join("storage.sqlite3.bak.20000101_000000");
         fs::write(&backup, b"recoverable transaction payload").unwrap();
         assert_eq!(
-            inspect_historical_backups(tmp.path(), &primary)
+            inspect_historical_backups(tmp.path(), &primary, MAX_INVENTORY_ENTRIES)
                 .eligible
                 .len(),
             1
@@ -4199,7 +4216,7 @@ mod tests {
         revalidate_historical_directory(&primary, &backup).unwrap();
         fs::write(directory.join("manifest.json"), b"restore authority").unwrap();
         assert!(revalidate_historical_directory(&primary, &backup).is_err());
-        let history = inspect_historical_backups(tmp.path(), &primary);
+        let history = inspect_historical_backups(tmp.path(), &primary, MAX_INVENTORY_ENTRIES);
         assert!(history.eligible.is_empty());
         assert_eq!(history.protected.kept, 2);
         assert_eq!(
@@ -5935,6 +5952,7 @@ mod tests {
         let mut report = RotateReport::default();
         reclaim_empty_rotation_directories(
             tmp.path(),
+            MAX_INVENTORY_ENTRIES,
             &mut remaining,
             None,
             &mut first_unit,
@@ -5963,6 +5981,7 @@ mod tests {
         let mut admissions = 0;
         reclaim_empty_rotation_directories(
             tmp.path(),
+            MAX_INVENTORY_ENTRIES,
             &mut remaining,
             Some(Instant::now()),
             &mut first_unit,
@@ -6097,23 +6116,57 @@ mod tests {
         .unwrap();
         create_fixture_directory(nested.join("unfinished-stage"));
 
+        let budget = RotationWorkBudget {
+            inventory_entries: 64,
+            empty_directories: 8,
+            ..RotationWorkBudget::strict(None)
+        };
+        let rotate = || {
+            rotate_storage_backups_impl(
+                tmp.path(),
+                &primary,
+                3,
+                stage_backup_noreplace,
+                None,
+                budget,
+                |_| {},
+            )
+            .unwrap()
+        };
+        let admit = || {
+            periodic_publication_budget(tmp.path(), &primary, 3, budget.inventory_entries)?.admit()
+        };
+
         // The first bounded sweep still leaves an incomplete inventory. A
         // cleanup that waits for a complete inventory can never make progress
         // on this real filesystem fixture, even though the directories are empty.
-        let count = MAX_INVENTORY_ENTRIES + 2 * MAX_RECLAIM_DIRECTORIES_PER_PASS + 1;
+        let count = budget.inventory_entries + 2 * budget.empty_directories + 1;
         for index in 0..count {
             fs::create_dir(reclaimable.join(format!("rotation-20000101T000000Z-{}", index + 10)))
                 .unwrap();
         }
-        let remaining = || fs::read_dir(&reclaimable).unwrap().count() - 3;
+        let protected = [&unknown, &recorded, &nested];
+        let remaining = || {
+            fs::read_dir(&reclaimable)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| !protected.contains(&path))
+                .count()
+        };
         assert_eq!(remaining(), count);
-        let error = admit_periodic_publication(tmp.path(), &primary, 3).unwrap_err();
+        let error = admit().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reclaimable inventory entry budget exhausted"),
+            "{error}"
+        );
         assert!(!periodic_publication_budget_exhausted(&error));
 
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_BACKUP_ROTATION_DELETE", "false")],
             || {
-                let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+                let report = rotate();
                 assert!(report.inventory_incomplete);
                 assert_eq!(
                     remaining(),
@@ -6127,7 +6180,7 @@ mod tests {
             || {
                 let authority =
                     mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
-                let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+                let report = rotate();
                 assert!(report.admission_refused);
                 assert_eq!(
                     remaining(),
@@ -6139,18 +6192,19 @@ mod tests {
                 let mut previous = count;
                 // Leave room for protected entries to consume inspection
                 // work, while requiring a fixed bound and progress every pass.
-                for pass in 0..=count.div_ceil(MAX_RECLAIM_DIRECTORIES_PER_PASS / 2) {
-                    let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+                for pass in 0..=count.div_ceil(budget.empty_directories / 2) {
+                    let report = rotate();
                     let current = remaining();
                     assert!(current < previous, "pass {pass}: {report:?}");
                     assert!(
-                        previous - current <= MAX_RECLAIM_DIRECTORIES_PER_PASS,
+                        previous - current <= budget.empty_directories,
                         "pass {pass} exceeded its combined directory-removal budget"
                     );
                     if pass == 0 {
                         assert!(report.inventory_incomplete);
                         assert!(report.admission_refused);
                     }
+                    assert_eq!(report.empty_directories_deleted, previous - current);
                     assert_eq!(report.deleted, 0, "empty cleanup cannot claim file unlinks");
                     assert_eq!(report.bytes_reclaimed, 0);
                     assert_eq!(fs::read(&primary).unwrap(), b"live mailbox sentinel");
@@ -6158,10 +6212,13 @@ mod tests {
                         fs::read(recorded.join("manifest.json")).unwrap(),
                         b"recovery transaction evidence"
                     );
-                    assert!(unknown.is_dir());
-                    assert!(nested.join("unfinished-stage").is_dir());
+                    assert!(unknown.is_dir(), "operator evidence directory went missing");
+                    assert!(
+                        nested.join("unfinished-stage").is_dir(),
+                        "unfinished recovery stage went missing"
+                    );
                     if current == 0 {
-                        admit_periodic_publication(tmp.path(), &primary, 3)
+                        admit()
                             .expect("drained empty history restores normal publication admission");
                         return;
                     }
