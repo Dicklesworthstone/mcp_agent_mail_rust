@@ -873,14 +873,42 @@ setup_server_env() {
 # Creates: 1 project, 5 agents, 30 messages across 6 threads,
 # 3 file reservations, contacts — enough data to fill all screens
 # with realistic content for profiling.
+seed_fixture_tool() {
+    local case_id="$1"
+    local tool="$3"
+    e2e_rpc_call "$@" || e2e_fatal "Fixture ${case_id} HTTP request failed"
+    if ! python3 - "${E2E_ARTIFACT_DIR}/${case_id}/response.json" "${tool}" <<'PY'
+import json
+import sys
+
+response_path, tool = sys.argv[1:]
+with open(response_path, encoding="utf-8") as response_file:
+    response = json.load(response_file)
+result = response.get("result")
+if response.get("id") != 1 or "error" in response or not isinstance(result, dict) or result.get("isError"):
+    raise SystemExit(f"{tool} failed: {response}")
+
+data = json.loads("".join(part["text"] for part in result["content"] if part["type"] == "text"))
+if tool in {"ensure_project", "register_agent"} and not isinstance(data.get("id"), int):
+    raise SystemExit(f"{tool} did not return a fixture ID: {data}")
+if tool == "send_message" and len(data.get("deliveries", [])) != 1:
+    raise SystemExit(f"{tool} did not deliver to the fixture recipient: {data}")
+if tool == "file_reservation_paths" and (len(data.get("granted", [])) != 1 or data.get("conflicts")):
+    raise SystemExit(f"{tool} did not grant the fixture reservation: {data}")
+if tool == "request_contact" and data.get("status") != "approved":
+    raise SystemExit(f"{tool} did not approve the same-project fixture contact: {data}")
+PY
+    then
+        e2e_fatal "Fixture ${case_id} response failed validation"
+    fi
+}
+
 seed_realistic_data() {
     local port="$1"
     local fixture_profile="${2:-medium}"
     local url="http://127.0.0.1:${port}/mcp/"
 
     local project_key="/tmp/e2e-traversal-project"
-    SEED_CALL_SEQ="${SEED_CALL_SEQ:-0}"
-
     e2e_log "Seeding realistic test data..."
 
     local agent_count=5
@@ -908,9 +936,8 @@ seed_realistic_data() {
     esac
 
     # 1. Ensure project
-    SEED_CALL_SEQ=$((SEED_CALL_SEQ + 1))
-    e2e_rpc_call "seed_project" "${url}" "ensure_project" \
-        "{\"human_key\":\"${project_key}\"}" >/dev/null 2>&1 || true
+    seed_fixture_tool "seed_project" "${url}" "ensure_project" \
+        "{\"human_key\":\"${project_key}\"}"
 
     # 2. Register agents with different programs/models
     local all_agents=("RedFox" "BlueLake" "GreenPeak" "GoldCastle" "SwiftHawk" "IvoryWolf" "AmberFinch" "TealComet")
@@ -921,9 +948,8 @@ seed_realistic_data() {
     local models=("${all_models[@]:0:${agent_count}}")
 
     for i in "${!agents[@]}"; do
-        SEED_CALL_SEQ=$((SEED_CALL_SEQ + 1))
-        e2e_rpc_call "seed_agent_${agents[$i]}" "${url}" "register_agent" \
-            "{\"project_key\":\"${project_key}\",\"program\":\"${programs[$i]}\",\"model\":\"${models[$i]}\",\"name\":\"${agents[$i]}\",\"task_description\":\"E2E traversal test agent ${i}\"}" >/dev/null 2>&1 || true
+        seed_fixture_tool "seed_agent_${agents[$i]}" "${url}" "register_agent" \
+            "{\"project_key\":\"${project_key}\",\"program\":\"${programs[$i]}\",\"model\":\"${models[$i]}\",\"name\":\"${agents[$i]}\",\"task_description\":\"E2E traversal test agent ${i}\"}"
     done
 
     # 3. Send messages across multiple threads
@@ -950,43 +976,33 @@ seed_realistic_data() {
         # Initial message
         local from_idx=$((t % ${#agents[@]}))
         local to_idx=$(((t + 1) % ${#agents[@]}))
-        SEED_CALL_SEQ=$((SEED_CALL_SEQ + 1))
-        e2e_rpc_call "seed_msg_${msg_idx}" "${url}" "send_message" \
-            "{\"project_key\":\"${project_key}\",\"sender_name\":\"${agents[$from_idx]}\",\"to\":[\"${agents[$to_idx]}\"],\"subject\":\"[${thread}] ${subj}\",\"body_md\":\"Starting work on ${subj}. This is message ${msg_idx} in thread ${thread}.\",\"thread_id\":\"${thread}\",\"importance\":\"normal\"}" >/dev/null 2>&1 || true
+        seed_fixture_tool "seed_msg_${msg_idx}" "${url}" "send_message" \
+            "{\"project_key\":\"${project_key}\",\"sender_name\":\"${agents[$from_idx]}\",\"to\":[\"${agents[$to_idx]}\"],\"subject\":\"[${thread}] ${subj}\",\"body_md\":\"Starting work on ${subj}. This is message ${msg_idx} in thread ${thread}.\",\"thread_id\":\"${thread}\",\"importance\":\"normal\"}"
         msg_idx=$((msg_idx + 1))
 
         # Configurable number of replies per thread
         for r in $(seq 1 ${replies_per_thread}); do
             local r_from=$((($from_idx + r) % ${#agents[@]}))
             local r_to=$((($to_idx + r) % ${#agents[@]}))
-            SEED_CALL_SEQ=$((SEED_CALL_SEQ + 1))
-            e2e_rpc_call "seed_msg_${msg_idx}" "${url}" "send_message" \
-                "{\"project_key\":\"${project_key}\",\"sender_name\":\"${agents[$r_from]}\",\"to\":[\"${agents[$r_to]}\"],\"subject\":\"Re: [${thread}] ${subj}\",\"body_md\":\"Reply ${r}: Progress update on ${subj}. Benchmark results look promising with ${r}0% improvement.\",\"thread_id\":\"${thread}\",\"importance\":\"normal\"}" >/dev/null 2>&1 || true
+            seed_fixture_tool "seed_msg_${msg_idx}" "${url}" "send_message" \
+                "{\"project_key\":\"${project_key}\",\"sender_name\":\"${agents[$r_from]}\",\"to\":[\"${agents[$r_to]}\"],\"subject\":\"Re: [${thread}] ${subj}\",\"body_md\":\"Reply ${r}: Progress update on ${subj}. Benchmark results look promising with ${r}0% improvement.\",\"thread_id\":\"${thread}\",\"importance\":\"normal\"}"
             msg_idx=$((msg_idx + 1))
         done
     done
 
     # 4. Create file reservations
-    SEED_CALL_SEQ=$((SEED_CALL_SEQ + 1))
-    e2e_rpc_call "seed_reservation_1" "${url}" "file_reservation_paths" \
-        "{\"project_key\":\"${project_key}\",\"agent_name\":\"${agents[0]}\",\"file_paths\":[\"crates/mcp-agent-mail-core/src/**\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"FEAT-001\"}" >/dev/null 2>&1 || true
+    seed_fixture_tool "seed_reservation_1" "${url}" "file_reservation_paths" \
+        "{\"project_key\":\"${project_key}\",\"agent_name\":\"${agents[0]}\",\"paths\":[\"crates/mcp-agent-mail-core/src/**\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"FEAT-001\"}"
 
-    SEED_CALL_SEQ=$((SEED_CALL_SEQ + 1))
-    e2e_rpc_call "seed_reservation_2" "${url}" "file_reservation_paths" \
-        "{\"project_key\":\"${project_key}\",\"agent_name\":\"${agents[1]}\",\"file_paths\":[\"crates/mcp-agent-mail-db/src/**\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"BUG-042\"}" >/dev/null 2>&1 || true
+    seed_fixture_tool "seed_reservation_2" "${url}" "file_reservation_paths" \
+        "{\"project_key\":\"${project_key}\",\"agent_name\":\"${agents[1]}\",\"paths\":[\"crates/mcp-agent-mail-db/src/**\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"BUG-042\"}"
 
-    SEED_CALL_SEQ=$((SEED_CALL_SEQ + 1))
-    e2e_rpc_call "seed_reservation_3" "${url}" "file_reservation_paths" \
-        "{\"project_key\":\"${project_key}\",\"agent_name\":\"${agents[2]}\",\"file_paths\":[\"crates/mcp-agent-mail-tools/src/**\"],\"ttl_seconds\":1800,\"exclusive\":false,\"reason\":\"DOCS-12\"}" >/dev/null 2>&1 || true
+    seed_fixture_tool "seed_reservation_3" "${url}" "file_reservation_paths" \
+        "{\"project_key\":\"${project_key}\",\"agent_name\":\"${agents[2]}\",\"paths\":[\"crates/mcp-agent-mail-tools/src/**\"],\"ttl_seconds\":1800,\"exclusive\":false,\"reason\":\"DOCS-12\"}"
 
-    # 5. Create contacts
-    SEED_CALL_SEQ=$((SEED_CALL_SEQ + 1))
-    e2e_rpc_call "seed_contact_1" "${url}" "request_contact" \
-        "{\"project_key\":\"${project_key}\",\"from_agent\":\"${agents[0]}\",\"to_agent\":\"${agents[1]}\",\"reason\":\"Need to coordinate on DB changes\"}" >/dev/null 2>&1 || true
-
-    SEED_CALL_SEQ=$((SEED_CALL_SEQ + 1))
-    e2e_rpc_call "seed_contact_accept_1" "${url}" "respond_contact" \
-        "{\"project_key\":\"${project_key}\",\"from_agent\":\"${agents[1]}\",\"to_agent\":\"${agents[0]}\",\"accept\":true}" >/dev/null 2>&1 || true
+    # 5. The same-project contact request is automatically approved.
+    seed_fixture_tool "seed_contact_1" "${url}" "request_contact" \
+        "{\"project_key\":\"${project_key}\",\"from_agent\":\"${agents[0]}\",\"to_agent\":\"${agents[1]}\",\"reason\":\"Need to coordinate on DB changes\"}"
 
     # Save seed summary as artifact
     e2e_save_artifact "seed_data.json" "$(cat <<SEEDJSON
