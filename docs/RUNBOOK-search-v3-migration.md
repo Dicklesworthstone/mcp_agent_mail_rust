@@ -1,11 +1,10 @@
 # RUNBOOK: Search V3 Migration Playbook
 
-> Historical note (2026-04-18): This runbook describes the earlier Tantivy-led
-> Search V3 migration plan. The live product now uses frankensearch-backed
-> search; preserve the procedures below as historical design context rather
-> than current operator guidance.
+> This runbook records the original Search V3 migration plan. For the current
+> product's settings, supported queries, and failure behavior, see
+> [Search queries and pages](OPERATOR_COOKBOOK.md#search-messages-and-continue-a-result-page).
 
-**Status:** Active
+**Status:** Historical
 **Bead:** br-2tnl.8.3
 **Supplemental Bead:** br-1x3h5
 **Author:** MagentaMantis (claude-code/opus-4.5)

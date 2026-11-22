@@ -92,7 +92,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
 | **Robot Mode** | 19 agent-optimized CLI subcommands with `toon`/`json` output (`md` for thread and message views) for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
-| **Hybrid Search** | Portable lexical Search V3 uses the local Tantivy bridge. Optional FrankenSearch integration supplies semantic and hybrid routing in builds with the `hybrid` feature and the runtime opt-in `AM_SEARCH_SEMANTIC_ENABLED=true`. Without both, every query runs lexical. |
+| **Hybrid Search** | Portable releases default to lexical Search V3 through the local Tantivy bridge. Builds with `hybrid` and `AM_SEARCH_SEMANTIC_ENABLED=true` can add semantic candidates through FrankenSearch. |
 | **Pre-Commit Guard** | Git hook that blocks commits touching files reserved by other agents |
 | **Dual-Mode Interface** | MCP server (`mcp-agent-mail`) and operator CLI (`am`) share tools but enforce strict surface separation |
 
@@ -2452,7 +2452,7 @@ Common pitfalls
 | [ROLLOUT_PLAYBOOK.md](docs/ROLLOUT_PLAYBOOK.md) | Staged rollout strategy |
 | [SPEC-browser-parity-contract-deferred.md](docs/SPEC-browser-parity-contract-deferred.md) | Shipped public WASM replay boundary and deferred live browser-parity contract |
 | [SPEC-threat-model.md](docs/SPEC-threat-model.md) | Consolidated threat model covering assets, adversaries, attack surfaces, and mitigations |
-| [Search Architecture](#search-architecture) and [Search Pages](#search-pages) | Current routing, shadow exclusions, and robot pagination |
+| [Search queries and pages](docs/OPERATOR_COOKBOOK.md#search-messages-and-continue-a-result-page) | Current query grammar, filters, routing, and pagination |
 | [SPEC-search-v3-query-contract.md](docs/SPEC-search-v3-query-contract.md) | Historical Search V3 design proposal |
 | [SPEC-web-ui-parity-contract.md](docs/SPEC-web-ui-parity-contract.md) | Web UI parity and route contract |
 | [SPEC-verify-live-contract.md](docs/SPEC-verify-live-contract.md) | Static bundle live-verification rules |

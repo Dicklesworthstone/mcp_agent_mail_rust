@@ -339,6 +339,55 @@ thread transcript, and then a deep view of the selected message.
 pick a valid message ID from the recent messages. If the bead has no thread yet,
 search by subject text instead of the bead ID.
 
+### Search messages and continue a result page
+
+Portable release binaries default to `lexical`, which searches the local Tantivy
+index. Use `AM_SEARCH_ENGINE` to select the server default and
+`AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES` to override the MCP message-search tool.
+The old `legacy` and `fts5` settings select lexical search. Semantic retrieval
+requires a build with `hybrid` and `AM_SEARCH_SEMANTIC_ENABLED=true`. With the
+switch off, `semantic`, `hybrid`, and `auto` use lexical search. In a portable
+build with the switch on, `hybrid` and `auto` have only lexical candidates, and
+an eligible `semantic` request returns `DATABASE_ERROR` with the detail
+`semantic search unavailable: build without hybrid feature`.
+
+Set `project_key` on `search_messages`. Lexical text supports quoted phrases
+such as `"build plan"`, prefixes such as `migrat*`, and Boolean operators such
+as `deployment AND NOT checklist`. Use explicit parameters for `sender`,
+`thread_id`, comma-separated `importance`, inclusive dates, and
+`recipient_kind` (`to`, `cc`, or `bcc`). The `bcc` filter never exposes BCC
+identities. Invalid filters such as an unrecognized importance return an
+`INVALID_ARGUMENT` tool error.
+
+The default relevance order uses the selected backend. `ranking="recency"`,
+filter-only search, and filters the index cannot enforce before truncation
+use the deterministic SQL planner. A literally blank MCP query returns an
+empty result. Searchable relevance queries surface index errors instead of
+silently retrying on SQLite FTS5. Use `explain=true` and read `explain.method`,
+`normalized_query`, and `facets_applied` to see the executed route and filters.
+The `used_like_fallback` flag describes the SQL planner; the explicit shadow
+route reports `shadow_v3` with that flag false even though it scans with `LIKE`.
+
+MCP `limit` defaults to 20 and caps at 1,000. Without a cursor, `offset` plus
+the effective limit may total at most 5,000. Pass the returned `next_cursor`
+to continue, keeping the project, query, ranking, filters, and read route fixed.
+A cursor overrides `offset`. Keep paging when an empty recipient-kind page
+carries a cursor and partial-page diagnostics. `am robot search` marks the live
+route with `served_by: "server"`. If it switches to a private snapshot, start
+from page one. The corpus can change between reads on either route.
+
+In v0.3.41, robot search rejects malformed cursors before opening a mailbox.
+MCP can treat malformed cursors as absent and can accept a cursor from a
+different project while only returning rows from the requested project. Start
+again from page one if you lose the original query or cursor. The deprecated
+`AM_SEARCH_ENGINE=shadow` route uses up to five distinct positive keywords and
+rejects more than five distinct exclusions. Its keyword continuation can skip
+matches in v0.3.41 (`br-kp1in.107`), and robot search refuses live shadow hits
+without relevance scores. Use the lexical route for routine pagination.
+
+See the [Search V3 quality gates](SPEC-search-v3-quality-gates.md) for separate
+relevance and performance acceptance criteria.
+
 ## 6. Review one agent's last 24 hours [read-only]
 
 **Goal:** Pull a compact recent activity review without guessing timestamp

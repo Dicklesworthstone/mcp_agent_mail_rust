@@ -56,7 +56,8 @@ output.
 ## Search
 
 - [ADR-003-search-v3-architecture.md](ADR-003-search-v3-architecture.md) - high-level Search V3 architecture.
-- [SPEC-search-v3-query-contract.md](SPEC-search-v3-query-contract.md) - query, filter, and explain contract.
+- [Search queries and pages](OPERATOR_COOKBOOK.md#search-messages-and-continue-a-result-page) - current query, filter, routing, and explain behavior.
+- [SPEC-search-v3-query-contract.md](SPEC-search-v3-query-contract.md) - historical design proposal.
 - [SPEC-search-v3-quality-gates.md](SPEC-search-v3-quality-gates.md) - relevance and performance gates.
 - [SPEC-unified-search-corpus.md](SPEC-unified-search-corpus.md) - unified corpus schema and FTS migration strategy.
 - [search-v3-component-mapping.md](search-v3-component-mapping.md) - component-level mapping dossier.
@@ -70,7 +71,7 @@ output.
 - [DUAL_MODE_ROLLOUT_PLAYBOOK.md](DUAL_MODE_ROLLOUT_PLAYBOOK.md) - dual-mode rollout and kill-switch workflow.
 - [ROLLOUT_PLAYBOOK.md](ROLLOUT_PLAYBOOK.md) - staged rollout strategy.
 - [RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md](RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md) - legacy Python to Rust import.
-- [RUNBOOK-search-v3-migration.md](RUNBOOK-search-v3-migration.md) - Search V3 migration.
+- [RUNBOOK-search-v3-migration.md](RUNBOOK-search-v3-migration.md) - historical Search V3 migration.
 - [RUNBOOK-atc-rollback.md](RUNBOOK-atc-rollback.md) - ATC rollback.
 - [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md) - dual-mode migration guide.
 - [MIGRATION_v16_to_v17.md](MIGRATION_v16_to_v17.md) - ATC v16 to v17 migration.
