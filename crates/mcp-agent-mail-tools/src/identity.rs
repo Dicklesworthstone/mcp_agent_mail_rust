@@ -3328,7 +3328,8 @@ Check that all parameters have valid values."
     {
         match mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, agent_name).await {
             asupersync::Outcome::Ok(existing) => Some(existing),
-            _ => None,
+            Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
+            outcome => Some(db_outcome_to_mcp_result(outcome)?),
         }
     } else {
         None
@@ -3336,7 +3337,13 @@ Check that all parameters have valid values."
     if let Some(existing) = &existing_before {
         crate::session_identity::authorize_actor(ctx, existing, false, "re-register")?;
     }
+    #[cfg(test)]
+    tests::after_registration_preflight();
 
+    // Only a successful create establishes a new session identity. A missing
+    // preflight row does not: another registrant can win the insertion race,
+    // and a trusted-local upsert of its row is not proof of ownership.
+    let mut created_this_call = false;
     let mut row = if let Some(agent_name) = explicit_name {
         // Under session-bound identity, "absent" from the preflight cannot
         // authorize a later upsert: another session may create the same name
@@ -3356,21 +3363,27 @@ Check that all parameters have valid values."
             )
             .await
             {
-                Outcome::Ok(created) if reaper_exempt != Some(true) => created,
-                Outcome::Ok(_) => db_outcome_to_mcp_result(
-                    register_agent_db_with_retry(
-                        ctx,
-                        &pool,
-                        project_id,
-                        &agent_name,
-                        &program,
-                        &model,
-                        task_description.as_deref(),
-                        &policy,
-                        reaper_exempt,
-                    )
-                    .await,
-                )?,
+                Outcome::Ok(created) => {
+                    created_this_call = true;
+                    if reaper_exempt == Some(true) {
+                        db_outcome_to_mcp_result(
+                            register_agent_db_with_retry(
+                                ctx,
+                                &pool,
+                                project_id,
+                                &agent_name,
+                                &program,
+                                &model,
+                                task_description.as_deref(),
+                                &policy,
+                                reaper_exempt,
+                            )
+                            .await,
+                        )?
+                    } else {
+                        created
+                    }
+                }
                 Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
                     let raced = db_outcome_to_mcp_result(
                         mcp_agent_mail_db::queries::get_agent(
@@ -3442,6 +3455,7 @@ Check that all parameters have valid values."
             generate_agent_name,
         )
         .await?;
+        created_this_call = true;
         if reaper_exempt == Some(true) {
             // `create_agent` cannot set reaper_exempt; apply it with the
             // idempotent explicit-name upsert on the row we just created
@@ -3522,7 +3536,7 @@ Check that all parameters have valid values."
     // GH#279 (opt-in): this session established the agent when it created
     // it, or already held it.
     if let Some(agent_id) = row.id
-        && (existing_before.is_none() || crate::session_identity::holds(ctx, row.id))
+        && (created_this_call || crate::session_identity::holds(ctx, &row))
     {
         crate::session_identity::bind(ctx, project_id, agent_id, &row.name);
     }
@@ -4561,6 +4575,205 @@ mod tests {
     use fastmcp::McpContext;
     use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
     use std::path::PathBuf;
+
+    thread_local! {
+        // Schedule a real competing registration after the actual preflight
+        // read. The callback is removed before it runs and does not exist in
+        // production builds; neither DB outcomes nor ownership are substituted.
+        static REGISTRATION_PREFLIGHT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_registration_preflight() {
+        if let Some(hook) = REGISTRATION_PREFLIGHT_HOOK.with_borrow_mut(Option::take) {
+            hook();
+        }
+    }
+
+    struct RegistrationPreflightHook;
+
+    impl RegistrationPreflightHook {
+        fn install(hook: impl FnOnce() + 'static) -> Self {
+            REGISTRATION_PREFLIGHT_HOOK.with_borrow_mut(|slot| {
+                assert!(
+                    slot.is_none(),
+                    "registration scheduling hook already installed"
+                );
+                *slot = Some(Box::new(hook));
+            });
+            Self
+        }
+    }
+
+    impl Drop for RegistrationPreflightHook {
+        fn drop(&mut self) {
+            REGISTRATION_PREFLIGHT_HOOK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
+    async fn register_race_agent(
+        ctx: &McpContext,
+        project: &str,
+        name: &str,
+        program: &str,
+        token_policy: TokenPolicy,
+    ) -> McpResult<String> {
+        register_agent_with_token_policy(
+            ctx,
+            project.to_string(),
+            program.to_string(),
+            "test-model".to_string(),
+            Some(name.to_string()),
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            token_policy,
+        )
+        .await
+    }
+
+    #[test]
+    fn registration_race_never_binds_the_other_registrants_identity() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        crate::test_support::with_isolated_mailbox(
+            &LOCK,
+            "registration ownership race",
+            &[("MESSAGING_SESSION_IDENTITY", "true"), ("TMUX_PANE", "")],
+            |_| {
+                Config::reset_cached();
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    for policy in [TokenPolicy::Rotate, TokenPolicy::KeepExisting] {
+                        for already_bound in [false, true] {
+                            let project = format!("/registration-race-{policy:?}-{already_bound}");
+                            let contender = McpContext::with_state(
+                                cx.clone(),
+                                1,
+                                fastmcp_core::SessionState::new(),
+                            );
+                            ensure_project(&contender, project.clone(), None)
+                                .await
+                                .expect("project");
+                            if already_bound {
+                                register_race_agent(
+                                    &contender,
+                                    &project,
+                                    "BlueLake",
+                                    "owner",
+                                    TokenPolicy::Rotate,
+                                )
+                                .await
+                                .expect("contender's own identity");
+                            }
+                            let before_bindings =
+                                crate::session_identity::session_bindings(&contender);
+                            let winner_state = fastmcp_core::SessionState::new();
+                            let winner_row = std::sync::Arc::new(std::sync::Mutex::new(None));
+                            let published_row = std::sync::Arc::clone(&winner_row);
+                            let raced_project = project.clone();
+                            let raced_state = winner_state.clone();
+                            let hook = RegistrationPreflightHook::install(move || {
+                                // The first call has observed absence. A second
+                                // session now wins through the ordinary tool and
+                                // commits before the first attempts its create.
+                                let row = std::thread::spawn(move || {
+                                    let runtime = RuntimeBuilder::current_thread()
+                                        .build()
+                                        .expect("competing runtime");
+                                    runtime.block_on(async move {
+                                        let cx = Cx::current().expect("competing context");
+                                        let ctx =
+                                            McpContext::with_state(cx.clone(), 2, raced_state);
+                                        let response: serde_json::Value = serde_json::from_str(
+                                            &register_race_agent(
+                                                &ctx,
+                                                &raced_project,
+                                                "PurpleHill",
+                                                "winner",
+                                                TokenPolicy::Rotate,
+                                            )
+                                            .await
+                                            .expect("competing registration"),
+                                        )
+                                        .expect("competing JSON");
+                                        let pool = get_db_pool().expect("live pool");
+                                        mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                                            &cx,
+                                            &pool,
+                                            response["id"].as_i64().expect("winning agent id"),
+                                        )
+                                        .await
+                                        .into_result()
+                                        .expect("winning row")
+                                    })
+                                })
+                                .join()
+                                .expect("competing registration completed");
+                                *published_row.lock().unwrap() = Some(row);
+                            });
+                            let result = register_race_agent(
+                                &contender,
+                                &project,
+                                "PurpleHill",
+                                "contender",
+                                policy,
+                            )
+                            .await;
+                            drop(hook);
+                            let original = winner_row.lock().unwrap().take().expect("race ran");
+                            let pool = get_db_pool().expect("live pool");
+                            let current = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                                &cx,
+                                &pool,
+                                original.id.expect("winning agent id"),
+                            )
+                            .await
+                            .into_result()
+                            .expect("current winning row");
+                            if already_bound {
+                                let error =
+                                    result.expect_err("constrained session cannot upsert peer");
+                                assert_eq!(
+                                    crate::tool_error_code(&error),
+                                    Some("SESSION_IDENTITY_MISMATCH")
+                                );
+                                assert_eq!(
+                                    serde_json::to_value(&current).expect("current row JSON"),
+                                    serde_json::to_value(&original).expect("winning row JSON"),
+                                    "refusal must preserve the winning profile and token"
+                                );
+                            } else {
+                                let response: serde_json::Value = serde_json::from_str(
+                                    &result.expect("unbound trusted-local update remains allowed"),
+                                )
+                                .expect("registration JSON");
+                                assert_eq!(current.program, "contender");
+                                if policy == TokenPolicy::KeepExisting {
+                                    assert_eq!(
+                                        current.registration_token,
+                                        original.registration_token
+                                    );
+                                    assert!(response["registration_token"].is_null());
+                                }
+                            }
+                            assert_eq!(
+                                crate::session_identity::session_bindings(&contender),
+                                before_bindings,
+                                "losing the insert race must never establish a binding"
+                            );
+                            assert!(!crate::session_identity::holds(&contender, &current));
+                            let winner = McpContext::with_state(cx.clone(), 3, winner_state);
+                            assert!(crate::session_identity::holds(&winner, &current));
+                        }
+                    }
+                });
+            },
+        );
+    }
 
     /// All-green decomposed verdicts, for response-serialization tests that
     /// don't exercise the rollup logic.

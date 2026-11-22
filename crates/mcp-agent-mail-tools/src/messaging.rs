@@ -2528,7 +2528,7 @@ fn verify_sender(
     require_verified_sender: bool,
 ) -> McpResult<SenderProof> {
     let token = sender_token.filter(|token| !token.is_empty());
-    if token.is_none() && crate::session_identity::holds(ctx, sender.id) {
+    if token.is_none() && crate::session_identity::holds(ctx, sender) {
         return Ok(SenderProof::Session);
     }
     let verified = verify_sender_identity(
@@ -11588,6 +11588,191 @@ mod tests {
             mismatch.data.as_ref().expect("structured error")["error"]["type"],
             "SENDER_TOKEN_MISMATCH"
         );
+    }
+
+    #[test]
+    fn session_sender_proof_requires_the_canonical_identity() {
+        with_messaging_mailbox(&[("MESSAGING_SESSION_IDENTITY", "true")], |_| {
+            let ctx =
+                McpContext::with_state(Cx::for_testing(), 1, fastmcp_core::SessionState::new());
+            let own = AgentRow {
+                id: Some(1),
+                project_id: 10,
+                name: "BlueLake".to_string(),
+                registration_token: Some("current-test-token".to_string()),
+                ..AgentRow::default()
+            };
+            crate::session_identity::bind(&ctx, own.project_id, 1, &own.name);
+            assert_eq!(
+                verify_sender(&ctx, &own, &own.name, None, true).unwrap(),
+                SenderProof::Session
+            );
+            for other in [
+                AgentRow {
+                    name: "RedStone".to_string(),
+                    ..own.clone()
+                },
+                AgentRow {
+                    project_id: 20,
+                    ..own.clone()
+                },
+                AgentRow {
+                    id: Some(2),
+                    ..own.clone()
+                },
+            ] {
+                let error = verify_sender(&ctx, &other, &other.name, None, true)
+                    .expect_err("a matching numeric id alone is not sender proof");
+                assert_eq!(
+                    crate::tool_error_code(&error),
+                    Some("SENDER_TOKEN_REQUIRED")
+                );
+                assert_eq!(
+                    verify_sender(
+                        &ctx,
+                        &other,
+                        &other.name,
+                        other.registration_token.as_deref(),
+                        true,
+                    )
+                    .unwrap(),
+                    SenderProof::Token,
+                    "explicit proof for the resolved agent still authorizes"
+                );
+            }
+            let elsewhere = AgentRow {
+                project_id: 20,
+                ..own.clone()
+            };
+            assert_eq!(
+                verify_sender(&ctx, &elsewhere, &elsewhere.name, None, false).unwrap(),
+                SenderProof::Unverified,
+                "trusted-local permission in another project is not verified ownership"
+            );
+            let error = verify_sender(&ctx, &own, &own.name, Some("wrong-token"), false)
+                .expect_err("session proof must never bypass a supplied mismatched token");
+            assert_eq!(
+                crate::tool_error_code(&error),
+                Some("SENDER_TOKEN_MISMATCH")
+            );
+        });
+    }
+
+    #[test]
+    fn send_and_reply_refuse_a_reused_session_agent_id_before_persistence() {
+        for fail_closed in [false, true] {
+            with_messaging_mailbox(
+                &[
+                    ("MESSAGING_SESSION_IDENTITY", "true"),
+                    (
+                        "MESSAGING_FAIL_CLOSED_SEND_PROFILE",
+                        if fail_closed { "1" } else { "0" },
+                    ),
+                ],
+                |mailbox| {
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let cx = Cx::current().expect("request context");
+                        let pool = get_db_pool().expect("private mailbox pool");
+                        let project = ensure_project_row(&cx, &pool, "/reused-session-id").await;
+                        let project_id = project.id.unwrap();
+                        let sender = register_agent_row(&cx, &pool, project_id, "RedStone").await;
+                        let peer = register_agent_row(&cx, &pool, project_id, "GreenCastle").await;
+                        let original = queries::create_message_with_recipients(
+                            &cx,
+                            &pool,
+                            project_id,
+                            peer.id.unwrap(),
+                            "Original message",
+                            "A reply must prove the current sender's identity.",
+                            None,
+                            "normal",
+                            false,
+                            "[]",
+                            &[(sender.id.unwrap(), "to")],
+                        )
+                        .await
+                        .into_result()
+                        .expect("seed reply parent");
+
+                        let ctx = McpContext::with_state(
+                            cx.clone(),
+                            1,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        // Model a retained session after recovery assigned its
+                        // old numeric id to a differently named canonical row.
+                        crate::session_identity::bind(
+                            &ctx,
+                            project_id,
+                            sender.id.unwrap(),
+                            "BlueLake",
+                        );
+                        let send = send_message(
+                            &ctx,
+                            project.human_key.clone(),
+                            sender.name.clone(),
+                            vec![peer.name.clone()],
+                            "Must not be accepted".to_string(),
+                            "Stale session proof".to_string(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                        let reply = reply_message(
+                            &ctx,
+                            project.human_key.clone(),
+                            original.id.unwrap(),
+                            sender.name.clone(),
+                            "Must not be accepted either".to_string(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                        let expected = if fail_closed {
+                            "SENDER_TOKEN_REQUIRED"
+                        } else {
+                            "SESSION_IDENTITY_MISMATCH"
+                        };
+                        for result in [send, reply] {
+                            let error =
+                                result.expect_err("stale binding must refuse at the tool boundary");
+                            assert_eq!(crate::tool_error_code(&error), Some(expected));
+                        }
+                        let conn = mcp_agent_mail_db::DbConn::open_file(
+                            mailbox.database_path.to_str().unwrap(),
+                        )
+                        .expect("independent persisted-state reader");
+                        let rows = conn
+                            .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                            .expect("count persisted messages");
+                        assert_eq!(
+                            rows[0].get_named::<i64>("n").unwrap(),
+                            1,
+                            "neither rejected tool may persist a message"
+                        );
+                    });
+                },
+            );
+        }
     }
 
     #[test]

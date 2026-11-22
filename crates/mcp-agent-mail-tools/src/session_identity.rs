@@ -254,20 +254,19 @@ pub fn unbind(ctx: &McpContext, agent_id: i64) {
     });
 }
 
-/// Whether the live session's binding inventory contains `agent_id`.
-/// This id-only lookup does not establish a canonical-row match.
+/// Whether the live session holds the resolved canonical agent identity.
+/// A reused numeric id alone is never proof: the project and canonical name
+/// must still match the identity this session established.
 #[must_use]
-pub fn holds(ctx: &McpContext, agent_id: Option<i64>) -> bool {
+pub fn holds(ctx: &McpContext, agent: &mcp_agent_mail_db::AgentRow) -> bool {
     let Ok(snapshot) = ActorAuthorizationSnapshot::capture(ctx) else {
         return false;
     };
-    let held = agent_id.is_some_and(|agent_id| {
-        snapshot
-            .state
-            .held
-            .iter()
-            .any(|binding| binding.agent_id == agent_id)
-    });
+    let held = snapshot
+        .state
+        .held
+        .iter()
+        .any(|binding| binding.matches_agent(agent));
     held && ctx.ensure_live().is_ok()
 }
 
@@ -541,7 +540,9 @@ mod tests {
             let own = agent(1, 10, "BlueLake");
             bind(&ctx, 10, 1, &own.name);
             let snapshot = ActorAuthorizationSnapshot::capture(&ctx).unwrap();
+            assert!(holds(&ctx, &own));
             for other in [agent(1, 10, "RedStone"), agent(1, 10, "bluelake")] {
+                assert!(!holds(&ctx, &other), "a reused id cannot prove ownership");
                 let error = authorize_actor(&ctx, &other, false, "read inbox")
                     .expect_err("a reused id must not borrow the bound identity");
                 assert_eq!(
@@ -561,6 +562,7 @@ mod tests {
             // This policy still permits genuinely unbound projects; permission
             // through that fallback is not a canonical binding match.
             assert!(authorize_actor(&ctx, &agent(2, 20, "RedStone"), false, "read").is_ok());
+            assert!(!holds(&ctx, &agent(1, 20, "BlueLake")));
             unbind(&ctx, 1);
             assert!(
                 snapshot
@@ -578,14 +580,18 @@ mod tests {
             let cancelled = McpContext::with_state(asupersync::Cx::for_testing(), 1, state.clone());
             let live = McpContext::with_state(asupersync::Cx::for_testing(), 2, state);
             bind(&live, 10, 1, "BlueLake");
-            assert!(holds(&cancelled, Some(1)));
+            let own = agent(1, 10, "BlueLake");
+            assert!(holds(&cancelled, &own));
             cancelled.request_cancellation().cancel();
-            assert!(!holds(&cancelled, Some(1)));
+            assert!(!holds(&cancelled, &own));
             assert!(
-                holds(&live, Some(1)),
+                holds(&live, &own),
                 "cancellation must not erase another request's proof"
             );
-            assert!(!holds(&live, None));
+            assert!(!holds(
+                &live,
+                &mcp_agent_mail_db::AgentRow { id: None, ..own }
+            ));
         });
     }
 
@@ -798,7 +804,7 @@ mod tests {
             assert!(authorize_actor(&ctx, &other, false, "send messages").is_ok());
 
             bind(&ctx, 10, 1, "BlueLake");
-            assert!(holds(&ctx, Some(1)));
+            assert!(holds(&ctx, &own));
             assert!(authorize_actor(&ctx, &own, false, "send messages").is_ok());
             let error =
                 authorize_actor(&ctx, &other, false, "send messages").expect_err("borrowed name");
@@ -816,7 +822,7 @@ mod tests {
             );
 
             unbind(&ctx, 1);
-            assert!(!holds(&ctx, Some(1)));
+            assert!(!holds(&ctx, &own));
             assert!(authorize_actor(&ctx, &other, false, "send messages").is_ok());
         });
     }
@@ -826,7 +832,7 @@ mod tests {
         with_feature(false, || {
             let ctx = session_ctx();
             bind(&ctx, 10, 1, "BlueLake");
-            assert!(!holds(&ctx, Some(1)));
+            assert!(!holds(&ctx, &agent(1, 10, "BlueLake")));
             assert_eq!(identity_state(&ctx), SessionIdentityState::default());
             assert!(authorize_actor(&ctx, &agent(2, 10, "RedStone"), false, "send").is_ok());
         });
@@ -838,11 +844,14 @@ mod tests {
             let ctx = session_ctx();
             for id in 1..=i64::try_from(MAX_SESSION_BINDINGS + 3).expect("small") {
                 bind(&ctx, 10, id, "BlueLake");
-                assert!(holds(&ctx, Some(id)));
+                assert!(holds(&ctx, &agent(id, 10, "BlueLake")));
             }
             let held = session_bindings(&ctx);
             assert_eq!(held.len(), MAX_SESSION_BINDINGS);
-            assert!(!holds(&ctx, Some(1)), "oldest binding dropped");
+            assert!(
+                !holds(&ctx, &agent(1, 10, "BlueLake")),
+                "oldest binding dropped"
+            );
         });
     }
 
@@ -852,7 +861,7 @@ mod tests {
             bind(ctx, 20, id, "RedStone");
         }
         assert!(
-            !holds(ctx, Some(1)),
+            !holds(ctx, &agent(1, 10, "BlueLake")),
             "fixture must actually evict the proof"
         );
         assert_eq!(session_bindings(ctx).len(), MAX_SESSION_BINDINGS);
@@ -974,7 +983,7 @@ mod tests {
             evict_first_project(&ctx);
             let snapshot = ActorAuthorizationSnapshot::capture(&ctx).unwrap();
             bind(&ctx, 10, 1, "BlueLake");
-            assert!(holds(&ctx, Some(1)));
+            assert!(holds(&ctx, &agent(1, 10, "BlueLake")));
             assert!(authorize_actor(&ctx, &agent(1, 10, "BlueLake"), false, "send").is_ok());
             assert!(
                 snapshot
@@ -1018,8 +1027,8 @@ mod tests {
                 |ctx| bind(ctx, 30, 999, "GreenCastle"),
                 |ctx| unbind(ctx, 999),
             );
-            assert!(!holds(&ctx, Some(1)));
-            assert!(!holds(&ctx, Some(999)));
+            assert!(!holds(&ctx, &agent(1, 10, "BlueLake")));
+            assert!(!holds(&ctx, &agent(999, 30, "GreenCastle")));
             assert_eq!(identity_state(&ctx).evicted_projects, [10]);
             assert!(authorize_actor(&ctx, &agent(1000, 10, "GreenCastle"), false, "send").is_err());
             assert!(
@@ -1041,8 +1050,8 @@ mod tests {
                 |ctx| bind(ctx, 20, 2, "RedStone"),
             );
             assert_eq!(session_bindings(&ctx).len(), 2);
-            assert!(holds(&ctx, Some(1)));
-            assert!(holds(&ctx, Some(2)));
+            assert!(holds(&ctx, &agent(1, 10, "BlueLake")));
+            assert!(holds(&ctx, &agent(2, 20, "RedStone")));
             for project_id in [10, 20] {
                 let error = authorize_actor(
                     &ctx,
@@ -1086,7 +1095,10 @@ mod tests {
                 let held = session_bindings(&ctx);
                 assert_eq!(held.len(), 1, "unbind_first={unbind_first}");
                 assert_eq!((held[0].project_id, held[0].agent_id), (20, 2));
-                assert!(!holds(&ctx, Some(1)), "retired identity must stay unbound");
+                assert!(
+                    !holds(&ctx, &agent(1, 10, "BlueLake")),
+                    "retired identity must stay unbound"
+                );
                 assert!(
                     authorize_actor(&ctx, &agent(3, 20, "GreenCastle"), false, "send").is_err(),
                     "the newly bound project must keep its identity restriction"

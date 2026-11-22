@@ -384,6 +384,101 @@ fn unbound_sessions_keep_the_trusted_local_contract() {
 }
 
 #[test]
+fn registration_refresh_preserves_canonical_session_ownership() {
+    run_with_session_identity(true, true, |cx| async move {
+        let owner = McpContext::with_state(cx.clone(), 1, SessionState::new());
+        let other = McpContext::with_state(cx.clone(), 2, SessionState::new());
+        let project = format!("/tmp/session-registration-refresh-{}", unique_suffix());
+        ensure_project(&owner, project.clone(), None)
+            .await
+            .expect("project");
+        let recipient = create_identity(&other, &project).await;
+        register_named(&owner, &project, "BlueLake").await;
+        let original = stored_agent(&cx, &project, "BlueLake").await;
+
+        // A caller alias resolves to the stored canonical spelling. Refreshing
+        // an identity this session actually holds remains session verified,
+        // including the profile update that enables reaper exemption.
+        let response: Value = serde_json::from_str(
+            &register_agent(
+                &owner,
+                project.clone(),
+                "updated-program".to_string(),
+                "updated-model".to_string(),
+                Some("bluelake".to_string()),
+                Some("updated task".to_string()),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("refresh the held canonical identity"),
+        )
+        .expect("registration JSON");
+        assert_eq!(response["id"], original.id.unwrap());
+        assert_eq!(response["name"], "BlueLake");
+        assert_eq!(response["reaper_exempt"], true);
+        let refreshed = stored_agent(&cx, &project, "BlueLake").await;
+        assert_eq!(refreshed.inception_ts, original.inception_ts);
+        assert_eq!(refreshed.program, "updated-program");
+        assert!(mcp_agent_mail_tools::session_identity::holds(
+            &owner, &refreshed
+        ));
+        let sent = send_as(&owner, &project, "BlueLake", &recipient)
+            .await
+            .expect("refreshed identity still has session proof");
+        assert_eq!(sent["verified_sender"], true);
+        assert_eq!(sent["sender_verification"], "session");
+    });
+}
+
+#[test]
+fn registering_existing_agent_with_reused_id_does_not_bind_it() {
+    run_with_session_identity(true, true, |cx| async move {
+        let owner = McpContext::with_state(cx.clone(), 1, SessionState::new());
+        let stale = McpContext::with_state(cx.clone(), 2, SessionState::new());
+        let project = format!("/tmp/session-reused-registration-{}", unique_suffix());
+        ensure_project(&owner, project.clone(), None)
+            .await
+            .expect("project");
+        register_named(&owner, &project, "PurpleHill").await;
+        let current = stored_agent(&cx, &project, "PurpleHill").await;
+
+        // Model the process-local proof retained when a recovered database
+        // assigns the former identity's numeric id to a different project.
+        // The canonical database row, lookup, and registration remain real.
+        mcp_agent_mail_tools::session_identity::bind(
+            &stale,
+            current.project_id + 1000,
+            current.id.unwrap(),
+            "BlueLake",
+        );
+        let before = mcp_agent_mail_tools::session_identity::session_bindings(&stale);
+        register_named(&stale, &project, "PurpleHill").await;
+        assert_eq!(
+            mcp_agent_mail_tools::session_identity::session_bindings(&stale),
+            before,
+            "trusted-local profile refresh must not promote a reused id to ownership"
+        );
+        let refreshed = stored_agent(&cx, &project, "PurpleHill").await;
+        assert!(!mcp_agent_mail_tools::session_identity::holds(
+            &stale, &refreshed
+        ));
+        assert_eq!(
+            send_as(&stale, &project, "PurpleHill", "PurpleHill")
+                .await
+                .expect_err("no canonical session proof under the fail-closed profile"),
+            "SENDER_TOKEN_REQUIRED"
+        );
+        assert!(mcp_agent_mail_tools::session_identity::holds(
+            &owner, &refreshed
+        ));
+    });
+}
+
+#[test]
 fn contact_mutations_authorize_the_requester_recipient_and_policy_owner() {
     run_with_session_identity(true, false, |cx| async move {
         let session_a = McpContext::with_state(cx.clone(), 1, SessionState::new());

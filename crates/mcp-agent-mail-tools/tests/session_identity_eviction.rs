@@ -177,7 +177,7 @@ async fn evicted_fixture(cx: &Cx, root: &std::path::Path) -> EvictedFixture {
         .await
         .expect("initial owned send");
     assert_eq!(sent["sender_verification"], "session");
-    let original_id = stored_agent(cx, &first_project, &original).await.id;
+    let original_row = stored_agent(cx, &first_project, &original).await;
 
     // Exercise the shipped 32-proof boundary through actual registrations.
     // Assert eviction rather than allowing a changed limit to hide coverage.
@@ -186,7 +186,7 @@ async fn evicted_fixture(cx: &Cx, root: &std::path::Path) -> EvictedFixture {
         retained = create_identity(&actor, &second_project).await;
     }
     assert_eq!(session_identity::session_bindings(&actor).len(), 32);
-    assert!(!session_identity::holds(&actor, original_id));
+    assert!(!session_identity::holds(&actor, &original_row));
     EvictedFixture {
         actor,
         actor_state,
