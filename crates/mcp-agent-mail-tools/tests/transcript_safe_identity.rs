@@ -399,7 +399,7 @@ fn register_dispatch_can_suppress_token_on_creation_and_update() {
             .into_result()
             .unwrap();
             let token = stored.registration_token.expect("credential persists");
-            assert!(!token.is_empty());
+            assert_ne!(token, "", "persisted credential must be non-empty");
             assert_ne!(
                 previous.as_ref(),
                 Some(&token),

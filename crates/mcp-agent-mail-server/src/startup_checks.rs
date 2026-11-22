@@ -3277,13 +3277,13 @@ fn probe_db_lock(config: &Config) -> ProbeResult {
 
 /// Run all startup probes and return a report.
 ///
-/// The probes are ordered from fastest to slowest, and all probes run
-/// even if earlier ones fail (so the user sees all problems at once).
+/// All probes run even if earlier ones fail so the user sees all problems at once.
 fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
     vec![
+        // The default SQLite database lives under this directory on first run.
+        timed_startup_phase("storage", || probe_storage_root(config)),
         timed_startup_phase("database", || probe_database(config)),
         timed_startup_phase("db-lock", || probe_db_lock(config)),
-        timed_startup_phase("storage", || probe_storage_root(config)),
         timed_startup_phase("integrity", || probe_integrity(config)),
         timed_startup_phase("fd-limit", || probe_fd_limit(config)),
     ]
@@ -3368,6 +3368,8 @@ pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
     let mut results = vec![
         timed_startup_phase("http-path", || probe_http_path(config)),
         timed_startup_phase("auth", || probe_auth(config)),
+        // Create STORAGE_ROOT before validating the default database's parent.
+        timed_startup_phase("storage", || probe_storage_root(config)),
         timed_startup_phase("database", || probe_database(config)),
     ];
     if existing_agent_mail_server {
@@ -3379,9 +3381,6 @@ pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
     } else {
         results.push(timed_startup_phase("db-lock", || probe_db_lock(config)));
     }
-    results.push(timed_startup_phase("storage", || {
-        probe_storage_root(config)
-    }));
     if !existing_agent_mail_server {
         results.push(timed_startup_phase("integrity", || probe_integrity(config)));
     }
@@ -3530,9 +3529,9 @@ mod tests {
             "backup-rotation",
             "http-path",
             "auth",
+            "storage",
             "database",
             "db-lock",
-            "storage",
             "integrity",
             "fd-limit",
             "port",
@@ -3671,9 +3670,9 @@ mod tests {
                 "backup-rotation",
                 "http-path",
                 "auth",
+                "storage",
                 "database",
                 "db-lock",
-                "storage",
                 "integrity",
                 "fd-limit",
                 "port",
@@ -4344,6 +4343,33 @@ mod tests {
     }
 
     #[test]
+    fn startup_probes_accept_first_use_of_nested_storage_root() {
+        let dir = tempfile::tempdir().expect("private cold-start fixture");
+        let probes = [
+            ("http", run_startup_probes as fn(&Config) -> StartupReport),
+            ("stdio", run_stdio_startup_probes),
+        ];
+        for (transport, run_probes) in probes {
+            let mut config = default_config();
+            config.http_host = "127.0.0.1".into();
+            config.http_port = 0;
+            config.storage_root = dir.path().join(transport).join("mailbox");
+            let database = config.storage_root.join("storage.sqlite3");
+            config.database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&database);
+            assert!(!config.storage_root.exists());
+
+            let report = run_probes(&config);
+
+            assert!(report.is_ok(), "{transport} cold startup: {report:?}");
+            assert!(config.storage_root.is_dir());
+            assert!(
+                !database.exists(),
+                "preflight must leave database initialization to startup"
+            );
+        }
+    }
+
+    #[test]
     fn run_stdio_startup_probes_omits_http_only_checks() {
         // These probes open the real mailbox; never touch the shared default paths.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4372,7 +4398,7 @@ mod tests {
                     ..
                 })
         )));
-        capture.assert_phases(&["database", "db-lock", "storage", "integrity", "fd-limit"]);
+        capture.assert_phases(&["storage", "database", "db-lock", "integrity", "fd-limit"]);
     }
 
     #[test]
@@ -4517,8 +4543,8 @@ mod tests {
             "listener-detection",
             "http-path",
             "auth",
-            "database",
             "storage",
+            "database",
             "fd-limit",
         ]);
 
