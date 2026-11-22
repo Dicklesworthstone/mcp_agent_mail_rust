@@ -632,8 +632,11 @@ impl DashboardScreen {
     }
 
     /// Ingest new events from the ring buffer.
-    fn ingest_events(&mut self, state: &TuiSharedState) {
+    fn ingest_events(&mut self, state: &TuiSharedState) -> bool {
         let new_events = state.tick_events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
+        if new_events.is_empty() {
+            return false;
+        }
         for event in &new_events {
             self.last_seq = event.seq().max(self.last_seq);
             if let Some(preview) = RecentMessagePreview::from_event(event) {
@@ -642,6 +645,7 @@ impl DashboardScreen {
             self.push_event_entry(format_event(event));
         }
         self.trim_event_log();
+        true
     }
 
     #[allow(clippy::too_many_lines)]
@@ -819,7 +823,7 @@ impl DashboardScreen {
             // ubs:ignore — UI filter cache metadata, not an authentication secret.
             if *prev_key == current_key {
                 // Cache is still valid — filter state unchanged and event data
-                // wasn't modified (bump happens in tick on dirty.events).
+                // wasn't modified (bump happens after ingestion in tick).
                 return;
             }
         }
@@ -1526,14 +1530,15 @@ impl MailScreen for DashboardScreen {
     #[allow(clippy::cast_precision_loss)]
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         // ── Dirty-state gated data ingestion ────────────────────────
-        let current_gen = state.data_generation();
+        let mut current_gen = state.data_generation();
         let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
 
-        if dirty.events {
-            // Ingest new events from ring buffer.
-            self.ingest_events(state);
-            // Invalidate visible-entries and heatmap caches.
+        if dirty.events && self.ingest_events(state) {
             self.invalidate_visible_cache();
+            // The shared tick batch can end before the ring's tail. Each
+            // admitted push consumes one sequence, so keep the unseen suffix
+            // dirty until a later tick reaches it or finds no retained events.
+            current_gen.event_total_pushed = current_gen.event_total_pushed.min(self.last_seq);
         }
         if dirty.db_stats || !self.db_delta_baseline_ready {
             // Synthesize dashboard-friendly deltas from polled DB counters so
@@ -6118,6 +6123,8 @@ fn render_event_log(
     effects_enabled: bool,
     hit_regions: &RefCell<DashboardHitRegions>,
 ) {
+    const MIN_EVENT_COLUMN_WIDTH: u16 = 48;
+
     if area.height < 3 || area.width < 20 {
         return;
     }
@@ -6193,15 +6200,22 @@ fn render_event_log(
         return;
     }
 
-    let (window_start, window_end) =
-        event_log_window_bounds(total, scroll_offset, usize::from(viewer_area.height));
-    let window_entries = &entries[window_start..window_end];
-    let shimmer_progresses = dashboard_shimmer_progresses(window_entries, effects_enabled);
     if viewer_area.width == 0 {
         return;
     }
 
-    let event_cols = event_log_columns_for_width(viewer_area.width);
+    let event_cols = dense_columns_for_width(
+        viewer_area.width,
+        MIN_EVENT_COLUMN_WIDTH,
+        event_log_columns_for_width(viewer_area.width),
+    );
+    // The column renderer fills from the start of this slice. Size the tail
+    // window to the actual viewport so the newest events fit on screen.
+    let visible_capacity = usize::from(viewer_area.height).saturating_mul(event_cols);
+    let (window_start, window_end) =
+        event_log_window_bounds(total, scroll_offset, visible_capacity);
+    let window_entries = &entries[window_start..window_end];
+    let shimmer_progresses = dashboard_shimmer_progresses(window_entries, effects_enabled);
     let cols_u16 = u16::try_from(event_cols).unwrap_or(1).max(1);
     let estimated_col_width = if event_cols > 1 {
         let total_gap = cols_u16.saturating_sub(1);
@@ -6241,7 +6255,13 @@ fn render_event_log(
             .into_iter()
             .map(|line| Line::styled(line, Style::default().fg(tp.text_primary)))
             .collect::<Vec<_>>();
-        render_lines_with_columns(frame, viewer_area, &lines, 48, event_cols);
+        render_lines_with_columns(
+            frame,
+            viewer_area,
+            &lines,
+            MIN_EVENT_COLUMN_WIDTH,
+            event_cols,
+        );
         return;
     }
 
@@ -6366,17 +6386,14 @@ const fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
 fn event_log_window_bounds(
     total: usize,
     scroll_offset: usize,
-    viewport_rows: usize,
+    visible_capacity: usize,
 ) -> (usize, usize) {
-    if total == 0 || viewport_rows == 0 {
+    if total == 0 || visible_capacity == 0 {
         return (0, 0);
     }
 
     let end = total.saturating_sub(scroll_offset);
-    let window_rows = viewport_rows
-        .saturating_mul(4)
-        .max(viewport_rows.saturating_add(8));
-    let start = end.saturating_sub(window_rows);
+    let start = end.saturating_sub(visible_capacity);
     (start, end)
 }
 
@@ -7883,8 +7900,32 @@ mod tests {
         let _ = state.push_event(MailEvent::server_started("http://test", "test"));
         let _ = state.push_event(MailEvent::http_request("GET", "/", 200, 1, "127.0.0.1"));
 
-        screen.ingest_events(&state);
+        assert!(screen.ingest_events(&state));
         assert_eq!(screen.event_log.len(), 2);
+    }
+
+    #[test]
+    fn dashboard_drains_shared_event_tail_without_another_push() {
+        let state = TuiSharedState::new(&Config::default());
+        let mut screen = DashboardScreen::new();
+        for path in ["/first", "/second", "/final-event"] {
+            assert!(state.push_event(MailEvent::http_request("GET", path, 200, 1, "127.0.0.1")));
+        }
+
+        let to_seq = state.publish_tick_event_batch(0, state.events_since_limited(0, 2));
+        assert_eq!(to_seq, 2);
+        screen.tick(1, &state);
+        assert_eq!(screen.event_log.len(), 2);
+        assert_eq!(screen.visible_entries().len(), 2);
+
+        state.publish_tick_event_batch(to_seq, state.events_since_limited(to_seq, 2));
+        screen.tick(2, &state);
+        assert_eq!(screen.visible_entries().len(), 3);
+        assert!(screen.visible_entries()[2].summary.contains("/final-event"));
+
+        screen.tick(3, &state);
+        let seqs: Vec<_> = screen.event_log.iter().map(|entry| entry.seq).collect();
+        assert_eq!(seqs, [1, 2, 3]);
     }
 
     #[test]
@@ -9594,15 +9635,60 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_event_log_renders_the_visible_tail_across_column_layouts() {
+        let entries: Vec<_> = (1..=100)
+            .map(|seq| EventEntry {
+                kind: MailEventKind::HttpRequest,
+                severity: EventSeverity::Debug,
+                seq,
+                timestamp_micros: 0,
+                timestamp: "00:00:00.000".to_string(),
+                icon: '↔',
+                summary: format!("event-fixture-{seq:03}"),
+            })
+            .collect();
+        let entries: Vec<_> = entries.iter().collect();
+        let viewer = RefCell::new(crate::console::LogPane::new());
+        let hit_regions = RefCell::new(DashboardHitRegions::default());
+        for (width, scroll_offset, expected) in
+            [(120, 0, 100), (200, 0, 100), (200, 7, 93), (500, 0, 100)]
+        {
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = Frame::new(width, 15, &mut pool);
+            render_event_log(
+                &mut frame,
+                Rect::new(0, 0, width, 15),
+                &viewer,
+                &entries,
+                scroll_offset,
+                scroll_offset == 0,
+                DashboardQuickFilter::All,
+                VerbosityTier::All,
+                0,
+                false,
+                &hit_regions,
+            );
+            let text = frame_text(&frame);
+            assert!(
+                text.contains(&format!("event-fixture-{expected:03}")),
+                "the event at the requested tail must appear at width {width}: {text}"
+            );
+            if scroll_offset > 0 {
+                assert!(!text.contains("event-fixture-100"));
+            }
+        }
+    }
+
+    #[test]
     fn event_log_window_bounds_follow_mode_uses_tail_window() {
-        let (start, end) = event_log_window_bounds(1_000, 0, 10);
+        let (start, end) = event_log_window_bounds(1_000, 0, 40);
         assert_eq!(end, 1_000);
         assert_eq!(start, 960);
     }
 
     #[test]
     fn event_log_window_bounds_scrolls_back_without_scanning_full_log() {
-        let (start, end) = event_log_window_bounds(1_000, 300, 10);
+        let (start, end) = event_log_window_bounds(1_000, 300, 40);
         assert_eq!(end, 700);
         assert_eq!(start, 660);
     }
