@@ -1497,8 +1497,6 @@ pub struct SearchCockpitScreen {
     last_detail_area: Cell<Rect>,
     /// Last split area (results + detail), used for border hit-testing.
     last_split_area: Cell<Rect>,
-    /// Small animation phase for header/status flourish.
-    ui_phase: u8,
     /// Markdown and detail renders share one entry and retained-byte budget.
     rendered_cache: RefCell<RenderedTextCache>,
     /// Last-seen data generation snapshot for dirty-state gating.
@@ -1593,7 +1591,6 @@ impl SearchCockpitScreen {
             last_results_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_detail_area: Cell::new(Rect::new(0, 0, 0, 0)),
             last_split_area: Cell::new(Rect::new(0, 0, 0, 0)),
-            ui_phase: 0,
             rendered_cache: RefCell::new(RenderedTextCache::default()),
             last_data_gen: super::DataGeneration::stale(),
             json_tree_state: RefCell::new(crate::tui_markdown::JsonTreeViewState::default()),
@@ -3779,13 +3776,12 @@ impl MailScreen for SearchCockpitScreen {
         Cmd::None
     }
 
-    fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+    fn tick(&mut self, _tick_count: u64, state: &TuiSharedState) {
         // ── Dirty-state gated data ingestion ────────────────────────
         let current_gen = state.data_generation();
         // Search is purely user-driven (debounce-gated), so we track
         // the generation for baseline continuity but do not gate on it.
 
-        self.ui_phase = (tick_count % 16) as u8;
         if self.search_dirty {
             if self.debounce_remaining > 0 {
                 self.debounce_remaining -= 1;
@@ -3880,7 +3876,7 @@ impl MailScreen for SearchCockpitScreen {
         } else {
             "List only".to_string()
         };
-        let telemetry = runtime_telemetry_line(state, self.ui_phase);
+        let telemetry = runtime_telemetry_line(state);
         render_query_bar(
             frame,
             query_area,
@@ -3888,7 +3884,6 @@ impl MailScreen for SearchCockpitScreen {
             self,
             matches!(self.focus, Focus::QueryBar),
             &layout_label,
-            self.ui_phase,
             &telemetry,
         );
 
@@ -4929,7 +4924,7 @@ fn QUERY_HELP_BG() -> PackedRgba {
     crate::tui_theme::TuiThemePalette::current().bg_deep
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 fn render_query_bar(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4937,7 +4932,6 @@ fn render_query_bar(
     screen: &SearchCockpitScreen,
     focused: bool,
     layout_label: &str,
-    ui_phase: u8,
     telemetry: &str,
 ) {
     let count = screen.results.len();
@@ -4959,9 +4953,8 @@ fn render_query_bar(
         ""
     };
 
-    let spinner = spinner_glyph(ui_phase);
     let title = format!(
-        "{spinner} Search {kind_label} ({count} results, {active_filters} filters){thread_label} [{layout_label}]{focus_label}"
+        "Search {kind_label} ({count} results, {active_filters} filters){thread_label} [{layout_label}]{focus_label}"
     );
 
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -5061,7 +5054,6 @@ fn render_query_bar(
     let has_active_query = !screen.query_input.value().trim().is_empty();
     let in_query = matches!(screen.focus, Focus::QueryBar);
     if content_inner.height >= 3 && (has_active_query || in_query) {
-        let meter = pulse_meter(ui_phase, 8);
         let state_label = if screen.search_dirty {
             if screen.debounce_remaining > 0 {
                 format!("pending:{}t", screen.debounce_remaining)
@@ -5075,8 +5067,7 @@ fn render_query_bar(
             .last_search_ms
             .map_or_else(|| "n/a".to_string(), |ms| format!("{ms}ms"));
         let chips = format!(
-            "{}  state:{}  scope:{}  type:{}  sort:{}  terms:{}  sql:{}  latency:{}",
-            meter,
+            "state:{}  scope:{}  type:{}  sort:{}  terms:{}  sql:{}  latency:{}",
             state_label,
             screen.scope_value_label(),
             screen.doc_kind_filter.label(),
@@ -5344,9 +5335,8 @@ fn render_query_lab(frame: &mut Frame<'_>, inner: Rect, screen: &SearchCockpitSc
         "route: {}",
         truncate_str(&screen.route_string(), 36)
     ));
-    let meter = pulse_meter(screen.ui_phase, 6);
     rows.push(format!(
-        "{meter} terms:{} matches:{}",
+        "terms:{} matches:{}",
         screen.highlight_terms.len(),
         screen.results.len()
     ));
@@ -6277,43 +6267,19 @@ fn viewport_range(total: usize, visible: usize, cursor: usize) -> (usize, usize)
     (start, end)
 }
 
-const fn spinner_glyph(phase: u8) -> &'static str {
-    match phase % 8 {
-        0 | 4 => "\u{25d0}",
-        1 | 5 => "\u{25d3}",
-        2 | 6 => "\u{25d1}",
-        _ => "\u{25d2}",
-    }
-}
-
-fn pulse_meter(phase: u8, width: usize) -> String {
-    const BARS: [char; 8] = [
-        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
-        '\u{2588}',
-    ];
-    let w = width.max(4);
-    let mut out = String::with_capacity(w);
-    for idx in 0..w {
-        let pos = (usize::from(phase) + idx) % BARS.len();
-        out.push(BARS[pos]);
-    }
-    out
-}
-
-fn runtime_telemetry_line(state: &TuiSharedState, ui_phase: u8) -> String {
+fn runtime_telemetry_line(state: &TuiSharedState) -> String {
     let counters = state.request_counters();
     // Server faults only (5xx), matching the dashboard "Error %" tile.
     let err = counters.status_5xx;
     let spark_raw = state.sparkline_snapshot();
     let spark = crate::tui_screens::dashboard::render_sparkline(&spark_raw, 12);
-    let meter = pulse_meter(ui_phase, 6);
     let sparkline = if spark.is_empty() {
         "......".to_string()
     } else {
         spark
     };
     let prefix = format!(
-        "{meter} req:{} ok:{} err:{} avg:{}ms",
+        "req:{} ok:{} err:{} avg:{}ms",
         counters.total,
         counters.status_2xx,
         err,

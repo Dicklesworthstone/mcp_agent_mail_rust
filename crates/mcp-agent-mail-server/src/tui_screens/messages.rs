@@ -1271,8 +1271,6 @@ pub struct MessageBrowserScreen {
     last_local_project: Option<String>,
     /// Reduced-motion mode forces static urgency badges.
     reduced_motion: bool,
-    /// Small animation phase for header/status flourish.
-    ui_phase: u8,
     /// Resizable results/detail layout.
     dock: DockLayout,
     /// Current drag state while resizing dock split.
@@ -1363,7 +1361,6 @@ impl MessageBrowserScreen {
             inbox_mode: InboxMode::Global,
             last_local_project: None,
             reduced_motion: reduced_motion_enabled(),
-            ui_phase: 0,
             dock: DockLayout::right_40(),
             dock_drag: DockDragState::Idle,
             message_drag: MessageDragState::Idle,
@@ -3709,7 +3706,6 @@ impl MailScreen for MessageBrowserScreen {
 
     fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
         self.update_urgent_pulse(tick_count);
-        self.ui_phase = (tick_count % 16) as u8;
         self.promote_pending_message_drag_if_due(state);
         // Debounce search execution
         if self.search_dirty {
@@ -3938,7 +3934,7 @@ impl MailScreen for MessageBrowserScreen {
                 self.hidden_system_count
             );
         }
-        let telemetry = runtime_telemetry_line(state, self.ui_phase);
+        let telemetry = runtime_telemetry_line(state);
         render_search_bar(
             frame,
             search_area,
@@ -3949,8 +3945,6 @@ impl MailScreen for MessageBrowserScreen {
             preset_label,
             &mode_label,
             &layout_label,
-            self.ui_phase,
-            MESSAGE_URGENT_PULSE_ON.load(Ordering::Relaxed),
             &telemetry,
         );
 
@@ -5047,15 +5041,12 @@ fn render_search_bar(
     preset_label: &str,
     mode_label: &str,
     layout_label: &str,
-    ui_phase: u8,
-    pulse_on: bool,
     telemetry: &str,
 ) {
-    let spinner = spinner_glyph(ui_phase);
     let mut title = if focused {
-        format!("{spinner} Search ({total_results} results) [EDITING]")
+        format!("Search ({total_results} results) [EDITING]")
     } else {
-        format!("{spinner} Search ({total_results} results)")
+        format!("Search ({total_results} results)")
     };
     // Append search method for explainability
     if !method_label.is_empty() {
@@ -5108,13 +5099,9 @@ fn render_search_bar(
         let input_area = Rect::new(content_inner.x, content_inner.y, content_inner.width, 1);
         input.render(input_area, frame);
         if content_inner.height > 1 {
-            let pulse = if pulse_on { "\u{25cf}" } else { "\u{25cb}" };
-            let meter = pulse_meter(ui_phase, 10);
-            let hint = format!(
-                "{pulse} {meter}  Mouse: click/select, wheel preset/scroll, drag split border   Ops: / j k J(toggle tree) K"
-            );
+            let hint = "Mouse: click/select, wheel preset/scroll, drag split border   Ops: / j k J(toggle tree) K";
             let hint_area = Rect::new(content_inner.x, content_inner.y + 1, content_inner.width, 1);
-            Paragraph::new(truncate_str(&hint, content_inner.width as usize))
+            Paragraph::new(truncate_str(hint, content_inner.width as usize))
                 .style(crate::tui_theme::text_hint(&tp))
                 .render(hint_area, frame);
         }
@@ -6471,43 +6458,19 @@ fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReply
         .render(Rect::new(inner.x, footer_y, inner.width, 1), frame);
 }
 
-const fn spinner_glyph(phase: u8) -> &'static str {
-    match phase % 8 {
-        0 | 4 => "\u{25d0}",
-        1 | 5 => "\u{25d3}",
-        2 | 6 => "\u{25d1}",
-        _ => "\u{25d2}",
-    }
-}
-
-fn pulse_meter(phase: u8, width: usize) -> String {
-    const BARS: [char; 8] = [
-        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
-        '\u{2588}',
-    ];
-    let w = width.max(4);
-    let mut out = String::with_capacity(w);
-    for idx in 0..w {
-        let pos = (usize::from(phase) + idx) % BARS.len();
-        out.push(BARS[pos]);
-    }
-    out
-}
-
-fn runtime_telemetry_line(state: &TuiSharedState, ui_phase: u8) -> String {
+fn runtime_telemetry_line(state: &TuiSharedState) -> String {
     let counters = state.request_counters();
     // Server faults only (5xx), matching the dashboard "Error %" tile.
     let err = counters.status_5xx;
     let spark_raw = state.sparkline_snapshot();
     let spark = crate::tui_screens::dashboard::render_sparkline(&spark_raw, 12);
-    let meter = pulse_meter(ui_phase, 6);
     let sparkline = if spark.is_empty() {
         "......".to_string()
     } else {
         spark
     };
     format!(
-        "{meter} req:{} ok:{} err:{} avg:{}ms spark:{}",
+        "req:{} ok:{} err:{} avg:{}ms spark:{}",
         counters.total,
         counters.status_2xx,
         err,
@@ -8568,8 +8531,6 @@ first body
             "",
             "", // mode_label
             "",
-            0,
-            false,
             "",
         );
     }
@@ -10335,8 +10296,6 @@ first body
             "Urgent",
             "", // mode_label
             "Right 40%",
-            3,
-            true,
             "req:1 ok:1 err:0 avg:1ms spark:......",
         );
     }
@@ -10356,8 +10315,6 @@ first body
             "",
             "",
             "",
-            0,
-            false,
             "",
         );
     }
