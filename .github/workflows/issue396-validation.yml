@@ -1,0 +1,132 @@
+name: Issue 396 registration token validation
+
+on:
+  push:
+    branches: ['validation/gh396-registration-tokens-5490b8a28d64']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh396-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_TERM_COLOR: never
+  CARGO_HTTP_USER_AGENT: 'mcp_agent_mail_rust-ci (+https://github.com/Dicklesworthstone/mcp_agent_mail_rust)'
+  RUST_TEST_THREADS: '1'
+
+jobs:
+  registration:
+    name: Compile and exercise registration credentials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install the repository-pinned compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "$toolchain" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Format source and record the exact patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          printf 'FORMAT_PATCH_BEGIN\n'
+          git diff --no-ext-diff --color=never
+          printf 'FORMAT_PATCH_END\n'
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Record the exact source tree being validated
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add --update
+          tree_sha="$(git write-tree)"
+          printf 'VALIDATED_TREE_SHA=%s\n' "$tree_sha"
+          printf 'VALIDATED_TREE_SHA=%s\n' "$tree_sha" >> "$GITHUB_ENV"
+      - name: Check the workspace and all targets
+        run: cargo check --locked --workspace --all-targets
+      - name: Check the production feature graph
+        run: cargo check --locked --workspace --lib --bins
+      - name: Check workspace lints
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Exercise real MCP registration and stored credential transitions
+        run: cargo test --locked -p mcp-agent-mail-tools --test it transcript_safe_identity:: -- --test-threads=1
+      - name: Exercise revoked sender proof in every profile
+        run: cargo test --locked -p mcp-agent-mail-tools --lib supplied_sender_token_is_rejected_after_revocation_in_every_profile -- --test-threads=1
+      - name: Exercise CLI output and private credential persistence
+        run: cargo test --locked -p mcp-agent-mail-cli --lib registration_ -- --test-threads=1
+      - name: Exercise operator token lifecycle
+        run: cargo test --locked -p mcp-agent-mail-cli --lib agent_token_ -- --test-threads=1
+      - name: Exercise the real CLI registration and token lifecycle
+        run: cargo test --locked -p mcp-agent-mail-cli --test it security_privacy_harness::cli_registration_token_lifecycle_is_private_and_authenticated -- --exact --test-threads=1
+      - name: Check retained MCP schemas and descriptions
+        run: cargo test --locked -p mcp-agent-mail-conformance --test it tool_description_parity:: -- --test-threads=1
+      - name: Exercise captured compatibility behavior
+        run: cargo test --locked -p mcp-agent-mail-conformance --test it conformance:: -- --test-threads=1
+      - name: Verify validation preserved the recorded source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test "$(git write-tree)" = "$VALIDATED_TREE_SHA"
+
+  source-scan:
+    name: Scan changed Rust files with pinned UBS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned scanner and scan changed files
+        env:
+          UBS_KEEP_TEMP: '1'
+          UBS_NO_AUTO_UPDATE: '1'
+          ENABLE_UV_TOOLS: '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scan_root="$RUNNER_TEMP/gh396-scanner"
+          mkdir -p "$scan_root/source" "$scan_root/ast" "$scan_root/tools" "$scan_root/cache" "$scan_root/tmp"
+          curl --user-agent 'mcp_agent_mail_rust-ci (+https://github.com/Dicklesworthstone/mcp_agent_mail_rust)' --fail --location --retry 3 \
+            https://github.com/Dicklesworthstone/ultimate_bug_scanner/archive/76d857de41b4da314b0be2f4022e0f5878710513.tar.gz \
+            --output "$scan_root/ubs.tar.gz"
+          tar -xzf "$scan_root/ubs.tar.gz" --strip-components=1 -C "$scan_root/source"
+          printf '%s  %s\n' \
+            1d43725c8b23b12ab9cb7efbc90a12897a5a3990ae66c1b203f7b3a8d7361336 "$scan_root/source/ubs" \
+            2ae1c3895c44eac54acf010af39b15e4971891377166802777877691a4832e6e "$scan_root/source/modules/ubs-rust.sh" \
+            > "$scan_root/checksums.txt"
+          curl --user-agent 'mcp_agent_mail_rust-ci (+https://github.com/Dicklesworthstone/mcp_agent_mail_rust)' --fail --location --retry 3 \
+            https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-unknown-linux-gnu.zip \
+            --output "$scan_root/ast.zip"
+          printf '%s  %s\n' \
+            f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8 "$scan_root/ast.zip" \
+            >> "$scan_root/checksums.txt"
+          sha256sum --check "$scan_root/checksums.txt"
+          unzip -q "$scan_root/ast.zip" -d "$scan_root/ast"
+          printf '%s  %s\n' \
+            7a5ab30160186184c0bf8bffc87da4af25123c183964cd98c11b0b354137db0a "$scan_root/ast/ast-grep" \
+            | sha256sum --check
+          chmod +x "$scan_root/ast/ast-grep"
+          export PATH="$scan_root/ast:$PATH"
+          export UBS_TOOLS_DIR="$scan_root/tools" UBS_CACHE_DIR="$scan_root/cache" TMPDIR="$scan_root/tmp"
+          bash "$scan_root/source/ubs" --only=rust --ci --no-color \
+            --no-auto-update --no-cache --no-cargo \
+            --module-dir="$scan_root/source/modules" --format=json \
+            --files="crates/mcp-agent-mail-tools/src/macros.rs,crates/mcp-agent-mail-tools/src/macros/contact_handshake_tests.rs,crates/mcp-agent-mail-tools/tests/session_identity.rs,crates/mcp-agent-mail-tools/tests/session_identity_eviction.rs,crates/mcp-agent-mail-tools/tests/validation_error_parity.rs,crates/mcp-agent-mail-tools/tests/system_error_parity.rs,crates/mcp-agent-mail-tools/tests/messaging_error_parity.rs,crates/mcp-agent-mail-tools/tests/project_mailbox.rs,crates/mcp-agent-mail-tools/tests/reservation_error_parity.rs,crates/mcp-agent-mail-tools/tests/idempotency_tool_acceptance.rs,crates/mcp-agent-mail-tools/tests/lifecycle_auth_transport.rs,crates/mcp-agent-mail-tools/tests/agent_name_parity.rs,crates/mcp-agent-mail-tools/tests/agent_activity.rs,crates/mcp-agent-mail-tools/tests/contact_policy_parity.rs,crates/mcp-agent-mail-tools/tests/registration_proof_gate.rs,crates/mcp-agent-mail-tools/tests/auto_register_profile.rs,crates/mcp-agent-mail-tools/tests/auto_name_collision.rs,crates/mcp-agent-mail-conformance/tests/error_code_parity.rs,crates/mcp-agent-mail-server/src/tui_screens/mod.rs,crates/mcp-agent-mail-conformance/tests/conformance.rs,crates/mcp-agent-mail-tools/src/resources.rs,crates/mcp-agent-mail-tools/tests/transcript_safe_identity.rs,crates/mcp-agent-mail-cli/src/lib.rs,crates/mcp-agent-mail-cli/tests/security_privacy_harness.rs,crates/mcp-agent-mail-tools/src/identity.rs,crates/mcp-agent-mail-tools/src/messaging.rs" "$GITHUB_WORKSPACE"
