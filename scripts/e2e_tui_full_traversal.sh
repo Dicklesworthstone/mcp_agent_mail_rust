@@ -342,6 +342,17 @@ profile_label = os.environ.get("E2E_PROFILE_LABEL", "profile")
 if profile_capture and not profile_dir:
     profile_dir = os.path.join(os.path.dirname(timing_file), "baseline_profile")
 
+strace_path = shutil.which("strace") if profile_capture else None
+strace_log_path = ""
+if profile_capture:
+    os.makedirs(profile_dir, exist_ok=True)
+if strace_path:
+    strace_log_path = os.path.join(profile_dir, f"{profile_label}_strace.log")
+    # Launch the tracee under strace so profiling works with Linux's default
+    # ptrace restrictions. -D keeps the TUI a direct child of the PTY driver:
+    # waitpid, terminal ownership, and pidstat all retain the same PID.
+    cmd = [strace_path, "-D", "-f", "-tt", "-T", "-o", strace_log_path, "--", *cmd]
+
 # Set terminal size (80x24 is standard; 120x40 for more screen detail)
 cols = int(os.environ.get("E2E_PTY_COLS", "120"))
 rows = int(os.environ.get("E2E_PTY_ROWS", "40"))
@@ -381,7 +392,7 @@ else:
         "captured_at_utc": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "tools": {
             "pidstat_available": shutil.which("pidstat") is not None,
-            "strace_available": shutil.which("strace") is not None,
+            "strace_available": strace_path is not None,
         },
         "tool_runs": [],
     }
@@ -414,7 +425,6 @@ else:
         })
 
     if profile_capture:
-        os.makedirs(profile_dir, exist_ok=True)
         if profile_meta["tools"]["pidstat_available"]:
             start_profile_tool(
                 "pidstat_process",
@@ -430,12 +440,6 @@ else:
                 "pidstat_wake",
                 ["pidstat", "-w", "-h", "-t", "-p", str(pid), "1"],
                 os.path.join(profile_dir, f"{profile_label}_pidstat_wake.txt"),
-            )
-        if profile_meta["tools"]["strace_available"]:
-            start_profile_tool(
-                "strace",
-                ["strace", "-f", "-tt", "-T", "-p", str(pid), "-o", os.path.join(profile_dir, f"{profile_label}_strace.log")],
-                os.path.join(profile_dir, f"{profile_label}_strace_runner_stdout.txt"),
             )
 
     def capture_chunk(chunk):
@@ -662,14 +666,7 @@ else:
     # Stop profiling tools before tearing down child.
     for entry in profile_processes:
         proc = entry["proc"]
-        if proc.poll() is not None:
-            continue
-        if entry["name"] == "strace":
-            try:
-                proc.send_signal(signal.SIGINT)
-            except ProcessLookupError:
-                pass
-        else:
+        if proc.poll() is None:
             proc.terminate()
     for entry in profile_processes:
         proc = entry["proc"]
@@ -775,16 +772,6 @@ else:
             reverse=True,
         )[:12]
         return summary
-
-    strace_log_path = ""
-    for entry in profile_processes:
-        if entry["name"] == "strace":
-            # Strace writes real trace to the -o path in its command.
-            try:
-                idx = entry["cmd"].index("-o")
-                strace_log_path = entry["cmd"][idx + 1]
-            except Exception:
-                strace_log_path = ""
 
     strace_summary = summarize_strace(strace_log_path)
     profile_meta["strace_summary"] = strace_summary
