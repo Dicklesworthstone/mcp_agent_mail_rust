@@ -10,6 +10,7 @@ use mcp_agent_mail_core::{
     TailLatencyPhaseLedger, TailLatencyPhaseRecorder, append_tail_latency_evidence_if_configured,
 };
 use mcp_agent_mail_db::micros_to_iso;
+use mcp_agent_mail_db::search_planner::MessageSearchCursorScope;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -90,6 +91,15 @@ fn parse_search_messages_window(
     }
 
     Ok((max_results, offset_val, planner_limit))
+}
+
+fn invalid_message_search_cursor() -> McpError {
+    legacy_tool_error(
+        "INVALID_ARGUMENT",
+        "invalid search cursor. Use next_cursor from the same project, query, and read route.",
+        true,
+        json!({"field": "cursor"}),
+    )
 }
 
 #[must_use]
@@ -1169,7 +1179,7 @@ limit : int
 offset : int
     Offset after filtering (default 0; offset plus limit at most 5000).
 cursor : str
-    Continue with next_cursor and the same query and filters; overrides offset.
+    Continue with next_cursor and the same project, query, and filters. Overrides offset.
 ranking : str
     Ranking mode: "relevance" (default) or "recency" (newest first).
 sender : str
@@ -1244,10 +1254,15 @@ pub async fn search_messages(
     phase.set_include_bodies(include_body_md);
     let (max_results, offset_val, planner_limit) =
         parse_search_messages_window(limit, offset, cursor.is_some())?;
-    let recipient_kind = parse_recipient_kind(recipient_kind.as_deref())?;
-
     // Legacy parity: empty query returns an empty result set (no DB call).
     let trimmed = query.trim();
+    if let Some(token) = cursor.as_deref()
+        && (trimmed.is_empty() || !MessageSearchCursorScope::accepts_syntax(token))
+    {
+        return Err(invalid_message_search_cursor());
+    }
+    let recipient_kind = parse_recipient_kind(recipient_kind.as_deref())?;
+
     if trimmed.is_empty() {
         phase.set_rows_returned(0);
         phase.mark("empty_query_short_circuit");
@@ -1298,6 +1313,17 @@ pub async fn search_messages(
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     phase.mark("scope_resolution");
+    let cursor_scope =
+        MessageSearchCursorScope::live(project_id, std::path::Path::new(pool.sqlite_path()));
+    let cursor = cursor
+        .as_deref()
+        .map(|token| {
+            cursor_scope
+                .position(token)
+                .map(str::to_owned)
+                .ok_or_else(invalid_message_search_cursor)
+        })
+        .transpose()?;
 
     // Build a SearchQuery with all facets
     let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
@@ -1410,7 +1436,10 @@ pub async fn search_messages(
         } else {
             None
         },
-        next_cursor: planner_response.next_cursor,
+        next_cursor: planner_response
+            .next_cursor
+            .as_deref()
+            .map(|position| cursor_scope.bind(position)),
         diagnostics,
     };
     let response = serde_json::to_string(&response)
@@ -2070,10 +2099,11 @@ mod tests {
 
     async fn call_recipient_search_tool(
         ctx: &McpContext,
+        project_key: &str,
         kind: &str,
         offset: Option<i32>,
         cursor: Option<String>,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, serde_json::Value> {
         let router = fastmcp_server::ServerBuilder::new("recipient-kind-search-test", "0")
             .tool(crate::SearchMessages)
             .build()
@@ -2084,7 +2114,7 @@ mod tests {
                 fastmcp::CallToolParams {
                     name: "search_messages".to_string(),
                     arguments: Some(json!({
-                        "project_key": "kind-search",
+                        "project_key": project_key,
                         "query": "needle",
                         "limit": 2,
                         "offset": offset,
@@ -2102,7 +2132,6 @@ mod tests {
             )
             .await
             .expect("registered recipient-kind tool call");
-        assert!(!response.is_error, "search tool returned an error response");
         assert_eq!(response.content.len(), 1, "one serialized search result");
         let fastmcp::legacy_2024::LegacyContent::Text { text: payload, .. } = &response.content[0]
         else {
@@ -2112,7 +2141,12 @@ mod tests {
             !payload.contains("HiddenOwl"),
             "search must not disclose BCC identities"
         );
-        serde_json::from_str(payload).expect("tool JSON")
+        let payload = serde_json::from_str(payload).expect("tool JSON");
+        if response.is_error {
+            Err(payload)
+        } else {
+            Ok(payload)
+        }
     }
 
     #[test]
@@ -2131,7 +2165,9 @@ mod tests {
                 .filter(|hit| hit.result.id % 3 == 0)
                 .map(|hit| hit.result.id)
                 .collect();
-            let first = call_recipient_search_tool(&ctx, " CC ", Some(3), None).await;
+            let first = call_recipient_search_tool(&ctx, "kind-search", " CC ", Some(3), None)
+                .await
+                .expect("first search page");
             let ids = |payload: &serde_json::Value| {
                 payload["result"]
                     .as_array()
@@ -2143,13 +2179,17 @@ mod tests {
             assert_eq!(ids(&first), expected[3..5]);
             let second = call_recipient_search_tool(
                 &ctx,
+                "kind-search",
                 "cc",
                 Some(3),
                 Some(first["next_cursor"].as_str().unwrap().to_string()),
             )
-            .await;
+            .await
+            .expect("continued search page");
             assert_eq!(ids(&second), expected[5..7], "cursor overrides offset");
-            let bcc = call_recipient_search_tool(&ctx, "bcc", None, None).await;
+            let bcc = call_recipient_search_tool(&ctx, "kind-search", "bcc", None, None)
+                .await
+                .expect("BCC search page");
             assert_eq!(
                 ids(&bcc),
                 [1],
@@ -2157,6 +2197,29 @@ mod tests {
             );
             assert!(bcc["result"][0].get("bcc").is_none());
             assert_eq!(bcc["result"][0]["body_md"], "needle body");
+        });
+    }
+
+    #[test]
+    fn recipient_kind_tool_rejects_cursors_from_other_projects_and_bad_tokens() {
+        with_recipient_search_corpus(|ctx, _| async move {
+            let first = call_recipient_search_tool(&ctx, "kind-search", "cc", None, None)
+                .await
+                .expect("source project page");
+            let cursor = first["next_cursor"].as_str().expect("source cursor");
+            for (project, token) in [
+                ("other-search", cursor.to_string()),
+                ("kind-search", String::new()),
+                ("kind-search", "not-a-cursor".to_string()),
+                ("kind-search", "s0000000000000000:i42".to_string()),
+                ("kind-search", format!("{cursor}{}", "0".repeat(128))),
+            ] {
+                let error = call_recipient_search_tool(&ctx, project, "cc", None, Some(token))
+                    .await
+                    .expect_err("invalid cursor must not start or resume a page");
+                assert_eq!(error["error"]["type"], "INVALID_ARGUMENT");
+                assert_eq!(error["error"]["data"]["field"], "cursor");
+            }
         });
     }
 

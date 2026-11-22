@@ -871,6 +871,8 @@ pub struct EnvironmentSnapshot {
     pub inbox_priority_snapshot: String,
     #[serde(default)]
     pub search_recipient_kind: String,
+    #[serde(default)]
+    pub search_cursor_scope: String,
     pub http: HttpSnapshot,
 }
 
@@ -906,6 +908,8 @@ pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
         project_path_resolution: "nearest_ancestor_v1".to_string(),
         inbox_priority_snapshot: "priority_v1".to_string(),
         search_recipient_kind: "delivery_v1".to_string(),
+        search_cursor_scope:
+            mcp_agent_mail_db::search_planner::MessageSearchCursorScope::CAPABILITY.to_string(),
         http: HttpSnapshot {
             host: config.http_host.clone(),
             port: config.http_port,

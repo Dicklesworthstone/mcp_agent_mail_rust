@@ -67,6 +67,7 @@ pub(crate) struct ServerResourceSession {
     ancestor_resolution: bool,
     inbox_priority_snapshot: bool,
     search_recipient_kind: bool,
+    search_cursor_scope: bool,
 }
 
 impl ServerResourceSession {
@@ -95,6 +96,7 @@ impl ServerResourceSession {
             ancestor_resolution: false,
             inbox_priority_snapshot: false,
             search_recipient_kind: false,
+            search_cursor_scope: false,
         })
     }
 
@@ -157,6 +159,7 @@ impl ServerResourceSession {
         session.ancestor_resolution = supports_ancestor_resolution(&payload)?;
         session.inbox_priority_snapshot = supports_inbox_priority_snapshot(&payload)?;
         session.search_recipient_kind = supports_search_recipient_kind(&payload)?;
+        session.search_cursor_scope = supports_search_cursor_scope(&payload)?;
         Ok(Some(session))
     }
 
@@ -172,6 +175,10 @@ impl ServerResourceSession {
         self.search_recipient_kind
     }
 
+    pub(crate) const fn supports_search_cursor_scope(&self) -> bool {
+        self.search_cursor_scope
+    }
+
     pub(crate) async fn verify_local_mailbox(&self, config: &Config) -> CliResult<()> {
         let (payload, _) = read_resource_json(
             &self.client,
@@ -185,6 +192,7 @@ impl ServerResourceSession {
             || (self.ancestor_resolution && !supports_ancestor_resolution(&payload)?)
             || (self.inbox_priority_snapshot && !supports_inbox_priority_snapshot(&payload)?)
             || (self.search_recipient_kind && !supports_search_recipient_kind(&payload)?)
+            || (self.search_cursor_scope && !supports_search_cursor_scope(&payload)?)
         {
             return Err(invalid_response(
                 "mailbox identity changed during server read",
@@ -296,6 +304,15 @@ fn supports_search_recipient_kind(value: &Value) -> CliResult<bool> {
         None => Ok(false),
         Some(Value::String(capability)) => Ok(capability == "delivery_v1"),
         Some(_) => Err(invalid_response("invalid search recipient-kind capability")),
+    }
+}
+
+fn supports_search_cursor_scope(value: &Value) -> CliResult<bool> {
+    use mcp_agent_mail_db::search_planner::MessageSearchCursorScope;
+    match value.get("search_cursor_scope") {
+        None => Ok(false),
+        Some(Value::String(capability)) => Ok(capability == MessageSearchCursorScope::CAPABILITY),
+        Some(_) => Err(invalid_response("invalid search cursor scope capability")),
     }
 }
 

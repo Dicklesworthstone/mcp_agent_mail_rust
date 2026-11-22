@@ -13033,7 +13033,9 @@ pub fn like_escape(term: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn message_candidate_predicate(query: &str) -> crate::DbResult<Option<(String, Vec<String>)>> {
+pub(crate) fn message_candidate_predicate(
+    query: &str,
+) -> crate::DbResult<Option<(String, Vec<String>)>> {
     if sanitize_fts_query(query).is_none() {
         return Ok(None);
     }

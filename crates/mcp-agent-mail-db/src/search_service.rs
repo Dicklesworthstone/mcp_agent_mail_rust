@@ -13,8 +13,8 @@ use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
     Direction, DocKind, Importance, PlanMethod, PlanParam, RankingMode, RecoverySuggestion,
-    ScopePolicy, SearchCursor, SearchQuery, SearchResponse, SearchResult, TextFieldScope,
-    ZeroResultGuidance, plan_search,
+    ScopePolicy, SearchCursor, SearchPlan, SearchQuery, SearchResponse, SearchResult,
+    TextFieldScope, ZeroResultGuidance, plan_legacy_message_search, plan_search,
 };
 use crate::search_scope::{
     RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
@@ -5812,21 +5812,29 @@ pub async fn execute_search(
 
     #[allow(deprecated)]
     if matches!(engine, SearchEngine::Legacy | SearchEngine::Shadow) {
-        let limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
-        let raw_results = match legacy_sql_candidate_results(cx, pool, query, limit).await {
+        let plan = match plan_legacy_message_search(query) {
+            Ok(plan) => plan,
+            Err(error) => return Outcome::Err(error),
+        };
+        let mut raw_results = match query_search_plan(cx, pool, &plan, query.doc_kind).await {
             Outcome::Ok(results) => results,
             Outcome::Err(err) => return Outcome::Err(err),
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
+        // SQL applies the same ID order and boundary before LIMIT on every
+        // page. If a candidate disappears during canonicalization, continue
+        // from the last examined row so later matches stay reachable.
+        let next_cursor = compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
+        for result in &mut raw_results {
+            result.score = None;
+        }
         let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
             Outcome::Ok(results) => results,
             Outcome::Err(err) => return Outcome::Err(err),
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
-        let raw_results = apply_cursor_window(raw_results, query);
-        let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
         let explain = if query.explain {
             Some(build_v3_query_explain(query, engine, None))
         } else {
@@ -5839,7 +5847,11 @@ pub async fn execute_search(
         global_metrics()
             .search
             .record_legacy_query(latency_us, false);
-        let resp = finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
+        let mut resp =
+            finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
+        if let Outcome::Ok(ref mut response) = resp {
+            response.next_cursor = next_cursor;
+        }
         if cache_allowed && let Outcome::Ok(ref val) = resp {
             cache.put(cache_key, val.clone());
         }
@@ -6252,6 +6264,7 @@ fn semantic_index_is_foreign_to_pool(pool: &DbPool) -> bool {
 /// from the supplied pool (no Search V3 lexical bridge), so it keeps working when
 /// reads are served from a reconstructed archive snapshot whose lexical index was
 /// never built.
+#[cfg(not(feature = "tantivy-engine"))]
 async fn legacy_sql_candidate_results(
     cx: &Cx,
     pool: &DbPool,
@@ -6467,6 +6480,32 @@ async fn hydrate_plan_recipients(
     Outcome::Ok(results)
 }
 
+async fn query_search_plan(
+    cx: &Cx,
+    pool: &DbPool,
+    plan: &SearchPlan,
+    doc_kind: DocKind,
+) -> Outcome<Vec<SearchResult>, DbError> {
+    if plan.method == PlanMethod::Empty && plan.sql.is_empty() {
+        return Outcome::Ok(Vec::new());
+    }
+    let conn = match pool.acquire(cx).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(err) => return Outcome::Err(DbError::Sqlite(err.to_string())),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let params = plan
+        .params
+        .iter()
+        .map(plan_param_to_value)
+        .collect::<Vec<_>>();
+    conn.query(cx, &plan.sql, &params)
+        .await
+        .map(|rows| map_planned_rows(rows, doc_kind))
+        .map_err(|err| DbError::Sqlite(err.to_string()))
+}
+
 async fn execute_sql_plan_search(
     cx: &Cx,
     pool: &DbPool,
@@ -6482,27 +6521,11 @@ async fn execute_sql_plan_search(
     let budgeted_query = product_sql_budgeted_query(query, product_sql_budget);
     let query = &budgeted_query;
     let plan = plan_search(query);
-    let raw_results = if plan.method == PlanMethod::Empty && plan.sql.is_empty() {
-        Vec::new()
-    } else {
-        let conn = match pool.acquire(cx).await {
-            Outcome::Ok(conn) => conn,
-            Outcome::Err(err) => return Outcome::Err(DbError::Sqlite(err.to_string())),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        };
-        let params = plan
-            .params
-            .iter()
-            .map(plan_param_to_value)
-            .collect::<Vec<_>>();
-        let rows = match conn.query(cx, &plan.sql, &params).await {
-            Outcome::Ok(rows) => rows,
-            Outcome::Err(err) => return Outcome::Err(DbError::Sqlite(err.to_string())),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        };
-        map_planned_rows(rows, query.doc_kind)
+    let raw_results = match query_search_plan(cx, pool, &plan, query.doc_kind).await {
+        Outcome::Ok(results) => results,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
     let raw_results = match hydrate_plan_recipients(cx, pool, query, raw_results).await {
         Outcome::Ok(results) => results,
@@ -11327,6 +11350,56 @@ mod tests {
             }
         }
         (root, pool, primary.unwrap())
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn shadow_keyword_search_pages_in_id_order_within_project() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let (_root, pool, project) = query_hint_mailbox(&cx).await;
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_sync("UPDATE messages SET importance = 'LOW' WHERE id = 3", &[])
+                .unwrap();
+            drop(conn);
+            let options = SearchOptions {
+                search_engine: Some(SearchEngine::Shadow),
+                ..SearchOptions::default()
+            };
+            let mut query = SearchQuery {
+                limit: Some(1),
+                explain: true,
+                ..SearchQuery::messages("commonmail NOT absentword", project.id.unwrap())
+            };
+            for expected in [1, 2, 3] {
+                let page = execute_search(&cx, &pool, &query, &options)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(page.explain.unwrap().method, "shadow_v3");
+                assert_eq!(page.results.len(), 1);
+                assert_eq!(page.results[0].result.id, expected);
+                query.cursor = Some(page.next_cursor.expect("full-page continuation"));
+            }
+            let last = execute_search(&cx, &pool, &query, &options)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(last.results.is_empty());
+            assert!(last.next_cursor.is_none());
+
+            query.cursor = None;
+            query.importance = vec![Importance::Low];
+            let filtered = execute_search(&cx, &pool, &query, &options)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(filtered.results.len(), 1);
+            assert_eq!(filtered.results[0].result.id, 3);
+        });
     }
 
     #[test]

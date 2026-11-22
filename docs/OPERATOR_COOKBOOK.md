@@ -376,6 +376,12 @@ carries a cursor and partial-page diagnostics. `am robot search` marks the live
 route with `served_by: "server"`. If it switches to a private snapshot, start
 from page one. The corpus can change between reads on either route.
 
+Current builds bind new cursors to the project, mailbox path, and read route.
+MCP reports `INVALID_ARGUMENT` with `data.field` set to `cursor` for malformed
+or foreign cursors. Start a new search after upgrading if you have a cursor
+from an older build. Robot can still continue a search against an older live
+server with the cursor that server returned.
+
 In v0.3.41, robot search rejects malformed cursors before opening a mailbox.
 MCP can treat malformed cursors as absent and can accept a cursor from a
 different project while only returning rows from the requested project. Start

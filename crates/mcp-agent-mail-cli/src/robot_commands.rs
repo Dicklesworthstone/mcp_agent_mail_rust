@@ -8164,19 +8164,25 @@ fn search_hit_age(now_us: i64, created_ts: i64) -> String {
     })
 }
 
+fn invalid_robot_search_cursor() -> CliError {
+    CliError::InvalidArgument(
+        "invalid search cursor. Use next_cursor from the same project, query, and read route."
+            .to_string(),
+    )
+}
+
 fn validate_robot_search_window(limit: usize, cursor: Option<&str>) -> Result<(), CliError> {
+    use mcp_agent_mail_db::search_planner::{MessageSearchCursorScope, SearchCursor};
     if !(1..=1000).contains(&limit) {
         return Err(CliError::InvalidArgument(
             "search --limit must be between 1 and 1000".to_string(),
         ));
     }
     if let Some(cursor) = cursor
-        && (cursor.len() > 128
-            || mcp_agent_mail_db::search_planner::SearchCursor::decode(cursor).is_none())
+        && !MessageSearchCursorScope::accepts_syntax(cursor)
+        && SearchCursor::decode(cursor).is_none()
     {
-        return Err(CliError::InvalidArgument(
-            "invalid search cursor; use next_cursor from the same query and filters".to_string(),
-        ));
+        return Err(invalid_robot_search_cursor());
     }
     Ok(())
 }
@@ -8193,6 +8199,7 @@ fn search_via_server(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<Option<(crate::context::ResolvedProject, SearchData)>, CliError> {
+    use mcp_agent_mail_db::search_planner::MessageSearchCursorScope;
     validate_robot_search_window(limit, cursor)?;
     let recipient_kind = parse_search_recipient_kind(recipient_kind)?;
     if !selection.permits_automatic_read(config) {
@@ -8225,6 +8232,14 @@ fn search_via_server(
         else {
             return Ok(None);
         };
+        if cursor.is_some_and(MessageSearchCursorScope::accepts_syntax)
+            && !session.supports_search_cursor_scope()
+        {
+            return Err(CliError::InvalidArgument(
+                "the running server cannot resume this search cursor. Start again without --cursor."
+                    .to_string(),
+            ));
+        }
         if !selection.supported_by(&session)
             || (recipient_kind.is_some() && !session.supports_search_recipient_kind())
         {
@@ -16799,7 +16814,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             limit,
             cursor,
         } => 'search: {
+            use mcp_agent_mail_db::search_planner::MessageSearchCursorScope;
             validate_robot_search_window(limit, cursor.as_deref())?;
+            if query.trim().is_empty() && cursor.is_some() {
+                return Err(invalid_robot_search_cursor());
+            }
             let config = mcp_agent_mail_core::Config::from_env();
             // br-kp1in.18: a running server answers from its live pool and
             // index in milliseconds; the private snapshot below costs seconds
@@ -16807,6 +16826,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // negotiated before dispatch so older daemons cannot silently
             // ignore it. Implicit CWD keeps nearest-ancestor project selection.
             if !query.trim().is_empty()
+                && !cursor
+                    .as_deref()
+                    .is_some_and(MessageSearchCursorScope::is_snapshot_token)
                 && let Some((project, data)) = search_via_server(
                     &config,
                     &automatic_robot_project_selection(args.project.as_deref())?,
@@ -16836,6 +16858,18 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             })?;
             let (project_id, project_slug) =
                 resolve_project(read_db.conn(), args.project.as_deref())?;
+            let cursor_scope =
+                MessageSearchCursorScope::snapshot(project_id, read_db._source.reported_path());
+            // Unscoped tokens may be sent to an older live server. The local
+            // snapshot cannot continue a page from that server or another source.
+            let cursor = cursor
+                .as_deref()
+                .map(|token| {
+                    cursor_scope
+                        .position(token)
+                        .ok_or_else(invalid_robot_search_cursor)
+                })
+                .transpose()?;
             // The search stack is typed to the runtime engine; a family served
             // by canonical SQLite (no namespace pair) is reported, not guessed.
             let search_conn = read_db.conn().as_franken().ok_or_else(|| {
@@ -16865,7 +16899,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 live_refresh_error =
                     mcp_agent_mail_db::search_service::refresh_live_lexical_index(&live_pool).err();
             }
-            let data = build_search(
+            let mut data = build_search(
                 search_conn,
                 read_db.pool(),
                 project_id,
@@ -16874,8 +16908,12 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 importance.as_deref(),
                 since.as_deref(),
                 limit,
-                cursor.as_deref(),
+                cursor,
             )?;
+            data.next_cursor = data
+                .next_cursor
+                .as_deref()
+                .map(|position| cursor_scope.bind(position));
             let search_index = data.search_index.clone();
             let mut env = RobotEnvelope::new(cmd_name, format, data);
             env._meta.project = Some(project_slug);
@@ -24455,6 +24493,67 @@ mod tests {
                 assert!(result.is_err(), "{fault} authority must fail closed");
             }
             assert_eq!(requests.len(), if fault == "changed" { 5 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn robot_search_cursor_negotiates_scope_across_server_versions() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+        use mcp_agent_mail_db::search_planner::{MessageSearchCursorScope, SearchCursor};
+
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
+        let raw = SearchCursor { score: 1.5, id: 7 }.encode();
+        let scoped = MessageSearchCursorScope::live(7, Path::new("mailbox.sqlite3")).bind(&raw);
+        for (cursor, capability_before, capability_after, dispatch, succeeds) in [
+            (raw.as_str(), false, false, true, true),
+            (scoped.as_str(), false, false, false, false),
+            (scoped.as_str(), true, true, true, true),
+            (scoped.as_str(), true, false, true, false),
+        ] {
+            let (result, requests) = with_test_server(
+                |config| {
+                    let mailbox = |scope| {
+                        let mut payload = mailbox_payload(config);
+                        if scope {
+                            payload["search_cursor_scope"] =
+                                MessageSearchCursorScope::CAPABILITY.into();
+                        }
+                        TestReply::Resource(payload)
+                    };
+                    let mut replies = vec![mailbox(capability_before)];
+                    if dispatch {
+                        replies.extend([
+                            TestReply::Resource(project.clone()),
+                            TestReply::Tool(serde_json::json!({"result":[]})),
+                            TestReply::Resource(project.clone()),
+                            mailbox(capability_after),
+                        ]);
+                    }
+                    replies
+                },
+                |config| {
+                    search_via_server(
+                        config,
+                        &crate::message_read::ProjectSelection::Exact("registered-project".into()),
+                        "needle",
+                        None,
+                        None,
+                        None,
+                        2,
+                        Some(cursor),
+                    )
+                },
+            );
+            assert_eq!(requests.len(), if dispatch { 5 } else { 1 });
+            if dispatch {
+                assert_eq!(requests[2]["params"]["arguments"]["cursor"], cursor);
+            }
+            if succeeds {
+                assert!(result.unwrap().is_some());
+            } else {
+                assert!(result.is_err());
+            }
         }
     }
 

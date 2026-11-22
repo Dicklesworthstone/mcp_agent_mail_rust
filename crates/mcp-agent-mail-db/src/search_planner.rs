@@ -13,6 +13,8 @@
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::query_assistance::QueryAssistance;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::Path;
 
 // ────────────────────────────────────────────────────────────────────
 // Facets & Filters
@@ -456,6 +458,9 @@ impl SearchCursor {
     /// Decode from an opaque string token.
     #[must_use]
     pub fn decode(token: &str) -> Option<Self> {
+        if token.len() > 128 {
+            return None;
+        }
         let (score_part, id_part) = token.split_once(":i")?;
         let hex = score_part.strip_prefix('s')?;
         let bits = u64::from_str_radix(hex, 16).ok()?;
@@ -467,6 +472,81 @@ impl SearchCursor {
         }
         let id = id_part.parse::<i64>().ok()?;
         Some(Self { score, id })
+    }
+}
+
+/// Binds a public message-search cursor to a project and mailbox read route.
+///
+/// The tag prevents accidental replay in another scope. Result authorization
+/// still comes from the resolved project and the search query.
+pub struct MessageSearchCursorScope {
+    route: &'static str,
+    tag: String,
+}
+
+impl MessageSearchCursorScope {
+    /// Capability announced by servers that validate scoped continuations.
+    pub const CAPABILITY: &'static str = "scoped_v1";
+
+    const LIVE: &'static str = "ml1";
+    const SNAPSHOT: &'static str = "ms1";
+
+    #[must_use]
+    pub fn live(project_id: i64, database_path: &Path) -> Self {
+        Self::new(Self::LIVE, project_id, database_path)
+    }
+
+    #[must_use]
+    pub fn snapshot(project_id: i64, database_path: &Path) -> Self {
+        Self::new(Self::SNAPSHOT, project_id, database_path)
+    }
+
+    fn new(route: &'static str, project_id: i64, database_path: &Path) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(route.as_bytes());
+        hash.update(project_id.to_be_bytes());
+        hash.update(database_path.as_os_str().as_encoded_bytes());
+        Self {
+            route,
+            tag: hex::encode(hash.finalize()),
+        }
+    }
+
+    #[must_use]
+    pub fn bind(&self, position: &str) -> String {
+        format!("{}:{}:{position}", self.route, self.tag)
+    }
+
+    #[must_use]
+    pub fn accepts_syntax(token: &str) -> bool {
+        Self::parts(token).is_some()
+    }
+
+    #[must_use]
+    pub fn is_snapshot_token(token: &str) -> bool {
+        Self::parts(token).is_some_and(|(route, _, _)| route == Self::SNAPSHOT)
+    }
+
+    #[must_use]
+    pub fn position<'a>(&self, token: &'a str) -> Option<&'a str> {
+        let (route, tag, position) = Self::parts(token)?;
+        (route == self.route && tag == self.tag).then_some(position)
+    }
+
+    fn parts(token: &str) -> Option<(&str, &str, &str)> {
+        if token.len() > 128 {
+            return None;
+        }
+        let (route, rest) = token.split_once(':')?;
+        let (tag, position) = rest.split_once(':')?;
+        if matches!(route, Self::LIVE | Self::SNAPSHOT)
+            && tag.len() == 64
+            && tag.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            SearchCursor::decode(position).map(|_| (route, tag, position))
+        } else {
+            None
+        }
     }
 }
 
@@ -935,7 +1015,7 @@ fn visit_like_conditions(
 #[must_use]
 pub fn plan_search(query: &SearchQuery) -> SearchPlan {
     let mut plan = match query.doc_kind {
-        DocKind::Message | DocKind::Thread => plan_message_search(query),
+        DocKind::Message | DocKind::Thread => plan_message_search(query, None),
         DocKind::Agent => plan_agent_search(query),
         DocKind::Project => plan_project_search(query),
     };
@@ -989,10 +1069,21 @@ const fn empty_plan_sql(kind: DocKind) -> &'static str {
     }
 }
 
+pub(crate) fn plan_legacy_message_search(query: &SearchQuery) -> crate::DbResult<SearchPlan> {
+    match crate::queries::message_candidate_predicate(&query.text)? {
+        Some(predicate) => Ok(plan_message_search(query, Some(predicate))),
+        None => Ok(SearchPlan::empty(scope_policy_label(&query.scope))),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-fn plan_message_search(query: &SearchQuery) -> SearchPlan {
+fn plan_message_search(
+    query: &SearchQuery,
+    legacy_predicate: Option<(String, Vec<String>)>,
+) -> SearchPlan {
     let limit = query.effective_limit();
     let mut facets_applied = Vec::new();
+    let legacy_keywords = legacy_predicate.is_some();
 
     // Determine method — LIKE-based SQL only (Tantivy handles relevance search).
     let method = if !query.text.is_empty() {
@@ -1030,22 +1121,27 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     // The planner now only generates LIKE-based SQL for fallback.
     let (select_cols, mut from_clause, order_clause) = match method {
         PlanMethod::Like => {
-            let default_columns = match query.text_fields {
-                TextFieldScope::SubjectAndBody => SUBJECT_AND_BODY_COLUMNS,
-                TextFieldScope::Subject => SUBJECT_COLUMN,
-                TextFieldScope::Body => BODY_COLUMN,
-            };
-            let mut like_parts = Vec::new();
-            for condition in like_conditions(&query.text, default_columns, 5) {
-                let any_column = condition.sql(|value| params.push(PlanParam::Text(value)));
-                like_parts.push(if condition.negated {
-                    format!("NOT {any_column}")
-                } else {
-                    any_column
-                });
-            }
-            if !like_parts.is_empty() {
-                where_clauses.push(like_parts.join(" AND "));
+            if let Some((predicate, values)) = legacy_predicate {
+                where_clauses.push(predicate);
+                params.extend(values.into_iter().map(PlanParam::Text));
+            } else {
+                let default_columns = match query.text_fields {
+                    TextFieldScope::SubjectAndBody => SUBJECT_AND_BODY_COLUMNS,
+                    TextFieldScope::Subject => SUBJECT_COLUMN,
+                    TextFieldScope::Body => BODY_COLUMN,
+                };
+                let mut like_parts = Vec::new();
+                for condition in like_conditions(&query.text, default_columns, 5) {
+                    let any_column = condition.sql(|value| params.push(PlanParam::Text(value)));
+                    like_parts.push(if condition.negated {
+                        format!("NOT {any_column}")
+                    } else {
+                        any_column
+                    });
+                }
+                if !like_parts.is_empty() {
+                    where_clauses.push(like_parts.join(" AND "));
+                }
             }
 
             (
@@ -1101,7 +1197,14 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     // ── Facet filters ──────────────────────────────────────────────
     if !query.importance.is_empty() {
         let placeholders: Vec<&str> = query.importance.iter().map(|_| "?").collect();
-        where_clauses.push(format!("m.importance IN ({})", placeholders.join(", ")));
+        // Legacy candidate hydration has always matched stored values
+        // case-insensitively. Keep that behavior when filtering before LIMIT.
+        let field = if legacy_keywords {
+            "m.importance COLLATE NOCASE"
+        } else {
+            "m.importance"
+        };
+        where_clauses.push(format!("{field} IN ({})", placeholders.join(", ")));
         for imp in &query.importance {
             params.push(PlanParam::Text(imp.as_str().to_string()));
         }
@@ -1605,6 +1708,48 @@ mod tests {
         assert!(SearchCursor::decode("s:i").is_none());
         assert!(SearchCursor::decode("snotahex:i1").is_none());
         assert!(SearchCursor::decode("s0000000000000000:inotanumber").is_none());
+    }
+
+    #[test]
+    fn message_page_cursor_binds_project_mailbox_and_read_route() {
+        let db = Path::new("storage.sqlite3");
+        let scope = MessageSearchCursorScope::live(7, db);
+        let position = SearchCursor {
+            score: -2.5,
+            id: 42,
+        }
+        .encode();
+        let token = scope.bind(&position);
+        assert!(MessageSearchCursorScope::accepts_syntax(&token));
+        assert_eq!(scope.position(&token), Some(position.as_str()));
+        assert!(scope.position(&position).is_none());
+        assert!(
+            MessageSearchCursorScope::live(8, db)
+                .position(&token)
+                .is_none()
+        );
+        assert!(
+            MessageSearchCursorScope::live(7, Path::new("other.sqlite3"))
+                .position(&token)
+                .is_none()
+        );
+        let snapshot = MessageSearchCursorScope::snapshot(7, db);
+        assert!(snapshot.position(&token).is_none());
+        assert!(!MessageSearchCursorScope::is_snapshot_token(&token));
+        let snapshot_token = snapshot.bind(&position);
+        assert!(MessageSearchCursorScope::is_snapshot_token(&snapshot_token));
+        assert_eq!(snapshot.position(&snapshot_token), Some(position.as_str()));
+        assert!(scope.position(&snapshot_token).is_none());
+        assert!(
+            scope
+                .position(&scope.bind("s7ff0000000000000:i42"))
+                .is_none()
+        );
+        assert!(
+            scope
+                .position(&scope.bind(&format!("s0:i{}42", "0".repeat(60))))
+                .is_none()
+        );
     }
 
     // ── DocKind ────────────────────────────────────────────────────
