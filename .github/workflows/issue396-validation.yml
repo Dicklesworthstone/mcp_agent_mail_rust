@@ -65,7 +65,7 @@ jobs:
       - name: Check workspace lints
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Exercise real MCP registration and stored credential transitions
-        run: cargo test --locked -p mcp-agent-mail-tools --test it transcript_safe_identity:: -- --test-threads=1
+        run: 'cargo test --locked -p mcp-agent-mail-tools --test it transcript_safe_identity:: -- --test-threads=1'
       - name: Exercise revoked sender proof in every profile
         run: cargo test --locked -p mcp-agent-mail-tools --lib supplied_sender_token_is_rejected_after_revocation_in_every_profile -- --test-threads=1
       - name: Exercise CLI output and private credential persistence
@@ -75,9 +75,9 @@ jobs:
       - name: Exercise the real CLI registration and token lifecycle
         run: cargo test --locked -p mcp-agent-mail-cli --test it security_privacy_harness::cli_registration_token_lifecycle_is_private_and_authenticated -- --exact --test-threads=1
       - name: Check retained MCP schemas and descriptions
-        run: cargo test --locked -p mcp-agent-mail-conformance --test it tool_description_parity:: -- --test-threads=1
+        run: 'cargo test --locked -p mcp-agent-mail-conformance --test it tool_description_parity:: -- --test-threads=1'
       - name: Exercise captured compatibility behavior
-        run: cargo test --locked -p mcp-agent-mail-conformance --test it conformance:: -- --test-threads=1
+        run: 'cargo test --locked -p mcp-agent-mail-conformance --test it conformance:: -- --test-threads=1'
       - name: Verify validation preserved the recorded source
         shell: bash
         run: |
