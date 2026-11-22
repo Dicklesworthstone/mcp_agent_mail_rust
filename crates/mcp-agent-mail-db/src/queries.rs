@@ -25044,34 +25044,32 @@ mod tests {
         // The second transaction must observe the first winner's replacement.
         let start = std::sync::Arc::new(std::sync::Barrier::new(3));
         let winners: Vec<_> = std::thread::scope(|scope| {
-            let workers: Vec<_> = ["replacement-one", "replacement-two"]
-                .into_iter()
-                .map(|token| {
-                    let pool = pool.clone();
-                    let start = start.clone();
-                    scope.spawn(move || {
-                        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-                            .build()
-                            .unwrap();
-                        start.wait();
-                        runtime.block_on(async {
-                            compare_and_swap_agent_registration_token(
-                                &Cx::for_testing(),
-                                &pool,
-                                project_id,
-                                agent_id,
-                                "BlueLake",
-                                "original-token",
-                                Some(token),
-                            )
-                            .await
-                            .into_result()
-                            .unwrap()
-                            .map(|_| token)
-                        })
+            // Start both workers before the caller joins the barrier.
+            let workers = ["replacement-one", "replacement-two"].map(|token| {
+                let pool = pool.clone();
+                let start = start.clone();
+                scope.spawn(move || {
+                    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                        .build()
+                        .unwrap();
+                    start.wait();
+                    runtime.block_on(async {
+                        compare_and_swap_agent_registration_token(
+                            &Cx::for_testing(),
+                            &pool,
+                            project_id,
+                            agent_id,
+                            "BlueLake",
+                            "original-token",
+                            Some(token),
+                        )
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .map(|_| token)
                     })
                 })
-                .collect();
+            });
             start.wait();
             workers
                 .into_iter()
