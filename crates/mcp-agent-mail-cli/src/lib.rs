@@ -97679,7 +97679,9 @@ struct DoctorSalvageArtifact {
     db_path: PathBuf,
     reported_path: PathBuf,
     detail: String,
-    _snapshot_source: Option<CanonicalSnapshotSource>,
+    // Boxed: the leased snapshot guard is large, and it would otherwise make
+    // `DoctorSalvageAttempt::Succeeded` several times the other variants.
+    _snapshot_source: Option<Box<CanonicalSnapshotSource>>,
 }
 
 #[derive(Debug)]
@@ -97946,7 +97948,7 @@ fn attempt_readable_sqlite_salvage_source(
         db_path: readable_path.to_path_buf(),
         reported_path: sqlite_path.to_path_buf(),
         detail,
-        _snapshot_source: snapshot_source,
+        _snapshot_source: snapshot_source.map(Box::new),
     })
 }
 
