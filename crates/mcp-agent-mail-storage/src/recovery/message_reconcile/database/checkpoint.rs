@@ -1367,6 +1367,12 @@ mod tests {
         // read-back. The fourth failure occurs after the authorized seed.
         for failing_operation in 1..=4 {
             super::super::tests::retention_fixture(1, |cx, pool, config| {
+                // GH#404 initializes a generation when the pool starts. This
+                // test needs the legacy empty relation to reach the seed and
+                // winner-read boundaries, including their SQL/panic failures.
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                conn.execute_raw("DELETE FROM db_identity").unwrap();
+                drop(conn);
                 let before = super::super::admission_tests::database_evidence(cx, pool);
                 let path = checkpoint_path(
                     &std::fs::canonicalize(pool.sqlite_path()).unwrap(),
@@ -1520,6 +1526,11 @@ mod tests {
     #[test]
     fn valid_query_only_refusal_keeps_the_generation_reader() {
         super::super::tests::retention_fixture(1, |cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            // Keep the original unseeded refusal contract after startup began
+            // publishing a durable recovery-state generation.
+            conn.execute_raw("DELETE FROM db_identity").unwrap();
+            drop(conn);
             let before = super::super::admission_tests::database_evidence(cx, pool);
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
             conn.execute_raw("PRAGMA query_only = ON").unwrap();
@@ -4283,8 +4294,17 @@ mod tests {
     fn fresh_mailbox_checkpoints_without_requiring_a_reservation_first() {
         super::super::tests::retention_fixture(1, |cx, pool, config| {
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let identities = conn
+                .query_sync("SELECT generation_id FROM db_identity", &[])
+                .unwrap();
+            assert_eq!(
+                identities.len(),
+                1,
+                "pool initialization seeds recovery identity"
+            );
+            let initial_generation = identities[0].get_named::<String>("generation_id").unwrap();
             assert!(
-                conn.query_sync("SELECT generation_id FROM db_identity", &[])
+                conn.query_sync("SELECT id FROM file_reservations", &[])
                     .unwrap()
                     .is_empty()
             );
@@ -4303,6 +4323,7 @@ mod tests {
             assert_eq!(report.checkpoint_saved, Some(true));
             assert_message_committed(cx, pool, config, 901, 1);
             let first = Binding::capture(cx, pool, config).unwrap();
+            assert_eq!(first.database_generation, initial_generation);
             assert!(first.path().unwrap().is_file());
             assert!(!first.database_generation.is_empty());
             assert!(
@@ -4344,6 +4365,9 @@ mod tests {
             let archive = std::fs::canonicalize(&config.storage_root).unwrap();
             let path = checkpoint_path(&database, &archive).unwrap();
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            // A fresh pool is seeded; this refusal specifically protects
+            // unseeded legacy databases opened query-only.
+            conn.execute_raw("DELETE FROM db_identity").unwrap();
             assert!(
                 conn.query_sync("SELECT generation_id FROM db_identity", &[])
                     .unwrap()
@@ -4376,6 +4400,9 @@ mod tests {
     #[test]
     fn critical_disk_pressure_leaves_an_unseeded_identity_untouched() {
         super::super::tests::retention_fixture(0, |cx, pool, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("DELETE FROM db_identity").unwrap();
+            drop(conn);
             let pressure = &mcp_agent_mail_core::global_metrics()
                 .system
                 .disk_pressure_level;

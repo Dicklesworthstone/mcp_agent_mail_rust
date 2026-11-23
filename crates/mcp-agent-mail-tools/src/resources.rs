@@ -2263,6 +2263,25 @@ fn is_build_slot_coordination_lock(path: &std::path::Path, root: &std::path::Pat
     )
 }
 
+/// Recovery publishers retain these flock files after unlocking. They have no
+/// archive-owner sidecar, so their presence is not missing lock metadata.
+/// Restrict the exception to the two root-level recovery mutex paths; project
+/// locks with the same names and other recovery-directory locks stay visible.
+fn is_recovery_state_coordination_lock(path: &Path, root: &Path) -> bool {
+    use std::path::Component::Normal;
+
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut parts = relative.components();
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(Normal(directory)), Some(Normal(file)), None)
+            if directory == mcp_agent_mail_db::recovery_state::DIRECTORY
+                && (file == ".state.lock" || file == "delivery-cursor.lock")
+    )
+}
+
 /// Get active archive locks.
 #[resource(
     uri = "resource://tooling/locks",
@@ -2287,10 +2306,10 @@ pub fn tooling_locks(_ctx: &McpContext) -> McpResult<String> {
             !archive_root
                 .zip(lock.get("path").and_then(serde_json::Value::as_str))
                 .is_some_and(|(root, path)| {
-                    is_build_slot_coordination_lock(
-                        std::path::Path::new(path),
-                        std::path::Path::new(root),
-                    )
+                    let path = Path::new(path);
+                    let root = Path::new(root);
+                    is_build_slot_coordination_lock(path, root)
+                        || is_recovery_state_coordination_lock(path, root)
                 })
         })
         .collect();
@@ -10575,6 +10594,98 @@ mod resource_shape_tests {
         assert!(legacy.latency.is_none());
 
         crate::metrics::reset_tool_metrics();
+    }
+
+    #[test]
+    fn tooling_locks_excludes_recovery_mutexes_but_retains_project_locks() {
+        with_serialized_resources(|| {
+            let config = Config::get();
+            let root = &config.storage_root;
+            mcp_agent_mail_storage::ensure_archive(&config, "backend").expect("archive");
+
+            // GH#406: create both persistent mutexes through their real
+            // publishers, using the canonical schema rather than lock stubs.
+            let conn = mcp_agent_mail_db::CanonicalDbConn::open_memory().expect("database");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("schema");
+            mcp_agent_mail_db::recovery_state::ensure_checkpoint(&conn, root)
+                .expect("recovery checkpoint");
+            mcp_agent_mail_db::reconstruct_state::record_issued_cursor(root, 42)
+                .expect("delivery cursor");
+
+            let raw = mcp_agent_mail_storage::collect_lock_status(&config).expect("raw locks");
+            let raw_locks = raw["locks"].as_array().expect("raw lock array");
+            for relative in [
+                "recovery-state/.state.lock",
+                "recovery-state/delivery-cursor.lock",
+            ] {
+                let path = root.join(relative);
+                let lock = raw_locks
+                    .iter()
+                    .find(|lock| lock["path"].as_str().is_some_and(|p| Path::new(p) == path))
+                    .expect("publisher retains its coordination inode after unlocking");
+                assert!(lock.get("owner").is_none(), "{relative}: {lock}");
+            }
+
+            let ctx = McpContext::new(Cx::for_testing(), 1);
+            let initial: LocksResponse =
+                serde_json::from_str(&tooling_locks(&ctx).expect("idle lock inventory"))
+                    .expect("idle response");
+            assert!(initial.locks.is_empty());
+            assert_eq!(initial.summary.total, 0);
+            assert_eq!(initial.summary.metadata_missing, 0);
+
+            // Identical basenames under projects are ordinary archive locks.
+            // Keep their actual flock handles and owner sidecars live while
+            // querying, including a project literally named recovery-state.
+            let mut held = Vec::new();
+            for relative in [
+                "projects/state-project/.state.lock",
+                "projects/recovery-state/delivery-cursor.lock",
+            ] {
+                let mut lock = mcp_agent_mail_storage::FileLock::new(root.join(relative));
+                lock.acquire().expect("acquire ordinary project lock");
+                held.push(lock);
+            }
+            let missing_owner = [
+                "projects/no-owner/.state.lock",
+                "recovery-state/operator.lock",
+                "recovery-state/nested/delivery-cursor.lock",
+                ".state.lock",
+            ];
+            for relative in missing_owner {
+                let path = root.join(relative);
+                std::fs::create_dir_all(path.parent().expect("lock parent")).expect("parent");
+                std::fs::write(path, b"unrecognized lock").expect("lock without metadata");
+            }
+
+            let response: LocksResponse =
+                serde_json::from_str(&tooling_locks(&ctx).expect("mixed lock inventory"))
+                    .expect("mixed response");
+            assert_eq!(response.summary.total, 2);
+            assert_eq!(response.summary.active, 2);
+            assert_eq!(response.summary.stale, 0);
+            assert_eq!(
+                response.summary.metadata_missing,
+                missing_owner.len() as u64
+            );
+            assert_eq!(
+                response
+                    .locks
+                    .iter()
+                    .map(|lock| lock.project_slug.as_str())
+                    .collect::<Vec<_>>(),
+                ["recovery-state", "state-project"]
+            );
+            let holder = format!("pid:{}", std::process::id());
+            assert!(
+                response
+                    .locks
+                    .iter()
+                    .all(|lock| { lock.holder == holder && !lock.acquired_ts.is_empty() })
+            );
+            drop(held);
+        });
     }
 
     #[test]

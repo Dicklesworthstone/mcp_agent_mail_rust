@@ -324,8 +324,21 @@ fn validate_agents_md(doc: &str, counts: LiveCounts) -> Result<(), String> {
                 source_of_truth: "mcp_agent_mail_server::build_server(...).into_router() resource/template inventory",
             },
             ClaimPattern {
+                label: "AGENTS conformance category native tool count",
+                regex: compile(
+                    r"38 tools\) plus (?P<count>\d+) Rust-native tools and \d+ resources",
+                ),
+                expected: counts
+                    .tools
+                    .checked_sub(38)
+                    .expect("Python compatibility inventory"),
+                source_of_truth: "mcp_agent_mail_tools::TOOL_CLUSTER_MAP minus the 38 supported Python compatibility tools",
+            },
+            ClaimPattern {
                 label: "AGENTS conformance category resource count",
-                regex: compile(r"38 tools\) plus 7 Rust-native tools and (?P<count>\d+) resources"),
+                regex: compile(
+                    r"38 tools\) plus \d+ Rust-native tools and (?P<count>\d+) resources",
+                ),
                 expected: counts.resources,
                 source_of_truth: "mcp_agent_mail_server::build_server(...).into_router() resource/template inventory",
             },
@@ -378,6 +391,28 @@ fn agents_md_counts_match_live_inventory() {
     let agents = read_file(workspace_root().join(AGENTS_RELATIVE));
     if let Err(err) = validate_agents_md(&agents, counts) {
         panic!("{err}");
+    }
+}
+
+#[test]
+fn intentionally_mutated_agents_conformance_counts_are_rejected() {
+    let counts = live_counts();
+    let agents = read_file(workspace_root().join(AGENTS_RELATIVE));
+    let phrase = compile(r"38 tools\) plus \d+ Rust-native tools and \d+ resources");
+    let native_tools = counts
+        .tools
+        .checked_sub(38)
+        .expect("Python compatibility inventory");
+    for (native, resources, claim) in [
+        (native_tools + 1, counts.resources, "native tool count"),
+        (native_tools, counts.resources + 1, "resource count"),
+    ] {
+        let replacement =
+            format!("38 tools) plus {native} Rust-native tools and {resources} resources");
+        let mutated = phrase.replace(&agents, replacement).to_string();
+        assert_ne!(mutated, agents, "conformance paragraph must be mutated");
+        let error = validate_agents_md(&mutated, counts).expect_err("stale inventory must fail");
+        assert!(error.contains(claim), "wrong conformance claim: {error}");
     }
 }
 

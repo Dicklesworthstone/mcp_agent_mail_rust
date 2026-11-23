@@ -9951,6 +9951,11 @@ mod tests {
                         database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
                             &root.join("live.sqlite3"),
                         ),
+                        // This is an independent source mailbox, not another
+                        // database generation of the configured outage mailbox.
+                        // Recovery-state authority must never be shared by the
+                        // two unrelated databases (GH#404, GH#406).
+                        storage_root: Some(root.join("live-archive")),
                         ..DbPoolConfig::default()
                     })
                     .expect("independent live mailbox");
@@ -9978,6 +9983,7 @@ mod tests {
                         crate::test_support::prepare_mailbox_before_outage(&cx).await;
                         let outage_pool = get_db_pool().expect("healthy configured mailbox");
                         assert_ne!(outage_pool.sqlite_path(), pool.sqlite_path());
+                        assert_ne!(outage_pool.storage_root(), pool.storage_root());
                         let outage_engine = outage_pool.engine_identity_key();
                         assert_eq!(
                             mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
@@ -10310,6 +10316,9 @@ mod tests {
                 std::fs::create_dir_all(&storage_root).expect("private outage archive root");
                 let cfg = DbPoolConfig {
                     database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&live_database),
+                    // Keep the replay source's recovery journal independent of
+                    // the configured mailbox whose only slot is occupied.
+                    storage_root: Some(fixture_root.join("live-archive")),
                     ..DbPoolConfig::default()
                 };
                 let pool = DbPool::new(&cfg).expect("independent live mailbox pool");
@@ -10375,6 +10384,7 @@ mod tests {
                         unavailable_database
                     );
                     assert_ne!(unavailable_pool.sqlite_path(), pool.sqlite_path());
+                    assert_ne!(unavailable_pool.storage_root(), pool.storage_root());
                     let outage_engine = unavailable_pool.engine_identity_key();
                     assert_eq!(
                         mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())

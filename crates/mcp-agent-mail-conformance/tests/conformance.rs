@@ -1000,6 +1000,8 @@ fn handwritten_tool_happy_case_tools() -> BTreeSet<&'static str> {
         "fetch_topic",
         "force_release_file_reservation",
         "retire_agent",
+        "revoke_agent_token",
+        "rotate_agent_token",
         "unretire_agent",
     ])
 }
@@ -3129,6 +3131,148 @@ fn lifecycle_tools_preserve_authorization_roster_and_permanent_deregistration_co
 }
 
 #[test]
+fn credential_tools_rotate_and_revoke_through_the_router_without_exposing_secrets() {
+    let _lock = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let env = setup_fixture_env();
+    let project_path = env.tmp.path().join("credential-project");
+    std::fs::create_dir_all(&project_path).expect("create credential fixture project");
+    let project_key = project_path.to_string_lossy().into_owned();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id = 15_000;
+    let invoke = |tool: &str, input: Value, req_id: &mut u64| {
+        execute_tool(
+            &env.router,
+            &cx,
+            &budget,
+            req_id,
+            tool,
+            args_from_value(&input),
+        )
+        .unwrap_or_else(|error| panic!("{tool} router failure: {error}"))
+    };
+    invoke(
+        "ensure_project",
+        serde_json::json!({ "human_key": &project_key }),
+        &mut req_id,
+    )
+    .expect("create credential project");
+
+    for (agent_name, return_token) in [("SilverLake", true), ("GreenStone", false)] {
+        let registered = invoke(
+            "register_agent",
+            serde_json::json!({
+                "project_key": &project_key,
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "name": agent_name,
+                "task_description": "credential conformance",
+                "return_registration_token": true
+            }),
+            &mut req_id,
+        )
+        .expect("register credential owner");
+        let original_token = registered["registration_token"]
+            .as_str()
+            .expect("registration returns requested credential");
+        let lookup = serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": agent_name,
+            "include_recent_commits": false
+        });
+        let before = invoke("whois", lookup.clone(), &mut req_id).expect("public identity");
+        assert!(before.get("registration_token").is_none());
+
+        let mut rotate = serde_json::json!({
+            "project_key": &project_key,
+            "agent_name": agent_name,
+            "registration_token": original_token
+        });
+        if return_token {
+            rotate["return_registration_token"] = serde_json::json!(true);
+        }
+        let rotated = invoke("rotate_agent_token", rotate, &mut req_id)
+            .expect("current credential authorizes rotation");
+        assert_eq!(rotated["agent_id"], registered["id"]);
+        assert_eq!(rotated["project_id"], registered["project_id"]);
+        assert_eq!(rotated["name"], agent_name);
+        assert_eq!(rotated["token_status"], "rotated");
+        assert_eq!(rotated["registration_token_returned"], return_token);
+        for tool in ["rotate_agent_token", "revoke_agent_token"] {
+            let failure = invoke(
+                tool,
+                serde_json::json!({
+                    "project_key": &project_key,
+                    "agent_name": agent_name,
+                    "registration_token": original_token
+                }),
+                &mut req_id,
+            )
+            .expect_err("a rotated credential must not authorize another change");
+            assert!(failure.contains("AUTHENTICATION_REQUIRED"), "{failure}");
+            assert!(
+                !failure.contains(original_token),
+                "errors must not echo credentials"
+            );
+        }
+
+        if return_token {
+            let replacement = rotated["registration_token"]
+                .as_str()
+                .expect("explicit opt-in returns replacement");
+            assert!(!replacement.is_empty());
+            assert_ne!(replacement, original_token);
+            let revoked = invoke(
+                "revoke_agent_token",
+                serde_json::json!({
+                    "project_key": &project_key,
+                    "agent_name": agent_name,
+                    "registration_token": replacement
+                }),
+                &mut req_id,
+            )
+            .expect("replacement credential authorizes revocation");
+            assert_eq!(revoked["agent_id"], registered["id"]);
+            assert_eq!(revoked["project_id"], registered["project_id"]);
+            assert_eq!(revoked["name"], agent_name);
+            assert_eq!(revoked["token_status"], "revoked");
+            assert_eq!(revoked["registration_token_returned"], false);
+            assert!(revoked.get("registration_token").is_none());
+            for tool in ["rotate_agent_token", "revoke_agent_token"] {
+                let failure = invoke(
+                    tool,
+                    serde_json::json!({
+                        "project_key": &project_key,
+                        "agent_name": agent_name,
+                        "registration_token": replacement
+                    }),
+                    &mut req_id,
+                )
+                .expect_err("a revoked credential must not authorize another change");
+                assert!(failure.contains("AUTHENTICATION_REQUIRED"), "{failure}");
+                assert!(
+                    !failure.contains(replacement),
+                    "errors must not echo credentials"
+                );
+            }
+        } else {
+            assert!(
+                rotated.get("registration_token").is_none(),
+                "rotation must omit the replacement credential by default"
+            );
+        }
+
+        let after = invoke("whois", lookup, &mut req_id).expect("public identity survives");
+        assert_eq!(
+            after, before,
+            "credential changes must preserve public identity"
+        );
+    }
+}
+
+#[test]
 fn topic_tools_persist_filter_and_inherit_topics_through_the_router() {
     let _lock = env_lock()
         .lock()
@@ -3891,11 +4035,34 @@ fn force_release_file_reservation_happy_path_is_covered() {
     let db_path = tmp.path().join("force-release-happy.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
     let storage = tmp.path().join("archive");
-    let project_key = tmp
-        .path()
-        .join("force-release-project")
-        .to_string_lossy()
-        .to_string();
+    // Unexpired leases require complete workspace activity evidence. A
+    // missing directory is an unknown signal, never proof of inactivity.
+    let project_path = tmp.path().join("force-release-project");
+    init_fixture_repo(&project_path);
+    let history = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Conformance",
+            "-c",
+            "user.email=conformance@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "conformance: known inactive workspace history",
+        ])
+        .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+        .current_dir(&project_path)
+        .status()
+        .expect("create physical workspace history");
+    assert!(
+        history.success(),
+        "create physical workspace history: {history}"
+    );
+    let project_key = project_path.to_string_lossy().into_owned();
     let _env_guard = EnvVarGuard::set(&[
         ("DATABASE_URL", &db_url),
         ("STORAGE_ROOT", storage.to_str().unwrap_or_default()),
@@ -3951,7 +4118,7 @@ fn force_release_file_reservation_happy_path_is_covered() {
             "project_key": project_key.as_str(),
             "agent_name": "BlueLake",
             "paths": ["nonexistent-force-release-path.rs"],
-            "ttl_seconds": 60,
+            "ttl_seconds": 3600,
             "exclusive": true,
             "reason": "conformance-force-release"
         })),
@@ -3988,6 +4155,25 @@ fn force_release_file_reservation_happy_path_is_covered() {
         "nonexistent-force-release-path.rs"
     );
     assert_eq!(released["reservation"]["notified"], false);
+    let reasons = released["reservation"]["stale_reasons"]
+        .as_array()
+        .expect("release includes the observed activity evidence");
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason == "path_pattern_unmatched")
+    );
+    for refused in [
+        "workspace_unavailable",
+        "filesystem_activity_unknown",
+        "git_activity_unknown",
+        "lease_expired",
+    ] {
+        assert!(
+            reasons.iter().all(|reason| reason != refused),
+            "the unexpired happy path requires complete inactivity evidence: {reasons:?}"
+        );
+    }
 }
 
 #[test]

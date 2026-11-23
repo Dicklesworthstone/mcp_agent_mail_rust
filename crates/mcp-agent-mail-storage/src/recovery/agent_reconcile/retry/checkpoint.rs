@@ -1856,6 +1856,9 @@ mod tests {
     fn agent_generation_initializes_once_and_restarts_without_reservations() {
         with_mailbox(|cx, pool, config, _| {
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            // GH#404 seeds fresh pools. Recreate the legacy unseeded state
+            // explicitly so this still exercises the reconciler's initializer.
+            conn.execute_raw("DELETE FROM db_identity").unwrap();
             assert!(
                 conn.query_sync("SELECT * FROM db_identity", &[])
                     .unwrap()
@@ -1922,6 +1925,9 @@ mod tests {
         for mode in 0..3 {
             with_mailbox(|cx, pool, config, scratch| {
                 let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                // Exercise the legacy initializer, not the identity already
+                // established by the pool's recovery-state checkpoint.
+                conn.execute_raw("DELETE FROM db_identity").unwrap();
                 assert!(
                     conn.query_sync("SELECT * FROM db_identity", &[])
                         .unwrap()
@@ -2034,6 +2040,9 @@ mod tests {
         for competing in [false, true] {
             with_mailbox(|cx, pool, config, _| {
                 let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                // An existing startup generation would bypass both the
+                // competing initializer and the ignored-write control.
+                conn.execute_raw("DELETE FROM db_identity").unwrap();
                 let other = if competing {
                     "INSERT OR IGNORE INTO db_identity VALUES(0,'cafefeed');"
                 } else {

@@ -1631,6 +1631,7 @@ mod tests {
                 "cc": [], "bcc": [], "subject": "shared recovery", "thread_id": null,
                 "topic": null, "created": mcp_agent_mail_db::micros_to_iso(1_000_000),
                 "project": "/test/reconcile", "project_slug": "reconcile-project",
+                "sender_project": "/test/reconcile", "sender_project_slug": "reconcile-project",
                 "importance": "normal", "ack_required": true, "attachments": [],
             });
             let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &[])

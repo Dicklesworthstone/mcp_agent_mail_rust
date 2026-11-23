@@ -888,15 +888,18 @@ pub fn resolve_existing_token(
 }
 
 fn read_configured_bearer_token_file() -> Result<Option<String>, SetupError> {
-    // Honor the same process/user-global authority as Config, never a project
-    // .env override. The setup reader also rejects non-UTF-8 process values and
-    // preserves the existing thread-local environment seam used by its tests.
-    let path = utf8_env_value_for_setup("HTTP_BEARER_TOKEN_FILE")?
-        .or_else(|| crate::config::infra_env_value("HTTP_BEARER_TOKEN_FILE"));
-    path.map(|path| {
-        crate::config::read_http_bearer_token_file(Path::new(&path)).map_err(SetupError::from)
-    })
-    .transpose()
+    // Preserve the setup tests' thread-local process-value seam. Production
+    // uses Config's parser, including its source precedence and fail-closed
+    // UTF-8/file validation, instead of reading this knob a second way.
+    #[cfg(test)]
+    if TEST_ENV_OVERRIDES.with(|cell| cell.borrow().contains_key("HTTP_BEARER_TOKEN_FILE"))
+        && let Some(path) = utf8_env_value_for_setup("HTTP_BEARER_TOKEN_FILE")?
+    {
+        return crate::config::read_http_bearer_token_file(Path::new(&path))
+            .map(Some)
+            .map_err(SetupError::from);
+    }
+    crate::config::configured_http_bearer_token_file().map_err(SetupError::from)
 }
 
 /// Read `HTTP_BEARER_TOKEN=...` from a .env file.
@@ -10251,6 +10254,53 @@ mod tests {
         assert_eq!(
             resolve_token_for_save(None, &env_path).unwrap().token(),
             "actual-service-token"
+        );
+    }
+
+    #[test]
+    fn setup_and_runtime_share_configured_token_file_authority() {
+        let tmp = setup_real_tempdir();
+        let token_path = tmp.path().join("service-token");
+        let env_path = tmp.path().join("config.env");
+        std::fs::write(&token_path, "shared-file-token\n").unwrap();
+        std::fs::write(&env_path, "HTTP_BEARER_TOKEN=stale-config-token\n").unwrap();
+        crate::config::with_process_env_overrides_for_test(
+            &[
+                ("HTTP_BEARER_TOKEN_FILE", token_path.to_str().unwrap()),
+                ("HTTP_BEARER_TOKEN", "stale-inline-token"),
+                ("STORAGE_ROOT", tmp.path().to_str().unwrap()),
+            ],
+            || {
+                let config = crate::Config::from_env();
+                assert_eq!(
+                    config.http_bearer_token.as_deref(),
+                    Some("shared-file-token")
+                );
+                assert_eq!(resolve_token(None, &env_path).unwrap(), "shared-file-token");
+                assert_eq!(
+                    resolve_existing_token(None, &env_path).unwrap(),
+                    config.http_bearer_token
+                );
+                assert_eq!(
+                    resolve_token_for_save(None, &env_path).unwrap().token(),
+                    "shared-file-token"
+                );
+
+                // Re-reading an invalid file must reject setup just as startup
+                // does, without falling back to either stale inline token.
+                std::fs::write(&token_path, "private-sentinel\nsecond-line\n").unwrap();
+                let rejected = crate::Config::from_env();
+                assert!(rejected.http_bearer_token.is_none());
+                assert!(rejected.validate_user_env_authority().is_err());
+                for error in [
+                    resolve_token(None, &env_path).err().unwrap(),
+                    resolve_existing_token(None, &env_path).err().unwrap(),
+                    resolve_token_for_save(None, &env_path).err().unwrap(),
+                ] {
+                    assert!(error.to_string().contains("HTTP_BEARER_TOKEN_FILE"));
+                    assert!(!error.to_string().contains("private-sentinel"));
+                }
+            },
         );
     }
 

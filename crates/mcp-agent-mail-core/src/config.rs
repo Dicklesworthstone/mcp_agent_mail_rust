@@ -2413,20 +2413,13 @@ impl Config {
         // An explicitly selected file is authoritative even when an inline
         // token is also present; unreadable credentials must not downgrade the
         // loopback server to its intentionally supported no-auth mode.
-        if matches!(
-            env::var("HTTP_BEARER_TOKEN_FILE"),
-            Err(env::VarError::NotUnicode(_))
-        ) {
-            config.user_env_authority_error =
-                Some("HTTP_BEARER_TOKEN_FILE must name a valid UTF-8 absolute path".to_string());
-        } else if let Some(path) = infra_env_value("HTTP_BEARER_TOKEN_FILE") {
-            match read_http_bearer_token_file(Path::new(&path)) {
-                Ok(token) => config.http_bearer_token = Some(token),
-                Err(error) => config.user_env_authority_error = Some(error.to_string()),
+        match configured_http_bearer_token_file() {
+            Ok(Some(token)) => config.http_bearer_token = Some(token),
+            Ok(None) => {
+                config.http_bearer_token =
+                    full_env_value("HTTP_BEARER_TOKEN").filter(|s| !s.is_empty());
             }
-        } else {
-            config.http_bearer_token =
-                full_env_value("HTTP_BEARER_TOKEN").filter(|s| !s.is_empty());
+            Err(error) => config.user_env_authority_error = Some(error.to_string()),
         }
         config.http_allow_localhost_unauthenticated = env_bool(
             "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED",
@@ -4180,6 +4173,32 @@ pub fn read_env_authority_text(path: &Path) -> io::Result<Option<String>> {
             format!("{} is not valid UTF-8: {error}", path.display()),
         )
     })
+}
+
+/// Resolve the credential-file authority shared by runtime startup and setup.
+///
+/// A process value takes precedence over the user-global configuration; a
+/// project .env cannot choose the file. Keep this separate from inline-token
+/// resolution because setup ranks its explicit env-file snapshot ahead of an
+/// inline process token. An invalid selected file must never fall through to
+/// another credential source or to unauthenticated startup.
+///
+/// # Errors
+///
+/// Rejects non-UTF-8 process paths and invalid or unreadable credential files.
+pub(crate) fn configured_http_bearer_token_file() -> io::Result<Option<String>> {
+    if matches!(
+        env::var("HTTP_BEARER_TOKEN_FILE"),
+        Err(env::VarError::NotUnicode(_))
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HTTP_BEARER_TOKEN_FILE must name a valid UTF-8 absolute path",
+        ));
+    }
+    infra_env_value("HTTP_BEARER_TOKEN_FILE")
+        .map(|path| read_http_bearer_token_file(Path::new(&path)))
+        .transpose()
 }
 
 /// Read an explicitly selected bearer token without exposing it in process
@@ -6250,29 +6269,32 @@ mod tests {
         "env_usize(",
     ];
 
-    /// Env names the `from_env` body passes as a string literal to any call.
+    /// Env names the configuration parsers pass as a string literal to any call.
     fn env_names_parsed_by_config(config_rs: &str) -> std::collections::BTreeSet<String> {
-        let start = config_rs
-            .find("    fn from_env_with_generation_hook(")
-            .expect("from_env parser");
-        let open = start + config_rs[start..].find('{').expect("parser body");
-        let end = matching_brace_end(config_rs, open).expect("parser end");
-        let parser = &config_rs[start..end];
         let mut names = std::collections::BTreeSet::new();
-        for (at, _) in parser.match_indices('(') {
-            // Calls rustfmt splits across lines put the literal on the next line.
-            let Some(rest) = parser[at + 1..].trim_start().strip_prefix('"') else {
-                continue;
-            };
-            let Some(end) = rest.find('"') else { continue };
-            let name = &rest[..end];
-            if name.len() >= 3
-                && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-            {
-                names.insert(name.to_string());
+        for header in [
+            "    fn from_env_with_generation_hook(",
+            "pub(crate) fn configured_http_bearer_token_file(",
+        ] {
+            let start = config_rs.find(header).expect("configuration parser");
+            let open = start + config_rs[start..].find('{').expect("parser body");
+            let end = matching_brace_end(config_rs, open).expect("parser end");
+            let parser = &config_rs[start..end];
+            for (at, _) in parser.match_indices('(') {
+                // Calls rustfmt splits across lines put the literal on the next line.
+                let Some(rest) = parser[at + 1..].trim_start().strip_prefix('"') else {
+                    continue;
+                };
+                let Some(end) = rest.find('"') else { continue };
+                let name = &rest[..end];
+                if name.len() >= 3
+                    && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    names.insert(name.to_string());
+                }
             }
         }
         names
@@ -6378,6 +6400,29 @@ mod tests {
     }
 
     #[test]
+    fn reread_detector_keeps_delegated_token_file_authority() {
+        let names = env_names_parsed_by_config(
+            r#"impl Config {
+    fn from_env_with_generation_hook() {
+        configured_http_bearer_token_file();
+    }
+}
+pub(crate) fn configured_http_bearer_token_file() {
+    infra_env_value("HTTP_BEARER_TOKEN_FILE");
+}
+"#,
+        );
+        let source = vec![(
+            "setup.rs".to_string(),
+            "let path = infra_env_value(\"HTTP_BEARER_TOKEN_FILE\");".to_string(),
+        )];
+        assert_eq!(
+            raw_rereads(&names, &source),
+            vec![("HTTP_BEARER_TOKEN_FILE".to_string(), "setup.rs".to_string())]
+        );
+    }
+
+    #[test]
     fn test_module_stripping_skips_braces_in_literals_and_comments() {
         let source = r##"fn before() { var("KEEP_BEFORE"); }
 #[cfg(test)]
@@ -6407,7 +6452,9 @@ fn after() { var("KEEP_AFTER"); }
         let config_rs = config_rs_source();
         let names = env_names_parsed_by_config(&config_rs);
         assert!(
-            names.len() > 150 && names.contains("DATABASE_POOL_SIZE"),
+            names.len() > 150
+                && names.contains("DATABASE_POOL_SIZE")
+                && names.contains("HTTP_BEARER_TOKEN_FILE"),
             "expected the full from_env knob list, parsed {}",
             names.len()
         );

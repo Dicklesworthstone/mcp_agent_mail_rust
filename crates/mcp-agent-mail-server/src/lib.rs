@@ -41324,7 +41324,7 @@ first body
             state.server_info.name, COMPAT_SERVER_NAME,
             "COMPAT LOCK: build_server() must produce the locked server name"
         );
-        assert_eq!(state.router.tools_count(), 45);
+        assert_eq!(state.router.tools_count(), 47);
         let templates = state.router.resource_templates();
         assert_eq!(templates.len(), 25);
         assert_eq!(

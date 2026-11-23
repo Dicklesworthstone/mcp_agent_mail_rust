@@ -2347,7 +2347,33 @@ mod tests {
                 let repo = Repository::open(&config.storage_root).unwrap();
                 let head = repo.head().unwrap().peel_to_commit().unwrap();
                 let head_id = head.id();
-                let previous_head = head.parent_id(0).unwrap();
+                // Recovery-state checkpoints can add commits that leave these
+                // managed entries unchanged. Moving to an arbitrary parent is
+                // therefore not a profile race. Construct a real committed
+                // tree without the managed profile, keeping working files and
+                // the shared index untouched.
+                let mut missing_profile = git2::Index::new_ext(repo.object_format()).unwrap();
+                missing_profile.read_tree(&head.tree().unwrap()).unwrap();
+                missing_profile
+                    .remove_path(Path::new("projects/project/agents/BlueLake/profile.json"))
+                    .unwrap();
+                let missing_tree_id = missing_profile.write_tree_to(&repo).unwrap();
+                let missing_tree = repo.find_tree(missing_tree_id).unwrap();
+                let changed_head = repo
+                    .commit(
+                        None,
+                        &head.author(),
+                        &head.committer(),
+                        "test: concurrent HEAD loses the managed profile",
+                        &missing_tree,
+                        &[&head],
+                    )
+                    .unwrap();
+                assert!(
+                    missing_tree
+                        .get_path(Path::new("projects/project/agents/BlueLake/profile.json"))
+                        .is_err()
+                );
                 let path = profile_path(config);
                 let root = config.storage_root.clone();
                 let before = fs::read(&path).unwrap();
@@ -2367,7 +2393,7 @@ mod tests {
                         1 => fs::write(&hook_path, &hook_bytes).unwrap(),
                         2 => Repository::open(&root)
                             .unwrap()
-                            .set_head_detached(previous_head)
+                            .set_head_detached(changed_head)
                             .unwrap(),
                         _ => unreachable!(),
                     }));

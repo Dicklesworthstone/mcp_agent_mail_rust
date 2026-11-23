@@ -297,6 +297,9 @@ fn error_code_catalog_is_stable() {
         "PATH_TOO_LONG",
         "PAYLOAD_TOO_LARGE",
         "RECIPIENT_NOT_FOUND",
+        // GH#404: a committed receipt whose recovery-state publication
+        // failed must not claim archive-only recovery is complete.
+        "RECOVERY_STATE_UNAVAILABLE",
         "RELEASE_INTENT_WRITE_FAILED",
         "RESERVATION_ACTIVE",
         // fdece065: acquire and renew fail closed when the guard-visible
