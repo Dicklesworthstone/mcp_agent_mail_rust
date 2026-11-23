@@ -1,5 +1,69 @@
 # Dependency Upgrade Log
 
+## November 22, 2026 — compatible lockfile refresh (build-time and config crates)
+
+A lockfile-only refresh. No manifest requirement changes and no source
+changes. Only crates outside the request path move:
+
+- `gix-*` (15 crates, all patch releases): `gix-bitmap` 0.6.1 -> 0.6.2,
+  `gix-chunk` 0.10.1 -> 0.10.2, `gix-command` 0.12.1 -> 0.12.2,
+  `gix-config-value` 0.21.1 -> 0.21.2, `gix-error` 0.5.2 -> 0.5.3,
+  `gix-imara-diff` 0.3.3 -> 0.3.4, `gix-packetline` 0.24.1 -> 0.24.2,
+  `gix-parallel` 0.50.1 -> 0.50.2, `gix-path` 0.14.1 -> 0.14.2,
+  `gix-prompt` 0.19.1 -> 0.19.2, `gix-quote` 0.10.1 -> 0.10.2,
+  `gix-trace` 0.3.1 -> 0.3.2, `gix-utils` 0.5.2 -> 0.5.3,
+  `gix-validate` 0.13.1 -> 0.13.2, `gix-zlib` 0.4.0 -> 0.4.1. gix reaches
+  the workspace only as a build dependency (`vergen-gix` in `tru`'s build
+  script), so none of it is linked into the binaries. The update adds
+  `faster-hex` 2.0.0, `parking_lot` 0.13.0 (with `lock_api` 0.5.0,
+  `parking_lot_core` 0.10.0, `redox_syscall` 0.9.5) and `winreg` 0.56.0
+  beside the existing versions, all on that build-only path.
+- `toml_edit` 0.25.19 -> 0.25.20 and `toml_parser` 1.1.5 -> 1.1.6:
+  configuration parsing and editing.
+- `walkdir` 2.5.0 -> 2.5.1.
+
+Held, with reasons:
+
+- `hashbrown` 0.17.1 -> 0.17.2, `zerocopy`/`zerocopy-derive` 0.8.63 ->
+  0.8.64, `globset` 0.4.21 -> 0.4.22 and `json5` 1.3.7 -> 1.3.8 sit on the
+  request path (hash maps everywhere, reservation glob matching, SQL JSON
+  functions). They need a same-worker A/B benchmark before they move, and
+  none was run.
+- `wasm-bindgen` 0.2.127 -> 0.2.130 with `js-sys`/`web-sys` 0.3.104 ->
+  0.3.107 and `wasm-bindgen-futures` 0.4.77 -> 0.4.80 (wasm targets only,
+  through Asupersync): the update adds a `tokio` lock entry for the
+  emscripten target. The workspace does not use tokio, and nothing it
+  builds for native targets changes.
+- Pinned by registry FastMCP 0.13.0 (`=` requirements): `clap` 4.6.9,
+  `serde_json` 1.0.154, `syn` 3.0.10 and others. FastMCP 0.14.0,
+  FrankenSQLite 0.5.1, SQLModel 0.6.0 and FrankenTUI 0.11.0 are published,
+  but each is a breaking 0.x release of a core runtime crate and needs code
+  changes, the full suite and benchmarks. Asupersync, `fsqlite-core` and the
+  SQLModel pool stay on their pinned Git revisions.
+- `age` and `rpassword` are pinned with `=` in the workspace manifest.
+
+Audit (`cargo audit`, advisory database of 2026-11-22): two vulnerabilities
+remain, and neither can be fixed by a lockfile bump.
+
+- RUSTSEC-2026-0592, `url` 2.5.8 (stack overflow in `Url::origin()` on
+  nested `blob:` URLs; fixed in 2.5.9). Every published FastMCP
+  (`fastmcp-core` 0.12.0 through 0.14.0) requires `url = "=2.5.8"`, so
+  this needs a FastMCP release first.
+- RUSTSEC-2026-0459, `libsqlite3-sys` 0.38.2 (bundled C SQLite CVE; fixed
+  in 0.39.0). It comes in through `sqlmodel-sqlite` 0.5.1, which the CLI
+  links. `sqlmodel-sqlite` 0.6.0 moves to `libsqlite3-sys` 0.40, but that
+  is the breaking SQLModel 0.6 migration together with the pinned
+  SQLModel pool/core revision.
+
+The 15 remaining warnings (unmaintained `basic-toml`, `chrono`, `paste`,
+`proc-macro-error2`; unsound `heapless` 0.8.0, `lru` 0.16.4, `rustix`
+1.1.5) are unchanged by this refresh. `rustix` 1.1.6 is available, but
+the pinned FrankenSearch revision requires `rustix = "=1.1.5"`.
+
+Verification: `cargo clippy --workspace --all-targets -- -D warnings`
+passed with this lockfile through strict remote execution (it also builds
+and runs the `tru` build script that uses gix).
+
 ## November 13, 2026 — transaction-bound archive headers (br-kp1in.52)
 
 FrankenSQLite 0.4.13 could read a logical database header in one transaction
