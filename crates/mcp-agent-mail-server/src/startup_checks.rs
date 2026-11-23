@@ -2431,6 +2431,13 @@ fn probe_database(config: &Config) -> ProbeResult {
 /// legacy-import regression can run it from a fresh process against a
 /// freshly imported target (GH#268).
 pub fn probe_integrity(config: &Config) -> ProbeResult {
+    probe_integrity_with_cancellation(config, &mut || false)
+}
+
+fn probe_integrity_with_cancellation(
+    config: &Config,
+    cancelled: &mut impl FnMut() -> bool,
+) -> ProbeResult {
     #[cfg(test)]
     record_startup_work(0);
     if !config.integrity_check_on_startup {
@@ -2455,53 +2462,39 @@ pub fn probe_integrity(config: &Config) -> ProbeResult {
         }
     }
 
-    let database_file_missing = resolved_db_path.as_ref().is_some_and(|path| !path.exists());
-
-    // Skip integrity probe for fresh installs to avoid noisy recovery warnings.
-    if database_file_missing
-        && !path_is_real_directory(&std::path::Path::new(&config.storage_root).join("projects"))
-    {
-        return ProbeResult::Ok { name: "integrity" };
-    }
-
-    // Retry the activity lock with short backoff.  After auto_clear_db_blockers
-    // kills a stale Agent Mail process, the kernel may need a few hundred
-    // milliseconds to fully release flock() descriptors (especially on macOS).
-    // Without this retry the integrity probe would immediately fail with a
-    // misleading "mailbox activity lock is busy" error.
-    let _integrity_activity_lock = {
-        const MAX_LOCK_ATTEMPTS: u32 = 8;
-        const LOCK_BACKOFF_MS: u64 = 150;
-        let mut last_err = String::new();
-        let mut acquired = None;
-        for attempt in 0..MAX_LOCK_ATTEMPTS {
-            match acquire_mailbox_activity_lock_for_database_url(
+    let _integrity_activity_lock = match wait_for_mailbox_activity_lock(
+        "integrity probe",
+        || {
+            acquire_mailbox_activity_lock_for_database_url(
                 &config.database_url,
                 MailboxActivityLockMode::Exclusive,
-            ) {
-                Ok(lock) => {
-                    acquired = Some(lock);
-                    break;
-                }
-                Err(err) => {
-                    last_err = err.to_string();
-                    if attempt + 1 < MAX_LOCK_ATTEMPTS {
-                        tracing::debug!(
-                            attempt = attempt + 1,
-                            max = MAX_LOCK_ATTEMPTS,
-                            "activity lock busy during integrity probe; retrying after {}ms",
-                            LOCK_BACKOFF_MS
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(LOCK_BACKOFF_MS));
-                    }
-                }
-            }
-        }
-        match acquired {
-            Some(lock) => lock,
-            None => return integrity_busy_probe_failure(config, &last_err),
+            )
+        },
+        cancelled,
+    ) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return ProbeResult::Fail(ProbeFailure {
+                name: "integrity",
+                problem: format!(
+                    "Failed to acquire mailbox activity lock for integrity probe: {error}"
+                ),
+                fix: "Check DATABASE_URL, the activity-lock path, and filesystem permissions."
+                    .into(),
+            });
         }
     };
+
+    // A legitimate writer may have created or restored the primary while we
+    // waited. Only the state observed under the activity lock can authorize
+    // missing-primary recovery.
+    let database_file_missing = resolved_db_path.as_ref().is_some_and(|path| !path.exists());
+
+    // Fresh installs need no integrity/recovery work. Check this under the lock
+    // too: a direct CLI initializer may have created the mailbox during the wait.
+    if database_file_missing && !path_is_real_directory(&config.storage_root.join("projects")) {
+        return ProbeResult::Ok { name: "integrity" };
+    }
 
     // `run_startup_integrity_check` owns recovery for a database it can open,
     // but deliberately reports a missing primary as `IntegrityCorruption` so
@@ -2889,6 +2882,77 @@ fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
         fix: "Wait for the current mailbox owner to finish, or stop the conflicting `am`, `mcp-agent-mail`, or mutating `am doctor` process and retry."
             .into(),
     })
+}
+
+/// Wait for startup admission without turning legitimate mailbox activity into
+/// a supervisor restart loop (GH#403). Ordinary CLI lock acquisitions remain
+/// nonblocking. Only contention is retryable; filesystem/configuration errors
+/// must still fail promptly.
+///
+/// This runs before the standalone server installs its signal handlers, so
+/// SIGINT/SIGTERM retain their normal termination behavior during the wait.
+/// Refresh Type=notify's startup deadline without ever claiming readiness.
+/// Embedded callers supply their cancellation authority; the bounded sleep
+/// keeps shutdown responsive without installing process-global signal handlers.
+pub(crate) fn wait_for_mailbox_activity_lock<T>(
+    phase: &'static str,
+    mut acquire: impl FnMut() -> std::io::Result<T>,
+    mut cancelled: impl FnMut() -> bool,
+) -> std::io::Result<T> {
+    const MAX_BACKOFF: Duration = Duration::from_secs(1);
+    const STATUS_INTERVAL: Duration = Duration::from_secs(5);
+
+    let started = std::time::Instant::now();
+    let mut backoff = Duration::from_millis(150);
+    let mut next_status = Duration::ZERO;
+    let mut waited = false;
+    loop {
+        if cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("server startup cancelled while waiting for {phase}"),
+            ));
+        }
+        match acquire() {
+            Ok(lock) => {
+                if waited {
+                    tracing::info!(
+                        target: "mcp_agent_mail_server::startup",
+                        phase,
+                        waited_secs = started.elapsed().as_secs(),
+                        "startup_mailbox_activity_lock_acquired"
+                    );
+                    // Lock contention may have consumed the unit's entire
+                    // normal 300s activation budget. Give the remaining
+                    // integrity/preflight work that budget again on progress.
+                    crate::sd_notify(&format!(
+                        "STATUS=Mailbox activity lock acquired for {phase}; continuing startup\nEXTEND_TIMEOUT_USEC=300000000"
+                    ));
+                }
+                return Ok(lock);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let elapsed = started.elapsed();
+                if elapsed >= next_status {
+                    tracing::warn!(
+                        target: "mcp_agent_mail_server::startup",
+                        phase,
+                        waited_secs = elapsed.as_secs(),
+                        %error,
+                        "startup_mailbox_activity_lock_waiting"
+                    );
+                    crate::sd_notify(&format!(
+                        "STATUS=Waiting for mailbox activity lock during {phase}\nEXTEND_TIMEOUT_USEC=15000000"
+                    ));
+                    next_status = elapsed + STATUS_INTERVAL;
+                }
+                waited = true;
+                std::thread::sleep(backoff);
+                backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3281,18 +3345,28 @@ fn probe_db_lock(config: &Config) -> ProbeResult {
     }
 }
 
-/// Run all startup probes and return a report.
-///
-/// All probes run even if earlier ones fail so the user sees all problems at once.
-fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
-    vec![
+/// Run independent checks even after a failure, but do not wait for integrity
+/// admission when a prerequisite has already made startup impossible.
+fn shared_runtime_startup_probes(
+    config: &Config,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Vec<ProbeResult> {
+    let mut results = vec![
         // The default SQLite database lives under this directory on first run.
         timed_startup_phase("storage", || probe_storage_root(config)),
         timed_startup_phase("database", || probe_database(config)),
         timed_startup_phase("db-lock", || probe_db_lock(config)),
-        timed_startup_phase("integrity", || probe_integrity(config)),
-        timed_startup_phase("fd-limit", || probe_fd_limit(config)),
-    ]
+    ];
+    if results
+        .iter()
+        .all(|result| matches!(result, ProbeResult::Ok { .. }))
+    {
+        results.push(timed_startup_phase("integrity", || {
+            probe_integrity_with_cancellation(config, cancelled)
+        }));
+    }
+    results.push(timed_startup_phase("fd-limit", || probe_fd_limit(config)));
+    results
 }
 
 /// Attribute startup wall time without changing the phase's return value or
@@ -3347,7 +3421,15 @@ fn rotate_backups_best_effort(config: &Config) {
 /// Run the full HTTP/TUI startup probe set.
 #[must_use]
 pub fn run_startup_probes(config: &Config) -> StartupReport {
-    let mut results = run_http_startup_preflight_probes(config).results;
+    run_startup_probes_with_cancellation(config, &mut || false)
+}
+
+pub(crate) fn run_startup_probes_with_cancellation(
+    config: &Config,
+    cancelled: &mut impl FnMut() -> bool,
+) -> StartupReport {
+    let mut results =
+        run_http_startup_preflight_probes_with_cancellation(config, cancelled).results;
     results.push(timed_startup_phase("port", || probe_port(config)));
     StartupReport { results }
 }
@@ -3357,6 +3439,13 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {
 /// Call this before deciding whether it is safe to tear down an existing server.
 #[must_use]
 pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
+    run_http_startup_preflight_probes_with_cancellation(config, &mut || false)
+}
+
+fn run_http_startup_preflight_probes_with_cancellation(
+    config: &Config,
+    cancelled: &mut impl FnMut() -> bool,
+) -> StartupReport {
     let existing_agent_mail_server = timed_startup_phase("listener-detection", || {
         matches!(
             check_port_status_at_mcp_path(&config.http_host, config.http_port, &config.http_path),
@@ -3387,8 +3476,14 @@ pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
     } else {
         results.push(timed_startup_phase("db-lock", || probe_db_lock(config)));
     }
-    if !existing_agent_mail_server {
-        results.push(timed_startup_phase("integrity", || probe_integrity(config)));
+    if !existing_agent_mail_server
+        && results
+            .iter()
+            .all(|result| matches!(result, ProbeResult::Ok { .. }))
+    {
+        results.push(timed_startup_phase("integrity", || {
+            probe_integrity_with_cancellation(config, cancelled)
+        }));
     }
     results.push(timed_startup_phase("fd-limit", || probe_fd_limit(config)));
     StartupReport { results }
@@ -3400,8 +3495,15 @@ pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
 /// checks are intentionally omitted to avoid noisy false positives.
 #[must_use]
 pub fn run_stdio_startup_probes(config: &Config) -> StartupReport {
+    run_stdio_startup_probes_with_cancellation(config, &mut || false)
+}
+
+pub(crate) fn run_stdio_startup_probes_with_cancellation(
+    config: &Config,
+    cancelled: &mut impl FnMut() -> bool,
+) -> StartupReport {
     StartupReport {
-        results: shared_runtime_startup_probes(config),
+        results: shared_runtime_startup_probes(config, cancelled),
     }
 }
 
@@ -3523,7 +3625,7 @@ mod tests {
         let capture = StartupPhaseCapture::default();
         let report =
             tracing::subscriber::with_default(capture.clone(), || run_startup_probes(&config));
-        assert_eq!(report.results.len(), 8);
+        assert_eq!(report.results.len(), 7);
         assert!(
             report
                 .failures()
@@ -3538,7 +3640,6 @@ mod tests {
             "storage",
             "database",
             "db-lock",
-            "integrity",
             "fd-limit",
             "port",
         ]);
@@ -5880,15 +5981,16 @@ mod tests {
     }
 
     #[test]
-    fn probe_integrity_reports_busy_when_mailbox_activity_lock_is_held() {
+    fn probe_integrity_waits_for_mailbox_activity_lock_release() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("busy.db");
         let conn =
             mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
-        conn.execute_raw("CREATE TABLE t(x TEXT)").unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize mailbox schema");
         drop(conn);
 
-        let _shared_lock = acquire_mailbox_activity_lock_for_database_url(
+        let shared_lock = acquire_mailbox_activity_lock_for_database_url(
             &format!("sqlite:///{}", db_path.display()),
             MailboxActivityLockMode::Shared,
         )
@@ -5896,11 +5998,102 @@ mod tests {
 
         let mut config = default_config();
         config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = dir.path().join("storage");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let releaser = std::thread::spawn(move || {
+            let started = started_rx.recv_timeout(Duration::from_secs(5));
+            // Exceed the old eight-attempt/1.05s budget after the probe enters
+            // lock admission, rather than depending on thread scheduling.
+            std::thread::sleep(Duration::from_millis(1_500));
+            drop(shared_lock);
+            started.expect("probe reached lock admission");
+        });
+        let mut started_tx = Some(started_tx);
 
-        let result = probe_integrity(&config);
+        reset_probe_recovery_attempt_count();
+        let result = probe_integrity_with_cancellation(&config, &mut || {
+            if let Some(tx) = started_tx.take() {
+                tx.send(()).expect("announce lock admission");
+            }
+            false
+        });
+        releaser.join().expect("lock releaser");
         assert!(
-            matches!(result, ProbeResult::Fail(ProbeFailure { name: "integrity", ref problem, .. }) if problem.contains("busy")),
-            "probe_integrity should report mailbox activity contention as busy: {result:?}"
+            matches!(result, ProbeResult::Ok { name: "integrity" }),
+            "probe must wait for legitimate activity and then check integrity: {result:?}"
+        );
+        assert_eq!(probe_recovery_attempt_count(), 0);
+    }
+
+    #[test]
+    fn probe_integrity_rechecks_missing_primary_after_activity_lock_wait() {
+        let dir = tempfile::tempdir().expect("private mailbox fixture");
+        let db_path = dir.path().join("created-during-wait.db");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).expect("archive directory");
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        let writer_lock = acquire_mailbox_activity_lock_for_database_url(
+            &config.database_url,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect("hold initializer's activity lock");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("probe reached lock admission with a missing primary");
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("initializer creates primary while holding activity lock");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize mailbox schema");
+            drop(conn);
+            drop(writer_lock);
+        });
+        let mut started_tx = Some(started_tx);
+
+        reset_probe_recovery_attempt_count();
+        let result = probe_integrity_with_cancellation(&config, &mut || {
+            if let Some(tx) = started_tx.take() {
+                tx.send(()).expect("announce lock admission");
+            }
+            false
+        });
+        writer.join().expect("mailbox initializer");
+        assert!(
+            matches!(result, ProbeResult::Ok { name: "integrity" }),
+            "the newly initialized primary must be checked, not reconstructed: {result:?}"
+        );
+        assert_eq!(
+            probe_recovery_attempt_count(),
+            0,
+            "pre-lock missing-primary evidence cannot authorize recovery"
+        );
+    }
+
+    #[test]
+    fn probe_integrity_reports_activity_lock_io_errors_without_retrying() {
+        let dir = tempfile::tempdir().expect("private mailbox fixture");
+        let db_path = dir.path().join("unavailable.db");
+        std::fs::create_dir(db_path.with_file_name("unavailable.db.activity.lock"))
+            .expect("directory cannot be opened as a lock file, even by root");
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = dir.path().join("storage");
+        let mut checkpoints = 0;
+
+        let result = probe_integrity_with_cancellation(&config, &mut || {
+            checkpoints += 1;
+            // Bound a regression that accidentally treats every I/O error as
+            // contention, while retaining the real lock-file open failure.
+            checkpoints > 1
+        });
+
+        assert_eq!(checkpoints, 1, "permanent I/O failure must not retry");
+        assert!(
+            matches!(result, ProbeResult::Fail(ProbeFailure { name: "integrity", ref problem, .. }) if problem.contains("Failed to acquire mailbox activity lock") && !problem.contains("cancelled")),
+            "the real lock-file error must remain visible: {result:?}"
         );
     }
 

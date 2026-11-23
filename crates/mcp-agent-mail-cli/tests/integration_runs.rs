@@ -10559,6 +10559,310 @@ fn serve_http_preserves_existing_client_configs_by_default() {
     check_serve_http_client_config_setup(false);
 }
 
+// GH#403: real cross-process flock contention must delay startup, including
+// systemd admission, without turning a busy CLI writer into a restart loop.
+#[cfg(target_os = "linux")]
+mod startup_mailbox_locks {
+    use super::*;
+    use std::os::linux::net::SocketAddrExt as _;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+
+    struct Server {
+        child: std::process::Child,
+        notify: UnixDatagram,
+        notifications: Vec<String>,
+        log_path: PathBuf,
+        address: std::net::SocketAddr,
+    }
+
+    impl Server {
+        fn start(env: &TestEnv, integrity_check: bool) -> Self {
+            let port = unused_loopback_port();
+            // Linux systemd accepts abstract sockets; avoid UNIX pathname
+            // limits when CI supplies a long TMPDIR for the private fixture.
+            let notify_name = format!(
+                "am-startup-{}-{}",
+                std::process::id(),
+                env.tmp.path().file_name().unwrap().to_string_lossy()
+            );
+            let notify_address = SocketAddr::from_abstract_name(notify_name.as_bytes()).unwrap();
+            let notify =
+                UnixDatagram::bind_addr(&notify_address).expect("bind systemd notify socket");
+            notify.set_nonblocking(true).unwrap();
+            let log_path = env.tmp.path().join("startup-lock-server.log");
+            let log = std::fs::File::create(&log_path).unwrap();
+            // Cargo supplies this path when compiling integration tests; it
+            // need not also exist in the test process's runtime environment.
+            let child = Command::new(env!("CARGO_BIN_EXE_am"))
+                .env_clear()
+                .envs(env.isolated_env())
+                .env("AM_ATC_ENABLED", "false")
+                .env("INTEGRITY_CHECK_ON_STARTUP", integrity_check.to_string())
+                .env("HTTP_PORT", port.to_string())
+                .env("NOTIFY_SOCKET", format!("@{notify_name}"))
+                .env("TMPDIR", env.tmp.path())
+                .current_dir(env.hostile_repo())
+                .args([
+                    "serve-http",
+                    "--no-tui",
+                    "--no-auth",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &port.to_string(),
+                ])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .expect("start actual server under mailbox contention");
+            Self {
+                child,
+                notify,
+                notifications: Vec::new(),
+                log_path,
+                address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            }
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(&self.log_path).unwrap()
+        }
+
+        fn drain_notifications(&mut self) {
+            let mut buffer = [0; 4096];
+            loop {
+                match self.notify.recv(&mut buffer) {
+                    Ok(len) => self
+                        .notifications
+                        .push(String::from_utf8_lossy(&buffer[..len]).into_owned()),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("read systemd startup notification: {error}"),
+                }
+            }
+        }
+
+        fn assert_waiting(&mut self) {
+            self.drain_notifications();
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "server exited while another process held the activity lock:\n{}",
+                self.log()
+            );
+            assert!(
+                !self.notifications.iter().any(|notice| ready_notice(notice)),
+                "startup advertised readiness before acquiring the activity lock: {:?}",
+                self.notifications
+            );
+            assert!(
+                std::net::TcpStream::connect_timeout(&self.address, Duration::from_millis(50))
+                    .is_err(),
+                "server started serving without acquiring the activity lock"
+            );
+        }
+
+        fn wait_for_contention(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                self.assert_waiting();
+                if self.notifications.iter().any(|notice| wait_notice(notice)) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "server did not report its mailbox wait to systemd:\n{}",
+                    self.log()
+                );
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        fn wait_for_readiness(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                self.drain_notifications();
+                assert!(
+                    self.child.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                    "server did not become ready after the activity lock was released:\n{}",
+                    self.log()
+                );
+                if self.notifications.iter().any(|notice| ready_notice(notice)) {
+                    let mut socket =
+                        std::net::TcpStream::connect_timeout(&self.address, Duration::from_secs(1))
+                            .expect("READY must name a live listener");
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    socket.write_all(b"GET /health/readiness HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: mcp_agent_mail_rust-agent\r\nConnection: close\r\n\r\n").unwrap();
+                    let mut response = String::new();
+                    BufReader::new(socket).read_line(&mut response).unwrap();
+                    assert!(
+                        response.starts_with("HTTP/1.1 200"),
+                        "systemd READY preceded HTTP readiness: {response}\n{}",
+                        self.log()
+                    );
+                    return;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn ready_notice(notice: &str) -> bool {
+        notice.lines().any(|line| line == "READY=1")
+    }
+
+    fn wait_notice(notice: &str) -> bool {
+        notice
+            .lines()
+            .any(|line| line.starts_with("STATUS=") && line.contains("mailbox"))
+            && notice.lines().any(|line| {
+                line.strip_prefix("EXTEND_TIMEOUT_USEC=")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|micros| micros > 0)
+            })
+    }
+
+    fn database_lock_path(env: &TestEnv) -> PathBuf {
+        PathBuf::from(format!("{}.activity.lock", env.db_path.display()))
+    }
+
+    fn hold_activity_lock(env: &TestEnv, integrity_check: bool) -> std::fs::File {
+        let path = if integrity_check {
+            database_lock_path(env)
+        } else {
+            env.storage_root.join(".mailbox.activity.lock")
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&file).expect("hold real cross-process activity lock");
+        file
+    }
+
+    #[test]
+    fn serve_http_waits_through_live_contention_and_becomes_ready_after_release() {
+        // The second case exercises runtime admission even when the integrity
+        // probe is disabled; extending only the probe would leave that exit.
+        for integrity_check in [true, false] {
+            let env = TestEnv::new();
+            init_cli_schema(&env.db_path);
+            let held_lock = hold_activity_lock(&env, integrity_check);
+            let before = file_snapshot(&env.db_path);
+            let mut server = Server::start(&env, integrity_check);
+            server.wait_for_contention();
+
+            // Synchronize on the actual wait before measuring. This exceeds
+            // the old 1.05 s retry limit and requires a second 5 s notification.
+            let deadline = Instant::now() + Duration::from_millis(6500);
+            while Instant::now() < deadline {
+                server.assert_waiting();
+                thread::sleep(Duration::from_millis(25));
+            }
+            assert_eq!(
+                file_snapshot(&env.db_path),
+                before,
+                "startup modified the mailbox before acquiring ownership"
+            );
+            assert!(
+                server
+                    .notifications
+                    .iter()
+                    .filter(|notice| wait_notice(notice))
+                    .count()
+                    >= 2,
+                "systemd timeout was not renewed during sustained contention: {:?}",
+                server.notifications
+            );
+            drop(held_lock);
+            server.wait_for_readiness();
+        }
+    }
+
+    #[test]
+    fn serve_http_responds_to_sigterm_while_waiting_for_activity_lock() {
+        let env = TestEnv::new();
+        init_cli_schema(&env.db_path);
+        let _held_lock = hold_activity_lock(&env, true);
+        let before = file_snapshot(&env.db_path);
+        let mut server = Server::start(&env, true);
+        server.wait_for_contention();
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(server.child.id()).unwrap());
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM)
+            .expect("send SIGTERM to this test's waiting server");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                assert_eq!(
+                    status.signal(),
+                    Some(nix::sys::signal::Signal::SIGTERM as i32)
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup lock wait ignored SIGTERM:\n{}",
+                server.log()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(file_snapshot(&env.db_path), before);
+    }
+
+    #[test]
+    fn serve_http_rejects_activity_lock_io_errors_without_waiting() {
+        let env = TestEnv::new();
+        init_cli_schema(&env.db_path);
+        // Use the storage-root lock: the CLI's earlier database cleanup
+        // intentionally quarantines non-file database-lock artifacts. A
+        // directory fails deterministically even when this test runs as root.
+        std::fs::create_dir(env.storage_root.join(".mailbox.activity.lock")).unwrap();
+        let before = file_snapshot(&env.db_path);
+        let mut server = Server::start(&env, false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                assert!(!status.success(), "invalid lock path was accepted");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup retried a permanent activity-lock I/O error:\n{}",
+                server.log()
+            );
+            server.drain_notifications();
+            thread::sleep(Duration::from_millis(25));
+        }
+        server.drain_notifications();
+        assert!(
+            server
+                .notifications
+                .iter()
+                .all(|notice| !wait_notice(notice) && !ready_notice(notice)),
+            "permanent lock error was advertised as a wait or success: {:?}",
+            server.notifications
+        );
+        assert!(server.log().contains("Is a directory"), "{}", server.log());
+        assert_eq!(file_snapshot(&env.db_path), before);
+    }
+}
+
 #[test]
 fn robot_metrics_reads_live_server_calls_and_labels_offline_fallback() {
     let env = TestEnv::new();

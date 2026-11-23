@@ -89,6 +89,17 @@ elapsed work. A finish event means the call returned; use the probe report to
 determine success. A start with no finish identifies an interrupted or still
 running phase. Work deferred during listener handoff has no phase events.
 
+If a live CLI operation holds a mailbox activity lock, server startup waits
+for its release. The `startup_mailbox_activity_lock_waiting` log names the
+startup phase, elapsed wait, and available owner details. A systemd
+`Type=notify` service remains activating: periodic `STATUS` and timeout
+extensions keep the wait alive without advertising readiness. Startup resumes
+when the lock is available; `SIGINT` and `SIGTERM` still stop a standalone
+server that is waiting. Inspect a prolonged wait with the read-only
+`am doctor locks --json`; do not remove lock files. Invalid lock paths and
+filesystem permission failures still fail startup. Skipping the integrity
+probe does not bypass the runtime mailbox ownership locks.
+
 For a slow boot-time integrity probe, `INTEGRITY_CHECK_ON_STARTUP=false` skips
 only that startup probe. The background guard remains enabled and starts its
 first cycle after `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` (default 300 seconds,

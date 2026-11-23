@@ -2140,18 +2140,40 @@ struct RuntimeMailboxActivityLocks {
 
 fn acquire_runtime_mailbox_activity_locks(
     config: &mcp_agent_mail_core::Config,
+    cancelled: impl FnMut() -> bool,
 ) -> std::io::Result<RuntimeMailboxActivityLocks> {
-    let storage_root_lock =
-        acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Exclusive)?;
-    let sqlite_lock = acquire_mailbox_activity_lock_for_database_url(
-        &config.database_url,
-        MailboxActivityLockMode::Shared,
-    )?;
-    Ok(RuntimeMailboxActivityLocks {
-        _storage_root_lock: storage_root_lock,
-        _sqlite_lock: sqlite_lock,
-    })
+    // A direct CLI writer can acquire either lock after the integrity probe
+    // finishes (or when that probe is skipped). Retry the complete admission so
+    // a failed SQLite acquisition drops the partial storage-root guard too.
+    startup_checks::wait_for_mailbox_activity_lock(
+        "runtime admission",
+        || {
+            let storage_root_lock =
+                acquire_mailbox_activity_lock(config, MailboxActivityLockMode::Exclusive)?;
+            let sqlite_lock = acquire_mailbox_activity_lock_for_database_url(
+                &config.database_url,
+                MailboxActivityLockMode::Shared,
+            )?;
+            Ok(RuntimeMailboxActivityLocks {
+                _storage_root_lock: storage_root_lock,
+                _sqlite_lock: sqlite_lock,
+            })
+        },
+        cancelled,
+    )
 }
+
+fn ensure_startup_not_cancelled(cancelled: &mut impl FnMut() -> bool) -> std::io::Result<()> {
+    if cancelled() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "server startup cancelled by its caller",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn ensure_stdio_startup_probes_pass(report: &startup_checks::StartupReport) -> std::io::Result<()> {
     if report.is_ok() {
         return Ok(());
@@ -2193,6 +2215,8 @@ async fn initialize_stdio_database(
 
 pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     config.validate_user_env_authority()?;
+    let mut cancelled = || cx.is_cancel_requested();
+    ensure_startup_not_cancelled(&mut cancelled)?;
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
@@ -2203,13 +2227,15 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     // `probe_integrity` takes an exclusive flock on the activity lockfile.
     // If we already hold a shared flock (from `acquire_runtime_mailbox_activity_locks`),
     // the exclusive attempt will fail with EAGAIN, deadlocking startup.
-    let probe_report = startup_checks::run_stdio_startup_probes(config);
+    let probe_report =
+        startup_checks::run_stdio_startup_probes_with_cancellation(config, &mut cancelled);
+    ensure_startup_not_cancelled(&mut cancelled)?;
     ensure_stdio_startup_probes_pass(&probe_report)?;
     ensure_boot_archive_preflight_pass(config)?;
 
-    // Now that probes have confirmed no other process holds the locks,
-    // acquire our runtime shared lock for the duration of the process.
-    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+    // Acquire runtime ownership for the duration of the process, waiting if a
+    // direct CLI writer won the race after the integrity probe released its lock.
+    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config, cancelled)?;
 
     // Finish the first pooled initialization before integrity/backup workers
     // open this database directly. Those opens bypass the pool's init gate and
@@ -2969,10 +2995,85 @@ fn reset_probe_state(config: &mcp_agent_mail_core::Config) -> (u32, Instant, Ins
     )
 }
 
+/// Preserve transport changes while polling the caller's shutdown authority
+/// during startup. The receiver remains owned by the eventual supervisor;
+/// waiting for a mailbox lock must not strand an embedder's shutdown request.
+struct HttpServerControl {
+    receiver: mpsc::Receiver<tui_bridge::ServerControlMsg>,
+    pending: VecDeque<tui_bridge::ServerControlMsg>,
+    shutdown_requested: bool,
+}
+
+impl HttpServerControl {
+    fn new(receiver: mpsc::Receiver<tui_bridge::ServerControlMsg>) -> Self {
+        Self {
+            receiver,
+            pending: VecDeque::new(),
+            shutdown_requested: false,
+        }
+    }
+
+    fn startup_shutdown_requested(&mut self) -> bool {
+        if self.shutdown_requested || self.receiver.is_closed() {
+            self.shutdown_requested = true;
+            return true;
+        }
+        // Bound each poll even if a caller continuously sends transport changes.
+        // New messages are observed at the next lock-wait checkpoint.
+        for _ in 0..self.receiver.len().max(1) {
+            match self.receiver.try_recv() {
+                Ok(tui_bridge::ServerControlMsg::Shutdown)
+                | Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled) => {
+                    self.shutdown_requested = true;
+                    return true;
+                }
+                Ok(tui_bridge::ServerControlMsg::SetTransportBase(base)) => {
+                    // An absolute selection supersedes every earlier change.
+                    self.pending.clear();
+                    self.pending
+                        .push_back(tui_bridge::ServerControlMsg::SetTransportBase(base));
+                }
+                Ok(tui_bridge::ServerControlMsg::ToggleTransportBase) => {
+                    let pending_count = self.pending.len();
+                    match self.pending.back_mut() {
+                        Some(tui_bridge::ServerControlMsg::SetTransportBase(base)) => {
+                            *base = base.toggle();
+                        }
+                        Some(tui_bridge::ServerControlMsg::ToggleTransportBase)
+                            if pending_count == 2 =>
+                        {
+                            let _ = self.pending.pop_back();
+                        }
+                        _ => self
+                            .pending
+                            .push_back(tui_bridge::ServerControlMsg::ToggleTransportBase),
+                    }
+                    // Keep at most two toggles, retaining parity. Two cannot
+                    // disappear entirely: on a custom HTTP path they select
+                    // /mcp/, whereas doing nothing preserves the custom path.
+                }
+                Err(mpsc::RecvError::Empty) => break,
+            }
+        }
+        self.shutdown_requested = self.receiver.is_closed();
+        self.shutdown_requested
+    }
+
+    async fn recv(&mut self, cx: &Cx) -> Result<tui_bridge::ServerControlMsg, mpsc::RecvError> {
+        if self.shutdown_requested {
+            return Ok(tui_bridge::ServerControlMsg::Shutdown);
+        }
+        if let Some(message) = self.pending.pop_front() {
+            return Ok(message);
+        }
+        self.receiver.recv(cx).await
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_http_headless_supervisor(
     config: mcp_agent_mail_core::Config,
-    control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    control_rx: Option<HttpServerControl>,
     on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
     // The standalone headless process owns its signal policy. Embedders using
@@ -2987,7 +3088,7 @@ fn run_http_headless_supervisor(
             asupersync::signal::sigint()?,
         ];
         let (tx, rx) = mpsc::channel(1);
-        (Some((tx, signals)), Some(rx))
+        (Some((tx, signals)), Some(HttpServerControl::new(rx)))
     } else {
         (None, control_rx)
     };
@@ -3061,7 +3162,7 @@ impl PreparedHttpStartup {
         self,
         control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
     ) -> std::io::Result<()> {
-        run_http_supervised(self, Some(control_rx))
+        run_http_supervised(self, Some(HttpServerControl::new(control_rx)))
     }
 
     pub fn run_with_tui(self) -> std::io::Result<()> {
@@ -3075,9 +3176,20 @@ impl PreparedHttpStartup {
 pub fn prepare_http_startup(
     config: &mcp_agent_mail_core::Config,
 ) -> std::io::Result<PreparedHttpStartup> {
+    prepare_http_startup_with_cancellation(config, &mut || false)
+}
+
+fn prepare_http_startup_with_cancellation(
+    config: &mcp_agent_mail_core::Config,
+    cancelled: &mut impl FnMut() -> bool,
+) -> std::io::Result<PreparedHttpStartup> {
     config.validate_user_env_authority()?;
+    ensure_startup_not_cancelled(cancelled)?;
     install_crash_marker_panic_hook(config.storage_root.clone());
-    let probe_report = startup_checks::run_startup_probes(config);
+    let probe_report = startup_checks::run_startup_probes_with_cancellation(config, cancelled);
+    // The report preserves probe diagnostics; retain cancellation's IO kind so
+    // controlled startup can return normally without launching any workers.
+    ensure_startup_not_cancelled(cancelled)?;
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
     }
@@ -4608,8 +4720,9 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
 /// the caller.
 ///
 /// A [`tui_bridge::ServerControlMsg::Shutdown`] on `control_rx` (or dropping
-/// every sender) stops the listener and then runs the same worker shutdown
-/// sequence a signalled headless process would, before returning.
+/// every sender) cancels startup lock waits, or stops the listener and then
+/// runs the same worker shutdown sequence a signalled headless process would,
+/// before returning.
 ///
 /// Embedders that host the server on a thread — integration tests in
 /// particular — use this so every background worker is stopped and joined
@@ -4620,12 +4733,24 @@ pub fn run_http_with_control(
     config: &mcp_agent_mail_core::Config,
     control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
 ) -> std::io::Result<()> {
-    prepare_http_startup(config)?.run_with_control(control_rx)
+    let mut control = HttpServerControl::new(control_rx);
+    let prepared = prepare_http_startup_with_cancellation(config, &mut || {
+        control.startup_shutdown_requested()
+    });
+    match prepared {
+        Ok(startup) => run_http_supervised(startup, Some(control)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::Interrupted && control.shutdown_requested =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn run_http_supervised(
     startup: PreparedHttpStartup,
-    control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    mut control_rx: Option<HttpServerControl>,
 ) -> std::io::Result<()> {
     let PreparedHttpStartup { config, on_ready } = startup;
     let config = &config;
@@ -4637,8 +4762,23 @@ fn run_http_supervised(
     mcp_agent_mail_core::pre_intern_policies();
 
     // Preparation ran the exclusive integrity probe before runtime locks.
-    // Acquire the real locks now; a competing owner still makes this fail.
-    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+    // Wait for any CLI activity admitted between preparation and this handoff.
+    let _runtime_mailbox_locks = match acquire_runtime_mailbox_activity_locks(config, || {
+        control_rx
+            .as_mut()
+            .is_some_and(HttpServerControl::startup_shutdown_requested)
+    }) {
+        Ok(locks) => locks,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::Interrupted
+                && control_rx
+                    .as_ref()
+                    .is_some_and(|control| control.shutdown_requested) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let startup_scope = StartupWorkerScope::default();
 
     // br-5mnkl: run the DB readiness warmup on a bounded background thread so a
@@ -4732,7 +4872,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
     mcp_agent_mail_core::pre_intern_policies();
 
     // Preparation already ran the probes before runtime activity locks.
-    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config, || false)?;
     let startup_scope = StartupWorkerScope::default();
 
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
@@ -4770,7 +4910,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
         http_runtime.handle(),
         config.clone(),
         Some(Arc::clone(&tui_state)),
-        Some(server_ctl_rx),
+        Some(HttpServerControl::new(server_ctl_rx)),
         Some(Arc::clone(&supervisor_fail_fast_active)),
         on_ready,
     ) {
@@ -5476,7 +5616,7 @@ fn spawn_http_supervisor_task(
     runtime_handle: RuntimeHandle,
     config: mcp_agent_mail_core::Config,
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
-    control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    control_rx: Option<HttpServerControl>,
     fail_fast_active: Option<Arc<AtomicBool>>,
     on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
@@ -5791,7 +5931,7 @@ async fn run_http_server_supervisor(
     runtime_handle: RuntimeHandle,
     mut config: mcp_agent_mail_core::Config,
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
-    mut control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    mut control_rx: Option<HttpServerControl>,
     mut on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
     let readiness_started = Instant::now();
@@ -22187,6 +22327,225 @@ mod tests {
         assert!(run_http_with_control(&config, rx).is_err());
     }
 
+    #[test]
+    fn http_startup_control_preserves_deferred_transport_changes() {
+        use tui_bridge::{ServerControlMsg, TransportBase};
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(ServerControlMsg::ToggleTransportBase)
+            .expect("queue first transport change");
+        tx.try_send(ServerControlMsg::SetTransportBase(TransportBase::Api))
+            .expect("queue second transport change");
+        let mut control = HttpServerControl::new(rx);
+        assert!(!control.startup_shutdown_requested());
+        tx.try_send(ServerControlMsg::ToggleTransportBase)
+            .expect("toggle the selected base during startup");
+        assert!(!control.startup_shutdown_requested());
+        assert_eq!(control.pending.len(), 1, "absolute selections coalesce");
+        tx.try_send(ServerControlMsg::SetTransportBase(TransportBase::Api))
+            .expect("queue a later change for the running supervisor");
+
+        let cx = Cx::for_testing();
+        for expected in [
+            ServerControlMsg::SetTransportBase(TransportBase::Mcp),
+            ServerControlMsg::SetTransportBase(TransportBase::Api),
+        ] {
+            assert_eq!(block_on(control.recv(&cx)), Ok(expected));
+        }
+
+        // An arbitrarily long wait cannot grow the deferred queue. Preserve
+        // two toggles for an even nonzero sequence so custom paths retain the
+        // running supervisor's normalization behavior.
+        for _ in 0..100 {
+            for _ in 0..4 {
+                tx.try_send(ServerControlMsg::ToggleTransportBase)
+                    .expect("queue repeated startup transport changes");
+            }
+            assert!(!control.startup_shutdown_requested());
+            assert_eq!(control.pending.len(), 2, "deferred state stays bounded");
+        }
+        assert_eq!(
+            block_on(control.recv(&cx)),
+            Ok(ServerControlMsg::ToggleTransportBase)
+        );
+        assert_eq!(
+            block_on(control.recv(&cx)),
+            Ok(ServerControlMsg::ToggleTransportBase)
+        );
+        tx.try_send(ServerControlMsg::ToggleTransportBase)
+            .expect("queue a transport change before shutdown");
+        tx.try_send(ServerControlMsg::Shutdown)
+            .expect("queue startup shutdown");
+        assert!(control.startup_shutdown_requested());
+        assert!(
+            control.startup_shutdown_requested(),
+            "shutdown stays latched"
+        );
+    }
+
+    #[test]
+    fn controlled_http_startup_cancels_integrity_lock_wait() {
+        if run_prepared_http_test_in_child(
+            "tests::controlled_http_startup_cancels_integrity_lock_wait",
+        ) {
+            return;
+        }
+        for disconnect in [false, true] {
+            assert_controlled_startup_lock_wait_cancels(false, disconnect);
+        }
+    }
+
+    #[test]
+    fn controlled_http_startup_cancels_runtime_lock_wait_and_releases_partial_guard() {
+        if run_prepared_http_test_in_child(
+            "tests::controlled_http_startup_cancels_runtime_lock_wait_and_releases_partial_guard",
+        ) {
+            return;
+        }
+        for disconnect in [false, true] {
+            assert_controlled_startup_lock_wait_cancels(true, disconnect);
+        }
+    }
+
+    #[test]
+    fn stdio_startup_cancels_integrity_lock_wait() {
+        if run_prepared_http_test_in_child("tests::stdio_startup_cancels_integrity_lock_wait") {
+            return;
+        }
+        let config = prepared_http_test_config();
+        let database = resolve_server_database_url_sqlite_path(&config.database_url)
+            .expect("private SQLite path");
+        let before = std::fs::read(&database).expect("database before contention");
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(mailbox_activity_lock_path(&database))
+            .expect("open external writer activity lock");
+        fs2::FileExt::lock_exclusive(&holder).expect("hold external writer activity lock");
+        let cx = Cx::for_testing();
+        let worker_cx = cx.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = result_tx.send(block_on(run_stdio(&worker_cx, &config)));
+        });
+        let early = result_rx.recv_timeout(Duration::from_millis(1300));
+        let stayed_waiting = matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        cx.set_cancel_requested(true);
+        let cancelled = if stayed_waiting {
+            result_rx.recv_timeout(Duration::from_secs(3))
+        } else {
+            early
+        };
+        drop(holder);
+        let joined = worker.join();
+
+        assert!(stayed_waiting, "stdio exited on contention: {cancelled:?}");
+        assert!(joined.is_ok(), "stdio worker panicked");
+        assert!(
+            matches!(cancelled, Ok(Err(ref error)) if error.kind() == std::io::ErrorKind::Interrupted),
+            "stdio must observe its caller's Cx cancellation while the lock is held: {cancelled:?}"
+        );
+        assert_eq!(
+            std::fs::read(&database).expect("database after cancelled startup"),
+            before,
+        );
+    }
+
+    fn assert_controlled_startup_lock_wait_cancels(runtime_admission: bool, disconnect: bool) {
+        let config = prepared_http_test_config();
+        let prepared = runtime_admission
+            .then(|| prepare_http_startup(&config).expect("prepare before competing writer"));
+        let database = resolve_server_database_url_sqlite_path(&config.database_url)
+            .expect("private SQLite path");
+        let before = std::fs::read(&database).expect("database before contention");
+        // Use a raw kernel lock, outside the process-local guard registry, to
+        // reproduce the direct CLI writer's actual exclusion mechanism.
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(mailbox_activity_lock_path(&database))
+            .expect("open external writer activity lock");
+        fs2::FileExt::lock_exclusive(&holder).expect("hold external writer activity lock");
+        let storage_root = config.storage_root.clone();
+        let (tx, rx) = mpsc::channel(4);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = if let Some(startup) = prepared {
+                startup.run_with_control(rx)
+            } else {
+                run_http_with_control(&config, rx)
+            };
+            let _ = result_tx.send(result);
+        });
+
+        let early = result_rx.recv_timeout(Duration::from_millis(1300));
+        let stayed_waiting = matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        // Failed SQLite admission must drop its partial root guard before
+        // waiting. Holding that root here also proves cancellation does not
+        // require either competing lock to become available.
+        let partial_root = runtime_admission.then(|| {
+            let root = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(storage_root.join(".mailbox.activity.lock"))
+                .expect("open runtime root lock");
+            let deadline = Instant::now() + Duration::from_millis(200);
+            let acquired = loop {
+                if fs2::FileExt::try_lock_exclusive(&root).is_ok() {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            (root, acquired)
+        });
+        let partial_root_released = partial_root.as_ref().is_none_or(|(_, acquired)| *acquired);
+        let shutdown_sent = if disconnect {
+            drop(tx);
+            true
+        } else {
+            tx.try_send(tui_bridge::ServerControlMsg::Shutdown).is_ok()
+        };
+        let cancelled = if stayed_waiting {
+            result_rx.recv_timeout(Duration::from_secs(3))
+        } else {
+            early
+        };
+        // Always release fixture locks and join before asserting, including
+        // the regression case where the caller's cancellation was ignored.
+        drop(partial_root);
+        drop(holder);
+        let joined = worker.join();
+
+        assert!(
+            stayed_waiting,
+            "startup exited on contention: {cancelled:?}"
+        );
+        assert!(
+            partial_root_released,
+            "runtime wait retained a partial root guard"
+        );
+        assert!(shutdown_sent, "startup dropped its control receiver early");
+        assert!(joined.is_ok(), "startup worker panicked");
+        assert!(
+            matches!(cancelled, Ok(Ok(()))),
+            "startup must stop promptly while the writer remains active: {cancelled:?}"
+        );
+        assert_eq!(
+            std::fs::read(&database).expect("database after cancelled startup"),
+            before,
+            "waiting or cancellation must not inspect or repair through the writer's lock"
+        );
+    }
+
     fn config_for_boot_check_storage(
         storage_root: &std::path::Path,
         mode: &str,
@@ -23880,8 +24239,8 @@ first body
             ..Default::default()
         };
 
-        let _runtime_locks =
-            acquire_runtime_mailbox_activity_locks(&config).expect("acquire runtime locks");
+        let _runtime_locks = acquire_runtime_mailbox_activity_locks(&config, || false)
+            .expect("acquire runtime locks");
         let _other_root_lock = acquire_mailbox_activity_lock_for_storage_root(
             &other_storage_root,
             MailboxActivityLockMode::Exclusive,
