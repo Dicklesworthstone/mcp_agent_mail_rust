@@ -11692,8 +11692,11 @@ fn sqlite_canonical_file_check_proving_orphans(
     proven_orphans: &RefCell<Option<NeverWrittenOrphanPages>>,
 ) -> Result<bool, SqlError> {
     const CONTEXT: &str = "canonical SQLite integrity diagnostic";
-    let (verdict, staged) =
-        with_canonical_diagnostic_conn_inspecting(path, CONTEXT, |conn, private_copy| {
+    let rejection_witness = RefCell::new(None);
+    let (verdict, staged) = with_canonical_diagnostic_conn_inspecting(
+        path,
+        CONTEXT,
+        |conn, private_copy| {
             let details = sqlite_pragma_check_details_canonical(conn, kind)?;
             if integrity::details_indicate_ok(&details) {
                 return Ok(true);
@@ -11726,10 +11729,155 @@ fn sqlite_canonical_file_check_proving_orphans(
                     }
                 }
             }
-            Ok(integrity::integrity_details_are_suspect(&details)
-                || canonical_details_are_collated_index_disagreement(conn, &details))
-        })?;
+            let accepted = integrity::integrity_details_are_suspect(&details)
+                || canonical_details_are_collated_index_disagreement(conn, &details);
+            if !accepted && let Some(copy) = private_copy {
+                match staged_rejection_witness(copy, details) {
+                    Ok(witness) => {
+                        rejection_witness.replace(Some(witness));
+                    }
+                    Err(error) => tracing::debug!(
+                        path = %path.display(),
+                        error = %error,
+                        "could not fingerprint a rejected staged copy; the rejection stays inconclusive"
+                    ),
+                }
+            }
+            Ok(accepted)
+        },
+    )?;
+    if verdict || !staged {
+        forget_staged_rejection(path, kind);
+    } else if let Some(witness) = rejection_witness.into_inner()
+        && let Some(standing) = staged_rejection_confirmed(
+            path,
+            kind,
+            witness,
+            Instant::now(),
+            STAGED_REJECTION_CONFIRMATION_SPAN,
+        )
+    {
+        tracing::warn!(
+            path = %path.display(),
+            check = %kind,
+            standing_secs = standing.as_secs(),
+            "canonical SQLite rejected byte-identical staged copies of the live family taken \
+             {}s apart; nothing changed the family in between, so neither copy can be torn and \
+             the rejection is canonical (GH#392)",
+            standing.as_secs()
+        );
+        return Ok(false);
+    }
     canonical_boolean_verdict(path, CONTEXT, verdict, staged)
+}
+
+/// How long a staged canonical rejection must stand, on byte-identical copies,
+/// before it counts as a canonical rejection (GH#392). Integrity cycles are
+/// further apart than this, so in practice the second cycle confirms.
+const STAGED_REJECTION_CONFIRMATION_SPAN: Duration = Duration::from_secs(10);
+
+/// A staged copy that canonical SQLite rejected: the copy's bytes and what
+/// canonical SQLite said about them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedRejectionWitness {
+    /// SHA-256 over the staged copy's main file and WAL.
+    family_digest: [u8; 32],
+    details: Vec<String>,
+}
+
+type StagedRejectionKey = (PathBuf, String);
+
+/// The first rejection of each unchanged staged family, per path and check
+/// kind, with when it was seen.
+static STAGED_CANONICAL_REJECTIONS: std::sync::LazyLock<
+    Mutex<HashMap<StagedRejectionKey, (StagedRejectionWitness, Instant)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn staged_rejection_key(path: &Path, kind: integrity::CheckKind) -> StagedRejectionKey {
+    (path.to_path_buf(), kind.to_string())
+}
+
+fn staged_rejection_witness(
+    copy: &Path,
+    details: Vec<String>,
+) -> std::io::Result<StagedRejectionWitness> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+
+    let mut hasher = sha2::Sha256::new();
+    for suffix in ["", "-wal"] {
+        let member = if suffix.is_empty() {
+            copy.to_path_buf()
+        } else {
+            sqlite_sidecar_path(copy, suffix)
+        };
+        let mut file = match std::fs::File::open(&member) {
+            Ok(file) => file,
+            Err(error) if !suffix.is_empty() && error.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update(b"absent");
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        hasher.update(file.metadata()?.len().to_le_bytes());
+        let mut buffer = vec![0_u8; 256 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(StagedRejectionWitness {
+        family_digest: hasher.finalize().into(),
+        details,
+    })
+}
+
+/// Whether a staged rejection of `path` is confirmed by an earlier one.
+///
+/// One rejected staged copy proves nothing: a copy taken while a writer is
+/// active can be torn. Copies taken at least `span` apart that are
+/// byte-identical and draw the same rows show that nothing changed the family
+/// in between, so neither copy was torn by a write; the rejection is canonical
+/// SQLite's verdict on the live bytes, the verdict startup reaches on them
+/// once the server is stopped. Without this, a running server deferred on such
+/// a family forever while skipping its full checks and maintenance (GH#392).
+///
+/// Returns how long the rejection has stood when it is confirmed. A changed
+/// copy or a different verdict restarts the observation.
+fn staged_rejection_confirmed(
+    path: &Path,
+    kind: integrity::CheckKind,
+    witness: StagedRejectionWitness,
+    now: Instant,
+    span: Duration,
+) -> Option<Duration> {
+    const MAX_TRACKED: usize = 64;
+
+    let key = staged_rejection_key(path, kind);
+    let mut registry = STAGED_CANONICAL_REJECTIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some((first, first_seen)) = registry.get(&key)
+        && *first == witness
+    {
+        let standing = now.saturating_duration_since(*first_seen);
+        return (standing >= span).then_some(standing);
+    }
+    if registry.len() >= MAX_TRACKED {
+        registry.clear();
+    }
+    registry.insert(key, (witness, now));
+    None
+}
+
+fn forget_staged_rejection(path: &Path, kind: integrity::CheckKind) {
+    STAGED_CANONICAL_REJECTIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&staged_rejection_key(path, kind));
 }
 
 /// Prove never-used pages of a family that was inspected through a direct
@@ -12435,6 +12583,9 @@ fn reconcile_with_canonical_proving_orphans(
                 // reconstructing. A genuinely corrupt file will be re-probed on
                 // the next cycle once contention clears, and `Ok(false)` (a real
                 // canonical rejection) still preserves the verdict and recovers.
+                // For a family canonical SQLite can only inspect through a staged
+                // copy, that `Ok(false)` comes from byte-identical rejected copies
+                // on two cycles (GH#392).
                 let canonical_error_msg = canonical_error.to_string();
                 if crate::error::is_lock_error(&canonical_error_msg)
                     || is_sqlite_snapshot_conflict_error_message(&canonical_error_msg)
@@ -35726,6 +35877,161 @@ mod tests {
             std::os::unix::fs::symlink(&path, &link).expect("create symlink");
             assert!(health_probe_file_stamp(&link).is_err());
         }
+    }
+
+    fn staged_rejection_test_witness(digest_byte: u8, row: &str) -> StagedRejectionWitness {
+        StagedRejectionWitness {
+            family_digest: [digest_byte; 32],
+            details: vec![row.to_string()],
+        }
+    }
+
+    #[test]
+    fn staged_rejection_is_confirmed_only_by_an_unchanged_copy_after_the_span() {
+        let dir = tempfile::tempdir().expect("registry key fixture");
+        let path = dir.path().join("standing.sqlite3");
+        let kind = integrity::CheckKind::Quick;
+        let span = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let first = || staged_rejection_test_witness(1, "NULL value in t.x");
+
+        assert_eq!(
+            staged_rejection_confirmed(&path, kind, first(), t0, span),
+            None
+        );
+        assert_eq!(
+            staged_rejection_confirmed(&path, kind, first(), t0 + Duration::from_secs(5), span),
+            None,
+            "an unchanged rejection inside the span is still unconfirmed"
+        );
+        assert_eq!(
+            staged_rejection_confirmed(&path, kind, first(), t0 + Duration::from_secs(11), span),
+            Some(Duration::from_secs(11))
+        );
+        assert_eq!(
+            staged_rejection_confirmed(
+                &path,
+                integrity::CheckKind::Full,
+                first(),
+                t0 + Duration::from_secs(12),
+                span
+            ),
+            None,
+            "each check kind keeps its own observation"
+        );
+
+        // A copy whose bytes or rows changed (a writer was active) restarts it.
+        let changed = staged_rejection_test_witness(2, "NULL value in t.x");
+        assert_eq!(
+            staged_rejection_confirmed(
+                &path,
+                kind,
+                changed.clone(),
+                t0 + Duration::from_secs(20),
+                span
+            ),
+            None
+        );
+        assert_eq!(
+            staged_rejection_confirmed(
+                &path,
+                kind,
+                changed.clone(),
+                t0 + Duration::from_secs(25),
+                span
+            ),
+            None
+        );
+        let other_rows = staged_rejection_test_witness(2, "row 2 missing from index i");
+        assert_eq!(
+            staged_rejection_confirmed(&path, kind, other_rows, t0 + Duration::from_secs(40), span),
+            None
+        );
+
+        // An acceptance in between forgets the earlier rejection.
+        forget_staged_rejection(&path, kind);
+        assert_eq!(
+            staged_rejection_confirmed(&path, kind, changed, t0 + Duration::from_secs(60), span),
+            None
+        );
+    }
+
+    /// A Franken-admitted family whose only row breaks its `NOT NULL`
+    /// constraint, the defect GH#392 was reported with. Canonical SQLite can
+    /// only inspect such a family through a staged copy.
+    fn seed_staged_not_null_violation(path: &Path) {
+        let conn = crate::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+            .expect("open fixture");
+        conn.execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("settle fixture journal mode");
+        conn.execute_raw("CREATE TABLE diagnostic_fixture (value INTEGER NOT NULL);")
+            .expect("create fixture table");
+        conn.execute_raw("INSERT INTO diagnostic_fixture (value) VALUES (0);")
+            .expect("populate fixture table");
+        let root_page = conn
+            .query_sync(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'diagnostic_fixture'",
+                &[],
+            )
+            .expect("read fixture root page")[0]
+            .get_named::<i64>("rootpage")
+            .expect("decode fixture root page");
+        drop(conn);
+
+        // The row's record is [payload len, rowid, header len, serial type]:
+        // serial type 8 is the integer 0, serial type 0 is NULL.
+        let mut bytes = std::fs::read(path).expect("read fixture");
+        let page_size = match u16::from_be_bytes([bytes[16], bytes[17]]) {
+            1 => 65_536,
+            size => usize::from(size),
+        };
+        let page = (usize::try_from(root_page).unwrap() - 1) * page_size;
+        assert_eq!(bytes[page], 13, "fixture root page must be a table leaf");
+        let cell = page + usize::from(u16::from_be_bytes([bytes[page + 8], bytes[page + 9]]));
+        assert_eq!(
+            &bytes[cell..cell + 4],
+            &[2, 1, 2, 8],
+            "unexpected fixture record"
+        );
+        bytes[cell + 3] = 0;
+        std::fs::write(path, bytes).expect("write fixture");
+        admit_diagnostic_database_with_franken(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_staged_canonical_rejection_is_confirmed_on_a_later_cycle() {
+        // GH#392: canonical SQLite rejected every staged copy of this family,
+        // and the reconcile deferred on each one forever because a staged
+        // rejection might come from a torn copy.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("standing-defect.sqlite3");
+        seed_staged_not_null_violation(&path);
+        let kind = integrity::CheckKind::Quick;
+        let proven_orphans = RefCell::new(None);
+
+        let first = sqlite_canonical_file_check_proving_orphans(&path, kind, &proven_orphans);
+        assert!(
+            matches!(&first, Err(error) if is_canonical_second_opinion_inconclusive(&error.to_string())),
+            "one staged rejection stays inconclusive: {first:?}"
+        );
+
+        // The next integrity cycle comes after the confirmation span.
+        let remembered = STAGED_CANONICAL_REJECTIONS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&staged_rejection_key(&path, kind))
+            .map(|(_, seen)| {
+                *seen = seen
+                    .checked_sub(STAGED_REJECTION_CONFIRMATION_SPAN)
+                    .expect("backdate the first rejection");
+            });
+        assert!(remembered.is_some(), "the first rejection is remembered");
+        let second = sqlite_canonical_file_check_proving_orphans(&path, kind, &proven_orphans);
+        assert!(
+            matches!(second, Ok(false)),
+            "an unchanged staged rejection must become a canonical rejection: {second:?}"
+        );
     }
 
     /// br-eru3j: back-to-back probes of an unchanged family stage and check
