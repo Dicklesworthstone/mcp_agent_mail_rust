@@ -17001,7 +17001,7 @@ struct CanonicalSnapshotSource {
     reported_path: PathBuf,
     kind: CanonicalSnapshotSourceKind,
     receipt_state_preserved: bool,
-    _snapshot_dir: Option<tempfile::TempDir>,
+    _snapshot_dir: Option<mcp_agent_mail_db::pool::EphemeralSnapshotTempDir>,
     _staged_family: Option<mcp_agent_mail_db::pool::SqliteHealthProbeSource>,
 }
 
@@ -17014,7 +17014,10 @@ impl std::fmt::Debug for CanonicalSnapshotSource {
             .field("receipt_state_preserved", &self.receipt_state_preserved)
             .field(
                 "snapshot_dir",
-                &self._snapshot_dir.as_ref().map(tempfile::TempDir::path),
+                &self
+                    ._snapshot_dir
+                    .as_ref()
+                    .map(mcp_agent_mail_db::pool::EphemeralSnapshotTempDir::path),
             )
             .field("staged_family", &self._staged_family.is_some())
             .finish()
@@ -17056,6 +17059,22 @@ fn canonical_snapshot_tempdir_in(
         })
 }
 
+fn canonical_mailbox_snapshot_tempdir(
+    kind: mcp_agent_mail_db::pool::EphemeralSnapshotKind,
+    context: &str,
+) -> CliResult<mcp_agent_mail_db::pool::EphemeralSnapshotTempDir> {
+    let temp_root = mcp_agent_mail_db::pool::snapshot_temp_root();
+    mcp_agent_mail_db::pool::EphemeralSnapshotTempDir::new_in(kind, &temp_root).map_err(|error| {
+        CliError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "{context}: TMPDIR unusable at {}: {error}",
+                temp_root.display()
+            ),
+        ))
+    })
+}
+
 impl CanonicalSnapshotSource {
     fn live(path: PathBuf) -> Self {
         Self {
@@ -17074,7 +17093,10 @@ impl CanonicalSnapshotSource {
         live_salvage_db_path: Option<&Path>,
         context: &str,
     ) -> CliResult<Self> {
-        let snapshot_dir = canonical_snapshot_tempdir("canonical-mailbox-snapshot-", context)?;
+        let snapshot_dir = canonical_mailbox_snapshot_tempdir(
+            mcp_agent_mail_db::pool::EphemeralSnapshotKind::Mailbox,
+            context,
+        )?;
         let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
         let reconstruct = live_salvage_db_path.map_or_else(
             || mcp_agent_mail_db::reconstruct_from_archive(&actual_path, storage_root),
@@ -17106,7 +17128,10 @@ impl CanonicalSnapshotSource {
         source_path: &Path,
         context: &str,
     ) -> CliResult<Self> {
-        let snapshot_dir = canonical_snapshot_tempdir("canonical-mailbox-full-snapshot-", context)?;
+        let snapshot_dir = canonical_mailbox_snapshot_tempdir(
+            mcp_agent_mail_db::pool::EphemeralSnapshotKind::FullMailbox,
+            context,
+        )?;
         let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
         vacuum_live_franken_sqlite_into_snapshot(source_path, &actual_path, context)?;
         Ok(Self {
@@ -17744,7 +17769,9 @@ fn open_db_async_canonical_read_with_database_url(
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
-    let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
+    // The private snapshot and its pool are command-scoped. The runtime
+    // factory retains pools between requests, outliving this directory owner.
+    let pool = mcp_agent_mail_db::DbPool::new(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
         .with_search_identity_path(&source.reported_path().display().to_string());
     Ok(CanonicalReadPool {
@@ -17769,7 +17796,9 @@ fn open_db_sync_async_canonical_read_with_database_url(
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     pool_cfg.database_url = sqlite_url_from_path(source.actual_path());
     pool_cfg.storage_root = Some(storage_root);
-    let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
+    // Keep pooled connections under the same command-scoped owner as `conn`
+    // and the snapshot; a process-resident runtime pool would pin its files.
+    let pool = mcp_agent_mail_db::DbPool::new(&pool_cfg)
         .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
         .with_search_identity_path(&source.reported_path().display().to_string());
     Ok(CanonicalReadDbPool {
@@ -83347,6 +83376,202 @@ startup_timeout_sec = 42
         let canonical_tmpdir = real_tmpdir.canonicalize().expect("canonicalize tempdir");
         assert_eq!(snapshot.path().parent(), Some(canonical_tmpdir.as_path()));
         assert!(snapshot.path().is_dir());
+    }
+
+    #[test]
+    fn canonical_mailbox_snapshots_clean_up_after_reads_and_errors() {
+        const CHILD_ENV: &str = "AM_TEST_CANONICAL_SNAPSHOT_CLEANUP_FIXTURE";
+        const CHILD_TEST: &str =
+            "tests::canonical_mailbox_snapshots_clean_up_after_reads_and_errors";
+        const CHILD_COMPLETE: &str = "canonical-snapshot-cleanup-child-complete";
+
+        fn exercise_private_pool(pool: &mcp_agent_mail_db::DbPool) -> PathBuf {
+            let config = mcp_agent_mail_db::DbPoolConfig {
+                database_url: sqlite_url_from_path(Path::new(pool.sqlite_path())),
+                storage_root: Some(pool.storage_root().to_path_buf()),
+                ..mcp_agent_mail_db::DbPoolConfig::from_env()
+            };
+            assert!(
+                mcp_agent_mail_db::get_cached_pool(&config).is_none(),
+                "private snapshot pools must not acquire process-resident ownership"
+            );
+            block_on_async(|cx| async move {
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) AS count FROM messages", &[])
+                    .unwrap();
+                assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 1);
+            });
+            Path::new(pool.sqlite_path())
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        }
+
+        fn assert_private_pool_released(directory: &Path) {
+            assert!(
+                !directory.exists(),
+                "the pool owner must remove its snapshot"
+            );
+            #[cfg(target_os = "linux")]
+            {
+                let retained: Vec<_> = std::fs::read_dir("/proc/self/fd")
+                    .unwrap()
+                    .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                    .filter(|target| {
+                        let target = target.to_string_lossy();
+                        Path::new(target.strip_suffix(" (deleted)").unwrap_or(&target))
+                            .starts_with(directory)
+                    })
+                    .collect();
+                assert!(
+                    retained.is_empty(),
+                    "pool drop must close snapshot descriptors before removing their files: {retained:?}"
+                );
+            }
+        }
+
+        if let Some(fixture) = std::env::var_os(CHILD_ENV) {
+            let fixture = PathBuf::from(fixture);
+            let temp_root = fixture.join("snapshots").canonicalize().unwrap();
+            assert_eq!(mcp_agent_mail_db::pool::snapshot_temp_root(), temp_root);
+            let storage_root = fixture.join("archive");
+            let messages = seed_archive_mailbox_project(&storage_root);
+            write_archive_mailbox_message(
+                &messages,
+                "cleanup__1.md",
+                1,
+                "Alice",
+                "Snapshot cleanup witness",
+                "normal",
+                "2026-03-22T00:00:00Z",
+                "archive snapshot payload",
+            );
+            let source_path = fixture.join("live.sqlite3");
+            let source =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(source_path.to_str().unwrap())
+                    .expect("create canonical live source");
+            source
+                .execute_raw(
+                    "PRAGMA journal_mode = DELETE;\n\
+                     CREATE TABLE messages(id INTEGER PRIMARY KEY);\n\
+                     INSERT INTO messages(id) VALUES (7);",
+                )
+                .expect("seed readable source with incomplete mailbox schema");
+            drop(source);
+            let source_before = sqlite_family_bytes_for_cli_open_test(&source_path);
+
+            for _ in 0..2 {
+                let archive = CanonicalSnapshotSource::archive_snapshot(
+                    source_path.clone(),
+                    &storage_root,
+                    None,
+                    "snapshot cleanup test",
+                )
+                .expect("reconstruct private archive snapshot");
+                let directory = archive.actual_path().parent().unwrap().to_path_buf();
+                assert_eq!(directory.parent(), Some(temp_root.as_path()));
+                let reader = archive.open_read_only("snapshot cleanup test").unwrap();
+                let rows = reader
+                    .query_sync("SELECT subject FROM messages", &[])
+                    .expect("read archive snapshot");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_named::<String>("subject").unwrap(),
+                    "Snapshot cleanup witness"
+                );
+                drop(reader);
+                drop(archive);
+                assert!(!directory.exists(), "completed archive reads must clean up");
+
+                let full = CanonicalSnapshotSource::live_full_sqlite_snapshot(
+                    source_path.clone(),
+                    &source_path,
+                    "snapshot cleanup test",
+                )
+                .expect("materialize a full private snapshot");
+                let directory = full.actual_path().parent().unwrap().to_path_buf();
+                assert_eq!(directory.parent(), Some(temp_root.as_path()));
+                let reader = full.open_read_only("snapshot cleanup test").unwrap();
+                let rows = reader.query_sync("SELECT id FROM messages", &[]).unwrap();
+                assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 7);
+                drop(reader);
+                drop(full);
+                assert!(
+                    !directory.exists(),
+                    "completed full snapshots must clean up"
+                );
+
+                // This fails after both the archive directory and a full live
+                // salvage copy exist, matching the degraded CLI error path.
+                let error = CanonicalSnapshotSource::archive_snapshot(
+                    source_path.clone(),
+                    &storage_root,
+                    Some(&source_path),
+                    "snapshot cleanup test",
+                )
+                .expect_err("the incomplete live schema must refuse reconstruction");
+                assert!(
+                    error.to_string().contains("messages schema is incomplete"),
+                    "unexpected reconstruction failure: {error}"
+                );
+                assert!(
+                    std::fs::read_dir(&temp_root).unwrap().next().is_none(),
+                    "failed reads must clean up both salvage and mailbox snapshots"
+                );
+            }
+
+            let missing_source_url = sqlite_url_from_path(&fixture.join("missing-live.sqlite3"));
+            let read_pool = open_db_async_canonical_read_with_database_url(
+                &missing_source_url,
+                Some(&storage_root),
+                "snapshot pool cleanup test",
+            )
+            .expect("open private asynchronous archive reader");
+            let directory = exercise_private_pool(read_pool.pool());
+            drop(read_pool);
+            assert_private_pool_released(&directory);
+
+            let read_db_pool = open_db_sync_async_canonical_read_with_database_url(
+                &missing_source_url,
+                Some(&storage_root),
+                "snapshot pool cleanup test",
+            )
+            .expect("open private synchronous/asynchronous archive reader");
+            let directory = exercise_private_pool(read_db_pool.pool());
+            drop(read_db_pool);
+            assert_private_pool_released(&directory);
+            assert!(std::fs::read_dir(&temp_root).unwrap().next().is_none());
+            assert_eq!(
+                sqlite_family_bytes_for_cli_open_test(&source_path),
+                source_before,
+                "scratch cleanup must leave the live mailbox bytes unchanged"
+            );
+            println!("{CHILD_COMPLETE}");
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let temp_root = fixture.path().join("snapshots");
+        std::fs::create_dir(&temp_root).unwrap();
+        let temp_root = temp_root.canonicalize().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CHILD_TEST, "--nocapture"])
+            .env(CHILD_ENV, fixture.path())
+            .env("TMPDIR", &temp_root)
+            .env("TEMP", &temp_root)
+            .env("TMP", &temp_root)
+            .output()
+            .expect("run isolated canonical snapshot cleanup test");
+        assert!(
+            output.status.success(),
+            "canonical snapshot cleanup child failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETE));
+        assert!(std::fs::read_dir(&temp_root).unwrap().next().is_none());
     }
 
     #[test]

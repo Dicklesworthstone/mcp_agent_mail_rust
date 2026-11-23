@@ -10045,6 +10045,282 @@ pub struct CanonicalSnapshotTempDir {
     canonical_path: PathBuf,
 }
 
+/// Disposable database copies whose abandoned directories can be reclaimed.
+/// Recovery candidates retained for forensic inspection deliberately use
+/// [`CanonicalSnapshotTempDir`] instead.
+#[derive(Debug, Clone, Copy)]
+pub enum EphemeralSnapshotKind {
+    LiveSalvage,
+    Mailbox,
+    FullMailbox,
+}
+
+impl EphemeralSnapshotKind {
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::LiveSalvage => "reconstruct-live-salvage-",
+            Self::Mailbox => "canonical-mailbox-snapshot-",
+            Self::FullMailbox => "canonical-mailbox-full-snapshot-",
+        }
+    }
+
+    const fn database_name(self) -> &'static str {
+        match self {
+            Self::LiveSalvage => "salvage.sqlite3",
+            Self::Mailbox | Self::FullMailbox => "mailbox.sqlite3",
+        }
+    }
+
+    fn from_directory_name(name: &OsStr) -> Option<Self> {
+        let name = name.to_str()?;
+        [Self::LiveSalvage, Self::Mailbox, Self::FullMailbox]
+            .into_iter()
+            .find(|kind| {
+                name.strip_prefix(kind.prefix())
+                    .is_some_and(|suffix| !suffix.is_empty())
+            })
+    }
+}
+
+const EPHEMERAL_SNAPSHOT_LEASE: &str = ".agent-mail-snapshot-lease";
+const EPHEMERAL_SNAPSHOT_LEASE_CONTENT: &[u8] = b"agent-mail ephemeral SQLite snapshot v1\n";
+
+/// A private scratch directory with immediate cleanup and crash recovery.
+///
+/// A `TempDir` alone cannot clean up after a timed-out CLI is killed (GH#401).
+/// The lease is locked before its complete recognition record is written and
+/// stays locked until this owner drops. Subsequent allocations in the same
+/// temp root reclaim only positively identified, unlocked scratch directories.
+/// There is no age cutoff: an arbitrarily slow live reader keeps its snapshot.
+/// Keep this owner alive until every connection to its database has closed.
+#[derive(Debug)]
+pub struct EphemeralSnapshotTempDir {
+    directory: Option<tempfile::TempDir>,
+    canonical_path: PathBuf,
+    lease: Option<std::fs::File>,
+}
+
+impl EphemeralSnapshotTempDir {
+    pub fn new(kind: EphemeralSnapshotKind) -> std::io::Result<Self> {
+        Self::new_in(kind, &snapshot_temp_root())
+    }
+
+    pub fn new_in(kind: EphemeralSnapshotKind, root: &Path) -> std::io::Result<Self> {
+        use std::io::Write as _;
+
+        // Freeze the cleanup guard's spelling too, not only the database path:
+        // neither a relative TMPDIR nor a changed symlink may strand the copy.
+        let root = root.canonicalize()?;
+        // Reclaim before allocating: abandoned copies may have filled TMPDIR.
+        sweep_abandoned_ephemeral_snapshots_in(&root);
+        let directory = tempfile::Builder::new()
+            .prefix(kind.prefix())
+            .tempdir_in(&root)?;
+        let canonical_path = directory.path().to_path_buf();
+        let mut lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(canonical_path.join(EPHEMERAL_SNAPSHOT_LEASE))?;
+        fs2::FileExt::try_lock_exclusive(&lease)?;
+        // An interrupted/partial write is deliberately not authority to reap.
+        lease.write_all(EPHEMERAL_SNAPSHOT_LEASE_CONTENT)?;
+        Ok(Self {
+            directory: Some(directory),
+            canonical_path,
+            lease: Some(lease),
+        })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.canonical_path
+    }
+}
+
+impl Drop for EphemeralSnapshotTempDir {
+    fn drop(&mut self) {
+        // Windows may refuse deletion while a lease handle remains open.
+        // The owner has finished using the database before releasing the lease.
+        #[cfg(windows)]
+        drop(self.lease.take());
+        if let Some(directory) = self.directory.take()
+            && let Err(error) = remove_ephemeral_snapshot_directory(&directory.keep())
+        {
+            // Do not silently hide a filesystem failure during normal cleanup.
+            tracing::warn!(
+                path = %self.canonical_path.display(),
+                %error,
+                "could not remove ephemeral SQLite snapshot"
+            );
+        }
+        drop(self.lease.take());
+    }
+}
+
+fn ephemeral_snapshot_entry_is_owned(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        metadata.uid() == rustix::process::geteuid().as_raw()
+            && (!metadata.is_file() || metadata.nlink() == 1)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
+    }
+}
+
+fn ephemeral_snapshot_payload_name(kind: EphemeralSnapshotKind, name: &OsStr) -> bool {
+    let Some(suffix) = name.to_str().and_then(|name| {
+        name.strip_prefix(kind.database_name()).or_else(|| {
+            // ATC simulate snapshots its telemetry alongside the mailbox.
+            match kind {
+                EphemeralSnapshotKind::FullMailbox => name.strip_prefix("atc.sqlite3"),
+                EphemeralSnapshotKind::LiveSalvage | EphemeralSnapshotKind::Mailbox => None,
+            }
+        })
+    }) else {
+        return false;
+    };
+    // Reconstruction compacts the private database before exposing it. A kill
+    // during FrankenSQLite's VACUUM can leave its random rebuild image and
+    // that image's own sidecars in the same directory.
+    let suffix = if let Some(rebuild) = suffix.strip_prefix(".fsqlite-vacuum-rebuild-") {
+        let Some((nonce, suffix)) = rebuild.split_once(".tmp") else {
+            return false;
+        };
+        if nonce.len() != 32
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return false;
+        }
+        suffix
+    } else {
+        suffix
+    };
+    // The engine publishes its first-open marker with a private sibling, so
+    // interruption may leave the staging file instead of the final marker.
+    if let Some(staging) = suffix.strip_prefix(".fsqlite-migration-state.tmp.") {
+        return staging.split_once('.').is_some_and(|(pid, sequence)| {
+            !pid.is_empty()
+                && !sequence.is_empty()
+                && pid.bytes().all(|byte| byte.is_ascii_digit())
+                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    }
+    matches!(
+        suffix,
+        "" | "-wal"
+            | "-shm"
+            | "-journal"
+            | "-wal-cert"
+            | "-wal-cert-head"
+            | "-fsqlite-ns-gate"
+            | "-fsqlite-ns-use"
+            | "-fsqlite-ns-gate.retired-private-salvage"
+            | "-fsqlite-ns-use.retired-private-salvage"
+            | "-wal-cert.retired-private-salvage"
+            | "-wal-cert-head.retired-private-salvage"
+            | ".fsqlite-migration-state"
+    )
+}
+
+fn reclaim_abandoned_ephemeral_snapshot(
+    path: &Path,
+    kind: EphemeralSnapshotKind,
+) -> std::io::Result<bool> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || !ephemeral_snapshot_entry_is_owned(&metadata) {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    if metadata.mode() & 0o077 != 0 {
+        // Only private directories allocated by this owner qualify.
+        return Ok(false);
+    }
+    let directory_identity = same_file::Handle::from_path(path)?;
+    let lease_path = path.join(EPHEMERAL_SNAPSHOT_LEASE);
+    let mut lease = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&lease_path)?;
+    let lease_metadata = lease.metadata()?;
+    if !ephemeral_snapshot_entry_is_owned(&lease_metadata)
+        || lease_metadata.len() != EPHEMERAL_SNAPSHOT_LEASE_CONTENT.len() as u64
+        || fs2::FileExt::try_lock_exclusive(&lease).is_err()
+    {
+        return Ok(false);
+    }
+    let mut record = [0_u8; EPHEMERAL_SNAPSHOT_LEASE_CONTENT.len()];
+    lease.read_exact(&mut record)?;
+    if record != EPHEMERAL_SNAPSHOT_LEASE_CONTENT {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file()
+            || !ephemeral_snapshot_entry_is_owned(&metadata)
+            || (name != EPHEMERAL_SNAPSHOT_LEASE && !ephemeral_snapshot_payload_name(kind, &name))
+        {
+            return Ok(false);
+        }
+    }
+    // Recheck identities after locking and inspection. A renamed directory or
+    // replaced marker is not the scratch owner whose lease we acquired.
+    if !std::fs::symlink_metadata(path)?.is_dir()
+        || directory_identity != same_file::Handle::from_path(path)?
+        || same_file::Handle::from_file(lease.try_clone()?)?
+            != same_file::Handle::from_file(
+                mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&lease_path)?,
+            )?
+    {
+        return Ok(false);
+    }
+    drop(directory_identity);
+    #[cfg(windows)]
+    drop(lease);
+    remove_ephemeral_snapshot_directory(path)?;
+    Ok(true)
+}
+
+/// Remove the lease last: an I/O error or another killed poll during cleanup
+/// must not strand a full database after losing its ownership record. A kill
+/// between the final two unlinks can leave only an empty directory.
+fn remove_ephemeral_snapshot_directory(path: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_name() != EPHEMERAL_SNAPSHOT_LEASE {
+            // Scratch payloads are flat files. Do not recursively remove an
+            // unexpected directory even when it was placed in our tempdir.
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    std::fs::remove_file(path.join(EPHEMERAL_SNAPSHOT_LEASE))?;
+    std::fs::remove_dir(path)
+}
+
+fn sweep_abandoned_ephemeral_snapshots_in(root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut reclaimed = 0;
+    for entry in entries.flatten() {
+        let Some(kind) = EphemeralSnapshotKind::from_directory_name(&entry.file_name()) else {
+            continue;
+        };
+        let path = entry.path();
+        if reclaim_abandoned_ephemeral_snapshot(&path, kind).unwrap_or(false) {
+            reclaimed += 1;
+            tracing::debug!(path = %path.display(), "reclaimed abandoned SQLite snapshot");
+        }
+    }
+    reclaimed
+}
+
 /// The staging directory chosen by [`ensure_usable_snapshot_temp_root`] when
 /// the environment's temp directory cannot hold a probe copy. Set at most once
 /// per process; every later staging area is created there.
@@ -23082,6 +23358,316 @@ mod tests {
                 .starts_with(real_tmpdir.canonicalize().expect("canonical real tmpdir")),
             "snapshot path should use the resolved real temp root: {}",
             snapshot.path().display()
+        );
+    }
+
+    #[test]
+    fn ephemeral_snapshot_cleanup_survives_owner_termination() {
+        const CHILD_ROOT: &str = "MCP_AGENT_MAIL_EPHEMERAL_SNAPSHOT_CHILD_ROOT";
+        const TEST: &str =
+            "pool_impl::tests::ephemeral_snapshot_cleanup_survives_owner_termination";
+        const KINDS: [EphemeralSnapshotKind; 3] = [
+            EphemeralSnapshotKind::LiveSalvage,
+            EphemeralSnapshotKind::Mailbox,
+            EphemeralSnapshotKind::FullMailbox,
+        ];
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let snapshots = KINDS.map(|kind| {
+                let snapshot = EphemeralSnapshotTempDir::new_in(kind, &root).unwrap();
+                let database = snapshot.path().join(kind.database_name());
+                let conn = crate::DbConn::open_file(database.to_str().unwrap()).unwrap();
+                conn.execute_raw(
+                    "CREATE TABLE witness(value TEXT); INSERT INTO witness VALUES ('preserved');",
+                )
+                .unwrap();
+                crate::close_db_conn(conn, "close ephemeral snapshot fixture writer");
+                std::fs::write(
+                    sqlite_sidecar_path(&database, "-fsqlite-ns-gate.retired-private-salvage"),
+                    b"retired namespace witness",
+                )
+                .unwrap();
+                let rebuild = sqlite_sidecar_path(
+                    &database,
+                    ".fsqlite-vacuum-rebuild-0123456789abcdef0123456789abcdef.tmp",
+                );
+                std::fs::copy(&database, &rebuild).unwrap();
+                std::fs::write(
+                    sqlite_sidecar_path(&rebuild, "-wal"),
+                    b"private rebuild WAL",
+                )
+                .unwrap();
+                std::fs::write(
+                    sqlite_sidecar_path(&rebuild, ".fsqlite-migration-state.tmp.123.1"),
+                    b"interrupted migration marker publication",
+                )
+                .unwrap();
+                if matches!(kind, EphemeralSnapshotKind::FullMailbox) {
+                    std::fs::copy(&database, snapshot.path().join("atc.sqlite3")).unwrap();
+                }
+                snapshot
+            });
+            std::fs::write(root.join("child-ready"), b"ready").unwrap();
+            let mut release = String::new();
+            std::io::stdin().read_line(&mut release).unwrap();
+            assert!(snapshots.iter().all(|snapshot| snapshot.path().exists()));
+            return;
+        }
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let live = EphemeralSnapshotTempDir::new_in(KINDS[0], root.path()).unwrap();
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD_ROOT, root.path())
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("start real snapshot owner"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !root.path().join("child-ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "child exited before creating the leased databases"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "child did not publish its snapshots"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let children: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                EphemeralSnapshotKind::from_directory_name(&entry.file_name()).is_some()
+                    && entry.path() != live.path()
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            children.len(),
+            KINDS.len(),
+            "child filter must run all three allocations"
+        );
+        let next = EphemeralSnapshotTempDir::new_in(KINDS[1], root.path()).unwrap();
+        assert!(
+            children.iter().all(|path| path.exists()),
+            "live leases must survive a sweep"
+        );
+        assert!(
+            live.path().exists(),
+            "same-process live leases also survive"
+        );
+        drop(next);
+
+        child
+            .0
+            .kill()
+            .expect("terminate only the private snapshot fixture");
+        let status = child.0.wait().unwrap();
+        assert!(
+            !status.success(),
+            "the fixture must bypass normal destructors"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+        }
+        assert!(
+            children.iter().all(|path| path.exists()),
+            "termination must leave actual orphan copies"
+        );
+        let next = EphemeralSnapshotTempDir::new_in(KINDS[1], root.path()).unwrap();
+        assert!(
+            children.iter().all(|path| !path.exists()),
+            "the next allocation must reclaim every abandoned copy and sidecar"
+        );
+        assert!(live.path().exists());
+        let next_path = next.path().to_path_buf();
+        drop(next);
+        assert!(
+            !next_path.exists(),
+            "normal drop must still clean immediately"
+        );
+    }
+
+    fn abandoned_ephemeral_snapshot_fixture(root: &Path, kind: EphemeralSnapshotKind) -> PathBuf {
+        let mut snapshot = EphemeralSnapshotTempDir::new_in(kind, root).unwrap();
+        let path = snapshot.directory.take().unwrap().keep();
+        drop(snapshot);
+        path
+    }
+
+    #[test]
+    fn ephemeral_snapshot_cleanup_keeps_lease_until_payload_removal_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot =
+            EphemeralSnapshotTempDir::new_in(EphemeralSnapshotKind::Mailbox, root.path()).unwrap();
+        let path = snapshot.path().to_path_buf();
+        std::fs::write(path.join("mailbox.sqlite3"), b"private database").unwrap();
+        // A non-file payload makes cleanup fail without permission-dependent
+        // behavior (the regression must also work when tests run as root).
+        let obstruction = path.join("unexpected-directory");
+        std::fs::create_dir(&obstruction).unwrap();
+        std::fs::write(obstruction.join("preserve.txt"), b"unrecognized data").unwrap();
+        drop(snapshot);
+        assert!(path.join(EPHEMERAL_SNAPSHOT_LEASE).exists());
+        assert!(obstruction.join("preserve.txt").exists());
+
+        let retained = root.path().join("retained-directory");
+        std::fs::rename(&obstruction, &retained).unwrap();
+        let _next =
+            EphemeralSnapshotTempDir::new_in(EphemeralSnapshotKind::Mailbox, root.path()).unwrap();
+        assert!(!path.exists(), "an interrupted cleanup remains reclaimable");
+        assert_eq!(
+            std::fs::read(retained.join("preserve.txt")).unwrap(),
+            b"unrecognized data"
+        );
+    }
+
+    #[test]
+    fn ephemeral_snapshot_sweep_refuses_unrecognized_or_foreign_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let kind = EphemeralSnapshotKind::Mailbox;
+        let legacy = CanonicalSnapshotTempDir::new_in(kind.prefix(), root.path())
+            .unwrap()
+            .preserve();
+        std::fs::write(legacy.join(kind.database_name()), b"retained evidence").unwrap();
+        let malformed = abandoned_ephemeral_snapshot_fixture(root.path(), kind);
+        std::fs::write(malformed.join(EPHEMERAL_SNAPSHOT_LEASE), b"partial").unwrap();
+        let foreign = abandoned_ephemeral_snapshot_fixture(root.path(), kind);
+        std::fs::write(foreign.join("irreplaceable.txt"), b"not a scratch database").unwrap();
+        let nested = abandoned_ephemeral_snapshot_fixture(root.path(), kind);
+        std::fs::create_dir(nested.join(kind.database_name())).unwrap();
+        std::fs::write(
+            nested.join(kind.database_name()).join("data"),
+            b"nested data",
+        )
+        .unwrap();
+        let unrecognized = root.path().join("unrelated-directory");
+        std::fs::create_dir(&unrecognized).unwrap();
+        std::fs::write(
+            unrecognized.join(EPHEMERAL_SNAPSHOT_LEASE),
+            EPHEMERAL_SNAPSHOT_LEASE_CONTENT,
+        )
+        .unwrap();
+        let empty_orphan = abandoned_ephemeral_snapshot_fixture(root.path(), kind);
+
+        let _next = EphemeralSnapshotTempDir::new_in(kind, root.path()).unwrap();
+        assert!(
+            !empty_orphan.exists(),
+            "an abandoned lease without payload is reclaimable"
+        );
+        for path in [&legacy, &malformed, &foreign, &nested, &unrecognized] {
+            assert!(
+                path.exists(),
+                "unrecognized content must survive: {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(legacy.join(kind.database_name())).unwrap(),
+            b"retained evidence"
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("irreplaceable.txt")).unwrap(),
+            b"not a scratch database"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ephemeral_snapshot_sweep_refuses_links_and_shared_directories() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let kind = EphemeralSnapshotKind::LiveSalvage;
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        let victim_file = victim.join("precious.sqlite3");
+        std::fs::write(&victim_file, b"unrelated database").unwrap();
+        let directory_link = root.path().join(format!("{}symlink", kind.prefix()));
+        symlink(&victim, &directory_link).unwrap();
+        let payload_link = abandoned_ephemeral_snapshot_fixture(root.path(), kind);
+        symlink(&victim_file, payload_link.join(kind.database_name())).unwrap();
+        let payload_hardlink = abandoned_ephemeral_snapshot_fixture(root.path(), kind);
+        std::fs::hard_link(&victim_file, payload_hardlink.join(kind.database_name())).unwrap();
+        let marker_link = abandoned_ephemeral_snapshot_fixture(root.path(), kind);
+        std::fs::rename(
+            marker_link.join(EPHEMERAL_SNAPSHOT_LEASE),
+            victim.join("lease"),
+        )
+        .unwrap();
+        symlink(
+            victim.join("lease"),
+            marker_link.join(EPHEMERAL_SNAPSHOT_LEASE),
+        )
+        .unwrap();
+        let shared = abandoned_ephemeral_snapshot_fixture(root.path(), kind);
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _next = EphemeralSnapshotTempDir::new_in(kind, root.path()).unwrap();
+        for path in [
+            &directory_link,
+            &payload_link,
+            &payload_hardlink,
+            &marker_link,
+            &shared,
+        ] {
+            assert!(
+                path.exists(),
+                "links and nonprivate directories must survive: {}",
+                path.display()
+            );
+        }
+        assert_eq!(std::fs::read(victim_file).unwrap(), b"unrelated database");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ephemeral_snapshot_cleanup_uses_canonical_root_after_alias_changes() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let replacement = root.path().join("replacement");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        symlink(&original, &alias).unwrap();
+        let snapshot =
+            EphemeralSnapshotTempDir::new_in(EphemeralSnapshotKind::Mailbox, &alias).unwrap();
+        let path = snapshot.path().to_path_buf();
+        assert_eq!(
+            path.parent(),
+            Some(original.canonicalize().unwrap().as_path())
+        );
+        std::fs::write(path.join("mailbox.sqlite3"), b"owned copy").unwrap();
+        std::fs::rename(&alias, root.path().join("old-alias")).unwrap();
+        symlink(&replacement, &alias).unwrap();
+        let decoy = replacement.join(path.file_name().unwrap());
+        std::fs::create_dir(&decoy).unwrap();
+        std::fs::write(decoy.join("mailbox.sqlite3"), b"unrelated copy").unwrap();
+
+        drop(snapshot);
+        assert!(
+            !path.exists(),
+            "the original canonical directory must be cleaned"
+        );
+        assert_eq!(
+            std::fs::read(decoy.join("mailbox.sqlite3")).unwrap(),
+            b"unrelated copy"
         );
     }
 

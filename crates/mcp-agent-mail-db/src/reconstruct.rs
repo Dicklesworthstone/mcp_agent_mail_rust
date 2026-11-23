@@ -2275,17 +2275,18 @@ fn finalize_reconstruction_candidate(conn: DbConn, db_path: &Path, context: &str
 }
 
 struct MaterializedLiveSalvage {
-    _directory: crate::pool::CanonicalSnapshotTempDir,
+    _directory: crate::pool::EphemeralSnapshotTempDir,
     path: PathBuf,
 }
 
 fn materialize_live_salvage(path: &Path) -> DbResult<MaterializedLiveSalvage> {
-    let directory = crate::pool::CanonicalSnapshotTempDir::new("reconstruct-live-salvage-")
-        .map_err(|error| {
-            DbError::Sqlite(format!(
-                "reconstruct live salvage: cannot allocate private snapshot directory: {error}"
-            ))
-        })?;
+    let directory =
+        crate::pool::EphemeralSnapshotTempDir::new(crate::pool::EphemeralSnapshotKind::LiveSalvage)
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "reconstruct live salvage: cannot allocate private snapshot directory: {error}"
+                ))
+            })?;
     let snapshot_path = directory.path().join("salvage.sqlite3");
     let snapshot_text = snapshot_path.to_str().ok_or_else(|| {
         DbError::Sqlite(format!(
@@ -12148,6 +12149,89 @@ body
         assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 7);
         drop(private);
         crate::close_db_conn(writer, "clean up engine-neutral salvage fixture");
+    }
+
+    #[test]
+    fn live_salvage_materialization_cleans_up_after_success_and_failure() {
+        const CHILD_ENV: &str = "AM_TEST_LIVE_SALVAGE_CLEANUP_FIXTURE";
+        const CHILD_TEST: &str =
+            "reconstruct::tests::live_salvage_materialization_cleans_up_after_success_and_failure";
+        const CHILD_COMPLETE: &str = "live-salvage-cleanup-child-complete";
+
+        if let Some(fixture) = std::env::var_os(CHILD_ENV) {
+            let fixture = PathBuf::from(fixture);
+            let temp_root = fixture.join("snapshots").canonicalize().unwrap();
+            assert_eq!(crate::pool::snapshot_temp_root(), temp_root);
+            let source_dir = fixture.join("source");
+            std::fs::create_dir(&source_dir).unwrap();
+            let (source_path, source_before) = seed_sidecarless_canonical_salvage_source(
+                &source_dir,
+                &[
+                    "CREATE TABLE cleanup_witness(value INTEGER NOT NULL);",
+                    "INSERT INTO cleanup_witness(value) VALUES (41);",
+                ],
+            );
+
+            for _ in 0..3 {
+                let materialized = materialize_live_salvage(&source_path)
+                    .expect("materialize live source for a repeated read");
+                let snapshot_dir = materialized.path.parent().unwrap().to_path_buf();
+                assert_eq!(snapshot_dir.parent(), Some(temp_root.as_path()));
+                let reader = open_read_only_salvage_db(&materialized.path)
+                    .expect("open private salvage copy");
+                let rows = reader
+                    .query_sync("SELECT value FROM cleanup_witness", &[])
+                    .expect("read materialized source data");
+                assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 41);
+                assert!(snapshot_dir.is_dir(), "the reader must retain its copy");
+                drop(reader);
+                drop(materialized);
+                assert!(
+                    !snapshot_dir.exists(),
+                    "the completed read must remove its database and companion artifacts"
+                );
+
+                let error = materialize_live_salvage(&source_dir.join("missing.sqlite3"))
+                    .err()
+                    .expect("a missing source must fail after allocating its private directory");
+                assert!(error.to_string().contains("cannot open source"));
+                assert!(
+                    std::fs::read_dir(&temp_root).unwrap().next().is_none(),
+                    "neither successful nor failed polling reads may leave scratch directories"
+                );
+            }
+            assert_eq!(
+                exact_test_directory_files(&source_dir),
+                source_before,
+                "temporary cleanup must leave the live source family byte-identical"
+            );
+            println!("{CHILD_COMPLETE}");
+            return;
+        }
+
+        // Isolate TMPDIR from the other parallel tests and from any staging
+        // fallback they choose; the child exercises the production allocator.
+        let fixture = tempfile::tempdir().unwrap();
+        let temp_root = fixture.path().join("snapshots");
+        std::fs::create_dir(&temp_root).unwrap();
+        let temp_root = temp_root.canonicalize().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CHILD_TEST, "--nocapture"])
+            .env(CHILD_ENV, fixture.path())
+            .env("TMPDIR", &temp_root)
+            .env("TEMP", &temp_root)
+            .env("TMP", &temp_root)
+            .output()
+            .expect("run isolated live-salvage cleanup test");
+        assert!(
+            output.status.success(),
+            "live-salvage cleanup child failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETE));
+        assert!(std::fs::read_dir(&temp_root).unwrap().next().is_none());
     }
 
     /// Seed a canonical-written source with no FrankenSQLite namespace pair:

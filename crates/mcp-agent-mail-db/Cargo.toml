@@ -34,7 +34,7 @@ tempfile.workspace = true
 fs2.workspace = true
 same-file.workspace = true
 nix = { workspace = true, features = ["fs", "process", "signal"] }
-rustix.workspace = true
+rustix = { workspace = true, features = ["process"] }
 url.workspace = true
 
 # frankensearch: two-tier hybrid search implementation (optional, for hybrid feature)
