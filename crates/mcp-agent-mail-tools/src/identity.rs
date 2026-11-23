@@ -2458,15 +2458,15 @@ fn lifecycle_auth_decision(
 /// bound to the agent may stand in for the registration token; over HTTP
 /// (`am serve-http`) the pane context is a client assertion and only the
 /// token authorizes.
-fn authenticate_lifecycle_agent(
+fn authenticate_lifecycle_agent<'a>(
     project: &mcp_agent_mail_db::ProjectRow,
-    agent: &mcp_agent_mail_db::AgentRow,
-    registration_token: Option<&str>,
+    agent: &'a mcp_agent_mail_db::AgentRow,
+    registration_token: Option<&'a str>,
     pane_id: Option<&str>,
     tmux_server: mcp_agent_mail_core::TmuxServer<'_>,
     transport: mcp_agent_mail_core::CallTransport,
     action: &str,
-) -> McpResult<()> {
+) -> McpResult<Option<mcp_agent_mail_db::queries::AgentCredentialProof<'a>>> {
     let policy = mcp_agent_mail_core::LifecycleAuthPolicy::for_transport(transport);
     let Err(refusal) = lifecycle_auth_decision(
         policy,
@@ -2481,9 +2481,27 @@ fn authenticate_lifecycle_agent(
             .is_some_and(|resolved| resolved.eq_ignore_ascii_case(&agent.name))
         },
     ) else {
-        return Ok(());
+        // Keep the presented credential alive through the database transaction.
+        // A successful preflight cannot authorize a later write after rotation.
+        return Ok(registration_token
+            .filter(|token| !token.is_empty())
+            .map(|token| mcp_agent_mail_db::queries::AgentCredentialProof {
+                project_id: agent.project_id,
+                agent_name: &agent.name,
+                registration_token: token,
+            }));
     };
+    Err(lifecycle_auth_error(project, agent, transport, action, refusal))
+}
 
+fn lifecycle_auth_error(
+    project: &mcp_agent_mail_db::ProjectRow,
+    agent: &mcp_agent_mail_db::AgentRow,
+    transport: mcp_agent_mail_core::CallTransport,
+    action: &str,
+    refusal: LifecycleAuthRefusal,
+) -> McpError {
+    let policy = mcp_agent_mail_core::LifecycleAuthPolicy::for_transport(transport);
     let name = &agent.name;
     let message = match refusal {
         LifecycleAuthRefusal::TokenMismatch => format!(
@@ -2505,7 +2523,7 @@ the pane '{name}' registered in."
         ),
     };
 
-    Err(legacy_tool_error(
+    legacy_tool_error(
         "AUTHENTICATION_REQUIRED",
         message,
         true,
@@ -2518,7 +2536,33 @@ the pane '{name}' registered in."
             "policy": policy.as_str(),
             "reason": refusal.as_str(),
         }),
-    ))
+    )
+}
+
+fn lifecycle_mutation_result(
+    result: Outcome<mcp_agent_mail_db::AgentRow, mcp_agent_mail_db::DbError>,
+    project: &mcp_agent_mail_db::ProjectRow,
+    agent: &mcp_agent_mail_db::AgentRow,
+    transport: mcp_agent_mail_core::CallTransport,
+    action: &str,
+) -> McpResult<mcp_agent_mail_db::AgentRow> {
+    match result {
+        Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument { field, .. })
+            if matches!(
+                field,
+                "agent_credential_mismatch" | "agent_credential_unavailable"
+            ) =>
+        {
+            Err(lifecycle_auth_error(
+                project,
+                agent,
+                transport,
+                action,
+                LifecycleAuthRefusal::TokenMismatch,
+            ))
+        }
+        other => db_outcome_to_mcp_result(other),
+    }
 }
 
 /// Validate a tool's `call_transport` argument into a
@@ -4148,7 +4192,7 @@ pub async fn retire_agent(
         .await,
     )?;
     let agent = refresh_credential_agent(ctx, &pool, &agent).await?;
-    authenticate_lifecycle_agent(
+    let credential = authenticate_lifecycle_agent(
         &project,
         &agent,
         registration_token.as_deref(),
@@ -4166,15 +4210,23 @@ pub async fn retire_agent(
     let retired_at = agent
         .retired_at
         .unwrap_or_else(mcp_agent_mail_db::now_micros);
-    let updated = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::set_agent_retired_at(
+    let updated = lifecycle_mutation_result(
+        mcp_agent_mail_db::queries::set_agent_retired_at_guarded(
             ctx.cx(),
             &pool,
             agent_id,
             Some(retired_at),
+            credential,
         )
         .await,
+        &project,
+        &agent,
+        transport,
+        "retire_agent",
     )?;
+    let retired_at = updated.retired_at.ok_or_else(|| {
+        McpError::internal_error("Agent retirement timestamp missing after commit")
+    })?;
     // GH#279: a retired identity no longer belongs to the calling session.
     crate::session_identity::unbind(ctx, agent_id);
     let agent_json = agent_archive_profile_json(&updated, None);
@@ -4223,7 +4275,7 @@ pub async fn unretire_agent(
         .await,
     )?;
     let agent = refresh_credential_agent(ctx, &pool, &agent).await?;
-    authenticate_lifecycle_agent(
+    let credential = authenticate_lifecycle_agent(
         &project,
         &agent,
         registration_token.as_deref(),
@@ -4237,8 +4289,19 @@ pub async fn unretire_agent(
     let agent_id = agent
         .id
         .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
-    let updated = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::set_agent_retired_at(ctx.cx(), &pool, agent_id, None).await,
+    let updated = lifecycle_mutation_result(
+        mcp_agent_mail_db::queries::set_agent_retired_at_guarded(
+            ctx.cx(),
+            &pool,
+            agent_id,
+            None,
+            credential,
+        )
+        .await,
+        &project,
+        &agent,
+        transport,
+        "unretire_agent",
     )?;
     let agent_json = agent_archive_profile_json(&updated, None);
     try_write_agent_profile(&Config::get(), &project.slug, &agent_json);
@@ -4285,7 +4348,7 @@ pub async fn deregister_agent(
         .await,
     )?;
     let agent = refresh_credential_agent(ctx, &pool, &agent).await?;
-    authenticate_lifecycle_agent(
+    let credential = authenticate_lifecycle_agent(
         &project,
         &agent,
         registration_token.as_deref(),
@@ -4298,14 +4361,19 @@ pub async fn deregister_agent(
     let agent_id = agent
         .id
         .ok_or_else(|| McpError::internal_error("Agent row missing id"))?;
-    let updated = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::deregister_agent(
+    let updated = lifecycle_mutation_result(
+        mcp_agent_mail_db::queries::deregister_agent_guarded(
             ctx.cx(),
             &pool,
             agent_id,
             mcp_agent_mail_db::now_micros(),
+            credential,
         )
         .await,
+        &project,
+        &agent,
+        transport,
+        "deregister_agent",
     )?;
     // GH#279: a deregistered identity no longer belongs to the calling session.
     crate::session_identity::unbind(ctx, agent_id);
@@ -5072,6 +5140,114 @@ mod tests {
             lifecycle_auth_decision(policy, Some("tok-any"), None, probe),
             Err(LifecycleAuthRefusal::TokenMismatch)
         );
+    }
+
+    fn lifecycle_auth_fixture() -> (mcp_agent_mail_db::ProjectRow, mcp_agent_mail_db::AgentRow) {
+        (
+            mcp_agent_mail_db::ProjectRow {
+                id: Some(7),
+                slug: "lifecycle-proof".to_string(),
+                human_key: "/tmp/lifecycle-proof".to_string(),
+                created_at: 0,
+            },
+            mcp_agent_mail_db::AgentRow {
+                id: Some(23),
+                project_id: 7,
+                name: "BlueLake".to_string(),
+                registration_token: Some("lifecycle-current-secret".to_string()),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn lifecycle_preflight_retains_supplied_bearer_on_every_transport() {
+        let (project, agent) = lifecycle_auth_fixture();
+        let token = agent.registration_token.as_deref().unwrap();
+        for transport in [CallTransport::Stdio, CallTransport::Http] {
+            let proof = authenticate_lifecycle_agent(
+                &project,
+                &agent,
+                Some(token),
+                Some("%23"),
+                mcp_agent_mail_core::TmuxServer::from_validated(None),
+                transport,
+                "retire_agent",
+            )
+            .expect("current bearer authorizes preflight")
+            .expect("bearer authority must reach the mutation transaction");
+            assert_eq!(proof.project_id, agent.project_id);
+            assert_eq!(proof.agent_name, agent.name);
+            assert_eq!(proof.registration_token, token);
+
+            let Err(error) = authenticate_lifecycle_agent(
+                &project,
+                &agent,
+                Some("lifecycle-stale-secret"),
+                Some("%23"),
+                mcp_agent_mail_core::TmuxServer::from_validated(None),
+                transport,
+                "retire_agent",
+            ) else {
+                panic!("a stale supplied bearer must not become trusted pane authority");
+            };
+            assert_eq!(
+                error.data.as_ref().unwrap()["error"]["data"]["reason"],
+                "token_mismatch"
+            );
+            assert!(!error.message.contains(token));
+            assert!(!error.message.contains("lifecycle-stale-secret"));
+        }
+
+        for token in [None, Some("")] {
+            let Err(error) = authenticate_lifecycle_agent(
+                &project,
+                &agent,
+                token,
+                Some("%23"),
+                mcp_agent_mail_core::TmuxServer::from_validated(None),
+                CallTransport::Http,
+                "retire_agent",
+            ) else {
+                panic!("HTTP pane context cannot provide missing bearer authority");
+            };
+            assert_eq!(
+                error.data.as_ref().unwrap()["error"]["data"]["reason"],
+                "token_required"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_transaction_refusals_preserve_auth_contract_without_secrets() {
+        let (project, agent) = lifecycle_auth_fixture();
+        for transport in [CallTransport::Stdio, CallTransport::Http] {
+            for action in ["retire_agent", "unretire_agent", "deregister_agent"] {
+                for field in ["agent_credential_mismatch", "agent_credential_unavailable"] {
+                    let error = lifecycle_mutation_result(
+                        Outcome::Err(mcp_agent_mail_db::DbError::invalid(
+                            field,
+                            "private detail: lifecycle-current-secret lifecycle-stale-secret",
+                        )),
+                        &project,
+                        &agent,
+                        transport,
+                        action,
+                    )
+                    .expect_err("a transaction refusal must remain an authorization error");
+                    let data = error.data.as_ref().expect("structured auth refusal");
+                    assert_eq!(data["error"]["type"], "AUTHENTICATION_REQUIRED");
+                    assert_eq!(data["error"]["data"]["reason"], "token_mismatch");
+                    assert_eq!(data["error"]["data"]["transport"], transport.as_str());
+                    assert_eq!(data["error"]["data"]["token_param"], "registration_token");
+                    assert!(error.message.contains(action));
+                    for secret in ["lifecycle-current-secret", "lifecycle-stale-secret"] {
+                        assert!(!error.message.contains(secret));
+                        assert!(!data.to_string().contains(secret));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

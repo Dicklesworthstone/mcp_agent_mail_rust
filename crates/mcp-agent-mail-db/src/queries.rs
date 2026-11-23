@@ -8090,12 +8090,27 @@ pub async fn set_agent_reaper_exempt(
     Outcome::Ok(update)
 }
 
-/// Set or clear an agent's retirement timestamp.
+/// Set or clear an agent's retirement timestamp using trusted operator authority.
 pub async fn set_agent_retired_at(
     cx: &Cx,
     pool: &DbPool,
     agent_id: i64,
     retired_at: Option<i64>,
+) -> Outcome<AgentRow, DbError> {
+    set_agent_retired_at_guarded(cx, pool, agent_id, retired_at, None).await
+}
+
+/// Set or clear retirement, revalidating any supplied bearer in the mutation transaction.
+///
+/// Callers that accept a registration token must pass its proof here. A missing
+/// proof is reserved for authority established independently of that credential,
+/// such as an operator action or an authenticated local pane.
+pub async fn set_agent_retired_at_guarded(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    retired_at: Option<i64>,
+    credential: Option<AgentCredentialProof<'_>>,
 ) -> Outcome<AgentRow, DbError> {
     let agent = match run_with_mvcc_retry(cx, "set_agent_retired_at", || async {
     let conn = match acquire_conn(cx, pool).await {
@@ -8106,6 +8121,13 @@ pub async fn set_agent_retired_at(
     };
     let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        if let Some(proof) = credential {
+            try_in_tx!(
+                cx,
+                &tracked,
+                ensure_agent_credential_in_tx(cx, &tracked, agent_id, proof).await
+            );
+        }
 
         if try_in_tx!(
             cx,
@@ -8289,12 +8311,26 @@ pub async fn retire_agent_if_stale(
     Outcome::Ok(changed)
 }
 
-/// Mark an agent deregistered while preserving its row, reservations, and message history.
+/// Mark an agent deregistered using trusted operator authority, preserving history.
 pub async fn deregister_agent(
     cx: &Cx,
     pool: &DbPool,
     agent_id: i64,
     deregistered_at: i64,
+) -> Outcome<AgentRow, DbError> {
+    deregister_agent_guarded(cx, pool, agent_id, deregistered_at, None).await
+}
+
+/// Deregister an agent with an optional transaction-bound bearer proof.
+///
+/// Authorization is checked before the idempotent return as well as before a
+/// new tombstone. Revocation must not let an old token act on a retired name.
+pub async fn deregister_agent_guarded(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    deregistered_at: i64,
+    credential: Option<AgentCredentialProof<'_>>,
 ) -> Outcome<AgentRow, DbError> {
     let agent = match run_with_mvcc_retry(cx, "deregister_agent", || async {
     let conn = match acquire_conn(cx, pool).await {
@@ -8305,6 +8341,13 @@ pub async fn deregister_agent(
     };
     let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        if let Some(proof) = credential {
+            try_in_tx!(
+                cx,
+                &tracked,
+                ensure_agent_credential_in_tx(cx, &tracked, agent_id, proof).await
+            );
+        }
 
         let rows = try_in_tx!(
             cx,
@@ -25580,6 +25623,191 @@ mod tests {
                 .unwrap();
             assert!(durable.registration_token.is_none());
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn lifecycle_mutations_revalidate_bearer_after_preflight() {
+        for revoke in [false, true] {
+            let (cx, pool, _dir) =
+                setup_test_pool(&format!("lifecycle-credential-race-{revoke}.db"));
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("lifecycle credential runtime");
+            runtime.block_on(async {
+                let project = ensure_project(&cx, &pool, "/tmp/lifecycle-credential-race")
+                    .await
+                    .into_result()
+                    .unwrap();
+                let project_id = project.id.unwrap();
+                for (name, action) in [
+                    ("BlueLake", "retire"),
+                    ("GreenCastle", "unretire"),
+                    ("RedStone", "deregister"),
+                ] {
+                    let registered = register_agent(
+                        &cx,
+                        &pool,
+                        project_id,
+                        name,
+                        "codex-cli",
+                        "gpt-5",
+                        Some("preserve lifecycle profile"),
+                        None,
+                        None,
+                    )
+                    .await
+                    .into_result()
+                    .unwrap();
+                    let agent_id = registered.id.unwrap();
+                    update_agent_registration_token(&cx, &pool, agent_id, "preflight-token")
+                        .await
+                        .into_result()
+                        .unwrap();
+                    if action == "unretire" {
+                        set_agent_retired_at(&cx, &pool, agent_id, Some(111))
+                            .await
+                            .into_result()
+                            .unwrap();
+                    }
+
+                    // The tool has authenticated this exact identity and token.
+                    // Another real transaction wins before its mutation begins.
+                    let preflight = get_agent_by_id_fresh(&cx, &pool, agent_id)
+                        .await
+                        .into_result()
+                        .unwrap();
+                    let stale = AgentCredentialProof {
+                        project_id,
+                        agent_name: &preflight.name,
+                        registration_token: preflight.registration_token.as_deref().unwrap(),
+                    };
+                    let before = compare_and_swap_agent_registration_token(
+                        &cx,
+                        &pool,
+                        project_id,
+                        agent_id,
+                        name,
+                        "preflight-token",
+                        if revoke { None } else { Some("current-token") },
+                    )
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .expect("competing credential change wins");
+                    let result = match action {
+                        "retire" => {
+                            set_agent_retired_at_guarded(
+                                &cx, &pool, agent_id, Some(222), Some(stale),
+                            )
+                            .await
+                        }
+                        "unretire" => {
+                            set_agent_retired_at_guarded(&cx, &pool, agent_id, None, Some(stale))
+                                .await
+                        }
+                        _ => deregister_agent_guarded(&cx, &pool, agent_id, 222, Some(stale)).await,
+                    };
+                    let error = match result {
+                        Outcome::Err(error) => error,
+                        _ => panic!("stale bearer must be refused for {action}"),
+                    };
+                    let expected_field = if revoke {
+                        "agent_credential_unavailable"
+                    } else {
+                        "agent_credential_mismatch"
+                    };
+                    assert!(
+                        matches!(
+                            &error,
+                            DbError::InvalidArgument { field, .. } if *field == expected_field
+                        ),
+                        "{action}: {error}"
+                    );
+                    assert!(!error.to_string().contains("preflight-token"));
+                    assert!(!error.to_string().contains("current-token"));
+                    let after = get_agent_by_id_fresh(&cx, &pool, agent_id)
+                        .await
+                        .into_result()
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(&after).unwrap(),
+                        serde_json::to_value(&before).unwrap(),
+                        "refused {action} must preserve the complete profile"
+                    );
+                    assert!(
+                        get_agent_deregistered_at(&cx, &pool, agent_id)
+                            .await
+                            .into_result()
+                            .unwrap()
+                            .is_none(),
+                        "refused lifecycle calls must not create a tombstone"
+                    );
+
+                    // A credential issued after revocation/rotation still works;
+                    // the guard must not disable the transition itself.
+                    update_agent_registration_token(&cx, &pool, agent_id, "fresh-token")
+                        .await
+                        .into_result()
+                        .unwrap();
+                    let fresh = AgentCredentialProof {
+                        project_id,
+                        agent_name: name,
+                        registration_token: "fresh-token",
+                    };
+                    let accepted = match action {
+                        "retire" => {
+                            set_agent_retired_at_guarded(
+                                &cx, &pool, agent_id, Some(333), Some(fresh),
+                            )
+                            .await
+                        }
+                        "unretire" => {
+                            set_agent_retired_at_guarded(&cx, &pool, agent_id, None, Some(fresh))
+                                .await
+                        }
+                        _ => deregister_agent_guarded(&cx, &pool, agent_id, 333, Some(fresh)).await,
+                    }
+                    .into_result()
+                    .expect("current bearer may perform the lifecycle transition");
+                    match action {
+                        "retire" => assert_eq!(accepted.retired_at, Some(333)),
+                        "unretire" => assert_eq!(accepted.retired_at, None),
+                        _ => {
+                            assert_eq!(
+                                get_agent_deregistered_at(&cx, &pool, agent_id)
+                                    .await
+                                    .into_result()
+                                    .unwrap(),
+                                Some(333)
+                            );
+                            update_agent_registration_token(
+                                &cx, &pool, agent_id, "after-deregistration",
+                            )
+                            .await
+                            .into_result()
+                            .unwrap();
+                            assert!(matches!(
+                                deregister_agent_guarded(
+                                    &cx, &pool, agent_id, 444, Some(fresh),
+                                )
+                                .await,
+                                Outcome::Err(DbError::InvalidArgument { field, .. })
+                                    if field == "agent_credential_mismatch"
+                            ));
+                            assert_eq!(
+                                get_agent_deregistered_at(&cx, &pool, agent_id)
+                                    .await
+                                    .into_result()
+                                    .unwrap(),
+                                Some(333),
+                                "idempotent retries also require current authorization"
+                            );
+                        }
+                    }
+                }
+            });
+        }
     }
 
     #[test]
