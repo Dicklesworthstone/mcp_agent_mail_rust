@@ -59,6 +59,7 @@ fn read_ceiling(directory: &JournalDirectory) -> DbResult<Option<i64>> {
 }
 
 /// Persist the cursor bound before a successful API/CLI response can expose it.
+///
 /// The global ceiling is monotonic across database generations and concurrent
 /// readers. A failed write is an error, never an unprotected successful read.
 pub fn record_issued_cursor(storage_root: &Path, cursor: i64) -> DbResult<()> {
@@ -518,7 +519,7 @@ mod tests {
             vec![(90_002, 4000), (90_003, 4001)]
         );
         let empty = inbox_delivery_events_from_conn(&conn, 41, 122, Some(floor), 20).unwrap();
-        assert!(empty.events.is_empty());
+        assert_eq!(empty.events, [] as [crate::sync::InboxDeliveryEvent; 0]);
         assert_eq!(empty.tail_cursor, floor);
         conn.execute_raw(
             "INSERT INTO messages(id, project_id, sender_id, subject, body_md, created_ts) \

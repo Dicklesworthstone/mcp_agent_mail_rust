@@ -33,9 +33,10 @@ const ERROR_PREFIX: &str = "archive recovery state ";
 static PENDING_ARCHIVE_PATHS: LazyLock<Mutex<BTreeMap<PathBuf, BTreeSet<String>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-/// Hand completed state artifacts to the normal Git commit coalescer. Durable
-/// files remain recoverable even if the process exits before this hint drains;
-/// startup requeues the active generation without trusting an in-memory queue.
+/// Hand completed state artifacts to the normal Git commit coalescer.
+///
+/// Durable files remain recoverable if the process exits before this hint drains.
+/// Startup requeues the active generation from disk.
 pub fn note_pending_archive_paths(root: &Path, paths: impl IntoIterator<Item = String>) {
     let mut pending = PENDING_ARCHIVE_PATHS
         .lock()
@@ -132,10 +133,10 @@ fn state_error(context: &str, error: impl std::fmt::Display) -> DbError {
     ))
 }
 
-/// Distinguish failed durable recovery publication from an ordinary best-effort
-/// database operation. The database receipt may already have committed: after
-/// archive access is repaired, explicitly retry its read or ACK to finish
-/// publication without replacing the original receipt timestamps.
+/// Identify a failed durable recovery publication.
+///
+/// The receipt may already have committed. After restoring archive access,
+/// retry the read or ACK to publish the original receipt timestamps.
 #[must_use]
 pub fn is_publication_error(error: &DbError) -> bool {
     matches!(error, DbError::Internal(message) if message.starts_with(ERROR_PREFIX))
@@ -404,7 +405,8 @@ fn record_name(record: &RecoveryRecord) -> DbResult<String> {
         ),
     };
     let identity = identity.map_err(|error| state_error("record identity", error))?;
-    Ok(format!("{kind}-{:x}.json", Sha256::digest(identity)))
+    let digest = hex::encode(Sha256::digest(identity));
+    Ok(format!("{kind}-{digest}.json"))
 }
 
 fn validate_document(document: &RecordDocument, generation: &str) -> DbResult<()> {
@@ -670,7 +672,7 @@ fn stream_checkpoint(
     checkpoint_receipts(conn, &mut writer)?;
     checkpoint_contacts(conn, &mut writer)?;
     verify_checkpoint_counts(conn, &writer.manifest)?;
-    writer.manifest.baseline_sha256 = format!("{:x}", writer.digest.finalize());
+    writer.manifest.baseline_sha256 = hex::encode(writer.digest.finalize());
     Ok(writer.manifest)
 }
 
@@ -816,7 +818,8 @@ pub fn ensure_checkpoint(conn: &impl SyncQuery, root: &Path) -> DbResult<Manifes
                 "non-UTF-8 recovery filename",
             ));
         };
-        if (name.starts_with("receipt-") || name.starts_with("contact-")) && name.ends_with(".json")
+        if (name.starts_with("receipt-") || name.starts_with("contact-"))
+            && Path::new(name).extension().is_some_and(|ext| ext == "json")
         {
             note_pending_archive_paths(
                 root,
@@ -868,8 +871,9 @@ pub fn checkpoint_all(conn: &impl SyncQuery, root: &Path) -> DbResult<Manifest> 
 }
 
 /// Bind a Git commit's manifest and baseline to the same active generation.
-/// The storage publisher holds its own archive locks outside this function;
-/// state writers only enqueue paths and never call back into Git while locked.
+///
+/// The storage publisher holds its own archive locks outside this function.
+/// State writers only enqueue paths and never call back into Git while locked.
 pub fn with_archive_publication<T>(
     root: &Path,
     pending: &[String],
@@ -953,6 +957,7 @@ pub fn persist_receipts(
 }
 
 /// Reconcile all committed receipts for one project's bulk mark-read operation.
+///
 /// A retry may select no unread rows after an earlier database commit whose
 /// archive publication failed. Paging the settled receipts also completes that
 /// earlier publication without retaining an unbounded in-memory retry queue.
@@ -1050,7 +1055,7 @@ fn checked_baseline(generation: &JournalDirectory, manifest: &Manifest) -> DbRes
         .open_file(BASELINE_FILE, JournalFileMode::Read)
         .map_err(|error| state_error("baseline open", error))?;
     let mut digest = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let size = baseline
             .read(&mut buffer)
@@ -1060,7 +1065,7 @@ fn checked_baseline(generation: &JournalDirectory, manifest: &Manifest) -> DbRes
         }
         digest.update(&buffer[..size]);
     }
-    if format!("{:x}", digest.finalize()) != manifest.baseline_sha256 {
+    if hex::encode(digest.finalize()) != manifest.baseline_sha256 {
         return Err(state_error(
             "baseline checksum",
             "checkpoint bytes differ from the completed manifest",
@@ -1163,9 +1168,10 @@ fn visit_incremental_records(
     Ok(())
 }
 
-/// Visit the checked baseline first, followed by per-key updates from its one
-/// active generation. Missing legacy metadata is `None`; malformed or incomplete
-/// metadata is an error and must never be promoted as a successful recovery.
+/// Visit the active generation's checked baseline, then its per-key updates.
+///
+/// Missing legacy metadata returns `None`. Malformed or incomplete metadata
+/// causes recovery to return an error.
 pub fn visit_records(
     root: &Path,
     mut visit: impl FnMut(RecoveryRecord) -> DbResult<()>,

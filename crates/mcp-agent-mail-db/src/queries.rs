@@ -22720,8 +22720,12 @@ mod tests {
         let error = blocked
             .expect("cursor issuance must promptly refuse active promotion")
             .expect_err("promotion must prevent cursor issuance");
-        assert!(matches!(error, DbError::ResourceBusy(_)));
-        assert!(error.is_retryable());
+        match error {
+            asupersync::OutcomeError::Err(error @ DbError::ResourceBusy(_)) => {
+                assert!(error.is_retryable());
+            }
+            other => panic!("expected retryable database busy during promotion, got {other:?}"),
+        }
         assert!(!archived_while_promoting);
         assert_eq!(active_writers, 0);
         let page = runtime
