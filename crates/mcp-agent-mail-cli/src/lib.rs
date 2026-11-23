@@ -25933,6 +25933,7 @@ fn verify_install_dir_write_access(install_dir: &Path) -> Result<(), String> {
 /// Strategy: write new → rename old to .old.tmp → rename new to target (atomic).
 #[cfg(unix)]
 fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), String> {
+    refuse_symlink_replacement_target(target_path)?;
     let dir = target_path.parent().ok_or("no parent directory")?;
     let name = target_path
         .file_name()
@@ -25989,6 +25990,7 @@ fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), St
 /// new binary into place.
 #[cfg(windows)]
 fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), String> {
+    refuse_symlink_replacement_target(target_path)?;
     let dir = target_path.parent().ok_or("no parent directory")?;
     let name = target_path
         .file_name()
@@ -26026,32 +26028,115 @@ fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), St
     Ok(())
 }
 
+/// The file self-update must replace for the install path `path`.
+///
+/// A symlinked install (a stable link in a PATH directory pointing at the real
+/// binary) is updated through the link: the link's final target is replaced
+/// and the link itself is left intact. Renaming over the link instead turned
+/// it into a regular file and left the link's old target, which a supervised
+/// service may still run, on the previous version (GH#402). A link whose
+/// target is missing, or is not a regular file, is refused rather than
+/// guessed at.
+fn resolve_self_update_target(path: &Path) -> Result<PathBuf, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(path.to_path_buf());
+        }
+        Err(error) => return Err(format!("inspect {}: {error}", path.display())),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(path.to_path_buf());
+    }
+    let resolved = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "{} is a symlink whose target cannot be resolved ({error}); refusing to replace the link itself. Repair the link or reinstall with the installer.",
+            path.display()
+        )
+    })?;
+    let target_metadata = std::fs::symlink_metadata(&resolved)
+        .map_err(|error| format!("inspect symlink target {}: {error}", resolved.display()))?;
+    if !target_metadata.file_type().is_file() {
+        return Err(format!(
+            "{} is a symlink to {}, which is not a regular file; refusing to replace it",
+            path.display(),
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Replace both `am` and `mcp-agent-mail` binaries atomically.
 fn replace_binaries(release: &DownloadedRelease) -> Result<(), String> {
     let install_dir = find_install_dir()?;
+    replace_binaries_in(&install_dir, &release.am_binary, &release.server_binary)
+}
 
-    verify_install_dir_write_access(&install_dir)?;
-
+fn replace_binaries_in(
+    install_dir: &Path,
+    am_binary: &Path,
+    server_binary: &Path,
+) -> Result<(), String> {
     let (am_name, server_name) = if cfg!(windows) {
         ("am.exe", "mcp-agent-mail.exe")
     } else {
         ("am", "mcp-agent-mail")
     };
 
-    let am_target = install_dir.join(am_name);
-    let server_target = install_dir.join(server_name);
+    let am_install_path = install_dir.join(am_name);
+    let server_install_path = install_dir.join(server_name);
+    // Resolve both before replacing either, so a dangling link refuses the
+    // whole update instead of leaving the pair on different versions.
+    let am_target = resolve_self_update_target(&am_install_path)?;
+    let server_target = resolve_self_update_target(&server_install_path)?;
+
+    let mut verified_dirs: Vec<&Path> = Vec::new();
+    for target in [&am_target, &server_target] {
+        let dir = target
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", target.display()))?;
+        if !verified_dirs.contains(&dir) {
+            verify_install_dir_write_access(dir)?;
+            verified_dirs.push(dir);
+        }
+    }
+
+    for (name, install_path, target) in [
+        (am_name, &am_install_path, &am_target),
+        (server_name, &server_install_path, &server_target),
+    ] {
+        if install_path == target {
+            ftui_runtime::ftui_eprintln!("Replacing {name}...");
+        } else {
+            ftui_runtime::ftui_eprintln!(
+                "{} is a symlink; updating its target {} and keeping the link",
+                install_path.display(),
+                target.display()
+            );
+        }
+    }
 
     // Replace am first
-    ftui_runtime::ftui_eprintln!("Replacing {am_name}...");
-    atomic_replace_binary(&release.am_binary, &am_target)?;
+    atomic_replace_binary(am_binary, &am_target)?;
 
     // Replace mcp-agent-mail
-    ftui_runtime::ftui_eprintln!("Replacing {server_name}...");
-    atomic_replace_binary(&release.server_binary, &server_target).map_err(|e| {
+    atomic_replace_binary(server_binary, &server_target).map_err(|e| {
         format!("{server_name} replacement failed ({e}); {am_name} was already updated")
     })?;
 
     Ok(())
+}
+
+/// Refuse to rename over a symlink: callers resolve install links first
+/// (GH#402), so a link here means it appeared after resolution.
+fn refuse_symlink_replacement_target(target_path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(target_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "refusing to replace symlink {} with a regular file; update its target instead",
+            target_path.display()
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Full self-update: check, download, verify, and replace.
@@ -108925,6 +109010,121 @@ fn atomic_replace_binary_creates_new_file() {
 
     let content = std::fs::read(&target).unwrap();
     assert_eq!(content, b"fresh-binary");
+}
+
+#[cfg(unix)]
+#[test]
+fn replace_binaries_in_writes_through_symlinked_installs() {
+    use std::os::unix::fs::symlink;
+
+    // GH#402: `am` and `mcp-agent-mail` are stable links in a PATH directory
+    // pointing at real binaries elsewhere. The update must replace the real
+    // binaries and leave both links in place.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let real_dir = tmp.path().join("real");
+    let link_dir = tmp.path().join("link");
+    let staging = tmp.path().join("staging");
+    for dir in [&real_dir, &link_dir, &staging] {
+        std::fs::create_dir_all(dir).expect("create dir");
+    }
+    std::fs::write(real_dir.join("am"), b"old-am").expect("write old am");
+    std::fs::write(real_dir.join("mcp-agent-mail"), b"old-server").expect("write old server");
+    symlink(real_dir.join("am"), link_dir.join("am")).expect("link am");
+    symlink(
+        real_dir.join("mcp-agent-mail"),
+        link_dir.join("mcp-agent-mail"),
+    )
+    .expect("link server");
+    std::fs::write(staging.join("am"), b"new-am").expect("stage am");
+    std::fs::write(staging.join("mcp-agent-mail"), b"new-server").expect("stage server");
+
+    replace_binaries_in(
+        &link_dir,
+        &staging.join("am"),
+        &staging.join("mcp-agent-mail"),
+    )
+    .expect("replace through links");
+
+    for (name, expected) in [
+        ("am", b"new-am".as_slice()),
+        ("mcp-agent-mail", b"new-server"),
+    ] {
+        let link = link_dir.join(name);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat link")
+                .file_type()
+                .is_symlink(),
+            "{name} must stay a symlink"
+        );
+        assert_eq!(
+            std::fs::read(real_dir.join(name)).expect("read target"),
+            expected
+        );
+        assert_eq!(std::fs::read(&link).expect("read through link"), expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn replace_binaries_in_refuses_dangling_symlink_before_replacing_anything() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let install_dir = tmp.path().join("bin");
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&install_dir).expect("create install dir");
+    std::fs::create_dir_all(&staging).expect("create staging");
+    std::fs::write(install_dir.join("am"), b"old-am").expect("write old am");
+    symlink(
+        tmp.path().join("missing-server"),
+        install_dir.join("mcp-agent-mail"),
+    )
+    .expect("dangling server link");
+    std::fs::write(staging.join("am"), b"new-am").expect("stage am");
+    std::fs::write(staging.join("mcp-agent-mail"), b"new-server").expect("stage server");
+
+    let error = replace_binaries_in(
+        &install_dir,
+        &staging.join("am"),
+        &staging.join("mcp-agent-mail"),
+    )
+    .expect_err("a dangling install link must refuse the update");
+    assert!(error.contains("symlink"), "{error}");
+    assert_eq!(
+        std::fs::read(install_dir.join("am")).expect("read am"),
+        b"old-am",
+        "nothing may be replaced when one install path cannot be resolved"
+    );
+    assert!(
+        std::fs::symlink_metadata(install_dir.join("mcp-agent-mail"))
+            .expect("stat link")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_replace_binary_refuses_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let real = tmp.path().join("real-am");
+    std::fs::write(&real, b"old").expect("write real");
+    let link = tmp.path().join("am");
+    symlink(&real, &link).expect("link");
+    let new_binary = tmp.path().join("new-am");
+    std::fs::write(&new_binary, b"new").expect("write new");
+
+    assert!(atomic_replace_binary(&new_binary, &link).is_err());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("stat link")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(&real).expect("read real"), b"old");
 }
 
 #[test]
