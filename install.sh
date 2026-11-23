@@ -5098,10 +5098,35 @@ write_launchd_service_plist() {
   local http_path="$9"
 
   local log_dir="$home/Library/Logs/agent-mail"
-  local args_xml env_xml tmp_plist
+  local args_xml env_xml rust_env token_path worktree_root worktree_rc
   ensure_real_file_target_path "$plist_path" "LaunchAgent plist" || return 1
   ensure_real_directory_tree "$log_dir" "LaunchAgent log directory" || return 1
   ensure_real_directory_tree "$storage_root" "Agent Mail storage root" || return 1
+
+  # Keep credentials out of launchd's service metadata (#405). The server
+  # reads this private file directly and refuses startup if it is unavailable.
+  # Persist before publishing the plist so no service points at an unwritten
+  # credential. Reinstallation always repairs permissions and hard links.
+  if [ -z "$(trim_ascii_whitespace "$bearer_token")" ] \
+    || [[ "$bearer_token" == *$'\n'* || "$bearer_token" == *$'\r'* ]]; then
+    warn "Refusing to write a service credential that is empty or contains newlines."
+    return 1
+  fi
+  rust_env="$(HOME="$home" rust_config_env_path)" || return 1
+  token_path="${rust_env%/*}/service-token"
+  ensure_private_file_target_path "$token_path" "service bearer token" || return 1
+  if worktree_root=$(git_worktree_root_for_path "$token_path" || exit "$?"); then
+    warn "Refusing to write a service bearer token inside a Git worktree: $worktree_root"
+    return 1
+  else
+    worktree_rc=$?
+  fi
+  if [ "$worktree_rc" -ne 1 ]; then
+    warn "Cannot establish Git authority for the service bearer-token file: $token_path"
+    return 1
+  fi
+  printf '%s' "$bearer_token" \
+    | write_private_file_atomic "$token_path" "service bearer token" || return 1
 
   args_xml="$(
     plist_string_entry "$am_bin"
@@ -5118,14 +5143,13 @@ write_launchd_service_plist() {
     plist_env_entry "HOME" "$home"
     plist_env_entry "DATABASE_URL" "$database_url"
     plist_env_entry "STORAGE_ROOT" "$storage_root"
-    plist_env_entry "HTTP_BEARER_TOKEN" "$bearer_token"
+    plist_env_entry "HTTP_BEARER_TOKEN_FILE" "$token_path"
     plist_env_entry "HTTP_HOST" "$host"
     plist_env_entry "HTTP_PORT" "$port"
     plist_env_entry "HTTP_PATH" "$http_path"
   )"
 
-  tmp_plist="$(mktemp "${plist_path}.tmp.XXXXXX")" || return 1
-  if ! cat > "$tmp_plist" <<EOF
+  write_private_file_atomic "$plist_path" "LaunchAgent plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -5159,13 +5183,6 @@ ${env_xml}
 </dict>
 </plist>
 EOF
-  then
-    return 1
-  fi
-  # The plist embeds the HTTP bearer token, so it is a credential file even
-  # though launchd also treats it as service metadata.
-  chmod 600 "$tmp_plist" || return 1
-  mv -f "$tmp_plist" "$plist_path" || return 1
 }
 
 repair_launchd_service_env_from_rust_config() {
@@ -5184,6 +5201,19 @@ repair_launchd_service_env_from_rust_config() {
     return 1
   fi
   [ -f "$plist_path" ] || return 0
+
+  # The installer may target an older tagged binary. Do not give a token-file
+  # reference to one that ignores it and would start without authentication.
+  # This read-only command must reject an explicitly invalid credential path
+  # through the same config guard used before server startup. An unrelated
+  # failure is not evidence of support, and probe output may contain secrets.
+  local credential_probe
+  if credential_probe="$(HTTP_BEARER_TOKEN_FILE=relative-service-token-probe \
+      "$DEST/$BIN_CLI" config show-port 2>&1)" \
+    || [[ "$credential_probe" != *'HTTP_BEARER_TOKEN_FILE must name an absolute path'* ]]; then
+    warn "Refusing to rewrite LaunchAgent: the installed am binary cannot validate private service credentials. Upgrade am before retrying service installation."
+    return 1
+  fi
 
   local rust_env
   rust_env="$(rust_config_env_path)"

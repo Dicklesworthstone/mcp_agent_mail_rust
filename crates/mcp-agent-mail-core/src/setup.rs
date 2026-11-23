@@ -778,12 +778,16 @@ fn utf8_env_value_for_setup(key: &str) -> Result<Option<String>, SetupError> {
 }
 
 /// Resolve the bearer token from multiple sources in priority order:
-/// explicit flag > config.env file > `HTTP_BEARER_TOKEN` env var > generate new.
+/// explicit flag > `HTTP_BEARER_TOKEN_FILE` > config.env token >
+/// `HTTP_BEARER_TOKEN` env var > generate new.
 pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, SetupError> {
     if let Some(t) = explicit
         && !t.is_empty()
     {
         return Ok(t.to_string());
+    }
+    if let Some(token) = read_configured_bearer_token_file()? {
+        return Ok(token);
     }
     if let Some(t) = read_env_file_token(env_file)? {
         return Ok(t);
@@ -796,11 +800,11 @@ pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, 
     generate_token()
 }
 
-/// A setup token bound to the file generation from which it was resolved.
+/// A setup token bound to the env-file generation that its save will replace.
 ///
-/// Explicit tokens choose the replacement value, but do not bypass concurrent
-/// edits or unsafe file authorities. This intentionally does not implement
-/// `Debug`: its contents include a credential.
+/// Explicit tokens and token-file credentials choose the replacement value,
+/// but do not bypass concurrent edits or unsafe destination authorities. This
+/// intentionally does not implement `Debug`: its contents include a credential.
 pub struct ResolvedSetupToken {
     token: String,
     path: PathBuf,
@@ -842,6 +846,8 @@ pub fn resolve_token_for_save(
     }
     let token = if let Some(token) = explicit.filter(|token| !token.is_empty()) {
         token.to_owned()
+    } else if let Some(token) = read_configured_bearer_token_file()? {
+        token
     } else if let Some(token) = snapshot
         .as_ref()
         .and_then(|snapshot| token_from_env_text(&snapshot.content))
@@ -872,10 +878,25 @@ pub fn resolve_existing_token(
     {
         return Ok(Some(token.to_string()));
     }
+    if let Some(token) = read_configured_bearer_token_file()? {
+        return Ok(Some(token));
+    }
     if let Some(file_token) = read_env_file_token(env_file)? {
         return Ok(Some(file_token));
     }
     Ok(utf8_env_value_for_setup("HTTP_BEARER_TOKEN")?.filter(|token| !token.is_empty()))
+}
+
+fn read_configured_bearer_token_file() -> Result<Option<String>, SetupError> {
+    // Honor the same process/user-global authority as Config, never a project
+    // .env override. The setup reader also rejects non-UTF-8 process values and
+    // preserves the existing thread-local environment seam used by its tests.
+    let path = utf8_env_value_for_setup("HTTP_BEARER_TOKEN_FILE")?
+        .or_else(|| crate::config::infra_env_value("HTTP_BEARER_TOKEN_FILE"));
+    path.map(|path| {
+        crate::config::read_http_bearer_token_file(Path::new(&path)).map_err(SetupError::from)
+    })
+    .transpose()
 }
 
 /// Read `HTTP_BEARER_TOKEN=...` from a .env file.
@@ -887,16 +908,9 @@ fn read_env_file_token(path: &Path) -> Result<Option<String>, SetupError> {
 }
 
 fn token_from_env_text(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(val) = trimmed.strip_prefix("HTTP_BEARER_TOKEN=") {
-            let val = val.trim().trim_matches('"').trim_matches('\'');
-            if !val.is_empty() {
-                return Some(val.to_string());
-            }
-        }
-    }
-    None
+    crate::config::parse_dotenv_contents(content)
+        .remove("HTTP_BEARER_TOKEN")
+        .filter(|token| !token.is_empty())
 }
 
 /// Save only if the token authority still matches the resolution generation.
@@ -904,9 +918,23 @@ fn token_from_env_text(content: &str) -> Option<String> {
 pub fn save_token_to_env_file(resolved: &ResolvedSetupToken) -> Result<(), SetupError> {
     let env_path = &resolved.path;
     let token = resolved.token();
-    if token.contains('\n') || token.contains('\r') {
-        return Err(SetupError::Other("Token must not contain newlines".into()));
+    if token.contains(['\n', '\r', '\0']) {
+        return Err(SetupError::Other(
+            "Token must not contain newlines or NUL bytes".into(),
+        ));
     }
+    // Keep generated tokens readable while preserving literal punctuation,
+    // whitespace, quotes, and backslashes from an authoritative token file.
+    // Adjacent single/double-quoted segments are understood by both the runtime
+    // dotenv parser and shells, without expanding dollar signs or backticks.
+    let serialized_token = if token
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        token.to_owned()
+    } else {
+        format!("'{}'", token.replace('\'', "'\"'\"'"))
+    };
     let verify = |authority: Option<&SetupDirectoryAuthority>| {
         let observed = read_setup_file_with_authority(env_path, "token env file", authority)?;
         let matches = match (&resolved.snapshot, &observed) {
@@ -938,15 +966,20 @@ pub fn save_token_to_env_file(resolved: &ResolvedSetupToken) -> Result<(), Setup
             .map(|snapshot| snapshot.content.as_str());
 
         let content = existing_content.map_or_else(
-            || format!("HTTP_BEARER_TOKEN={token}\n"),
+            || format!("HTTP_BEARER_TOKEN={serialized_token}\n"),
             |existing| {
                 let mut found = false;
                 let updated: Vec<String> = existing
                     .lines()
                     .map(|line| {
-                        if line.trim_start().starts_with("HTTP_BEARER_TOKEN=") {
+                        let assignment = line.trim_start();
+                        let assignment = assignment.strip_prefix("export ").unwrap_or(assignment);
+                        if assignment
+                            .split_once('=')
+                            .is_some_and(|(key, _)| key.trim() == "HTTP_BEARER_TOKEN")
+                        {
                             found = true;
-                            format!("HTTP_BEARER_TOKEN={token}")
+                            format!("HTTP_BEARER_TOKEN={serialized_token}")
                         } else {
                             line.to_string()
                         }
@@ -956,7 +989,7 @@ pub fn save_token_to_env_file(resolved: &ResolvedSetupToken) -> Result<(), Setup
                     updated.join("\n") + "\n"
                 } else {
                     let sep = if existing.ends_with('\n') { "" } else { "\n" };
-                    format!("{existing}{sep}HTTP_BEARER_TOKEN={token}\n")
+                    format!("{existing}{sep}HTTP_BEARER_TOKEN={serialized_token}\n")
                 }
             },
         );
@@ -10195,6 +10228,138 @@ mod tests {
         let missing = tmp.path().join("no-env");
         let error = resolve_token(None, &missing).expect_err("rng failure should surface");
         assert!(error.to_string().contains("CSPRNG failure"));
+    }
+
+    #[test]
+    fn setup_token_file_precedes_inline_and_config_env_tokens() {
+        let tmp = setup_real_tempdir();
+        let token_path = tmp.path().join("service-token");
+        let env_path = tmp.path().join("config.env");
+        std::fs::write(&token_path, "actual-service-token\n").unwrap();
+        std::fs::write(&env_path, "HTTP_BEARER_TOKEN=stale-config-token\n").unwrap();
+        let _file = EnvVarGuard::set("HTTP_BEARER_TOKEN_FILE", token_path.as_os_str());
+        let _inline = EnvVarGuard::set("HTTP_BEARER_TOKEN", "stale-process-token");
+
+        assert_eq!(
+            resolve_token(None, &env_path).unwrap(),
+            "actual-service-token"
+        );
+        assert_eq!(
+            resolve_existing_token(None, &env_path).unwrap().as_deref(),
+            Some("actual-service-token")
+        );
+        assert_eq!(
+            resolve_token_for_save(None, &env_path).unwrap().token(),
+            "actual-service-token"
+        );
+    }
+
+    #[test]
+    fn setup_token_file_explicit_override_bypasses_invalid_file() {
+        let tmp = setup_real_tempdir();
+        let env_path = tmp.path().join("config.env");
+        let _file = EnvVarGuard::set("HTTP_BEARER_TOKEN_FILE", "");
+        assert_eq!(
+            resolve_token(Some("operator-token"), &env_path).unwrap(),
+            "operator-token"
+        );
+        assert_eq!(
+            resolve_existing_token(Some("operator-token"), &env_path)
+                .unwrap()
+                .as_deref(),
+            Some("operator-token")
+        );
+        assert_eq!(
+            resolve_token_for_save(Some("operator-token"), &env_path)
+                .unwrap()
+                .token(),
+            "operator-token"
+        );
+    }
+
+    #[test]
+    fn setup_token_file_errors_prevent_fallback_or_generation() {
+        let tmp = setup_real_tempdir();
+        let env_path = tmp.path().join("config.env");
+        let missing = tmp.path().join("missing-token");
+        let invalid = tmp.path().join("invalid-token");
+        std::fs::write(&env_path, "HTTP_BEARER_TOKEN=stale-config-token\n").unwrap();
+        std::fs::write(&invalid, b"private-sentinel\xff").unwrap();
+        let _inline = EnvVarGuard::set("HTTP_BEARER_TOKEN", "stale-process-token");
+        for path in [Path::new(""), missing.as_path(), invalid.as_path()] {
+            let _file = EnvVarGuard::set("HTTP_BEARER_TOKEN_FILE", path.as_os_str());
+            for error in [
+                resolve_token(Some(""), &env_path).err().unwrap(),
+                resolve_existing_token(None, &env_path).err().unwrap(),
+                resolve_token_for_save(None, &env_path).err().unwrap(),
+            ] {
+                let message = error.to_string();
+                assert!(message.contains("HTTP_BEARER_TOKEN_FILE"), "{message}");
+                assert!(!message.contains("private-sentinel"));
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn setup_token_file_rejects_non_utf8_process_path() {
+        let tmp = setup_real_tempdir();
+        let env_path = tmp.path().join("config.env");
+        let _file = EnvVarGuard::set_os("HTTP_BEARER_TOKEN_FILE", non_utf8_os_string());
+        for error in [
+            resolve_token(None, &env_path).err().unwrap(),
+            resolve_existing_token(None, &env_path).err().unwrap(),
+            resolve_token_for_save(None, &env_path).err().unwrap(),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("HTTP_BEARER_TOKEN_FILE"), "{message}");
+            assert!(message.contains("valid UTF-8"), "{message}");
+        }
+    }
+
+    #[test]
+    fn setup_token_file_save_roundtrips_literal_values() {
+        let tmp = setup_real_tempdir();
+        let token_path = tmp.path().join("service-token");
+        let env_path = tmp.path().join("config.env");
+        std::fs::write(
+            &env_path,
+            "# preserve this comment\nOTHER=value\nHTTP_BEARER_TOKEN=old\n\
+             export HTTP_BEARER_TOKEN = 'stale-later-assignment'\n",
+        )
+        .unwrap();
+        let _file = EnvVarGuard::set("HTTP_BEARER_TOKEN_FILE", token_path.as_os_str());
+        for token in [
+            "0123456789abcdef",
+            " token #hash 'quote' \"double\" \\slash $d `backtick` % <> =\t ",
+            "'starts-and-ends-with-quotes'",
+            "\"quoted\"",
+            "literal\\n\\t",
+            "non-ascii-é",
+        ] {
+            std::fs::write(&token_path, token).unwrap();
+            let resolved = resolve_token_for_save(None, &env_path).unwrap();
+            save_token_to_env_file(&resolved).unwrap();
+            assert_eq!(
+                read_env_file_token(&env_path).unwrap().as_deref(),
+                Some(token)
+            );
+            let runtime_values = crate::config::load_dotenv_file(&env_path);
+            assert_eq!(
+                runtime_values.get("HTTP_BEARER_TOKEN").map(String::as_str),
+                Some(token)
+            );
+            assert_eq!(
+                runtime_values.get("OTHER").map(String::as_str),
+                Some("value")
+            );
+            let contents = std::fs::read_to_string(&env_path).unwrap();
+            assert!(contents.starts_with("# preserve this comment\n"));
+            assert!(!contents.contains("stale-later-assignment"));
+            if token == "0123456789abcdef" {
+                assert!(contents.contains("HTTP_BEARER_TOKEN=0123456789abcdef\n"));
+            }
+        }
     }
 
     #[test]

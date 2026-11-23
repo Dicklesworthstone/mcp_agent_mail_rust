@@ -312,7 +312,7 @@ pub struct Config {
 
     // Application
     pub app_environment: AppEnvironment,
-    /// A rejected user-global env-file authority.
+    /// A rejected user-global env-file or explicit bearer-token-file authority.
     ///
     /// When present, higher-level server entry points must refuse startup. A
     /// missing or rejected bearer token cannot safely degrade to `None`,
@@ -2409,7 +2409,25 @@ impl Config {
         if let Some(v) = env_value("HTTP_PATH") {
             config.http_path = normalize_http_path(&v);
         }
-        config.http_bearer_token = full_env_value("HTTP_BEARER_TOKEN").filter(|s| !s.is_empty());
+        // Service managers carry only this path, never the credential itself.
+        // An explicitly selected file is authoritative even when an inline
+        // token is also present; unreadable credentials must not downgrade the
+        // loopback server to its intentionally supported no-auth mode.
+        if matches!(
+            env::var("HTTP_BEARER_TOKEN_FILE"),
+            Err(env::VarError::NotUnicode(_))
+        ) {
+            config.user_env_authority_error =
+                Some("HTTP_BEARER_TOKEN_FILE must name a valid UTF-8 absolute path".to_string());
+        } else if let Some(path) = infra_env_value("HTTP_BEARER_TOKEN_FILE") {
+            match read_http_bearer_token_file(Path::new(&path)) {
+                Ok(token) => config.http_bearer_token = Some(token),
+                Err(error) => config.user_env_authority_error = Some(error.to_string()),
+            }
+        } else {
+            config.http_bearer_token =
+                full_env_value("HTTP_BEARER_TOKEN").filter(|s| !s.is_empty());
+        }
         config.http_allow_localhost_unauthenticated = env_bool(
             "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED",
             config.http_allow_localhost_unauthenticated,
@@ -2651,10 +2669,16 @@ impl Config {
         );
         // Per-surface engine overrides: AM_SEARCH_ENGINE_FOR_<TOOL_NAME>
         // e.g., AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES=hybrid
-        for (key, value) in env::vars() {
-            if let Some(tool_name) = key.strip_prefix("AM_SEARCH_ENGINE_FOR_") {
+        // Inspect only UTF-8 overrides; an unrelated malformed environment
+        // value must not panic before a recorded credential error is returned.
+        for (key, value) in env::vars_os() {
+            if let Some(tool_name) = key
+                .to_str()
+                .and_then(|key| key.strip_prefix("AM_SEARCH_ENGINE_FOR_"))
+                && let Some(value) = value.to_str()
+            {
                 let tool_name = tool_name.to_lowercase();
-                let engine = SearchEngine::parse(&value);
+                let engine = SearchEngine::parse(value);
                 config
                     .search_rollout
                     .surface_overrides
@@ -3150,7 +3174,9 @@ impl Config {
         // funnel, which refuses to initialize this root under the same
         // predicate; `AM_ALLOW_HOME_STORAGE_ROOT=1` bypasses both.
         // ────────────────────────────────────────────────────────────
-        config.user_env_authority_error = user_env_authority_error();
+        config.user_env_authority_error = config
+            .user_env_authority_error
+            .or_else(user_env_authority_error);
         guard_against_default_storage_root_in_test_mode(&config.storage_root);
 
         config
@@ -3187,8 +3213,8 @@ impl Config {
         global_config_cache_reset();
     }
 
-    /// Reject use of a configuration whose user-global env-file authority
-    /// could not be read safely.
+    /// Reject use of a configuration whose user-global env-file or explicit
+    /// bearer-token-file authority could not be read safely.
     ///
     /// Callers must perform this check before any server startup mutation. In
     /// particular, silently treating an unsafe credential file as absent would
@@ -3340,7 +3366,11 @@ impl Config {
                 .http_bearer_token
                 .as_ref()
                 .map_or(ConfigSource::Default, |_| {
-                    detect_source("HTTP_BEARER_TOKEN")
+                    if infra_env_value("HTTP_BEARER_TOKEN_FILE").is_some() {
+                        detect_source("HTTP_BEARER_TOKEN_FILE")
+                    } else {
+                        detect_source("HTTP_BEARER_TOKEN")
+                    }
                 }),
         });
         lines.push(BootstrapLine {
@@ -4152,6 +4182,58 @@ pub fn read_env_authority_text(path: &Path) -> io::Result<Option<String>> {
     })
 }
 
+/// Read an explicitly selected bearer token without exposing it in process
+/// arguments, service-manager metadata, or the process environment.
+///
+/// The file must have an absolute path and satisfy the same bounded,
+/// regular-file, no-follow authority checks as user configuration. Its content
+/// is literal UTF-8, not shell or dotenv syntax. One final LF or CRLF is allowed;
+/// all other whitespace and punctuation are preserved exactly.
+///
+/// # Errors
+///
+/// Rejects missing, unsafe, unreadable, oversized, or invalid UTF-8 files, as
+/// well as empty/whitespace-only tokens and tokens containing CR, LF, or NUL.
+/// Error messages identify the file but never include credential contents.
+pub fn read_http_bearer_token_file(path: &Path) -> io::Result<String> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HTTP_BEARER_TOKEN_FILE must name an absolute path",
+        ));
+    }
+    let contents = read_env_authority_text(path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot read HTTP_BEARER_TOKEN_FILE {}: {error}",
+                    path.display()
+                ),
+            )
+        })?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("HTTP_BEARER_TOKEN_FILE {} does not exist", path.display()),
+            )
+        })?;
+    let token = contents
+        .strip_suffix("\r\n")
+        .or_else(|| contents.strip_suffix('\n'))
+        .unwrap_or(&contents);
+    if token.trim().is_empty() || token.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "HTTP_BEARER_TOKEN_FILE {} must contain one nonempty token without CR, LF, or NUL",
+                path.display()
+            ),
+        ));
+    }
+    Ok(token.to_owned())
+}
+
 /// Return the current process's user env-file authority candidates in exact
 /// precedence order.
 ///
@@ -4472,7 +4554,7 @@ pub fn update_envfile<S: std::hash::BuildHasher>(
     }
 }
 
-fn parse_dotenv_contents(contents: &str) -> HashMap<String, String> {
+pub(crate) fn parse_dotenv_contents(contents: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -6549,6 +6631,270 @@ fn after() { var("KEEP_AFTER"); }
         let _env = TestEnvOverrideGuard::set(&[("HTTP_BEARER_TOKEN", "")]);
         let config = Config::from_env();
         assert!(config.http_bearer_token.is_none());
+    }
+
+    #[test]
+    fn bearer_token_file_preserves_literal_bytes_and_one_final_line_ending() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("service.token");
+        let token = " \ttok#en'\"\\$%&<> =ümlaut\t ";
+        for ending in ["", "\n", "\r\n"] {
+            fs::write(&path, format!("{token}{ending}")).unwrap();
+            assert_eq!(read_http_bearer_token_file(&path).unwrap(), token);
+        }
+    }
+
+    #[test]
+    fn bearer_token_file_rejects_invalid_contents_without_echoing_secrets() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("service.token");
+        for token in [
+            "",
+            " \t ",
+            "\n",
+            "\r\n",
+            "private-sentinel\nsecond",
+            "private-sentinel\n\n",
+            "private-sentinel\r",
+            "private-sentinel\0",
+        ] {
+            fs::write(&path, token).unwrap();
+            let error = read_http_bearer_token_file(&path).expect_err("invalid token");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("HTTP_BEARER_TOKEN_FILE"));
+            assert!(!error.to_string().contains("private-sentinel"));
+        }
+    }
+
+    #[test]
+    fn bearer_token_file_rejects_missing_relative_and_nonregular_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("missing.token");
+        assert_eq!(
+            read_http_bearer_token_file(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        for path in [Path::new(""), Path::new("relative.token")] {
+            assert_eq!(
+                read_http_bearer_token_file(path).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert!(read_http_bearer_token_file(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn bearer_token_file_rejects_invalid_utf8_and_oversized_authorities() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("service.token");
+        fs::write(&path, b"private-sentinel\xff").unwrap();
+        let error = read_http_bearer_token_file(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("private-sentinel"));
+
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(ENV_AUTHORITY_FILE_MAX_BYTES + 1)
+            .unwrap();
+        let error = read_http_bearer_token_file(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("private-sentinel"));
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[test]
+    fn bearer_token_file_rejects_symlinks_and_fifo() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_parent = tmp.path().join("real-parent");
+        fs::create_dir(&real_parent).unwrap();
+        let real = real_parent.join("service.token");
+        fs::write(&real, "private-sentinel").unwrap();
+        let linked_file = tmp.path().join("linked.token");
+        symlink(&real, &linked_file).unwrap();
+        let linked_parent = tmp.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent).unwrap();
+        let fifo = tmp.path().join("fifo.token");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+
+        for path in [linked_file, linked_parent.join("service.token"), fifo] {
+            let error = read_http_bearer_token_file(&path).expect_err("unsafe authority");
+            assert!(!error.to_string().contains("private-sentinel"));
+        }
+        assert_eq!(fs::read_to_string(&real).unwrap(), "private-sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bearer_token_file_rejects_unreadable_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("service.token");
+        fs::write(&path, "private-sentinel").unwrap();
+        let permissions = fs::metadata(&path).unwrap().permissions();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        // A privileged runner can still read mode 000; do not claim it exercised
+        // the kernel's permission denial in that case.
+        let unreadable = fs::File::open(&path).is_err();
+        let result = read_http_bearer_token_file(&path);
+        fs::set_permissions(&path, permissions).unwrap();
+        if unreadable {
+            let error = result.expect_err("unreadable credential must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(!error.to_string().contains("private-sentinel"));
+        }
+    }
+
+    #[test]
+    fn bearer_token_file_overrides_inline_token_and_invalid_file_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("service.token");
+        let _generation = ConfigGenerationGuard::enter(std::sync::Arc::default());
+        let _env = TestEnvOverrideGuard::set(&[
+            ("HOME", tmp.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", tmp.path().to_str().unwrap()),
+            ("STORAGE_ROOT", tmp.path().to_str().unwrap()),
+            ("HTTP_BEARER_TOKEN_FILE", path.to_str().unwrap()),
+            ("HTTP_BEARER_TOKEN", "forbidden-inline-fallback"),
+        ]);
+
+        let missing = Config::from_env();
+        assert!(missing.http_bearer_token.is_none());
+        assert!(missing.validate_user_env_authority().is_err());
+
+        fs::write(&path, "private-file-token").unwrap();
+        let valid = Config::from_env();
+        assert_eq!(
+            valid.http_bearer_token.as_deref(),
+            Some("private-file-token")
+        );
+        valid.validate_user_env_authority().unwrap();
+        assert!(!format!("{valid:?}").contains("private-file-token"));
+
+        fs::write(&path, "private-file-token\nsecond-line").unwrap();
+        let invalid = Config::from_env();
+        assert!(invalid.http_bearer_token.is_none());
+        let error = invalid.validate_user_env_authority().unwrap_err();
+        assert!(error.to_string().contains("HTTP_BEARER_TOKEN_FILE"));
+        assert!(!error.to_string().contains("private-file-token"));
+        assert!(!format!("{invalid:?}").contains("private-file-token"));
+    }
+
+    #[test]
+    fn bearer_token_file_empty_setting_fails_closed() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("HTTP_BEARER_TOKEN_FILE", ""),
+            ("HTTP_BEARER_TOKEN", "forbidden-inline-fallback"),
+        ]);
+        let config = Config::from_env();
+        assert!(config.http_bearer_token.is_none());
+        assert!(config.validate_user_env_authority().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_process_bearer_token_file_rejects_non_utf8_path_without_fallback() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        const CHILD_MARKER: &str = "AM_TEST_NON_UTF8_BEARER_TOKEN_FILE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let config = Config::from_env();
+            assert!(config.http_bearer_token.is_none());
+            let error = config.validate_user_env_authority().unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("HTTP_BEARER_TOKEN_FILE"));
+            assert!(message.contains("valid UTF-8"));
+            assert!(!message.contains("private-sentinel"));
+            println!("{CHILD_MARKER}:executed");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::fresh_process_bearer_token_file_rejects_non_utf8_path_without_fallback",
+                "--nocapture",
+            ])
+            .current_dir(tmp.path())
+            .env(CHILD_MARKER, "1")
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+            .env("STORAGE_ROOT", tmp.path().join("storage"))
+            .env("HTTP_BEARER_TOKEN", "forbidden-inline-fallback")
+            .env(
+                "HTTP_BEARER_TOKEN_FILE",
+                std::ffi::OsString::from_vec(b"/private-sentinel-\xff".to_vec()),
+            )
+            .output()
+            .expect("spawn isolated invalid token-file path child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains(&format!("{CHILD_MARKER}:executed")),
+            "child must execute the non-UTF-8 case: {stdout}\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn fresh_process_bearer_token_file_uses_user_config_but_ignores_project_override() {
+        const CHILD_MARKER: &str = "AM_TEST_BEARER_TOKEN_FILE_AUTHORITY_CHILD";
+        if let Ok(mode) = std::env::var(CHILD_MARKER) {
+            let config = Config::from_env();
+            let expected = if mode == "user" {
+                "user-file-token"
+            } else {
+                "inline-token"
+            };
+            assert_eq!(config.http_bearer_token.as_deref(), Some(expected));
+            config.validate_user_env_authority().unwrap();
+            println!("{CHILD_MARKER}:{mode}:executed");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_dir = tmp.path().join("user").join(XDG_APP_DIR);
+        fs::create_dir_all(&config_dir).unwrap();
+        let token_path = tmp.path().join("service.token");
+        fs::write(&token_path, "user-file-token").unwrap();
+        fs::write(
+            config_dir.join("config.env"),
+            format!("HTTP_BEARER_TOKEN_FILE={}\n", token_path.display()),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(".env"),
+            "HTTP_BEARER_TOKEN_FILE=forbidden-relative-project-path\n",
+        )
+        .unwrap();
+
+        for mode in ["user", "project"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::fresh_process_bearer_token_file_uses_user_config_but_ignores_project_override",
+                    "--nocapture",
+                ])
+                .current_dir(tmp.path())
+                .env(CHILD_MARKER, mode)
+                .env("HOME", tmp.path())
+                .env("XDG_CONFIG_HOME", tmp.path().join(mode))
+                .env("STORAGE_ROOT", tmp.path().join("storage"))
+                .env("HTTP_BEARER_TOKEN", "inline-token")
+                .env_remove("HTTP_BEARER_TOKEN_FILE")
+                .output()
+                .expect("spawn isolated token-file config child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(
+                stdout.contains(&format!("{CHILD_MARKER}:{mode}:executed")),
+                "child must execute the selected case: {stdout}\n{stderr}"
+            );
+        }
     }
 
     #[test]

@@ -790,6 +790,30 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Migration and lifecycle | `legacy detect|import|status`, `upgrade`, `migrate`, `self-update`, `am-run`, `guard ...` | Migrate Python installs, perform DB-format upgrades, run slot-aware build commands, and manage guard hooks |
 | Break-glass admin | `clear-and-reset-everything` | Fully reset local state after optional archival. A running server holding the mailbox is stopped for the wipe: a systemd user service or LaunchAgent through its manager (and started again afterwards), any other Agent Mail process with SIGTERM, then SIGKILL after a grace period. Use sparingly. |
 
+### Managed service credentials
+
+`am service install` stores the selected bearer token in
+`$XDG_CONFIG_HOME/mcp-agent-mail/service-token` (default:
+`~/.config/mcp-agent-mail/service-token`). It writes that file and the systemd
+unit or launchd plist atomically with owner-only permissions (`0600`). Service
+definitions contain only `HTTP_BEARER_TOKEN_FILE`, so inspecting the unit, plist,
+or service-manager environment does not disclose the credential. The server
+reads the file directly without copying its contents into the process environment.
+
+Re-run `am service install` after upgrading to replace an older definition that
+embeds the token. Reinstallation preserves the configured credential, migrates
+an existing service's inline token when no newer token is configured, and repairs
+file permissions. Installations using `--no-auth` do not create or reference a
+credential file. Service installation does not rewrite your `config.env`.
+
+`HTTP_BEARER_TOKEN_FILE` can also be set in the process environment or user-global
+`config.env`. It takes precedence over `HTTP_BEARER_TOKEN` and must name an absolute
+path to a regular, readable file without symlink traversal. The contents are the
+literal UTF-8 token, without shell or dotenv quoting; one final LF or CRLF is
+allowed. An explicitly selected missing, empty, malformed, or unsafe file blocks
+startup instead of disabling authentication. Keep manually supplied files private
+with `chmod 600`.
+
 ### Setup Drift Reports
 
 `am setup status` is read-only. It inventories supported MCP clients, reports the
@@ -805,9 +829,10 @@ am setup run --dry-run --project-dir "$PWD" --format toon
 am setup run --yes --project-dir "$PWD" --format toon
 ```
 
-For bearer-header checks, pass `--token` to `am setup status` or expose the
-expected token through `HTTP_BEARER_TOKEN` / `config.env`; status output redacts
-token values.
+For bearer-header checks, pass `--token` to `am setup status` or configure the
+expected token through `HTTP_BEARER_TOKEN_FILE` or `HTTP_BEARER_TOKEN` /
+`config.env`; status output redacts token values. Setup uses the same selected
+token-file credential as the server.
 
 ### Family Detail
 
@@ -1471,7 +1496,8 @@ for the shipped replay boundary and the still-deferred live parity contract.
 | `/mail/api/projects/{project}/agents` | JSON roster for one project |
 | `/mail/archive/*` | Archive browser and time-travel routes |
 
-Auth: HTTP authentication is off when neither `HTTP_BEARER_TOKEN` nor JWT auth
+Auth: HTTP authentication is off when neither `HTTP_BEARER_TOKEN` (including a
+credential loaded through `HTTP_BEARER_TOKEN_FILE`) nor JWT auth
 is configured; this supports the trusted-local deployment described in
 [`SECURITY.md`](SECURITY.md). Configure a bearer token or JWT before exposing the
 server beyond loopback. With auth configured,
@@ -1543,6 +1569,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `HTTP_PORT` | `8765` | Bind port |
 | `HTTP_PATH` | `/mcp/` | MCP base path |
 | `HTTP_BEARER_TOKEN` | (unset unless configured, including via `.env`) | HTTP bearer credential; with JWT auth also disabled, an unset token leaves HTTP authentication off for trusted-local operation |
+| `HTTP_BEARER_TOKEN_FILE` | (unset) | Absolute path to a literal bearer-token file; process/user-global configuration only. Takes precedence over the inline token and blocks startup if the selected file cannot be read safely. Managed services use a private `service-token` file. |
 | `HTTP_ALLOWED_HOSTS` | (none) | Comma-separated extra `Host:` header values the HTTP listener accepts, in addition to the bind host, its loopback variant, and `localhost`. Set this (or pass repeatable `serve-http --allowed-host <HOST>`) to reach the `/mail` web UI via a hostname or reverse proxy instead of getting an HTTP 421. Empty by default (loopback-only). |
 | `DATABASE_URL` | `<STORAGE_ROOT>/storage.sqlite3` | SQLite connection URL. Unset, the database lives inside `STORAGE_ROOT`; an explicit relative path is resolved against the working directory |
 | `AM_CACHE_PROFILE` | `balanced` | Cache budget preset: `conservative`, `balanced`, or `high-memory` |

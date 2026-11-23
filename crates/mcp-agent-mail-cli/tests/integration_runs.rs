@@ -11490,6 +11490,452 @@ fn service_install_renders_descriptor_limit_and_upgrades_an_older_unit() {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn private_service_test_environment(env: &TestEnv) -> (Vec<(String, String)>, PathBuf) {
+    let fake_bin = env.tmp.path().join("fake-service-bin");
+    std::fs::create_dir_all(&fake_bin).expect("create fake service bin");
+    let calls_path = env.tmp.path().join("private-service-systemctl.log");
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            calls_path.display()
+        ),
+    )
+    .expect("write fake systemctl");
+    set_executable(&systemctl);
+    let runtime_dir = env.tmp.path().join("service-run");
+    std::fs::create_dir_all(&runtime_dir).expect("create service runtime directory");
+
+    let mut service_env = env.isolated_env();
+    service_env.retain(|(key, _)| key != "PATH");
+    service_env.extend([
+        (
+            "PATH".to_string(),
+            format!("{}:/usr/local/bin:/usr/bin:/bin", fake_bin.display()),
+        ),
+        (
+            "XDG_RUNTIME_DIR".to_string(),
+            runtime_dir.display().to_string(),
+        ),
+        (
+            "DBUS_SESSION_BUS_ADDRESS".to_string(),
+            format!("unix:path={}/bus", runtime_dir.display()),
+        ),
+        ("AM_INTERFACE_MODE".to_string(), "cli".to_string()),
+    ]);
+    (service_env, calls_path)
+}
+
+/// GH#405: the installed definition must never carry the bearer itself, even
+/// when replacing a legacy world-readable unit. Exercise the real CLI writer,
+/// including a custom absolute XDG path containing spaces and exact token bytes.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_install_keeps_tokens_private_and_repairs_legacy_permissions() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let env = TestEnv::new();
+    let (mut service_env, calls_path) = private_service_test_environment(&env);
+    let xdg = env.tmp.path().join("private config");
+    let token_path = xdg.join("mcp-agent-mail/service-token");
+    let unit_path = env.home_dir.join(".config/systemd/user/agent-mail.service");
+    let token = "service-token 'quoted' \"double\" \\backslash $cash %value & <tag>";
+    service_env.retain(|(key, _)| key != "XDG_CONFIG_HOME");
+    service_env.extend([
+        ("XDG_CONFIG_HOME".to_string(), xdg.display().to_string()),
+        ("HTTP_BEARER_TOKEN".to_string(), token.to_string()),
+    ]);
+
+    for reinstall in [false, true] {
+        let previous_inodes = if reinstall {
+            std::fs::write(
+                &unit_path,
+                format!("[Service]\nEnvironment=HTTP_BEARER_TOKEN={token}\n"),
+            )
+            .expect("write legacy credential-bearing unit");
+            std::fs::write(&token_path, "stale-service-token").expect("write stale credential");
+            for path in [&unit_path, &token_path] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+                    .expect("simulate legacy public permissions");
+            }
+            Some((
+                std::fs::metadata(&unit_path)
+                    .expect("legacy unit metadata")
+                    .ino(),
+                std::fs::metadata(&token_path)
+                    .expect("legacy token metadata")
+                    .ino(),
+            ))
+        } else {
+            None
+        };
+
+        let out = run_am_hermetic(
+            &service_env,
+            Some(env.tmp.path()),
+            &["service", "install", "--port", "18999"],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "install failed: {stdout}\n{stderr}");
+        assert!(
+            !stdout.contains(token) && !stderr.contains(token),
+            "install disclosed bearer"
+        );
+        let unit = std::fs::read_to_string(&unit_path).expect("read installed unit");
+        assert!(!unit.contains(token), "unit disclosed bearer");
+        assert!(
+            !unit.contains("HTTP_BEARER_TOKEN="),
+            "unit embeds direct bearer environment"
+        );
+        assert!(
+            unit.contains(&format!(
+                "Environment=\"HTTP_BEARER_TOKEN_FILE={}\"",
+                token_path.display()
+            )),
+            "unit must point to the private credential under the selected XDG directory: {unit}"
+        );
+        assert_eq!(
+            std::fs::read(&token_path).expect("read service token"),
+            token.as_bytes()
+        );
+        for path in [&unit_path, &token_path] {
+            assert_eq!(
+                std::fs::metadata(path)
+                    .expect("private file metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "{} must be private after install and reinstall",
+                path.display()
+            );
+        }
+        if let Some((unit_inode, token_inode)) = previous_inodes {
+            assert_ne!(
+                std::fs::metadata(&unit_path)
+                    .expect("new unit metadata")
+                    .ino(),
+                unit_inode,
+                "reinstall must replace the unit atomically"
+            );
+            assert_ne!(
+                std::fs::metadata(&token_path)
+                    .expect("new token metadata")
+                    .ino(),
+                token_inode,
+                "reinstall must replace the token atomically"
+            );
+        }
+    }
+
+    let calls = std::fs::read_to_string(calls_path).expect("systemctl calls");
+    let expected = "--user daemon-reload\n--user enable agent-mail.service\n--user restart agent-mail.service\n";
+    assert_eq!(
+        calls,
+        expected.repeat(2),
+        "each install must reload before restart"
+    );
+    assert!(
+        !env.xdg_config_home
+            .join("mcp-agent-mail/service-token")
+            .exists(),
+        "custom XDG install must not leave a second credential under HOME"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn service_install_without_auth_does_not_persist_or_reference_a_token() {
+    for configured_token in [None, Some("unused-service-secret")] {
+        let env = TestEnv::new();
+        let (mut service_env, _) = private_service_test_environment(&env);
+        let mut args = vec!["service", "install", "--port", "18999"];
+        if let Some(token) = configured_token {
+            service_env.push(("HTTP_BEARER_TOKEN".to_string(), token.to_string()));
+            args.push("--no-auth");
+        }
+        let out = run_am_hermetic(&service_env, Some(env.tmp.path()), &args);
+        assert!(
+            out.status.success(),
+            "token-free install: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let unit =
+            std::fs::read_to_string(env.home_dir.join(".config/systemd/user/agent-mail.service"))
+                .expect("installed token-free unit");
+        assert!(
+            !unit.contains("HTTP_BEARER_TOKEN"),
+            "token-free unit has a credential setting"
+        );
+        assert!(
+            !env.xdg_config_home
+                .join("mcp-agent-mail/service-token")
+                .exists(),
+            "token-free install must not create a credential file"
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("unused-service-secret"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("unused-service-secret"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn service_install_preserves_legacy_and_file_only_credentials_on_reinstall() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = TestEnv::new();
+    let (service_env, calls_path) = private_service_test_environment(&env);
+    let unit_path = env.home_dir.join(".config/systemd/user/agent-mail.service");
+    let token_path = env.xdg_config_home.join("mcp-agent-mail/service-token");
+    let token = "legacy-only-service-secret";
+    std::fs::create_dir_all(unit_path.parent().expect("unit directory"))
+        .expect("create unit directory");
+    std::fs::write(
+        &unit_path,
+        format!("[Service]\nEnvironment=HTTP_BEARER_TOKEN={token}\n"),
+    )
+    .expect("write legacy unit");
+    std::fs::set_permissions(&unit_path, std::fs::Permissions::from_mode(0o644))
+        .expect("legacy unit mode");
+
+    // The first process migrates a legacy inline token. The second must find
+    // that same token via the new definition's file reference, with no ambient
+    // HTTP_BEARER_TOKEN or config.env available in either process.
+    for phase in ["legacy-only", "file-only"] {
+        let out = run_am_hermetic(
+            &service_env,
+            Some(env.tmp.path()),
+            &["service", "install", "--port", "18999"],
+        );
+        assert!(
+            out.status.success(),
+            "{phase} reinstall: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let unit = std::fs::read_to_string(&unit_path).expect("migrated unit");
+        assert!(!unit.contains(token) && !unit.contains("HTTP_BEARER_TOKEN="));
+        assert!(unit.contains(&format!("HTTP_BEARER_TOKEN_FILE={}", token_path.display())));
+        assert_eq!(
+            std::fs::read(&token_path).expect("retained credential"),
+            token.as_bytes()
+        );
+        for path in [&unit_path, &token_path] {
+            assert_eq!(
+                std::fs::metadata(path)
+                    .expect("private metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(token));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(token));
+    }
+
+    let completed_calls = std::fs::read_to_string(&calls_path).expect("successful manager calls");
+    for file_value in [
+        env.tmp.path().join("missing-token").display().to_string(),
+        "\"unterminated".to_string(),
+    ] {
+        let broken_unit = format!("[Service]\nEnvironment=HTTP_BEARER_TOKEN_FILE={file_value}\n");
+        std::fs::write(&unit_path, &broken_unit).expect("write broken managed reference");
+        let out = run_am_hermetic(
+            &service_env,
+            Some(env.tmp.path()),
+            &["service", "install", "--port", "18999"],
+        );
+        assert!(
+            !out.status.success(),
+            "invalid managed credential must not become an unauthenticated install"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&unit_path).expect("retained definition"),
+            broken_unit
+        );
+        assert_eq!(
+            std::fs::read(&token_path).expect("retained credential"),
+            token.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls_path).expect("manager calls"),
+            completed_calls
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(token));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(token));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn service_install_rejects_linked_credential_targets_before_manager_calls() {
+    use std::os::unix::fs::symlink;
+
+    for linked_directory in [false, true] {
+        let env = TestEnv::new();
+        let (mut service_env, calls_path) = private_service_test_environment(&env);
+        service_env.push((
+            "HTTP_BEARER_TOKEN".to_string(),
+            "must-stay-private".to_string(),
+        ));
+        let config_dir = env.xdg_config_home.join("mcp-agent-mail");
+        let outside = env.tmp.path().join("outside-credentials");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        let outside_token = outside.join("service-token");
+        std::fs::write(&outside_token, "do-not-overwrite").expect("outside credential");
+        if linked_directory {
+            symlink(&outside, &config_dir).expect("symlink credential directory");
+        } else {
+            std::fs::create_dir_all(&config_dir).expect("credential directory");
+            symlink(&outside_token, config_dir.join("service-token")).expect("symlink credential");
+        }
+        let out = run_am_hermetic(
+            &service_env,
+            Some(env.tmp.path()),
+            &["service", "install", "--port", "18999"],
+        );
+        assert!(
+            !out.status.success(),
+            "linked credential path must fail closed"
+        );
+        assert!(
+            !calls_path.exists(),
+            "unsafe credentials must fail before calling systemctl"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_token).expect("outside credential"),
+            "do-not-overwrite"
+        );
+        assert!(
+            !env.home_dir
+                .join(".config/systemd/user/agent-mail.service")
+                .exists(),
+            "unsafe credential install must not publish a service definition"
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("must-stay-private"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("must-stay-private"));
+    }
+}
+
+/// Start a new CLI process with only the file reference. This checks the real
+/// Config loader, rather than proving only that a renderer emits the key.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_install_reads_private_token_file_in_a_fresh_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = TestEnv::new();
+    let (mut service_env, _) = private_service_test_environment(&env);
+    let source = env.tmp.path().join("source-token");
+    let token = "file-token 'quoted' \"double\" \\backslash $cash %value & <tag>";
+    std::fs::write(&source, token).expect("write source token");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))
+        .expect("private source");
+    service_env.push((
+        "HTTP_BEARER_TOKEN_FILE".to_string(),
+        source.display().to_string(),
+    ));
+
+    let out = run_am_hermetic(
+        &service_env,
+        Some(env.tmp.path()),
+        &["service", "install", "--port", "18999"],
+    );
+    assert!(
+        out.status.success(),
+        "file-backed service install: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let installed = env.xdg_config_home.join("mcp-agent-mail/service-token");
+    assert_eq!(
+        std::fs::read(&installed).expect("persisted loaded token"),
+        token.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(&source).expect("source token unchanged"),
+        token.as_bytes()
+    );
+    let unit =
+        std::fs::read_to_string(env.home_dir.join(".config/systemd/user/agent-mail.service"))
+            .expect("installed unit");
+    assert!(!unit.contains(token) && !unit.contains("HTTP_BEARER_TOKEN="));
+    assert!(unit.contains(&format!("HTTP_BEARER_TOKEN_FILE={}", installed.display())));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(token));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(token));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn service_install_fails_closed_for_missing_or_unsafe_token_file() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for case in ["missing", "symlink", "empty"] {
+        let env = TestEnv::new();
+        let (mut service_env, calls_path) = private_service_test_environment(&env);
+        let source = env.tmp.path().join("source-token");
+        if case == "symlink" {
+            let outside = env.tmp.path().join("outside-token");
+            std::fs::write(&outside, "source-secret").expect("outside token");
+            std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600))
+                .expect("private outside");
+            symlink(&outside, &source).expect("symlink source");
+        } else if case != "missing" {
+            std::fs::write(&source, if case == "empty" { "" } else { "source-secret" })
+                .expect("source token");
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))
+                .expect("source mode");
+        }
+        service_env.extend([
+            (
+                "HTTP_BEARER_TOKEN_FILE".to_string(),
+                source.display().to_string(),
+            ),
+            (
+                "HTTP_BEARER_TOKEN".to_string(),
+                "must-not-fallback".to_string(),
+            ),
+        ]);
+        let out = run_am_hermetic(
+            &service_env,
+            Some(env.tmp.path()),
+            &["service", "install", "--port", "18999"],
+        );
+        assert!(
+            !out.status.success(),
+            "{case} explicit credential file must fail closed"
+        );
+        assert!(
+            !calls_path.exists(),
+            "{case} credential file reached systemctl"
+        );
+        assert!(
+            !env.home_dir
+                .join(".config/systemd/user/agent-mail.service")
+                .exists(),
+            "{case} credential file published a unit"
+        );
+        assert!(
+            !env.xdg_config_home
+                .join("mcp-agent-mail/service-token")
+                .exists(),
+            "{case} credential file fell back to a different token"
+        );
+        for secret in ["source-secret", "must-not-fallback"] {
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).contains(secret),
+                "{case} leaked a secret"
+            );
+            assert!(
+                !String::from_utf8_lossy(&out.stderr).contains(secret),
+                "{case} leaked a secret"
+            );
+        }
+    }
+}
+
 /// Hermetic env for one `am` run against a private HOME and mailbox. The
 /// listener port is one nothing listens on, so mutations take the local path
 /// instead of reaching a live daemon.

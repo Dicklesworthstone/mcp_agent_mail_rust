@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Verifies that install.sh's LaunchAgent plist writer refuses symlinked service
-# paths before writing. The full installer is intentionally not sourced because
-# it performs network and installation work at the bottom of the script.
+# Verifies that install.sh's LaunchAgent writer keeps service credentials in a
+# private file and refuses unsafe paths. The full installer is intentionally
+# not sourced because it performs network and installation work at the bottom.
 
 set -euo pipefail
 
@@ -29,14 +29,15 @@ extract="$tmp/launchd_plist_functions.sh"
 extract_function() {
     local fn="$1"
     awk -v fn="$fn" '
-        $0 == fn "() {" {
+        $0 == fn "() {" || $0 == fn "() (" {
             in_fn = 1
+            end_fn = ($0 == fn "() (") ? ")" : "}"
             print
             next
         }
         in_fn {
             print
-            if ($0 == "}") {
+            if ($0 == end_fn) {
                 exit
             }
         }
@@ -62,6 +63,8 @@ extract_function() {
     extract_function plist_env_entry
     extract_function ensure_real_directory_tree
     extract_function ensure_real_file_target_path
+    extract_function git_authority_probe
+    extract_function git_worktree_root_for_path
     extract_function private_file_identity
     extract_function private_file_link_count
     extract_function private_file_security_identity
@@ -79,7 +82,7 @@ extract_function() {
     sed -n '/^install_legacy_launcher_takeover_shims() {/,/^# T1\.5:/p' "$INSTALL_SH" | sed '$d'
 } >"$extract"
 
-for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path private_file_identity private_file_link_count private_file_security_identity ensure_private_file_target_path write_private_file_atomic write_launchd_service_plist repair_launchd_service_env_from_rust_config trusted_system_directory_alias_target detect_mcp_configs remote_http_client_target_tools has_remote_http_client_targets probe_remote_http_endpoint ensure_remote_http_client_readiness configure_mcp_clients_for_install install_legacy_launcher_takeover_shims; do
+for required in rust_config_env_path generate_bearer_token plist_xml_escape ensure_real_directory_tree ensure_real_file_target_path git_authority_probe git_worktree_root_for_path private_file_identity private_file_link_count private_file_security_identity ensure_private_file_target_path write_private_file_atomic write_launchd_service_plist repair_launchd_service_env_from_rust_config trusted_system_directory_alias_target detect_mcp_configs remote_http_client_target_tools has_remote_http_client_targets probe_remote_http_endpoint ensure_remote_http_client_readiness configure_mcp_clients_for_install install_legacy_launcher_takeover_shims; do
     if ! grep -q "^${required}()" "$extract"; then
         fail "could not extract ${required} from install.sh"
     fi
@@ -149,32 +152,117 @@ write_test_plist() {
     local plist_path="$1"
     local home="$2"
     local storage_root="$3"
-    write_launchd_service_plist \
+    local config_home="${4-}"
+    local bearer_token="${5-tok&en}"
+    XDG_CONFIG_HOME="$config_home" write_launchd_service_plist \
         "$plist_path" \
         "/opt/agent mail/bin/am" \
         "$home" \
         "$storage_root" \
         "sqlite:///$storage_root/storage.sqlite3" \
-        "tok&en" \
+        "$bearer_token" \
         "127.0.0.1" \
         "8765" \
         "/mcp/?x=<y>"
 }
 
-step "scenario A: normal plist write succeeds and XML-escapes values"
+step "scenario A: normal plist references a private credential and escapes metadata"
 home_a="$tmp/home-a"
 storage_a="$tmp/storage-a"
 plist_a="$home_a/Library/LaunchAgents/com.agent-mail.plist"
 write_test_plist "$plist_a" "$home_a" "$storage_a" || fail "normal plist write failed"
 grep -q '<string>/opt/agent mail/bin/am</string>' "$plist_a" || fail "missing am binary argument"
-grep -q '<string>tok&amp;en</string>' "$plist_a" || fail "token was not XML-escaped"
+token_a="$home_a/.config/mcp-agent-mail/service-token"
+grep -Fq '<key>HTTP_BEARER_TOKEN_FILE</key>' "$plist_a" || fail "missing credential-file reference"
+grep -Fq "<string>$token_a</string>" "$plist_a" || fail "wrong service credential path"
+if grep -Eq 'HTTP_BEARER_TOKEN</key>|tok(&amp;|&)en' "$plist_a"; then
+    fail "bearer token leaked into the plist"
+fi
+[ "$(cat "$token_a")" = 'tok&en' ] || fail "private service credential changed"
+private_file_security_identity "$token_a" >/dev/null \
+    || fail "service credential was not published as a mode-600 single-link file"
 grep -q '<string>/mcp/?x=&lt;y&gt;</string>' "$plist_a" || fail "HTTP_PATH was not XML-escaped"
 if stat -f '%Lp' "$plist_a" >/dev/null 2>&1; then
     plist_a_mode="$(stat -f '%Lp' "$plist_a")"
 else
     plist_a_mode="$(stat -c '%a' "$plist_a")"
 fi
-[ "$plist_a_mode" = "600" ] || fail "credential-bearing plist mode was $plist_a_mode, expected 600"
+[ "$plist_a_mode" = "600" ] || fail "plist mode was $plist_a_mode, expected 600"
+
+step "scenario A2: reinstall repairs permissions and detaches existing credential hardlinks"
+token_a_peer="$tmp/service-token-peer"
+ln "$token_a" "$token_a_peer"
+chmod 644 "$token_a" "$plist_a"
+printf '\nlegacy inline token metadata\n' >>"$plist_a"
+special_token=' tok"en\backslash #$%&<>'"' end "
+write_test_plist "$plist_a" "$home_a" "$storage_a" '' "$special_token" \
+    >"$tmp/reinstall.stdout" 2>"$tmp/reinstall.stderr" \
+    || fail "service credential reinstall failed"
+printf '%s' "$special_token" >"$tmp/expected-service-token"
+cmp -s "$tmp/expected-service-token" "$token_a" \
+    || fail "service credential special characters were not preserved byte-for-byte"
+[ "$(cat "$token_a_peer")" = 'tok&en' ] || fail "outside credential hardlink was changed"
+private_file_security_identity "$token_a" >/dev/null \
+    || fail "reinstall did not repair credential mode and hard links"
+private_file_security_identity "$plist_a" >/dev/null \
+    || fail "reinstall did not repair plist mode"
+if grep -Fq "$special_token" "$plist_a" "$tmp/reinstall.stdout" "$tmp/reinstall.stderr" \
+    || grep -Fq 'legacy inline token metadata' "$plist_a"; then
+    fail "reinstall leaked a credential or kept legacy inline metadata"
+fi
+
+step "scenario A3: custom XDG authority selects the private credential path"
+home_xdg="$tmp/home-xdg"
+config_xdg="$tmp/config &<xdg>"
+plist_xdg="$home_xdg/Library/LaunchAgents/com.agent-mail.plist"
+token_xdg="$config_xdg/mcp-agent-mail/service-token"
+write_test_plist "$plist_xdg" "$home_xdg" "$tmp/storage-xdg" "$config_xdg" \
+    || fail "custom XDG service credential write failed"
+[ "$(cat "$token_xdg")" = 'tok&en' ] || fail "custom XDG credential was not persisted"
+[ ! -e "$home_xdg/.config/mcp-agent-mail/service-token" ] \
+    || fail "custom XDG credential also leaked into the HOME fallback"
+grep -Fq "<string>$tmp/config &amp;&lt;xdg&gt;/mcp-agent-mail/service-token</string>" "$plist_xdg" \
+    || fail "custom XDG credential path was not XML-escaped"
+
+step "scenario A4: unsafe credential targets fail before publishing a service"
+home_token_link="$tmp/home-token-link"
+plist_token_link="$home_token_link/Library/LaunchAgents/com.agent-mail.plist"
+mkdir -p "$home_token_link/.config/mcp-agent-mail"
+token_victim="$tmp/token-victim"
+printf 'do not overwrite\n' >"$token_victim"
+ln -s "$token_victim" "$home_token_link/.config/mcp-agent-mail/service-token"
+if write_test_plist "$plist_token_link" "$home_token_link" "$tmp/storage-token-link"; then
+    fail "symlinked service credential unexpectedly succeeded"
+fi
+[ "$(cat "$token_victim")" = 'do not overwrite' ] || fail "credential symlink victim was changed"
+[ ! -e "$plist_token_link" ] || fail "service was published after credential refusal"
+home_token_parent="$tmp/home-token-parent"
+plist_token_parent="$home_token_parent/Library/LaunchAgents/com.agent-mail.plist"
+mkdir -p "$home_token_parent/.config" "$tmp/outside-token-parent"
+ln -s "$tmp/outside-token-parent" "$home_token_parent/.config/mcp-agent-mail"
+if write_test_plist "$plist_token_parent" "$home_token_parent" "$tmp/storage-token-parent"; then
+    fail "symlinked service credential parent unexpectedly succeeded"
+fi
+[ ! -e "$tmp/outside-token-parent/service-token" ] || fail "credential crossed a symlinked parent"
+[ ! -e "$plist_token_parent" ] || fail "service was published after credential-parent refusal"
+
+step "scenario A5: invalid credentials and Git-worktree destinations are refused"
+home_invalid="$tmp/home-invalid-token"
+plist_invalid="$home_invalid/Library/LaunchAgents/com.agent-mail.plist"
+for invalid_token in '' '   ' $'line-one\nline-two' $'line-one\rline-two'; do
+    if write_test_plist "$plist_invalid" "$home_invalid" "$tmp/storage-invalid" '' "$invalid_token"; then
+        fail "invalid service credential was accepted"
+    fi
+done
+[ ! -e "$plist_invalid" ] || fail "invalid credential published a service"
+git_config="$tmp/git-config"
+mkdir -p "$git_config"
+git init -q -b main "$git_config"
+if write_test_plist "$plist_invalid" "$home_invalid" "$tmp/storage-invalid" "$git_config"; then
+    fail "service credential inside a Git worktree was accepted"
+fi
+[ ! -e "$git_config/mcp-agent-mail/service-token" ] || fail "credential was written inside a checkout"
+[ ! -e "$plist_invalid" ] || fail "Git-worktree credential refusal published a service"
 
 step "scenario B: symlinked plist target is rejected without mutating target"
 home_b="$tmp/home-b"
@@ -228,9 +316,10 @@ home_g="$tmp/home-g"
 storage_g="$tmp/storage from config"
 plist_g="$home_g/Library/LaunchAgents/com.agent-mail.plist"
 fake_bin="$tmp/fake-bin"
+fake_dest="$tmp/agent mail/bin"
 python_marker="$tmp/python-was-invoked"
 launchctl_log="$tmp/launchctl.log"
-mkdir -p "$home_g/Library/LaunchAgents" "$home_g/.config/mcp-agent-mail" "$fake_bin"
+mkdir -p "$home_g/Library/LaunchAgents" "$home_g/.config/mcp-agent-mail" "$fake_bin" "$fake_dest"
 printf 'stale plist\n' >"$plist_g"
 cat >"$home_g/.config/mcp-agent-mail/config.env" <<EOF
 STORAGE_ROOT="$storage_g"
@@ -250,30 +339,83 @@ cat >"$fake_bin/launchctl" <<EOF
 printf '%s\n' "\$*" >>"$launchctl_log"
 exit 0
 EOF
-chmod 755 "$fake_bin/python3" "$fake_bin/launchctl"
+cat >"$fake_dest/am" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = config ] && [ "${2:-}" = show-port ] \
+    && [ "${HTTP_BEARER_TOKEN_FILE:-}" = relative-service-token-probe ]; then
+    echo 'HTTP_BEARER_TOKEN_FILE must name an absolute path' >&2
+    exit 1
+fi
+exit 70
+EOF
+chmod 755 "$fake_bin/python3" "$fake_bin/launchctl" "$fake_dest/am"
 (
     export OS=darwin
     export HOME="$home_g"
-    export DEST="/opt/agent mail/bin"
+    export XDG_CONFIG_HOME=''
+    export DEST="$fake_dest"
     export BIN_CLI="am"
     export PATH="$fake_bin:$PATH"
     unset RUST_STORAGE_ROOT
     repair_launchd_service_env_from_rust_config
 )
 [ ! -e "$python_marker" ] || fail "repair path invoked python3"
-grep -Fq '<string>/opt/agent mail/bin/am</string>' "$plist_g" || fail "repair path did not write am ProgramArguments"
+grep -Fq "<string>$fake_dest/am</string>" "$plist_g" || fail "repair path did not write am ProgramArguments"
 grep -Fq "<string>sqlite:///$storage_g/storage.sqlite3</string>" "$plist_g" || fail "repair path did not use DATABASE_URL from config.env"
-grep -Fq '<string>repair&amp;token</string>' "$plist_g" || fail "repair path did not XML-escape HTTP_BEARER_TOKEN"
+grep -Fq '<key>HTTP_BEARER_TOKEN_FILE</key>' "$plist_g" || fail "repair path did not reference a credential file"
+if grep -Eq 'HTTP_BEARER_TOKEN</key>|repair(&amp;|&)token' "$plist_g"; then
+    fail "repair path embedded HTTP_BEARER_TOKEN in the plist"
+fi
+[ "$(cat "$home_g/.config/mcp-agent-mail/service-token")" = 'repair&token' ] \
+    || fail "repair path did not preserve the durable bearer token"
 grep -Fq '<string>/mcp/repair</string>' "$plist_g" || fail "repair path did not use HTTP_PATH from config.env"
 grep -q "^bootout " "$launchctl_log" || fail "repair path did not restart existing launchd service"
 grep -q "^bootstrap " "$launchctl_log" || fail "repair path did not bootstrap launchd service"
 
+step "scenario G2: old binaries and unrelated probe failures cannot publish file-only services"
+cp "$plist_g" "$tmp/plist-before-unsupported"
+cp "$launchctl_log" "$tmp/launchctl-before-unsupported"
+for probe_kind in old-binary unrelated-error; do
+    probe_dest="$tmp/$probe_kind"
+    mkdir -p "$probe_dest"
+    if [ "$probe_kind" = old-binary ]; then
+        cat >"$probe_dest/am" <<'EOF'
+#!/bin/sh
+printf '8765\n'
+exit 0
+EOF
+    else
+        cat >"$probe_dest/am" <<'EOF'
+#!/bin/sh
+echo 'unrelated failure containing private-probe-sentinel' >&2
+exit 1
+EOF
+    fi
+    chmod 755 "$probe_dest/am"
+    if (
+        export OS=darwin HOME="$home_g" XDG_CONFIG_HOME=''
+        export DEST="$probe_dest" BIN_CLI=am PATH="$fake_bin:$PATH"
+        repair_launchd_service_env_from_rust_config
+    ) >"$tmp/$probe_kind.stdout" 2>"$tmp/$probe_kind.stderr"; then
+        fail "$probe_kind was accepted as supporting private service credentials"
+    fi
+    cmp -s "$plist_g" "$tmp/plist-before-unsupported" \
+        || fail "$probe_kind changed the service definition"
+    cmp -s "$launchctl_log" "$tmp/launchctl-before-unsupported" \
+        || fail "$probe_kind restarted the service"
+    if grep -Fq 'private-probe-sentinel' "$tmp/$probe_kind.stdout" "$tmp/$probe_kind.stderr"; then
+        fail "credential capability probe output was exposed"
+    fi
+done
+
 step "scenario H: plist rewrite failure propagates to the caller"
+writer_failure_marker="$tmp/writer-failure-reached"
 if (
-    write_launchd_service_plist() { return 1; }
+    write_launchd_service_plist() { : >"$writer_failure_marker"; return 1; }
     export OS=darwin
     export HOME="$home_g"
-    export DEST="/opt/agent mail/bin"
+    export XDG_CONFIG_HOME=''
+    export DEST="$fake_dest"
     export BIN_CLI="am"
     export PATH="$fake_bin:$PATH"
     unset RUST_STORAGE_ROOT
@@ -281,12 +423,15 @@ if (
 ); then
     fail "plist rewrite failure was reported as successful"
 fi
+[ -e "$writer_failure_marker" ] || fail "plist rewrite failure scenario did not reach the writer"
 
 step "scenario I: launchctl bootstrap failure propagates to the caller"
+bootstrap_failure_marker="$tmp/bootstrap-failure-reached"
 cat >"$fake_bin/launchctl" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$launchctl_log"
 if [ "\${1:-}" = "bootstrap" ]; then
+    : >"$bootstrap_failure_marker"
     exit 69
 fi
 exit 0
@@ -295,7 +440,8 @@ chmod 755 "$fake_bin/launchctl"
 if (
     export OS=darwin
     export HOME="$home_g"
-    export DEST="/opt/agent mail/bin"
+    export XDG_CONFIG_HOME=''
+    export DEST="$fake_dest"
     export BIN_CLI="am"
     export PATH="$fake_bin:$PATH"
     unset RUST_STORAGE_ROOT
@@ -303,6 +449,7 @@ if (
 ); then
     fail "launchctl bootstrap failure was reported as successful"
 fi
+[ -e "$bootstrap_failure_marker" ] || fail "bootstrap failure scenario did not reach launchctl"
 
 step "scenario I2: production target discovery never resolves a relative HOME from cwd"
 relative_home_root="$tmp/relative-home-root"

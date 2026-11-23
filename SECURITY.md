@@ -108,7 +108,8 @@ limiting off) are deliberate for the trusted-local case. **Before exposing the
 server beyond loopback or sharing one instance among less-trusted agents**, you
 should:
 
-- Set `HTTP_BEARER_TOKEN` (or enable JWT) — auth is off by default. The server
+- Set `HTTP_BEARER_TOKEN`, use a private file through `HTTP_BEARER_TOKEN_FILE`,
+  or enable JWT — auth is off by default. The server
   logs a loud warning when bound to a non-loopback host with no auth configured.
 - Set `APP_ENVIRONMENT=production` to disable development-mode CORS reflection.
 - Enable rate limiting (`HTTP_RATE_LIMIT_ENABLED=true`).
@@ -116,6 +117,15 @@ should:
   enforcing auth/rate limits and a strict `Content-Security-Policy`.
 - Treat the SQLite DB, Git archive, and env files as plaintext at rest —
   confidentiality relies on OS account and filesystem permissions.
+
+Managed services created by `am service install` keep bearer tokens in an
+atomically written `0600` file under the canonical user config directory. The
+systemd unit and launchd plist contain its path, never its contents, and are also
+written with `0600` permissions. Reinstall an existing service after upgrading to
+remove legacy inline credentials. Explicit token-file failures block startup;
+they do not select unauthenticated operation. This protects against disclosure
+through service definitions and manager metadata, not other processes running
+under the same OS account. Previously exposed credentials should be rotated.
 
 See the [Configuration](README.md#configuration) and
 [Limitations](README.md#limitations) sections of the README for the full set of

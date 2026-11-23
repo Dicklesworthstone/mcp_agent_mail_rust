@@ -50,6 +50,7 @@ use mcp_agent_mail_core::disk::{
     classify_sqlite_recovery_candidate_name, sqlite_file_path_from_database_url,
     sqlite_url_from_path,
 };
+use mcp_agent_mail_core::setup;
 use mcp_agent_mail_core::{
     AgentDetectError, AgentDetectOptions, ArchiveScanDedupeRule, ArchiveScanDiagnostic,
     ArchiveScanScope, ArchiveScanSeverityBucket, ArchiveScanSummary, ArtifactPointer, Config,
@@ -5010,8 +5011,10 @@ fn systemd_service_configured_bind() -> Option<ManagedServiceBinding> {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn parse_systemd_environment_value(content: &str, key: &str) -> Option<String> {
+fn parse_systemd_environment_value(content: &str, key: &str) -> CliResult<Option<String>> {
     let needle = format!("{key}=");
+    let mut matched = None;
+    let invalid = || CliError::Other(format!("cannot parse systemd {key} value"));
     for line in content.lines() {
         let trimmed = line.trim();
         let Some(value) = trimmed
@@ -5020,28 +5023,77 @@ fn parse_systemd_environment_value(content: &str, key: &str) -> Option<String> {
         else {
             continue;
         };
-        let value = value.trim().trim_matches('"').trim_matches('\'');
+        let value = value.trim();
+        if value.is_empty() {
+            matched = None;
+            continue;
+        }
+        let value = if let Some(quoted) = value.strip_prefix('"') {
+            quoted.strip_suffix('"').ok_or_else(invalid)?
+        } else if let Some(quoted) = value.strip_prefix('\'') {
+            quoted.strip_suffix('\'').ok_or_else(invalid)?
+        } else {
+            value
+        };
         let Some(rest) = value.strip_prefix(&needle) else {
             continue;
         };
-        let token = rest.trim().trim_matches('"').trim_matches('\'');
-        if !token.is_empty() {
-            return Some(token.to_string());
+        // Decode the C-style escapes and literal percent specifiers emitted
+        // by systemd_environment_line, including paths with spaces or quotes.
+        let mut decoded = String::with_capacity(rest.len());
+        let mut chars = rest.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => match chars.next().ok_or_else(invalid)? {
+                    '\\' => decoded.push('\\'),
+                    '"' => decoded.push('"'),
+                    '\'' => decoded.push('\''),
+                    'n' => decoded.push('\n'),
+                    'r' => decoded.push('\r'),
+                    't' => decoded.push('\t'),
+                    's' => decoded.push(' '),
+                    _ => return Err(invalid()),
+                },
+                '%' if chars.peek() == Some(&'%') => {
+                    chars.next();
+                    decoded.push('%');
+                }
+                _ => decoded.push(ch),
+            }
         }
+        matched = Some(decoded);
     }
-    None
+    Ok(matched)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn systemd_bearer_token_from_unit(content: &str) -> CliResult<Option<String>> {
+    if let Some(path) = parse_systemd_environment_value(content, "HTTP_BEARER_TOKEN_FILE")? {
+        return mcp_agent_mail_core::config::read_http_bearer_token_file(Path::new(&path))
+            .map(Some)
+            .map_err(CliError::Io);
+    }
+    // Preserve the credential when reinstalling a unit from before GH#405.
+    Ok(
+        parse_systemd_environment_value(content, "HTTP_BEARER_TOKEN")?
+            .filter(|token| !token.is_empty()),
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_service_bearer_token() -> Option<String> {
-    let unit_path = systemd_unit_path()?;
-    let content = std::fs::read_to_string(unit_path).ok()?;
-    parse_systemd_environment_value(&content, "HTTP_BEARER_TOKEN")
+fn systemd_service_bearer_token() -> CliResult<Option<String>> {
+    let Some(unit_path) = systemd_unit_path() else {
+        return Ok(None);
+    };
+    let Some(content) = mcp_agent_mail_core::config::read_env_authority_text(&unit_path)? else {
+        return Ok(None);
+    };
+    systemd_bearer_token_from_unit(&content)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn systemd_service_bearer_token() -> Option<String> {
-    None
+fn systemd_service_bearer_token() -> CliResult<Option<String>> {
+    Ok(None)
 }
 
 #[cfg(target_os = "macos")]
@@ -5097,27 +5149,48 @@ fn launchd_service_configured_bind() -> Option<ManagedServiceBinding> {
 }
 
 #[cfg(target_os = "macos")]
-fn launchd_service_bearer_token() -> Option<String> {
-    let plist_path = launchd_plist_path()?;
-    let value = plist::Value::from_file(&plist_path).ok()?;
-    value
-        .as_dictionary()?
-        .get("EnvironmentVariables")?
-        .as_dictionary()?
-        .get("HTTP_BEARER_TOKEN")?
-        .as_string()
-        .map(str::trim)
+fn launchd_service_bearer_token() -> CliResult<Option<String>> {
+    let Some(plist_path) = launchd_plist_path() else {
+        return Ok(None);
+    };
+    let Some(content) = mcp_agent_mail_core::config::read_env_authority_text(&plist_path)? else {
+        return Ok(None);
+    };
+    let value = plist::Value::from_reader_xml(content.as_bytes())
+        .map_err(|_| CliError::Other("cannot parse LaunchAgent plist".to_string()))?;
+    let Some(env) = value
+        .as_dictionary()
+        .and_then(|dict| dict.get("EnvironmentVariables"))
+        .and_then(plist::Value::as_dictionary)
+    else {
+        return Ok(None);
+    };
+    if let Some(path) = env.get("HTTP_BEARER_TOKEN_FILE") {
+        let path = path.as_string().ok_or_else(|| {
+            CliError::Other("LaunchAgent HTTP_BEARER_TOKEN_FILE must be a path".to_string())
+        })?;
+        return mcp_agent_mail_core::config::read_http_bearer_token_file(Path::new(path))
+            .map(Some)
+            .map_err(CliError::Io);
+    }
+    // Legacy plists are read only for migration; new plists never embed secrets.
+    Ok(env
+        .get("HTTP_BEARER_TOKEN")
+        .and_then(plist::Value::as_string)
         .filter(|token| !token.is_empty())
-        .map(str::to_string)
+        .map(str::to_string))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn launchd_service_bearer_token() -> Option<String> {
-    None
+fn launchd_service_bearer_token() -> CliResult<Option<String>> {
+    Ok(None)
 }
 
-fn managed_service_bearer_token() -> Option<String> {
-    systemd_service_bearer_token().or_else(launchd_service_bearer_token)
+fn managed_service_bearer_token() -> CliResult<Option<String>> {
+    match systemd_service_bearer_token()? {
+        Some(token) => Ok(Some(token)),
+        None => launchd_service_bearer_token(),
+    }
 }
 
 // ── Unified process-owner model (br-bvq1x.9.4 / I4) ──────────────────────
@@ -9111,7 +9184,9 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         None
     } else {
         Some(
-            setup::resolve_token_for_save(None, &config_env_file)
+            // Client setup must use the credential this server actually
+            // requires, including one read from HTTP_BEARER_TOKEN_FILE.
+            setup::resolve_token_for_save(config.http_bearer_token.as_deref(), &config_env_file)
                 .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?,
         )
     };
@@ -10950,7 +11025,7 @@ pub(crate) fn local_server_bearer_token(config: &mcp_agent_mail_core::Config) ->
     config
         .http_bearer_token
         .clone()
-        .or_else(managed_service_bearer_token)
+        .or_else(|| managed_service_bearer_token().ok().flatten())
 }
 
 fn mcp_base_alias_path(path: &str) -> Option<&'static str> {
@@ -46463,14 +46538,21 @@ fn build_systemd_exec_start(
 }
 
 fn systemd_environment_line(key: &str, value: &str) -> String {
-    let assignment = format!("{key}={value}");
+    // Environment= expands systemd specifiers, but does not expand shell
+    // variables. Keep percent signs literal and never emit a physical newline.
+    let assignment = format!("{key}={}", value.replace('%', "%%"));
     if assignment
         .chars()
-        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\\'))
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '\\'))
     {
         format!(
             "Environment=\"{}\"",
-            assignment.replace('\\', "\\\\").replace('"', "\\\"")
+            assignment
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t")
         )
     } else {
         format!("Environment={assignment}")
@@ -46574,7 +46656,7 @@ fn build_systemd_unit_content(
     http_host: &str,
     http_port: u16,
     http_path: &str,
-    http_bearer_token: Option<&str>,
+    http_bearer_token_file: Option<&Path>,
 ) -> String {
     // StartLimit* + longer RestartSec: if WorkingDirectory is missing or the
     // binary is broken, systemd would otherwise hammer the journal in a tight
@@ -46590,8 +46672,11 @@ fn build_systemd_unit_content(
         systemd_environment_line("HTTP_PORT", &http_port.to_string()),
         systemd_environment_line("HTTP_PATH", http_path),
     ];
-    if let Some(token) = http_bearer_token.filter(|token| !token.is_empty()) {
-        env_lines.push(systemd_environment_line("HTTP_BEARER_TOKEN", token));
+    if let Some(path) = http_bearer_token_file {
+        env_lines.push(systemd_environment_line(
+            "HTTP_BEARER_TOKEN_FILE",
+            &path.display().to_string(),
+        ));
     }
     let env_lines = env_lines.join("\n");
 
@@ -46657,6 +46742,35 @@ fn setup_endpoint_from(
     )
 }
 
+/// Persist the chosen service credential before publishing manager metadata.
+/// Managers only receive this path: the server reads the raw token itself, so
+/// systemctl/launchctl inspection never exposes it. Reinstall also migrates a
+/// legacy inline credential when no newer configured token is available.
+fn prepare_service_token_file(config: &Config, no_auth: bool) -> CliResult<Option<PathBuf>> {
+    if no_auth {
+        return Ok(None);
+    }
+    let token = match config.http_bearer_token.as_ref() {
+        Some(token) => Some(token.clone()),
+        None => managed_service_bearer_token()?,
+    };
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    if token.trim().is_empty() || token.contains(['\n', '\r', '\0']) {
+        return Err(CliError::Other(
+            "service bearer token must be nonempty and contain no newlines or NUL bytes"
+                .to_string(),
+        ));
+    }
+
+    let path = canonical_setup_config_env_path()?.with_file_name("service-token");
+    setup::transform_config_atomic(&path, 0o600, false, true, |_| Ok(token.clone())).map_err(
+        |error| CliError::Other(format!("cannot persist service bearer token: {error}")),
+    )?;
+    Ok(Some(path))
+}
+
 fn service_install_systemd(
     am_bin: &Path,
     host: Option<String>,
@@ -46701,6 +46815,8 @@ fn service_install_systemd(
     // launch can open the DB file without surprise.
     ensure_sqlite_parent_dir_for_database_url(&abs_db_url)?;
 
+    ensure_real_file_target_path(&unit_path, "systemd unit")?;
+    let token_file = prepare_service_token_file(&config, no_auth)?;
     let unit_content = build_systemd_unit_content(
         &exec_args,
         &abs_storage_root,
@@ -46710,13 +46826,17 @@ fn service_install_systemd(
         listen_host,
         listen_port,
         &config.http_path,
-        (!no_auth)
-            .then_some(config.http_bearer_token.as_deref())
-            .flatten(),
+        token_file.as_deref(),
     );
 
-    ensure_real_file_target_path(&unit_path, "systemd unit")?;
-    std::fs::write(&unit_path, &unit_content)?;
+    setup::transform_config_atomic(
+        &unit_path,
+        0o600,
+        false,
+        false,
+        |_| Ok(unit_content.clone()),
+    )
+    .map_err(|error| CliError::Other(format!("cannot write systemd unit: {error}")))?;
     ftui_runtime::ftui_println!("Wrote {}", unit_path.display());
 
     // Reload, enable, and RESTART. On a re-install (which is exactly how
@@ -46749,7 +46869,7 @@ fn build_launchd_plist_content(
     http_host: &str,
     http_port: u16,
     http_path: &str,
-    http_bearer_token: Option<&str>,
+    http_bearer_token_file: Option<&Path>,
 ) -> String {
     // ThrottleInterval=30 mirrors the systemd unit's RestartSec=30 so a
     // crash-looping process doesn't hammer the logs on both macOS and Linux
@@ -46766,8 +46886,11 @@ fn build_launchd_plist_content(
         launchd_env_entry("HTTP_PORT", &http_port.to_string()),
         launchd_env_entry("HTTP_PATH", http_path),
     ];
-    if let Some(token) = http_bearer_token.filter(|token| !token.is_empty()) {
-        env_entries.push(launchd_env_entry("HTTP_BEARER_TOKEN", token));
+    if let Some(path) = http_bearer_token_file {
+        env_entries.push(launchd_env_entry(
+            "HTTP_BEARER_TOKEN_FILE",
+            &path.display().to_string(),
+        ));
     }
     let env_xml = env_entries.join("\n");
 
@@ -46856,6 +46979,8 @@ fn service_install_launchd(
     })?;
     ensure_sqlite_parent_dir_for_database_url(&abs_db_url)?;
 
+    ensure_real_file_target_path(&plist_path, "LaunchAgent plist")?;
+    let token_file = prepare_service_token_file(&config, no_auth)?;
     let plist_content = build_launchd_plist_content(
         &args_xml,
         &log_dir,
@@ -46866,12 +46991,14 @@ fn service_install_launchd(
         listen_host,
         listen_port,
         &config.http_path,
-        (!no_auth)
-            .then_some(config.http_bearer_token.as_deref())
-            .flatten(),
+        token_file.as_deref(),
     );
 
-    ensure_real_file_target_path(&plist_path, "LaunchAgent plist")?;
+    setup::transform_config_atomic(&plist_path, 0o600, false, false, |_| {
+        Ok(plist_content.clone())
+    })
+    .map_err(|error| CliError::Other(format!("cannot write LaunchAgent plist: {error}")))?;
+    ftui_runtime::ftui_println!("Wrote {}", plist_path.display());
 
     // Stop existing job first (ignore errors — may not be loaded).
     let _ = run_cmd(
@@ -46882,9 +47009,6 @@ fn service_install_launchd(
             &plist_path.display().to_string(),
         ],
     );
-
-    std::fs::write(&plist_path, &plist_content)?;
-    ftui_runtime::ftui_println!("Wrote {}", plist_path.display());
 
     run_cmd(
         "launchctl",
@@ -49167,7 +49291,7 @@ mod tests {
             "127.0.0.1",
             8765,
             "/mcp/",
-            Some("secret-token"),
+            Some(Path::new("/home/user/.config/mcp-agent-mail/service-token")),
         );
         assert!(
             unit.contains("WorkingDirectory=/home/user/projects/myapp"),
@@ -49194,9 +49318,12 @@ mod tests {
             "unit must preserve configured HTTP path"
         );
         assert!(
-            unit.contains("Environment=HTTP_BEARER_TOKEN=secret-token"),
-            "unit must preserve configured bearer token"
+            unit.contains(
+                "Environment=HTTP_BEARER_TOKEN_FILE=/home/user/.config/mcp-agent-mail/service-token"
+            ),
+            "unit must reference the private credential file"
         );
+        assert!(!unit.contains("HTTP_BEARER_TOKEN="));
     }
 
     #[test]
@@ -49207,7 +49334,9 @@ Environment=HTTP_HOST=127.0.0.1
 Environment=HTTP_BEARER_TOKEN=secret-token
 "#;
         assert_eq!(
-            parse_systemd_environment_value(unit, "HTTP_BEARER_TOKEN").as_deref(),
+            parse_systemd_environment_value(unit, "HTTP_BEARER_TOKEN")
+                .unwrap()
+                .as_deref(),
             Some("secret-token")
         );
     }
@@ -49219,9 +49348,60 @@ Environment=HTTP_BEARER_TOKEN=secret-token
 Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
 "#;
         assert_eq!(
-            parse_systemd_environment_value(unit, "HTTP_BEARER_TOKEN").as_deref(),
+            parse_systemd_environment_value(unit, "HTTP_BEARER_TOKEN")
+                .unwrap()
+                .as_deref(),
             Some("tok&en with spaces")
         );
+    }
+
+    #[test]
+    fn parse_systemd_environment_value_honors_later_assignments_and_resets() {
+        let unit = "Environment=HTTP_BEARER_TOKEN=stale\n\
+                    Environment=HTTP_BEARER_TOKEN=active\n";
+        assert_eq!(
+            parse_systemd_environment_value(unit, "HTTP_BEARER_TOKEN")
+                .unwrap()
+                .as_deref(),
+            Some("active")
+        );
+        assert_eq!(
+            parse_systemd_environment_value(&format!("{unit}Environment=\n"), "HTTP_BEARER_TOKEN")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_bearer_token_follows_private_file_and_rejects_missing_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("token % with \"quotes\" and \\slashes");
+        let token = "token with # $ % & < > ' \" and \\slashes";
+        setup::transform_config_atomic(&path, 0o600, false, true, |_| Ok(token.to_string()))
+            .expect("write private token");
+        let reference = systemd_environment_line("HTTP_BEARER_TOKEN_FILE", path.to_str().unwrap());
+        let unit = format!("[Service]\n{reference}\nEnvironment=HTTP_BEARER_TOKEN=stale-inline\n");
+        assert_eq!(
+            systemd_bearer_token_from_unit(&unit).unwrap().as_deref(),
+            Some(token)
+        );
+        assert!(!reference.contains(token));
+        assert!(
+            reference.contains("%%"),
+            "percent specifiers must be escaped"
+        );
+
+        for invalid_path in ["", "/nonexistent/agent-mail-gh405-token"] {
+            let invalid = format!(
+                "{}\nEnvironment=HTTP_BEARER_TOKEN=stale-inline\n",
+                systemd_environment_line("HTTP_BEARER_TOKEN_FILE", invalid_path)
+            );
+            assert!(systemd_bearer_token_from_unit(&invalid).is_err());
+        }
+        let malformed = "Environment=\"HTTP_BEARER_TOKEN_FILE=/tmp/bad\\q\"\n\
+                         Environment=HTTP_BEARER_TOKEN=stale-inline\n";
+        assert!(systemd_bearer_token_from_unit(malformed).is_err());
     }
 
     #[test]
@@ -49275,7 +49455,7 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             "127.0.0.1",
             8765,
             "/mcp/?x=<y>",
-            Some("tok&en with spaces"),
+            Some(Path::new("/home/user name/100%/service-token")),
         );
         assert!(
             unit.contains("Environment=\"HOME=/home/user name\""),
@@ -49288,9 +49468,12 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             "unit must quote DATABASE_URL with spaces: {unit}"
         );
         assert!(
-            unit.contains("Environment=\"HTTP_BEARER_TOKEN=tok&en with spaces\""),
-            "unit must quote HTTP_BEARER_TOKEN with spaces: {unit}"
+            unit.contains(
+                "Environment=\"HTTP_BEARER_TOKEN_FILE=/home/user name/100%%/service-token\""
+            ),
+            "unit must quote the credential path and escape percent specifiers: {unit}"
         );
+        assert!(!unit.contains("HTTP_BEARER_TOKEN="));
     }
 
     #[test]
@@ -49362,7 +49545,7 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             "127.0.0.1",
             8765,
             "/mcp/",
-            Some("secret-token"),
+            Some(Path::new("/Users/dev/.config/mcp-agent-mail/service-token")),
         );
         assert!(
             plist.contains("<key>WorkingDirectory</key>"),
@@ -49405,9 +49588,12 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             "plist must preserve configured HTTP path"
         );
         assert!(
-            plist.contains("<key>HTTP_BEARER_TOKEN</key>\n        <string>secret-token</string>"),
-            "plist must preserve configured bearer token"
+            plist.contains(
+                "<key>HTTP_BEARER_TOKEN_FILE</key>\n        <string>/Users/dev/.config/mcp-agent-mail/service-token</string>"
+            ),
+            "plist must reference the private credential file"
         );
+        assert!(!plist.contains("<key>HTTP_BEARER_TOKEN</key>"));
     }
 
     #[test]
@@ -49453,7 +49639,7 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             "127.0.0.1",
             8765,
             "/mcp/?x=<y>",
-            Some("tok&en"),
+            Some(Path::new("/Users/dev/config & <private>/service-token")),
         );
         assert!(
             plist.contains("<string>/Users/dev/home &lt;dir&gt;</string>"),
@@ -49470,9 +49656,11 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             "plist must XML-escape HTTP_PATH: {plist}"
         );
         assert!(
-            plist.contains("<string>tok&amp;en</string>"),
-            "plist must XML-escape HTTP_BEARER_TOKEN: {plist}"
+            plist
+                .contains("<string>/Users/dev/config &amp; &lt;private&gt;/service-token</string>"),
+            "plist must XML-escape the credential path: {plist}"
         );
+        assert!(!plist.contains("<key>HTTP_BEARER_TOKEN</key>"));
     }
 
     #[cfg(unix)]
