@@ -10113,9 +10113,18 @@ impl EphemeralSnapshotTempDir {
         let root = root.canonicalize()?;
         // Reclaim before allocating: abandoned copies may have filled TMPDIR.
         sweep_abandoned_ephemeral_snapshots_in(&root);
-        let directory = tempfile::Builder::new()
-            .prefix(kind.prefix())
-            .tempdir_in(&root)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(kind.prefix());
+        // tempfile creates directories with the process umask (usually 0755),
+        // and the sweep only reclaims owner-private directories. Without an
+        // explicit 0700 every abandoned copy was refused forever (GH#401), and
+        // other local users could list the mailbox copy.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let directory = builder.tempdir_in(&root)?;
         let canonical_path = directory.path().to_path_buf();
         let mut lease = std::fs::OpenOptions::new()
             .read(true)
@@ -23651,6 +23660,42 @@ mod tests {
             !next_path.exists(),
             "normal drop must still clean immediately"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ephemeral_snapshot_directories_are_owner_private_and_reclaimable() {
+        // GH#401: tempfile applies the process umask to directories (usually
+        // 0755), while the sweep reclaims only owner-private ones, so every
+        // abandoned copy used to be refused. Each kind must be allocated 0700
+        // and an abandoned one must go on the next allocation.
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        for kind in [
+            EphemeralSnapshotKind::LiveSalvage,
+            EphemeralSnapshotKind::Mailbox,
+            EphemeralSnapshotKind::FullMailbox,
+        ] {
+            let snapshot = EphemeralSnapshotTempDir::new_in(kind, root.path()).unwrap();
+            let mode = std::fs::metadata(snapshot.path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "{kind:?} snapshot directory mode {mode:o}"
+            );
+            drop(snapshot);
+            let abandoned = abandoned_ephemeral_snapshot_fixture(root.path(), kind);
+            std::fs::write(abandoned.join(kind.database_name()), b"abandoned copy").unwrap();
+            let next = EphemeralSnapshotTempDir::new_in(kind, root.path()).unwrap();
+            assert!(
+                !abandoned.exists(),
+                "{kind:?}: the next allocation must reclaim an abandoned copy"
+            );
+            drop(next);
+        }
     }
 
     fn abandoned_ephemeral_snapshot_fixture(root: &Path, kind: EphemeralSnapshotKind) -> PathBuf {
