@@ -44543,7 +44543,7 @@ fn server_message_payload_to_cli_json(payload: serde_json::Value) -> Option<serd
         .and_then(|v| v.as_array())
         .and_then(|items| items.first())
         .and_then(|item| item.get("payload"))?;
-    Some(serde_json::json!({
+    let mut bridged = serde_json::json!({
         "id": delivery_payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
         "subject": delivery_payload.get("subject").and_then(|v| v.as_str()).unwrap_or_default(),
         "body_md": delivery_payload.get("body_md").and_then(|v| v.as_str()).unwrap_or_default(),
@@ -44553,7 +44553,17 @@ fn server_message_payload_to_cli_json(payload: serde_json::Value) -> Option<serd
         "created_ts": delivery_payload.get("created_ts").and_then(|v| v.as_str()).unwrap_or_default(),
         "from": delivery_payload.get("from").and_then(|v| v.as_str()).unwrap_or_default(),
         "to": delivery_payload.get("to").cloned().unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
-    }))
+    });
+    // Whether the saved or supplied credential authenticated the sender is
+    // part of the send contract, in full and redacted receipts alike (GH#396).
+    // Carry the tool's verdict through; never infer one it did not report.
+    if let Some(verified) = payload
+        .get("verified_sender")
+        .and_then(serde_json::Value::as_bool)
+    {
+        bridged["verified_sender"] = verified.into();
+    }
+    Some(bridged)
 }
 
 fn format_iso_timestamp(iso: &str) -> String {
@@ -46221,6 +46231,26 @@ mod mail_server_cli_bridge_tests {
                 .and_then(|v| v.as_str()),
             Some("GreenStone")
         );
+        assert!(
+            bridged.get("verified_sender").is_none(),
+            "a verdict the tool did not report must not be invented"
+        );
+    }
+
+    #[test]
+    fn server_message_payload_bridge_reports_the_sender_verification_verdict() {
+        // GH#396: a full (non-redacted) send or reply receipt must still say
+        // whether the saved or supplied credential authenticated the sender.
+        for verified in [true, false] {
+            let payload = serde_json::json!({
+                "deliveries": [{ "payload": { "id": 7, "from": "BlueLake", "to": ["BlueLake"] } }],
+                "count": 1,
+                "verified_sender": verified,
+            });
+            let bridged = server_message_payload_to_cli_json(payload).expect("bridge result");
+            assert_eq!(bridged["id"], 7);
+            assert_eq!(bridged["verified_sender"], verified);
+        }
     }
 
     #[test]
