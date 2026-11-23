@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
+from itertools import pairwise
 import json
 import os
 import random
@@ -1346,7 +1347,8 @@ def swarm_log_gaps(log_text: str, started: float, stopped: float,
         if not timestamp.endswith("Z"):
             continue
         try:
-            stamp = datetime.fromisoformat(timestamp[:-1] + "+00:00").timestamp()
+            # Python 3.10's fromisoformat requires a numeric UTC offset.
+            stamp = datetime.fromisoformat(timestamp[:-1] + "+00:00").timestamp()  # noqa: FURB162
         except ValueError:
             continue
         if started <= stamp <= stopped:
@@ -1355,7 +1357,7 @@ def swarm_log_gaps(log_text: str, started: float, stopped: float,
 
     def longest_gap(end: float) -> float:
         points = [started, *(stamp for stamp in timestamps if stamp < end), end]
-        return round(max(b - a for a, b in zip(points, points[1:])), 3)
+        return round(max(b - a for a, b in pairwise(points)), 3)
 
     return {"swarm_log_events": len(timestamps),
             "longest_log_silence_s": longest_gap(stopped),
@@ -1531,7 +1533,7 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
             arm.kill(signal.SIGKILL)
             try:
                 arm.start()
-            except Exception as error:
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                 restart_error = f"{type(error).__name__}: {error}"
                 break
             clock["restarted_t"] = time.time()

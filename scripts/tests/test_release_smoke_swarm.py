@@ -109,14 +109,14 @@ class KillWindowTests(unittest.TestCase):
 
 class SwarmLogTests(unittest.TestCase):
     def test_silence_uses_phase_edges_and_pre_kill_window(self):
-        log = '\n'.join([
-            '1970-01-01T00:01:39Z  INFO before load',
-            '1970-01-01T00:01:45Z  WARN flush failed',
-            'untimestamped continuation',
-            '1970-01-01T00:05:10Z  INFO after restart',
-            '1970-01-01T00:05:16Z  INFO request',
-            '1970-01-01T00:05:31Z  INFO after load',
-        ])
+        log = (
+            '1970-01-01T00:01:39Z  INFO before load\n'
+            '1970-01-01T00:01:45Z  WARN flush failed\n'
+            'untimestamped continuation\n'
+            '1970-01-01T00:05:10Z  INFO after restart\n'
+            '1970-01-01T00:05:16Z  INFO request\n'
+            '1970-01-01T00:05:31Z  INFO after load\n'
+        )
 
         self.assertEqual(smoke.swarm_log_gaps(log, 100, 330, 300), {
             'swarm_log_events': 3,
