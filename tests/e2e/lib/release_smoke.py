@@ -4,7 +4,8 @@
 Drives a real `am serve-http` binary through the MCP HTTP protocol, as agents
 do, in an isolated HOME/STORAGE_ROOT/DATABASE_URL, with the server's soft
 RLIMIT_NOFILE started at 1024. Each arm (the candidate and an optional
-control, usually the previous release) runs the same phases:
+control, usually the previous release) starts its workload after mailbox
+readiness and runs the same phases:
 
   flow           README coordination loop: register, invalid-name refusal,
                  symmetric-glob reservation conflict, release + re-grant,
@@ -742,7 +743,7 @@ class Arm:
             "AM_INTERFACE_MODE": "cli",
         }
 
-    def start(self) -> None:
+    def start(self, *, wait_for_readiness: bool = False) -> None:
         def soft_limit_1024() -> None:
             _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
             resource.setrlimit(resource.RLIMIT_NOFILE, (min(1024, hard), hard))
@@ -754,22 +755,30 @@ class Arm:
                 cwd=self.root, env=self.env(), stdout=log_file, stderr=log_file,
                 preexec_fn=soft_limit_1024,
             )
-        deadline = time.time() + 120
-        while time.time() < deadline:
+        # Initial qualification starts with an admitted mailbox. Deliberate
+        # crash and restart phases still resume as soon as HTTP is live.
+        health_path = "/health/readiness" if wait_for_readiness else "/healthz"
+        health_url = f"http://127.0.0.1:{self.port}{health_path}"
+        deadline = time.monotonic() + 120
+        last_response = "no HTTP response"
+        while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{self.port}/healthz", timeout=2
-                ) as r:
+                with urllib.request.urlopen(health_url, timeout=2) as r:
                     if r.status == 200:
                         self.session = None
                         self.initialize()
                         return
+                    last_response = f"HTTP {r.status}"
+            except urllib.error.HTTPError as err:
+                last_response = f"HTTP {err.code}"
+                err.close()
             except (urllib.error.URLError, OSError):
                 pass
             if self.proc.poll() is not None:
                 raise RuntimeError(f"{self.name}: server exited during startup")
             time.sleep(0.5)
-        raise RuntimeError(f"{self.name}: server not ready within 120 s")
+        raise RuntimeError(f"{self.name}: {health_path} did not become healthy within 120 s "
+                           f"({last_response})")
 
     def kill(self, sig: int = signal.SIGKILL, grace_s: float = 60) -> bool:
         """Signal the server and wait up to `grace_s` for it to exit.
@@ -1600,7 +1609,7 @@ def run_arm(name: str, binary: Path, out: Path, *, archive_contention: bool = Fa
         version = subprocess.run([str(binary), "--version"], capture_output=True, text=True,
                                  timeout=60, env=arm.env())
         result["binary_version"] = (version.stdout or version.stderr).strip()[:200]
-        arm.start()
+        arm.start(wait_for_readiness=True)
         result["server_exe_sha256"] = sha256(Path(f"/proc/{arm.pid()}/exe"))
         soft, hard = Path(f"/proc/{arm.pid()}/limits").read_text().split("Max open files")[1].split()[:2]
         result["server_nofile_soft_hard"] = [soft, hard]

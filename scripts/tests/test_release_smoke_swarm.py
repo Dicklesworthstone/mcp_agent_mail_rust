@@ -1,4 +1,4 @@
-"""Tests of the release smoke's swarm-phase judgement logic (br-kp1in.34).
+"""Tests of release-smoke startup and swarm-phase judgement logic.
 
 These exercise helper policy and independent SQLite/archive fixtures, NOT
 Agent Mail; the phase itself runs against real binaries through
@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 spec = importlib.util.spec_from_file_location(
     'release_smoke',
@@ -27,6 +28,53 @@ smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
 
 TIMEOUT_ERROR = {'code': -32603, 'message': 'Request timed out after 30s (method=tools/call:file_reservation_paths)'}
+
+
+class StartupTests(unittest.TestCase):
+    def test_unready_mailbox_cannot_start_initial_release_phases(self):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch.object(smoke.subprocess, 'run') as version,
+            patch.object(smoke.subprocess, 'Popen') as spawn,
+            patch.object(smoke.Arm, 'initialize') as initialize,
+            patch.object(smoke.Arm, 'kill', return_value=True),
+            patch.object(smoke.time, 'monotonic', side_effect=[0, 0, 121]),
+            patch.object(smoke.time, 'sleep'),
+            patch.object(smoke.urllib.request, 'urlopen') as health,
+        ):
+            version.return_value.stdout = 'am test'
+            spawn.return_value.poll.return_value = None
+
+            def probe(url, timeout):
+                if url.endswith('/healthz'):
+                    self.fail('liveness cannot establish initial mailbox readiness')
+                self.assertTrue(url.endswith('/health/readiness'), url)
+                raise HTTPError(url, 503, 'Service Unavailable', {}, None)
+
+            health.side_effect = probe
+            result = smoke.run_arm('candidate', Path(sys.executable), Path(root))
+
+        health.assert_called_once()
+        initialize.assert_not_called()
+        self.assertEqual(result['verdict'], 'FAIL')
+        self.assertEqual(result['phases'], {})
+        self.assertIn('/health/readiness did not become healthy within 120 s (HTTP 503)',
+                      result['error'])
+
+    def test_deliberate_restart_still_connects_on_liveness(self):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch.object(smoke.subprocess, 'Popen'),
+            patch.object(smoke.Arm, 'initialize') as initialize,
+            patch.object(smoke.urllib.request, 'urlopen') as health,
+        ):
+            arm = smoke.Arm('restart', Path(sys.executable), Path(root))
+            health.return_value.__enter__.return_value.status = 200
+
+            arm.start()
+
+        health.assert_called_once_with(f'http://127.0.0.1:{arm.port}/healthz', timeout=2)
+        initialize.assert_called_once()
 
 
 class ClassifyCallTests(unittest.TestCase):
