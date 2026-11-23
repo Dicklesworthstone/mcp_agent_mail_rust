@@ -771,6 +771,80 @@ confirmed. Keep the staged evidence and review `failures` before retrying.
 operation to finish and retry. Run repair commands only after reading the doctor
 output; diagnosis should come before mutation.
 
+### Recover from an archive with incomplete mailbox state [stateful]
+
+An archive can contain every message and still be an incomplete recovery
+source (GH#404). Reconstruction checks the completed candidate before
+promotion. Automatic startup/runtime recovery, `doctor repair`, and ordinary
+`am doctor reconstruct --yes` require complete readable salvage or a validated
+recovery-state checkpoint with evidence that delivery cursors can be reset
+safely. `--yes` confirms the operation; it does not authorize state loss.
+Creating a private archive-derived snapshot for inspection does not authorize
+replacing the live database.
+
+Current builds checkpoint project/agent identities, direct and shared-mailbox
+read/ack receipts, and contact decisions in `STORAGE_ROOT/recovery-state/`.
+Subsequent receipt and contact changes publish per-key records. Keep that
+directory and the delivery-cursor evidence with the message archive. A
+validated checkpoint can restore receipt/contact state without a readable
+database. Archive recovery still cannot reproduce the original delivery
+ledger: it advances beyond the recorded cursor ceiling and explicitly expires
+old cursors so consumers can resynchronize. See the
+[recovery runbook](RECOVERY_RUNBOOK.md#archive-only-coordination-recovery-gh404).
+
+Legacy archives without a completed checkpoint cannot recover read/ack
+receipts or contact decisions that were never saved. Matching message counts
+do not prove those survived. Missing identity evidence can also renumber
+project/agent IDs or leave unknown sender placeholders; conflicting or
+ambiguous identity evidence cannot safely be guessed. These losses can replay
+unread history, require new contact handshakes, and invalidate consumers'
+saved delivery cursors. Even modern checkpoints do not archive product rows
+or product/project associations: that state still requires readable salvage
+or a suitable database backup.
+
+During degraded reads, `fetch_inbox` rejects `unread_only=true` or
+`ack_overdue_only=true` with `RECOVERY_STATE_UNAVAILABLE` when its archive
+snapshot cannot establish receipt continuity. The same safeguard applies to
+CLI `check-inbox`, pending-ack commands, and filtered `robot inbox` views
+(including its default unread view). An archive-only candidate with a validated
+checkpoint permits those reads even when it still lacks other evidence
+required for live promotion. Incomplete salvage remains refused. Unfiltered
+history remains available, including `robot inbox --all`;
+without validated receipt evidence, receipt-derived counts, priorities, and
+missing read/ack timestamps in historical or diagnostic views are unknown
+state, not proof that a message is unread or unacknowledged.
+
+On refusal, retain the original database family and any preserved reconstruction
+candidate or quarantine artifacts. Inspect the diagnostic and available
+backups before choosing recovery. A valid database backup can contain state
+the message archive lacks. Use the service's exact `DATABASE_URL` and
+`STORAGE_ROOT`, stop it gracefully through its supervisor, prevent automatic
+restarts, and confirm `safe_to_mutate` in the drain report:
+
+```bash
+am doctor locks --json
+am doctor drain --json
+am doctor backups --json
+am doctor reconstruct --dry-run --json
+```
+
+The dry run builds and checks a private candidate without promoting it.
+Inspect `salvage_outcome`, `candidate_validation.would_refuse`,
+`requires_lossy_recovery`, and `state_loss_risks`. The existing `salvage` field
+describes the source and does not prove that a merge completed. If a suitable
+backup cannot restore the mailbox and you explicitly accept the reported
+state loss, run:
+
+```bash
+am doctor reconstruct --allow-state-loss --yes
+```
+
+This override applies only to that manual reconstruction. Ownership, integrity,
+and recovery-promotion checks still apply. Preserve the recovery evidence,
+review the resulting warnings, and reconcile consumer read/ack tracking and
+delivery cursors before resuming polling or notifications. The override does
+not recover missing state or establish ambiguous cross-project identities.
+
 ### Interpreting descriptor growth
 
 The daemon's MCP `health_check` includes a `descriptors` health contributor

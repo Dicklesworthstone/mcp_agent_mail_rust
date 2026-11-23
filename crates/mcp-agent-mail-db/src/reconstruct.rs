@@ -20,6 +20,10 @@
 //! Recovery flows that have a readable salvage database merge those DB-only rows
 //! back into the reconstructed mailbox so contact and product-bus state is
 //! preserved alongside the canonical archive-backed data.
+//! Building a valid candidate is not permission to replace a mailbox: promotion
+//! callers must check [`ReconstructStats::require_recovery_state`]. A validated
+//! archive checkpoint also needs a durable cursor witness before promotion;
+//! otherwise an explicit operator decision must accept the unprotected state.
 
 use crate::error::{DbError, DbResult};
 use crate::schema;
@@ -92,6 +96,12 @@ const DB_MESSAGE_ID_BATCH_ROWS: usize = 4096;
 const MAX_ITEMIZED_WARNINGS: usize = 10_000;
 
 const LEGACY_RECOVERY_STATE_WARNING: &str = "Archive has no completed recovery-state checkpoint: historical read/ack receipts and contact links cannot be recovered from these files. Restore a healthy backup to retain that state; old delivery cursors may also require resynchronization.";
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_ARCHIVED_IDENTITY_READ_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Read an archive text artifact with a bounded-memory cap (see
 /// [`MAX_ARCHIVE_ARTIFACT_BYTES`]). Returns an `InvalidData` error if the file
@@ -565,9 +575,30 @@ fn apply_atc_sidecar_schema(sidecar_path: &str) -> DbResult<()> {
     )
 }
 
+/// Provenance of readable database salvage in a completed candidate (GH#404).
+///
+/// A successful archive replay or a supplied salvage path is not evidence that
+/// receipts, contacts or issued delivery cursors survived. `Merged` records a
+/// committed merge from a recognized mailbox schema; it does not promise that
+/// numeric project/agent IDs are unchanged. Validated archive checkpoints are
+/// a separate source of authority for their supported coordination state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconstructionSalvage {
+    /// No source was merged, including a corruption-triggered fallback.
+    #[default]
+    ArchiveOnly,
+    /// The recognized source's merge transaction committed without row skips.
+    Merged,
+    /// Some source state was merged, but required schema or identities were missing.
+    Incomplete,
+}
+
 /// Statistics returned after a reconstruction attempt.
 #[derive(Debug, Clone, Default)]
 pub struct ReconstructStats {
+    /// Actual salvage outcome, assessed after the merge transaction completes.
+    pub salvage: ReconstructionSalvage,
     /// Number of projects discovered and inserted.
     pub projects: usize,
     /// Number of agents discovered and inserted.
@@ -750,6 +781,106 @@ impl ArchiveMessageInventory {
 }
 
 impl ReconstructStats {
+    /// Whether promotion needs explicit acceptance of unprotected coordination
+    /// state. Checkpoint admission covers its recorded mail state, not every
+    /// database table; see [`Self::recovery_state_limitations`].
+    #[must_use]
+    pub const fn requires_lossy_recovery(&self) -> bool {
+        if self.parse_errors != 0
+            || self.salvaged_rows_skipped_unmapped != 0
+            || self.salvaged_placeholder_senders != 0
+        {
+            return true;
+        }
+        match self.salvage {
+            ReconstructionSalvage::Merged => false,
+            ReconstructionSalvage::ArchiveOnly => {
+                !self.recovery_checkpoint_present || self.delivery_cursor_reset_floor.is_none()
+            }
+            ReconstructionSalvage::Incomplete => true,
+        }
+    }
+
+    /// Whether receipt-filtered snapshots have validated receipt authority.
+    /// They do not issue delivery cursors, so a valid archive checkpoint can
+    /// support these reads even when promotion lacks a cursor witness.
+    #[must_use]
+    pub const fn has_receipt_state(&self) -> bool {
+        if self.parse_errors != 0
+            || self.salvaged_rows_skipped_unmapped != 0
+            || self.salvaged_placeholder_senders != 0
+        {
+            return false;
+        }
+        matches!(self.salvage, ReconstructionSalvage::Merged)
+            || (matches!(self.salvage, ReconstructionSalvage::ArchiveOnly)
+                && self.recovery_checkpoint_present)
+    }
+
+    /// State whose continuity cannot be established from the completed result.
+    /// These are risks, not counts: an unreadable source cannot prove zero loss.
+    #[must_use]
+    pub fn recovery_state_loss_risks(&self) -> Vec<&'static str> {
+        if !self.requires_lossy_recovery() {
+            return Vec::new();
+        }
+        let mut risks = Vec::new();
+        if self.parse_errors != 0 {
+            risks.push("canonical archive messages or identities skipped after parse failures");
+        }
+        if self.salvaged_rows_skipped_unmapped == 0 && self.salvaged_placeholder_senders == 0 {
+            if matches!(self.salvage, ReconstructionSalvage::Merged) {
+                return risks;
+            }
+            if matches!(self.salvage, ReconstructionSalvage::ArchiveOnly)
+                && self.recovery_checkpoint_present
+            {
+                if self.delivery_cursor_reset_floor.is_none() {
+                    risks.push("issued inbox delivery cursors and sequence continuity (no archived cursor ceiling)");
+                }
+                return risks;
+            }
+        }
+        risks.extend([
+            "recipient and shared-mailbox read/ack state",
+            "contact links and product associations",
+            "issued inbox delivery cursors and sequence continuity",
+            "project and agent numeric identities",
+            "cross-project sender identities (unknown placeholder agents may be created)",
+        ]);
+        risks
+    }
+
+    /// Nonblocking limits of checkpoint-based mail-state recovery. A valid
+    /// checkpoint is not a complete database backup.
+    #[must_use]
+    pub const fn recovery_state_limitations(&self) -> &'static [&'static str] {
+        if !matches!(self.salvage, ReconstructionSalvage::Merged)
+            && self.recovery_checkpoint_present
+        {
+            return &[
+                "archive checkpoints do not cover product/project associations or other unarchived database-only state",
+            ];
+        }
+        &[]
+    }
+
+    /// Refuse promotion without complete salvage or supported checkpoint authority.
+    /// Raw builders remain usable for read-only inspection and explicit manual
+    /// recovery; `--yes` is not authorization to discard this state.
+    pub fn require_recovery_state(&self) -> DbResult<()> {
+        if self.requires_lossy_recovery() {
+            return Err(DbError::Sqlite(format!(
+                "archive recovery requires explicit state-loss acceptance: {:?} salvage (checkpoint={}, cursor_reset_floor={:?}) cannot establish continuity of {}; refusing to promote this candidate. Restore a verified backup or inspect `am doctor reconstruct --dry-run`; only an operator may accept these losses with `am doctor reconstruct --allow-state-loss --yes`",
+                self.salvage,
+                self.recovery_checkpoint_present,
+                self.delivery_cursor_reset_floor,
+                self.recovery_state_loss_risks().join("; ")
+            )));
+        }
+        Ok(())
+    }
+
     /// Push an itemized warning, or count it as suppressed once the
     /// [`MAX_ITEMIZED_WARNINGS`] cap is reached (br-5mnkl). Every unbounded
     /// per-artifact/per-row warning site must route through this so the
@@ -857,6 +988,17 @@ impl std::fmt::Display for ReconstructStats {
             "reconstructed {} projects, {} agents, {} messages ({} recipients), {} parse errors",
             self.projects, self.agents, self.messages, self.recipients, self.parse_errors
         )?;
+        if self.requires_lossy_recovery() {
+            write!(
+                f,
+                "; {:?} salvage requires explicit state-loss acceptance ({})",
+                self.salvage,
+                self.recovery_state_loss_risks().join("; ")
+            )?;
+        }
+        for limitation in self.recovery_state_limitations() {
+            write!(f, "; {limitation}")?;
+        }
         if self.duplicate_canonical_message_files > 0 {
             write!(
                 f,
@@ -1665,6 +1807,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         false,
         true,
         &mut ReservationReplayProvenance::default(),
+        &mut None,
     )
 }
 
@@ -1733,6 +1876,7 @@ fn reconstruct_from_archive_impl(
     create_empty_target: bool,
     replay_recovery_state: bool,
     reservation_provenance: &mut ReservationReplayProvenance,
+    checkpoint_manifest: &mut Option<crate::recovery_state::Manifest>,
 ) -> DbResult<ReconstructStats> {
     let mut stats = ReconstructStats::default();
     crate::pool::validate_sqlite_target_path(db_path, "reconstruct sqlite target")
@@ -1911,6 +2055,14 @@ fn reconstruct_from_archive_impl(
         // Otherwise a lexically earlier legacy project/profile could consume
         // the explicit ID of a later artifact (GH#404).
         let identity_ids = ArchivedIdentityIds::read(storage_root)?;
+        checkpoint_manifest.clone_from(&identity_ids.checkpoint_manifest);
+        #[cfg(test)]
+        {
+            let hook = AFTER_ARCHIVED_IDENTITY_READ_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let recorded_project_ids =
             reserve_archived_identity_ids(&conn, &project_dirs, &identity_ids)?;
 
@@ -2033,7 +2185,13 @@ fn reconstruct_from_archive_impl(
         invalidate_unresolved_archive_reply_parents(&conn, &mut stats)?;
 
         if replay_recovery_state {
-            restore_archived_coordination_state(&conn, storage_root, true, &mut stats)?;
+            restore_archived_coordination_state(
+                &conn,
+                storage_root,
+                true,
+                checkpoint_manifest.as_ref(),
+                &mut stats,
+            )?;
         }
 
         // ATC telemetry now lives in a dedicated sidecar DB (atc.sqlite3) that
@@ -2071,9 +2229,11 @@ fn restore_archived_coordination_state(
     conn: &DbConn,
     storage_root: &Path,
     reset_cursors: bool,
+    expected_manifest: Option<&crate::recovery_state::Manifest>,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
-    let recovered_state = crate::reconstruct_state::restore(conn, storage_root, reset_cursors)?;
+    let recovered_state =
+        crate::reconstruct_state::restore(conn, storage_root, reset_cursors, expected_manifest)?;
     // Recovery candidates intentionally omit the legacy receipt triggers.
     // Recount after both salvage and archive receipts so direct readers of the
     // reconstructed file see the restored unread/ACK state before pool startup.
@@ -2344,6 +2504,7 @@ pub fn reconstruct_from_archive_with_live_salvage(
                     true,
                     true,
                     &mut ReservationReplayProvenance::default(),
+                    &mut None,
                 )?;
                 stats.push_warning(format!(
                     "live salvage source {} could not be materialized because it is corrupt ({message}); rebuilt archive-only candidate",
@@ -2372,7 +2533,9 @@ pub fn reconstruct_from_archive_with_live_salvage(
 /// - missing, symlink, lock, and other non-corruption probe failures still
 ///   refuse so we cannot silently drop DB-only coordination state
 /// - a present file that is not readable SQLite, or that fails full
-///   `integrity_check`, degrades to archive-only (warned, still promotable)
+///   `integrity_check`, produces an archive-only candidate for inspection;
+///   promotion requires validated checkpoint authority or explicit acceptance
+///   of unprotected state
 /// - a merge that fails with a corruption-class error also degrades; the
 ///   merge transaction is rolled back first
 /// - candidate compaction/checkpoint failures always refuse promotion, including
@@ -2389,8 +2552,10 @@ fn reconstruct_from_archive_with_salvage(
     // Salvage is mandatory when the source is a *healthy* readable SQLite
     // file: missing/symlink/lock failures still refuse so we cannot silently
     // drop DB-only coordination state. A source that is present but not a
-    // readable SQLite image — or that fails full integrity_check — must not
-    // block the archive rebuild. Merging a btree-desynced live mailbox is
+    // readable SQLite image — or that fails full integrity_check — can still
+    // produce a candidate for inspection. A skipped source cannot authorize
+    // promotion; that needs independent checkpoint authority or explicit consent.
+    // Merging a btree-desynced live mailbox is
     // how reconstruct injected phantom identities and then refused
     // promotion (br-r6awv / br-eudur).
     let mut salvage_for_merge: Option<&Path> = None;
@@ -2406,17 +2571,19 @@ fn reconstruct_from_archive_with_salvage(
     }
 
     let mut reservation_provenance = ReservationReplayProvenance::default();
+    let mut checkpoint_manifest = None;
     let mut stats = reconstruct_from_archive_impl(
         db_path,
         storage_root,
         salvage_db_path.is_some(),
         salvage_for_merge.is_none(),
         &mut reservation_provenance,
+        &mut checkpoint_manifest,
     )?;
     if let Some(message) = unreadable_salvage {
         stats.push_warning(format!(
             "salvage source skipped ({message}); \
-             rebuilt archive-only candidate so doctor can promote a heal"
+             rebuilt archive-only candidate whose checkpoint authority must be checked before promotion"
         ));
     }
     if let Some(salvage_db_path) = salvage_for_merge {
@@ -2434,9 +2601,13 @@ fn reconstruct_from_archive_with_salvage(
                 conn.execute_raw("BEGIN IMMEDIATE").map_err(|error| {
                     DbError::Sqlite(format!("reconstruct salvage recovery state: {error}"))
                 })?;
-                if let Err(error) =
-                    restore_archived_coordination_state(&conn, storage_root, false, &mut stats)
-                {
+                if let Err(error) = restore_archived_coordination_state(
+                    &conn,
+                    storage_root,
+                    false,
+                    checkpoint_manifest.as_ref(),
+                    &mut stats,
+                ) {
                     let _ = conn.execute_raw("ROLLBACK");
                     return Err(error);
                 }
@@ -2450,12 +2621,12 @@ fn reconstruct_from_archive_with_salvage(
             Err(error) => {
                 let message = error.to_string();
                 if crate::pool::is_corruption_error_message(&message) {
-                    // Merge rolled back. Keep the archive-only candidate so
-                    // `am doctor reconstruct` can promote a heal instead of
-                    // leaving the mailbox wedged on a corrupt-but-openable source.
+                    // Merge rolled back, including the salvage provenance.
+                    // Keep the candidate for inspection, then evaluate its
+                    // restored checkpoint authority before any promotion.
                     stats.push_warning(format!(
                         "salvage merge from {} failed with corruption ({message}); \
-                         keeping archive-only candidate so doctor can promote a heal",
+                         keeping archive-only candidate whose checkpoint authority must be checked before promotion",
                         salvage_db_path.display()
                     ));
                     let conn = DbConn::open_file(db_path.to_str().ok_or_else(|| {
@@ -2466,9 +2637,13 @@ fn reconstruct_from_archive_with_salvage(
                     })?;
                     conn.execute_raw("BEGIN IMMEDIATE")
                         .map_err(|error| DbError::Sqlite(error.to_string()))?;
-                    if let Err(error) =
-                        restore_archived_coordination_state(&conn, storage_root, true, &mut stats)
-                    {
+                    if let Err(error) = restore_archived_coordination_state(
+                        &conn,
+                        storage_root,
+                        true,
+                        checkpoint_manifest.as_ref(),
+                        &mut stats,
+                    ) {
                         let _ = conn.execute_raw("ROLLBACK");
                         return Err(error);
                     }
@@ -2501,7 +2676,8 @@ pub enum SalvageSourceVerdict {
     /// The source validates; its DB-only rows will be merged into the rebuild.
     Mergeable,
     /// The source is unreadable or corrupt. The rebuild proceeds archive-only
-    /// and records this reason as a warning on the promotable candidate.
+    /// and records this reason as a warning; promotion needs validated
+    /// checkpoint authority or explicit acceptance of unprotected state.
     DegradesToArchiveOnly(String),
     /// The source could not be validated for a non-corruption reason, so the
     /// rebuild refuses rather than silently dropping DB-only coordination
@@ -4613,6 +4789,36 @@ fn salvage_ts_or_zero<E>(value: Result<i64, E>) -> i64 {
     value.unwrap_or(0)
 }
 
+/// A non-NULL receipt or expiry must never silently become NULL on a decode
+/// failure. Missing legacy columns are disclosed by the schema provenance gate;
+/// present values must be integers or unambiguous legacy timestamp text.
+fn salvage_optional_timestamp(
+    row: &sqlmodel_core::Row,
+    column: &str,
+    present: bool,
+) -> DbResult<Option<i64>> {
+    if !present {
+        return Ok(None);
+    }
+    match row.get_named::<Option<i64>>(column) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let parsed = row.get_named::<String>(column).ok().and_then(|value| {
+                let value = value.trim();
+                value
+                    .parse::<i64>()
+                    .ok()
+                    .or_else(|| crate::iso_to_micros(&value.replacen(' ', "T", 1)))
+            });
+            parsed.map(Some).ok_or_else(|| {
+                DbError::Sqlite(format!(
+                    "reconstruct salvage: cannot decode non-null {column}; refusing to erase receipt/contact state: {error}"
+                ))
+            })
+        }
+    }
+}
+
 fn merge_salvaged_inception_ts(current_inception_ts: i64, salvaged_inception_ts: i64) -> i64 {
     if salvaged_inception_ts <= 0 {
         current_inception_ts
@@ -5006,6 +5212,60 @@ fn enrich_existing_agent_from_salvage(
     Ok(())
 }
 
+/// Missing tables and optional-column defaults are useful for inspecting old or
+/// damaged images, but cannot prove that database-only state was recovered.
+/// Keep that distinction separate from SQLite integrity and merge success.
+fn salvage_has_required_state_schema(
+    conn: &DbConn,
+    source: &Path,
+    stats: &mut ReconstructStats,
+) -> DbResult<bool> {
+    let required: &[(&str, &[&str])] = &[
+        ("projects", &["id", "slug", "human_key"]),
+        ("agents", &["id", "project_id", "name"]),
+        ("messages", &["id", "project_id", "sender_id"]),
+        (
+            "message_recipients",
+            &["message_id", "agent_id", "kind", "read_ts", "ack_ts"],
+        ),
+        (
+            "project_mailbox_receipts",
+            &["message_id", "agent_id", "read_ts", "ack_ts"],
+        ),
+        ("agent_links", &["status", "expires_ts"]),
+        ("products", &["id", "product_uid", "name"]),
+        ("product_project_links", &["product_id", "project_id"]),
+    ];
+    let mut complete = true;
+    for (table, required_columns) in required {
+        if !table_exists(conn, table)? {
+            complete = false;
+            stats.push_warning(format!(
+                "salvage source {} lacks required state table {table}; candidate inspection is allowed but promotion requires explicit state-loss acceptance",
+                source.display()
+            ));
+            continue;
+        }
+        let columns = table_columns(conn, table)?;
+        let missing = required_columns
+            .iter()
+            .copied()
+            .filter(|column| !columns.contains(*column))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            complete = false;
+            stats.push_warning(format!(
+                "salvage source {} lacks required state schema {table}.{{{}}}; candidate inspection is allowed but promotion requires explicit state-loss acceptance",
+                source.display(),
+                missing.join(", ")
+            ));
+        }
+    }
+    // The delivery-history merger separately checks migration, trigger and
+    // sequence authority, including legacy sources predating delivery cursors.
+    Ok(complete)
+}
+
 #[allow(clippy::too_many_lines)]
 fn merge_salvaged_database(
     target_db_path: &Path,
@@ -5073,9 +5333,12 @@ fn merge_salvaged_database(
             "Salvage database {} contained none of the expected mail/product tables",
             salvage_db_path.display()
         ));
+        stats.salvage = ReconstructionSalvage::Incomplete;
         return Ok(target_conn);
     }
 
+    let complete_state_schema =
+        salvage_has_required_state_schema(&salvage_conn, salvage_db_path, stats)?;
     target_conn
         .execute_raw("BEGIN IMMEDIATE;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: begin transaction: {e}")))?;
@@ -6008,9 +6271,9 @@ fn merge_salvaged_database(
                     DbError::Sqlite(format!("reconstruct salvage: query agent_links: {e}"))
                 })?;
             // #219: without identity maps every link is unmappable by
-            // definition. The per-row skip logic below handles each one
-            // (regenerable handshake state must never refuse a recovery);
-            // this blanket note just makes the cause obvious in the log.
+            // definition. The per-row skip logic below keeps an inspectable
+            // candidate; those skips require explicit state-loss acceptance
+            // before promotion. This note makes the cause obvious in the log.
             if !agent_link_rows.is_empty() && (project_id_map.is_empty() || agent_id_map.is_empty())
             {
                 stats.push_warning(format!(
@@ -6046,9 +6309,8 @@ fn merge_salvaged_database(
                 // dangling cross-generation artifact (a write that raced a
                 // recovery promotion referenced identities the salvage
                 // source never held). Auto-handshake links regenerate on the
-                // next send; skipping one row is strictly better than
-                // refusing the entire recovery with "unmapped origin agent"
-                // forever. Skips are itemized and counted.
+                // next send. Skips are itemized and counted so an operator
+                // can inspect the candidate and explicitly accept the loss.
                 let link_label = format!(
                     "{source_origin_project_id}/{source_origin_agent_id}->{source_peer_project_id}/{source_peer_agent_id}"
                 );
@@ -6083,9 +6345,15 @@ fn merge_salvaged_database(
                     continue;
                 }
 
-                let link_status = row
-                    .get_named::<String>("status")
-                    .unwrap_or_else(|_| "pending".to_string());
+                let link_status = if agent_link_columns.contains("status") {
+                    row.get_named::<String>("status").map_err(|error| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: cannot decode contact status for {link_label}; refusing to replace it with pending: {error}"
+                        ))
+                    })?
+                } else {
+                    "pending".to_string()
+                };
                 let reason = row.get_named::<String>("reason").unwrap_or_default();
                 // created_ts is optional on legacy agent_links. A missing
                 // column must stay deterministic (0), not `now_micros()`, but
@@ -6094,13 +6362,26 @@ fn merge_salvaged_database(
                 let decoded_created_ts = row.get_named::<i64>("created_ts").ok();
                 let created_ts = decoded_created_ts.unwrap_or(0);
                 let updated_ts = row.get_named::<i64>("updated_ts").unwrap_or(created_ts);
-                let expires_ts = row.get_named::<i64>("expires_ts").ok();
-                if decoded_created_ts.is_some_and(|ts| ts <= 0) || updated_ts < created_ts {
+                let expires_ts = salvage_optional_timestamp(
+                    row,
+                    "expires_ts",
+                    agent_link_columns.contains("expires_ts"),
+                )?;
+                if decoded_created_ts.is_some_and(|ts| ts <= 0) {
                     stats.push_warning(format!(
-                        "skipped salvaged agent_link {link_label}: invalid timestamp ordering ({created_ts}, {updated_ts})"
+                        "skipped salvaged agent_link {link_label}: invalid creation timestamp {created_ts}"
                     ));
                     stats.salvaged_rows_skipped_unmapped += 1;
                     continue;
+                }
+                if updated_ts < created_ts {
+                    // Contact decisions come from the readable source, not
+                    // wall-clock ordering. A clock correction can put a later
+                    // block before its creation timestamp; dropping it would
+                    // let an older archived approval replace that decision.
+                    stats.push_warning(format!(
+                        "salvaged agent_link {link_label} update timestamp {updated_ts} precedes creation timestamp {created_ts}; preserving the readable source contact decision and exact timestamps"
+                    ));
                 }
 
                 let existing_links = target_conn
@@ -6914,8 +7195,9 @@ fn merge_salvaged_database(
                 })?;
                     // #219: recipient rows carry per-recipient read/ack
                     // state. A dangling agent or message reference is a
-                    // cross-generation artifact; losing one recipient's read
-                    // state is trivial next to refusing the whole recovery.
+                    // cross-generation artifact. Preserve the remaining rows
+                    // for inspection, but the skip makes promotion require
+                    // explicit state-loss acceptance (GH#404).
                     let Some(target_agent_id) = agent_id_map.get(&source_agent_id).copied() else {
                         stats.push_warning(format!(
                             "skipped salvaged recipient state for message {source_message_id}: agent id {source_agent_id} is absent from the salvage source"
@@ -6940,8 +7222,16 @@ fn merge_salvaged_database(
                         target_message_id,
                         stats,
                     );
-                    let read_ts = row.get_named::<i64>("read_ts").ok();
-                    let ack_ts = row.get_named::<i64>("ack_ts").ok();
+                    let read_ts = salvage_optional_timestamp(
+                        row,
+                        "read_ts",
+                        recipient_columns.contains("read_ts"),
+                    )?;
+                    let ack_ts = salvage_optional_timestamp(
+                        row,
+                        "ack_ts",
+                        recipient_columns.contains("ack_ts"),
+                    )?;
                     recipient_json_updates.insert(target_message_id);
 
                     let existing_rows = target_conn
@@ -7005,12 +7295,9 @@ fn merge_salvaged_database(
                             "salvaged recipient ({target_message_id}, {target_agent_id}) has conflicting kinds {current_kind:?} (candidate) and {kind:?} (salvage); adopted the salvage kind to preserve DB coordination-state continuity"
                         ));
                     }
-                    let current_read_ts = existing_row
-                        .get_named::<Option<i64>>("read_ts")
-                        .unwrap_or_default();
-                    let current_ack_ts = existing_row
-                        .get_named::<Option<i64>>("ack_ts")
-                        .unwrap_or_default();
+                    let current_read_ts =
+                        salvage_optional_timestamp(existing_row, "read_ts", true)?;
+                    let current_ack_ts = salvage_optional_timestamp(existing_row, "ack_ts", true)?;
                     if current_read_ts != read_ts
                         || current_ack_ts != ack_ts
                         || current_kind != kind
@@ -7119,8 +7406,8 @@ fn merge_salvaged_database(
                         stats.salvaged_rows_skipped_unmapped += 1;
                         continue;
                     }
-                    let read_ts = row.get_named::<i64>("read_ts").ok();
-                    let ack_ts = row.get_named::<i64>("ack_ts").ok();
+                    let read_ts = salvage_optional_timestamp(row, "read_ts", true)?;
+                    let ack_ts = salvage_optional_timestamp(row, "ack_ts", true)?;
                     for (sql, params) in [
                         (
                             "INSERT OR IGNORE INTO project_mailbox_receipts \
@@ -7224,6 +7511,14 @@ fn merge_salvaged_database(
             "reconstruct salvage: commit transaction: {e}"
         )));
     }
+    stats.salvage = if complete_state_schema
+        && stats.salvaged_rows_skipped_unmapped == 0
+        && stats.salvaged_placeholder_senders == 0
+    {
+        ReconstructionSalvage::Merged
+    } else {
+        ReconstructionSalvage::Incomplete
+    };
     Ok(target_conn)
 }
 
@@ -7233,6 +7528,8 @@ fn merge_salvaged_database(
 
 #[derive(Default)]
 struct ArchivedIdentityIds {
+    /// The exact checkpoint used for identity discovery; absence is evidence too.
+    checkpoint_manifest: Option<crate::recovery_state::Manifest>,
     projects: HashMap<String, crate::recovery_state::ProjectIdentity>,
     agents: HashMap<(i64, String), i64>,
     project_owners: HashMap<i64, String>,
@@ -7243,7 +7540,7 @@ impl ArchivedIdentityIds {
     fn read(storage_root: &Path) -> DbResult<Self> {
         use crate::recovery_state::RecoveryRecord;
         let mut ids = Self::default();
-        crate::recovery_state::visit_records(storage_root, |record| {
+        let manifest = crate::recovery_state::visit_records(storage_root, |record| {
             match record {
                 RecoveryRecord::Project(project) => ids.project(project)?,
                 RecoveryRecord::Agent(agent) => ids.agent(agent)?,
@@ -7258,6 +7555,7 @@ impl ArchivedIdentityIds {
             }
             Ok(())
         })?;
+        ids.checkpoint_manifest = manifest;
         Ok(ids)
     }
 
@@ -8497,6 +8795,170 @@ mod tests {
             error.to_string().contains("project id conflicts"),
             "{error}"
         );
+    }
+
+    struct CheckpointIdentityReadHookGuard;
+
+    impl Drop for CheckpointIdentityReadHookGuard {
+        fn drop(&mut self) {
+            AFTER_ARCHIVED_IDENTITY_READ_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    fn after_checkpoint_identity_read(
+        callback: impl FnOnce() + 'static,
+    ) -> CheckpointIdentityReadHookGuard {
+        AFTER_ARCHIVED_IDENTITY_READ_TEST_HOOK.with(|hook| {
+            assert!(hook.borrow().is_none());
+            *hook.borrow_mut() = Some(Box::new(callback));
+        });
+        CheckpointIdentityReadHookGuard
+    }
+
+    fn checkpoint_drift_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = directory.path().join("archive");
+        write_recovery_identity_fixture(
+            &storage,
+            "project",
+            Some(7),
+            &[("Sender", Some(17)), ("Recipient", Some(29))],
+        );
+        write_recovery_identity_message(&storage, "project", 1, "Sender", &["Recipient"], None);
+        let source = directory.path().join("source.db");
+        let replacement = directory.path().join("replacement.db");
+        reconstruct_from_archive(&source, &storage).unwrap();
+        reconstruct_from_archive(&replacement, &storage).unwrap();
+        let conn = DbConn::open_file(replacement.to_str().unwrap()).unwrap();
+        conn.execute_raw("UPDATE message_recipients SET read_ts = 222, ack_ts = 333")
+            .unwrap();
+        drop(conn);
+        (directory, storage, source, replacement)
+    }
+
+    #[test]
+    fn gh404_checkpoint_generation_drift_rolls_back_and_fresh_retry_restores_state() {
+        for (use_salvage, corrupt_salvage) in [(false, false), (true, false), (true, true)] {
+            let (directory, storage, source_path, replacement_path) = checkpoint_drift_fixture();
+            let source = DbConn::open_file(source_path.to_str().unwrap()).unwrap();
+            let first = crate::recovery_state::ensure_checkpoint(&source, &storage).unwrap();
+            crate::reconstruct_state::checkpoint_cursor(&source, &storage).unwrap();
+            drop(source);
+            let changed_storage = storage.clone();
+            let changed_source = source_path.clone();
+            let _hook = after_checkpoint_identity_read(move || {
+                let replacement = DbConn::open_file(replacement_path.to_str().unwrap()).unwrap();
+                let next = crate::recovery_state::ensure_checkpoint(&replacement, &changed_storage)
+                    .unwrap();
+                assert_ne!(first.generation, next.generation);
+                assert_eq!(next.receipts, 1);
+                if corrupt_salvage {
+                    std::fs::rename(
+                        &changed_source,
+                        changed_source.with_extension("retained.db"),
+                    )
+                    .unwrap();
+                    std::fs::write(&changed_source, b"not a SQLite database").unwrap();
+                }
+            });
+            let target = directory.path().join("refused.db");
+            let result = if use_salvage {
+                reconstruct_from_archive_with_private_salvage(&target, &storage, &source_path)
+            } else {
+                reconstruct_from_archive(&target, &storage)
+            };
+            let error = result.expect_err("two valid but different checkpoints must not be mixed");
+            assert!(
+                error.to_string().contains(
+                    "active checkpoint changed between identity discovery and state replay"
+                ),
+                "salvage={use_salvage}, corruption={corrupt_salvage}: {error}"
+            );
+            let refused = DbConn::open_file(target.to_str().unwrap()).unwrap();
+            if use_salvage {
+                let receipts = refused
+                    .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                    .unwrap();
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(
+                    receipts[0].get_named::<Option<i64>>("read_ts").unwrap(),
+                    None
+                );
+                assert_eq!(
+                    receipts[0].get_named::<Option<i64>>("ack_ts").unwrap(),
+                    None
+                );
+            } else {
+                let tables = refused
+                    .query_sync(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='message_recipients'",
+                        &[],
+                    )
+                    .unwrap();
+                assert!(tables.is_empty(), "archive-only transaction must roll back");
+            }
+            drop(refused);
+
+            let retry = directory.path().join("fresh-retry.db");
+            let stats = reconstruct_from_archive(&retry, &storage).unwrap();
+            stats.require_recovery_state().unwrap();
+            let recovered = DbConn::open_file(retry.to_str().unwrap()).unwrap();
+            let receipts = recovered
+                .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].get_named::<i64>("read_ts").unwrap(), 222);
+            assert_eq!(receipts[0].get_named::<i64>("ack_ts").unwrap(), 333);
+        }
+    }
+
+    #[test]
+    fn gh404_checkpoint_presence_drift_is_refused() {
+        for checkpoint_disappears in [false, true] {
+            let (directory, storage, source_path, replacement_path) = checkpoint_drift_fixture();
+            if checkpoint_disappears {
+                let source = DbConn::open_file(source_path.to_str().unwrap()).unwrap();
+                crate::recovery_state::ensure_checkpoint(&source, &storage).unwrap();
+            }
+            let changed_storage = storage.clone();
+            let retained_checkpoint = directory.path().join("retained-recovery-state");
+            let _hook = after_checkpoint_identity_read(move || {
+                if checkpoint_disappears {
+                    std::fs::rename(
+                        changed_storage.join(crate::recovery_state::DIRECTORY),
+                        retained_checkpoint,
+                    )
+                    .unwrap();
+                } else {
+                    let replacement =
+                        DbConn::open_file(replacement_path.to_str().unwrap()).unwrap();
+                    crate::recovery_state::ensure_checkpoint(&replacement, &changed_storage)
+                        .unwrap();
+                }
+            });
+            let target = directory.path().join("refused.db");
+            let error = reconstruct_from_archive(&target, &storage)
+                .expect_err("checkpoint presence must match the identity pass, including absence");
+            assert!(
+                error.to_string().contains(
+                    "active checkpoint changed between identity discovery and state replay"
+                ),
+                "{error}"
+            );
+            let refused = DbConn::open_file(target.to_str().unwrap()).unwrap();
+            assert!(
+                refused
+                    .query_sync(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='message_recipients'",
+                        &[],
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            let retry = directory.path().join("fresh-retry.db");
+            let stats = reconstruct_from_archive(&retry, &storage).unwrap();
+            assert_eq!(stats.recovery_checkpoint_present, !checkpoint_disappears);
+        }
     }
 
     #[test]
@@ -10258,6 +10720,7 @@ mod tests {
     #[test]
     fn reconstruct_stats_display() {
         let stats = ReconstructStats {
+            salvage: ReconstructionSalvage::ArchiveOnly,
             projects: 2,
             agents: 5,
             messages: 100,
@@ -10295,6 +10758,267 @@ mod tests {
         assert!(display.contains("5 agents"));
         assert!(display.contains("100 messages"));
         assert!(display.contains("3 parse errors"));
+        assert!(display.contains("explicit state-loss acceptance"));
+    }
+
+    #[test]
+    fn reconstruct_stats_distinguish_receipt_authority_from_promotion_authority() {
+        for (salvage, checkpoint, floor, receipt_authority, promotion_authority) in [
+            (
+                ReconstructionSalvage::ArchiveOnly,
+                false,
+                None,
+                false,
+                false,
+            ),
+            (ReconstructionSalvage::ArchiveOnly, true, None, true, false),
+            (
+                ReconstructionSalvage::ArchiveOnly,
+                true,
+                Some(0),
+                true,
+                true,
+            ),
+            (ReconstructionSalvage::Merged, false, None, true, true),
+            (
+                ReconstructionSalvage::Incomplete,
+                true,
+                Some(0),
+                false,
+                false,
+            ),
+        ] {
+            let stats = ReconstructStats {
+                salvage,
+                recovery_checkpoint_present: checkpoint,
+                delivery_cursor_reset_floor: floor,
+                ..ReconstructStats::default()
+            };
+            assert_eq!(stats.has_receipt_state(), receipt_authority);
+            assert_eq!(stats.require_recovery_state().is_ok(), promotion_authority);
+            assert_eq!(
+                stats.recovery_state_loss_risks().is_empty(),
+                promotion_authority
+            );
+            if receipt_authority && !promotion_authority {
+                assert_eq!(stats.recovery_state_loss_risks().len(), 1);
+                assert!(stats.recovery_state_loss_risks()[0].contains("cursor"));
+            }
+            if checkpoint && salvage == ReconstructionSalvage::ArchiveOnly {
+                assert!(stats.to_string().contains("product/project associations"));
+            }
+        }
+
+        // Even a claimed complete merge or checkpoint must not hide known row
+        // loss or a substituted identity in the completed candidate.
+        for salvage in [
+            ReconstructionSalvage::Merged,
+            ReconstructionSalvage::ArchiveOnly,
+        ] {
+            for (skipped, placeholders) in [(1, 0), (0, 1)] {
+                let stats = ReconstructStats {
+                    salvage,
+                    recovery_checkpoint_present: true,
+                    delivery_cursor_reset_floor: Some(0),
+                    salvaged_rows_skipped_unmapped: skipped,
+                    salvaged_placeholder_senders: placeholders,
+                    ..ReconstructStats::default()
+                };
+                assert!(!stats.has_receipt_state());
+                assert!(stats.require_recovery_state().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn archive_candidate_discloses_state_loss_without_blocking_inspection() {
+        let tmp = tempfile::tempdir().expect("private recovery fixture");
+        let archive = tmp.path().join("archive");
+        let candidate = tmp.path().join("candidate.sqlite3");
+        write_archive_message(&archive, "test-project", 77);
+
+        let stats = reconstruct_from_archive(&candidate, &archive).expect("build archive snapshot");
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.salvage, ReconstructionSalvage::ArchiveOnly);
+        let error = stats
+            .require_recovery_state()
+            .expect_err("messages alone cannot authorize promotion")
+            .to_string();
+        for required in [
+            "read/ack",
+            "contact links",
+            "delivery cursors",
+            "numeric identities",
+            "placeholder agents",
+            "--allow-state-loss",
+        ] {
+            assert!(
+                error.contains(required),
+                "missing loss disclosure {required}: {error}"
+            );
+        }
+        assert_eq!(serde_json::to_value(stats.salvage).unwrap(), "archive_only");
+        let conn = SqliteDbConn::open_file(candidate.to_str().unwrap()).unwrap();
+        assert_eq!(
+            conn.query_sync("SELECT id FROM messages", &[]).unwrap()[0]
+                .get_named::<i64>("id")
+                .unwrap(),
+            77
+        );
+    }
+
+    #[test]
+    fn salvage_provenance_distinguishes_empty_mailbox_from_unrelated_database() {
+        let tmp = tempfile::tempdir().expect("private recovery fixture");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(archive.join("projects")).unwrap();
+
+        for (name, complete) in [("empty-mailbox", true), ("unrelated", false)] {
+            let source = tmp.path().join(format!("{name}.sqlite3"));
+            let candidate = tmp.path().join(format!("{name}-candidate.sqlite3"));
+            let conn = SqliteDbConn::open_file(source.to_str().unwrap()).unwrap();
+            if complete {
+                conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+            } else {
+                conn.execute_raw("CREATE TABLE unrelated(value INTEGER);")
+                    .unwrap();
+            }
+            drop(conn);
+            let source_before = std::fs::read(&source).unwrap();
+            let stats =
+                reconstruct_from_archive_with_private_salvage(&candidate, &archive, &source)
+                    .unwrap();
+            assert_eq!(stats.salvaged_messages, 0);
+            assert_eq!(
+                stats.salvage,
+                if complete {
+                    ReconstructionSalvage::Merged
+                } else {
+                    ReconstructionSalvage::Incomplete
+                }
+            );
+            assert_eq!(stats.require_recovery_state().is_ok(), complete);
+            assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn salvage_without_receipt_column_requires_explicit_state_loss_acceptance() {
+        let tmp = tempfile::tempdir().expect("private recovery fixture");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(archive.join("projects")).unwrap();
+        let source = tmp.path().join("missing-ack.sqlite3");
+        let candidate = tmp.path().join("candidate.sqlite3");
+        let conn = SqliteDbConn::open_file(source.to_str().unwrap()).unwrap();
+        conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+        conn.execute_raw("DROP INDEX idx_mr_agent_ack; DROP INDEX idx_mr_ack_message; ALTER TABLE message_recipients DROP COLUMN ack_ts;").unwrap();
+        drop(conn);
+
+        let stats = reconstruct_from_archive_with_private_salvage(&candidate, &archive, &source)
+            .expect("legacy schema remains inspectable");
+        assert_eq!(stats.salvage, ReconstructionSalvage::Incomplete);
+        assert!(stats.require_recovery_state().is_err());
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("message_recipients.{ack_ts}"))
+        );
+    }
+
+    #[test]
+    fn salvage_requires_shared_receipt_table_and_rejects_view_as_contact_authority() {
+        let tmp = tempfile::tempdir().expect("private recovery fixture");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(archive.join("projects")).unwrap();
+        for view in [false, true] {
+            let source = tmp.path().join(format!("missing-shared-{view}.sqlite3"));
+            let candidate = tmp.path().join(format!("candidate-{view}.sqlite3"));
+            let conn = SqliteDbConn::open_file(source.to_str().unwrap()).unwrap();
+            conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+            if view {
+                conn.execute_raw("DROP TABLE agent_links; CREATE VIEW agent_links AS SELECT 'approved' AS status, NULL AS expires_ts;").unwrap();
+            } else {
+                conn.execute_raw("DROP TABLE project_mailbox_receipts;")
+                    .unwrap();
+            }
+            drop(conn);
+            let stats =
+                reconstruct_from_archive_with_private_salvage(&candidate, &archive, &source)
+                    .expect("incomplete salvage remains inspectable");
+            assert_eq!(stats.salvage, ReconstructionSalvage::Incomplete);
+            assert!(stats.require_recovery_state().is_err());
+            let missing_table = if view {
+                "agent_links"
+            } else {
+                "project_mailbox_receipts"
+            };
+            assert!(stats.warnings.iter().any(|warning| {
+                warning.contains(&format!("required state table {missing_table}"))
+            }));
+        }
+    }
+
+    #[test]
+    fn salvage_preserves_legacy_receipt_text_and_refuses_invalid_non_null_state() {
+        let tmp = tempfile::tempdir().expect("private recovery fixture");
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(archive.join("projects")).unwrap();
+        for (name, timestamp, expected) in [
+            (
+                "legacy",
+                "2026-02-22T12:00:00Z",
+                Some(1_771_761_600_000_000_i64),
+            ),
+            ("invalid", "not-a-timestamp", None),
+        ] {
+            let source = tmp.path().join(format!("{name}.sqlite3"));
+            let candidate = tmp.path().join(format!("{name}-candidate.sqlite3"));
+            let conn = SqliteDbConn::open_file(source.to_str().unwrap()).unwrap();
+            conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (100, 'test-project', '/test-project', 1);
+                 INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES
+                     (10, 100, 'Alice', 'coder', 'test', '', 1, 2), (11, 100, 'Bob', 'coder', 'test', '', 1, 2);
+                 INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES (77, 100, 10, 'Receipt witness', 'retained body', 3);"
+            ).unwrap();
+            conn.execute_sync("INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (77, 11, 'to', 4, ?)", &[Value::Text(timestamp.to_string())]).unwrap();
+            drop(conn);
+            let source_before = std::fs::read(&source).unwrap();
+            let result =
+                reconstruct_from_archive_with_private_salvage(&candidate, &archive, &source);
+            if let Some(expected) = expected {
+                let stats = result.expect("unambiguous legacy timestamp must survive salvage");
+                stats
+                    .require_recovery_state()
+                    .expect("no receipt state was discarded");
+                let recovered = SqliteDbConn::open_file(candidate.to_str().unwrap()).unwrap();
+                let rows = recovered
+                    .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 4);
+                assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), expected);
+            } else {
+                let error = result
+                    .expect_err("invalid non-NULL state must not become unread/unacknowledged");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("refusing to erase receipt/contact state"),
+                    "{error}"
+                );
+                let recovered = SqliteDbConn::open_file(candidate.to_str().unwrap()).unwrap();
+                assert!(
+                    recovered
+                        .query_sync("SELECT id FROM messages", &[])
+                        .unwrap()
+                        .is_empty(),
+                    "refused salvage must roll back"
+                );
+            }
+            assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        }
     }
 
     #[test]
@@ -11514,10 +12238,10 @@ body
             stats.salvaged_messages, 1,
             "the DB-only message must be merged from the canonical-served source"
         );
+        assert_eq!(stats.salvage, ReconstructionSalvage::Incomplete);
         assert!(
-            stats.warnings.is_empty(),
-            "a healthy sidecar-less source must not degrade to archive-only: {:?}",
-            stats.warnings
+            stats.require_recovery_state().is_err(),
+            "this legacy fixture lacks contact/product schema, so successful row salvage cannot authorize promotion"
         );
 
         let target = SqliteDbConn::open_file(target_path.to_str().unwrap())
@@ -11857,6 +12581,8 @@ body
             "dangling link (agent 925) and recipient (agent 464) must be skipped, got {}",
             stats.salvaged_rows_skipped_unmapped
         );
+        assert_eq!(stats.salvage, ReconstructionSalvage::Incomplete);
+        assert!(stats.require_recovery_state().is_err());
         assert!(
             stats
                 .warnings
@@ -15485,8 +16211,13 @@ archive body
             )
             .expect("insert product link");
 
-        reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-            .expect("salvage merge should preserve db-only rows");
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("salvage merge should preserve db-only rows");
+        assert_eq!(stats.salvage, ReconstructionSalvage::Merged);
+        stats
+            .require_recovery_state()
+            .expect("recognized committed salvage permits promotion");
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
         let contact_rows = conn
@@ -15665,11 +16396,17 @@ archive body
         FAIL_SALVAGE_QUERY_MESSAGES.with(|hook| hook.set(true));
         let stats =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-                .expect("corrupt salvage merge must not block an archive-only heal");
+                .expect("corrupt salvage still permits inspecting an archive-only candidate");
+
+        assert_eq!(stats.salvage, ReconstructionSalvage::ArchiveOnly);
+        let refusal = stats
+            .require_recovery_state()
+            .expect_err("rolled-back salvage must not authorize promotion");
+        assert!(refusal.to_string().contains("--allow-state-loss"));
 
         assert!(
             db_path.exists(),
-            "archive-only candidate must exist so doctor can promote a heal"
+            "archive-only candidate must remain available for inspection"
         );
         assert!(
             stats.warnings.iter().any(|warning| {
@@ -15727,9 +16464,11 @@ archive body
         let stats =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
                 .expect("unreadable salvage must not block archive rebuild");
+        assert_eq!(stats.salvage, ReconstructionSalvage::ArchiveOnly);
+        assert!(stats.require_recovery_state().is_err());
         assert!(
             db_path.exists(),
-            "archive-only candidate must exist so doctor can promote a heal"
+            "archive-only candidate must remain available for inspection"
         );
         assert!(
             stats.warnings.iter().any(|warning| {
@@ -15886,9 +16625,11 @@ archive body
         let stats =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
                 .expect("integrity-failed salvage must not block archive rebuild");
+        assert_eq!(stats.salvage, ReconstructionSalvage::ArchiveOnly);
+        assert!(stats.require_recovery_state().is_err());
         assert!(
             db_path.exists(),
-            "archive-only candidate must exist so doctor can promote a heal"
+            "archive-only candidate must remain available for inspection"
         );
         assert!(
             stats.warnings.iter().any(|warning| {

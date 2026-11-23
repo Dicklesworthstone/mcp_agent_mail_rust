@@ -22692,7 +22692,11 @@ mod tests {
             .unwrap();
         });
         let ceiling_path = storage_root.join("recovery-state/delivery-cursor.json");
-        assert!(!ceiling_path.exists());
+        let initial_ceiling = std::fs::read(&ceiling_path).expect("healthy zero cursor checkpoint");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&initial_ceiling).unwrap()["issued_through"],
+            0
+        );
         let owner = crate::write_barrier::try_acquire_promotion_barrier_if_idle()
             .expect("own recovery promotion");
         let reader_pool = pool.clone();
@@ -22712,7 +22716,7 @@ mod tests {
             done_tx.send(result.into_result()).unwrap();
         });
         let blocked = done_rx.recv_timeout(std::time::Duration::from_secs(2));
-        let archived_while_promoting = ceiling_path.exists();
+        let ceiling_while_promoting = std::fs::read(&ceiling_path).unwrap();
         let active_writers = crate::write_barrier::active_writer_count();
         drop(owner);
         reader.join().expect("cursor reader exits");
@@ -22720,13 +22724,12 @@ mod tests {
         let error = blocked
             .expect("cursor issuance must promptly refuse active promotion")
             .expect_err("promotion must prevent cursor issuance");
-        match error {
-            asupersync::OutcomeError::Err(error @ DbError::ResourceBusy(_)) => {
-                assert!(error.is_retryable());
-            }
-            other => panic!("expected retryable database busy during promotion, got {other:?}"),
-        }
-        assert!(!archived_while_promoting);
+        let asupersync::OutcomeError::Err(error) = error else {
+            panic!("promotion refusal must be a retryable database error: {error:?}");
+        };
+        assert!(matches!(&error, DbError::ResourceBusy(_)));
+        assert!(error.is_retryable());
+        assert_eq!(ceiling_while_promoting, initial_ceiling);
         assert_eq!(active_writers, 0);
         let page = runtime
             .block_on(fetch_inbox_delivery_events(&cx, &pool, 1, 1, Some(0), 10))

@@ -10,7 +10,7 @@ use crate::CanonicalDbConn;
 use crate::error::{DbError, DbResult};
 use crate::pool::SyncQuery;
 use crate::recovery_state::{
-    AgentIdentity, ContactRecord, ProjectIdentity, ReceiptRecord, RecoveryRecord,
+    AgentIdentity, ContactRecord, Manifest, ProjectIdentity, ReceiptRecord, RecoveryRecord,
 };
 use fs2::FileExt as _;
 use mcp_agent_mail_core::journal_io::{JournalDirectory, JournalFileMode};
@@ -63,11 +63,15 @@ fn read_ceiling(directory: &JournalDirectory) -> DbResult<Option<i64>> {
 /// The global ceiling is monotonic across database generations and concurrent
 /// readers. A failed write is an error, never an unprotected successful read.
 pub fn record_issued_cursor(storage_root: &Path, cursor: i64) -> DbResult<()> {
-    if cursor < 0 {
-        return Err(error("cannot archive a negative delivery cursor"));
-    }
     if cursor == 0 {
         return Ok(());
+    }
+    record_cursor_ceiling(storage_root, cursor)
+}
+
+fn record_cursor_ceiling(storage_root: &Path, cursor: i64) -> DbResult<()> {
+    if cursor < 0 {
+        return Err(error("cannot archive a negative delivery cursor"));
     }
     let directory = JournalDirectory::open(storage_root, CURSOR_DIRECTORY, true).map_err(error)?;
     let lock = directory
@@ -109,7 +113,11 @@ pub fn record_issued_cursor(storage_root: &Path, cursor: i64) -> DbResult<()> {
 }
 
 /// Protect cursors issued by an older version before this version first serves
-/// the healthy database. Include pruned tails and the AUTOINCREMENT allocator.
+/// the healthy database.
+///
+/// Include pruned tails and the AUTOINCREMENT allocator.
+/// Persist an explicit zero when no cursor has been issued; recovery must not
+/// infer that state from a missing witness.
 pub fn checkpoint_cursor(conn: &impl SyncQuery, storage_root: &Path) -> DbResult<()> {
     let rows = conn
         .query_sync(
@@ -125,7 +133,7 @@ pub fn checkpoint_cursor(conn: &impl SyncQuery, storage_root: &Path) -> DbResult
         .ok_or_else(|| error("delivery ceiling query returned no row"))?
         .get_named::<i64>("ceiling")
         .map_err(error)?;
-    record_issued_cursor(storage_root, ceiling)?;
+    record_cursor_ceiling(storage_root, ceiling)?;
     // An earlier process may have synced the witness and exited before its
     // asynchronous Git publication. Requeue the existing file on startup even
     // when this database has no larger cursor to publish.
@@ -394,11 +402,14 @@ fn restore_contact(
 
 /// Apply a validated complete checkpoint followed by its latest per-key
 /// records. All writes belong to the candidate's existing transaction: a bad
-/// record makes the whole candidate ineligible for promotion.
+/// record or a different checkpoint from identity discovery makes the whole
+/// candidate ineligible for promotion. Compare explicit absence too, before
+/// changing delivery cursor state.
 pub(crate) fn restore(
     conn: &CanonicalDbConn,
     storage_root: &Path,
     reset_cursors: bool,
+    expected_manifest: Option<&Manifest>,
 ) -> DbResult<RestoredState> {
     let mut restored = RestoredState::default();
     if !reset_cursors {
@@ -414,9 +425,27 @@ pub(crate) fn restore(
     }
     let manifest = crate::recovery_state::visit_records(storage_root, |record| {
         match record {
-            RecoveryRecord::Project(_) | RecoveryRecord::Agent(_) => {
-                // The reconstruction identity pass consumes these before
-                // messages and their dependent coordination rows are replayed.
+            RecoveryRecord::Project(project) => {
+                let recovered_id = resolve_project(conn, &project)?;
+                if reset_cursors && recovered_id != project.id {
+                    return Err(error(format!(
+                        "checkpoint project {} has recovered numeric id {recovered_id}, expected {}",
+                        project.slug, project.id
+                    )));
+                }
+            }
+            RecoveryRecord::Agent(agent) => {
+                // A checkpoint can name an identity with no receipt/contact
+                // references. Verify it too: a missing project or profile
+                // must not turn a partial archive into a complete recovery.
+                let project_id = resolve_project(conn, &agent.project)?;
+                let recovered_id = resolve_agent(conn, &agent)?;
+                if reset_cursors && (project_id != agent.project.id || recovered_id != agent.id) {
+                    return Err(error(format!(
+                        "checkpoint agent {}/{} has recovered numeric identity {project_id}/{recovered_id}, expected {}/{}",
+                        agent.project.slug, agent.name, agent.project.id, agent.id
+                    )));
+                }
             }
             RecoveryRecord::Receipt(receipt) => {
                 restore_receipt(conn, &receipt)?;
@@ -429,6 +458,11 @@ pub(crate) fn restore(
         }
         Ok(())
     })?;
+    if manifest.as_ref() != expected_manifest {
+        return Err(error(
+            "active checkpoint changed between identity discovery and state replay",
+        ));
+    }
     restored.checkpoint_present = manifest.is_some();
     if reset_cursors {
         restored.cursor_reset_floor = reset_archive_cursors(conn, storage_root)?;
@@ -444,7 +478,7 @@ mod tests {
     use super::*;
     use crate::sync::{InboxDeliveryEventError, inbox_delivery_events_from_conn};
 
-    fn mailbox() -> CanonicalDbConn {
+    fn empty_mailbox() -> CanonicalDbConn {
         let conn = CanonicalDbConn::open_memory().unwrap();
         conn.execute_raw(crate::schema::PRAGMA_DB_INIT_BASE_SQL)
             .unwrap();
@@ -458,6 +492,11 @@ mod tests {
                 conn.execute_raw(&migration.up).unwrap();
             }
         }
+        conn
+    }
+
+    fn mailbox() -> CanonicalDbConn {
+        let conn = empty_mailbox();
         conn.execute_raw(
             "INSERT INTO projects(id, slug, human_key, created_at) VALUES (41, 'project', '/project', 1); \
              INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES \
@@ -485,6 +524,123 @@ mod tests {
         record_issued_cursor(directory.path(), 2).unwrap();
         assert_eq!(read_ceiling(&state).unwrap(), Some(90_000));
         assert!(record_issued_cursor(directory.path(), -1).is_err());
+    }
+
+    #[test]
+    fn healthy_empty_checkpoint_publishes_explicit_zero_cursor_witness() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = empty_mailbox();
+        record_issued_cursor(directory.path(), 0).unwrap();
+        assert!(!directory.path().join(CURSOR_DIRECTORY).exists());
+
+        checkpoint_cursor(&source, directory.path()).unwrap();
+        let state = JournalDirectory::open(directory.path(), CURSOR_DIRECTORY, false).unwrap();
+        assert_eq!(read_ceiling(&state).unwrap(), Some(0));
+        let candidate = empty_mailbox();
+        assert_eq!(
+            reset_archive_cursors(&candidate, directory.path()).unwrap(),
+            Some(1),
+            "an explicit zero witness permits a safe recovery reset"
+        );
+
+        record_issued_cursor(directory.path(), 70_000).unwrap();
+        checkpoint_cursor(&source, directory.path()).unwrap();
+        assert_eq!(
+            read_ceiling(&state).unwrap(),
+            Some(70_000),
+            "a healthy empty source must not lower a prior issued ceiling"
+        );
+    }
+
+    #[test]
+    fn complete_checkpoint_without_cursor_witness_requires_explicit_recovery_acceptance() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("archive");
+        let project = root.join("projects/project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"id":41,"slug":"project","human_key":"/project","created_at":1}"#,
+        )
+        .unwrap();
+        let source = directory.path().join("healthy.sqlite3");
+        crate::reconstruct::reconstruct_from_archive(&source, &root).unwrap();
+        let conn = CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+        crate::recovery_state::ensure_checkpoint(&conn, &root).unwrap();
+        let witness = root.join(CURSOR_DIRECTORY).join(CURSOR_FILE);
+        assert!(!witness.exists());
+
+        let unprotected = directory.path().join("without-witness.sqlite3");
+        let stats = crate::reconstruct::reconstruct_from_archive(&unprotected, &root).unwrap();
+        assert!(stats.recovery_checkpoint_present);
+        assert!(stats.has_receipt_state());
+        assert_eq!(stats.delivery_cursor_reset_floor, None);
+        let refusal = stats
+            .require_recovery_state()
+            .expect_err("a receipt checkpoint cannot establish a missing cursor ceiling");
+        assert!(refusal.to_string().contains("cursor"), "{refusal}");
+        assert!(
+            !witness.exists(),
+            "recovery must not invent a zero ceiling to authorize its own promotion"
+        );
+
+        checkpoint_cursor(&conn, &root).unwrap();
+        let cursor_journal = JournalDirectory::open(&root, CURSOR_DIRECTORY, false).unwrap();
+        assert_eq!(read_ceiling(&cursor_journal).unwrap(), Some(0));
+        let protected = directory.path().join("with-witness.sqlite3");
+        let stats = crate::reconstruct::reconstruct_from_archive(&protected, &root).unwrap();
+        assert!(stats.recovery_checkpoint_present);
+        assert!(stats.has_receipt_state());
+        assert_eq!(stats.delivery_cursor_reset_floor, Some(1));
+        stats
+            .require_recovery_state()
+            .expect("healthy zero witness makes the checkpoint recovery admissible");
+    }
+
+    #[test]
+    fn archive_checkpoint_requires_recorded_numeric_identities_without_salvage() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = mailbox();
+        let manifest = crate::recovery_state::ensure_checkpoint(&source, directory.path()).unwrap();
+
+        for remap_project in [false, true] {
+            let candidate = empty_mailbox();
+            let project_id = if remap_project { 141 } else { 41 };
+            candidate
+                .execute_sync(
+                    "INSERT INTO projects(id,slug,human_key,created_at) VALUES(?,'project','/project',1)",
+                    &[Value::BigInt(project_id)],
+                )
+                .unwrap();
+            for (id, name) in [(220, "Alice"), (221, "Bob"), (222, "Empty")] {
+                candidate
+                    .execute_sync(
+                        "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+                         VALUES(?,?,?,'test','test',1,1)",
+                        &[
+                            Value::BigInt(id),
+                            Value::BigInt(project_id),
+                            Value::Text(name.to_string()),
+                        ],
+                    )
+                    .unwrap();
+            }
+            let refusal = restore(&candidate, directory.path(), true, Some(&manifest))
+                .expect_err("archive recovery cannot renumber checkpoint identities");
+            let expected = if remap_project {
+                "checkpoint project"
+            } else {
+                "checkpoint agent"
+            };
+            assert!(refusal.to_string().contains(expected), "{refusal}");
+            assert!(refusal.to_string().contains("numeric"), "{refusal}");
+
+            assert!(
+                restore(&candidate, directory.path(), false, Some(&manifest))
+                    .expect("readable salvage may retain its verified stable-identity remapping")
+                    .checkpoint_present
+            );
+        }
     }
 
     #[test]
@@ -641,6 +797,101 @@ mod tests {
     }
 
     #[test]
+    fn archive_recovery_refuses_missing_unreferenced_checkpoint_identity() {
+        for missing_project in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("archive");
+            archive(&root);
+            let source = directory.path().join("original.sqlite3");
+            crate::reconstruct::reconstruct_from_archive(&source, &root).unwrap();
+            let conn = CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+            if missing_project {
+                conn.execute_raw(
+                    "INSERT INTO projects(id,slug,human_key,created_at) \
+                     VALUES(77,'checkpoint-only','/checkpoint-only',1)",
+                )
+                .unwrap();
+            } else {
+                conn.execute_raw(
+                    "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+                     VALUES(190,41,'CheckpointOnly','test','test',1,1)",
+                )
+                .unwrap();
+            }
+            checkpoint_cursor(&conn, &root).unwrap();
+            crate::recovery_state::ensure_checkpoint(&conn, &root).unwrap();
+            drop(conn);
+            let source_before = std::fs::read(&source).unwrap();
+            let rebuilt = directory.path().join("rebuilt.sqlite3");
+            let refusal = crate::reconstruct::reconstruct_from_archive(&rebuilt, &root).expect_err(
+                "every checkpoint identity must exist even without receipts or contacts",
+            );
+            let expected = if missing_project {
+                "missing project checkpoint-only"
+            } else {
+                "missing or ambiguous agent project/CheckpointOnly"
+            };
+            assert!(refusal.to_string().contains(expected), "{refusal}");
+            assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn archive_checkpoint_cannot_authorize_skipped_unread_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("archive");
+        archive(&root);
+        let source = directory.path().join("original.sqlite3");
+        crate::reconstruct::reconstruct_from_archive(&source, &root).unwrap();
+        let conn = CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+        let manifest = crate::recovery_state::ensure_checkpoint(&conn, &root).unwrap();
+        assert_eq!(
+            manifest.receipts, 0,
+            "the skipped message has no receipt reference"
+        );
+        record_issued_cursor(&root, 70_000).unwrap();
+        drop(conn);
+        let source_before = std::fs::read(&source).unwrap();
+        let checkpoint_paths = [
+            root.join(CURSOR_DIRECTORY).join("active.json"),
+            root.join(CURSOR_DIRECTORY)
+                .join(format!("g{}", manifest.generation))
+                .join("baseline.jsonl"),
+            root.join(CURSOR_DIRECTORY).join(CURSOR_FILE),
+        ];
+        let checkpoint_before = checkpoint_paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let damaged_message = root.join("projects/project/messages/2026/11/message-4000.md");
+        std::fs::write(&damaged_message, b"unread message with damaged envelope").unwrap();
+        let damaged_before = std::fs::read(&damaged_message).unwrap();
+
+        let rebuilt = directory.path().join("rebuilt.sqlite3");
+        let stats = crate::reconstruct::reconstruct_from_archive(&rebuilt, &root)
+            .expect("raw inspection still materializes the recoverable message");
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.parse_errors, 1);
+        assert!(stats.recovery_checkpoint_present);
+        assert!(stats.delivery_cursor_reset_floor.is_some());
+        assert!(!stats.has_receipt_state());
+        let refusal = stats
+            .require_recovery_state()
+            .expect_err("a checkpoint cannot excuse known archive message loss");
+        assert!(refusal.to_string().contains("parse failures"), "{refusal}");
+        assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        assert_eq!(std::fs::read(&damaged_message).unwrap(), damaged_before);
+        assert_eq!(
+            checkpoint_paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect::<Vec<_>>(),
+            checkpoint_before,
+            "inspection must not modify the recovery authority"
+        );
+    }
+
+    #[test]
     fn archive_only_rebuild_restores_checkpoint_and_later_receipts_and_contact_blocks() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("archive");
@@ -743,11 +994,17 @@ mod tests {
         .unwrap();
         assert!(stats.recovery_checkpoint_present);
         assert!(stats.recovery_state_from_salvage);
+        assert_eq!(
+            stats.salvage,
+            crate::reconstruct::ReconstructionSalvage::Merged
+        );
+        assert_eq!(stats.salvaged_rows_skipped_unmapped, 0);
+        stats.require_recovery_state().unwrap();
         assert_eq!(stats.salvaged_messages, 1);
         let conn = CanonicalDbConn::open_file(rebuilt.to_str().unwrap()).unwrap();
         let rows = conn
             .query_sync(
-                "SELECT r.read_ts,r.ack_ts,l.status,l.reason FROM agents a \
+                "SELECT r.read_ts,r.ack_ts,l.status,l.reason,l.created_ts,l.updated_ts FROM agents a \
              JOIN message_recipients r ON r.agent_id=a.id \
              JOIN agent_links l ON l.b_agent_id=a.id WHERE a.name='Unarchived'",
                 &[],
@@ -756,6 +1013,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 111);
         assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 333);
+        assert_eq!(rows[0].get_named::<i64>("created_ts").unwrap(), 10);
+        assert_eq!(rows[0].get_named::<i64>("updated_ts").unwrap(), 7);
         assert_eq!(rows[0].get_named::<String>("status").unwrap(), "blocked");
         assert_eq!(
             rows[0].get_named::<String>("reason").unwrap(),

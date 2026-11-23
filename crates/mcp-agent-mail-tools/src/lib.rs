@@ -2268,6 +2268,25 @@ pub mod tool_util {
         pub(crate) fn live_sqlite_path(&self) -> Option<&str> {
             self.snapshot.is_none().then(|| self.pool.sqlite_path())
         }
+
+        /// Missing archive receipts mean unknown state, not unread/unacknowledged.
+        /// Historical content remains readable, but receipt-filtered consumers
+        /// must not replay old notifications from a lossy reconstructed view.
+        pub(crate) fn require_receipt_state(&self) -> McpResult<()> {
+            if self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.has_preserved_receipt_state())
+            {
+                return Err(legacy_tool_error(
+                    "RECOVERY_STATE_UNAVAILABLE",
+                    "Archive fallback cannot establish read/ack state; unread-only and overdue-ack inbox reads are unavailable until the mailbox is recovered. Unfiltered message history remains readable.",
+                    true,
+                    json!({"source": "archive_snapshot", "unavailable_state": ["read_ts", "ack_ts"]}),
+                ));
+            }
+            Ok(())
+        }
     }
 
     impl std::ops::Deref for ToolReadPool {

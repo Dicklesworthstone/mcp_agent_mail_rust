@@ -28,6 +28,12 @@ baseline. Later read/ack and contact mutations publish bounded per-key records
 before reporting success. The archive publisher commits the manifest, its
 baseline and changed records to Git together. Keep this directory with the
 project/message archive when copying or backing up the mailbox.
+Recovery journal writes also publish a durable read revision, so cached archive
+reads observe receipt changes before Git publication. Older checkpoints without
+that revision remain readable, but their snapshots are rebuilt for each request.
+Reconstruction binds identity discovery and state replay to the same completed
+manifest. A checkpoint replacement, appearance or disappearance between those
+passes refuses the candidate and rolls back before resetting delivery cursors.
 Restoring a superseded database generation requires its matching archive
 checkpoint; otherwise reconstruct a fresh database from the active archive.
 
@@ -68,12 +74,29 @@ promotion completes. A non-consuming inbox peek remains available.
 
 An older archive with no completed recovery-state checkpoint still cannot
 recover historical read/ack receipts or contact decisions. The reconstruction
-report warns about this loss, and automatic promotion emits an error-level
-summary. Upgrade while the database is healthy so its existing state can be
+report warns about this loss, and automatic recovery, `doctor repair`, and
+ordinary `am doctor reconstruct --yes` refuse promotion without complete
+readable salvage or a validated checkpoint and safe delivery-cursor reset
+evidence. Partial salvage is also refused. `--yes` alone does not accept state
+loss. Preserve the original database family and any reconstruction candidate
+for inspection.
+
+Receipt-filtered archive reads require complete salvage or a validated
+archive-only checkpoint. Without that authority, unread and pending-ACK
+queries return `RECOVERY_STATE_UNAVAILABLE` before returning rows or changing
+receipts. Unfiltered message history remains available; absent read/ack
+timestamps in that history do not prove that a message is unhandled. Receipt
+authority alone does not establish the cursor evidence needed for promotion.
+
+Upgrade while the database is healthy so its existing state can be
 checkpointed. If corruption and state loss have already occurred, restore a
-healthy pre-incident database backup when available. Product/project links and
-other database-only state still require readable salvage; the new checkpoint
-does not claim to replace a complete database backup.
+healthy pre-incident database backup when available. After stopping and
+draining the mailbox owner, an operator can explicitly accept the reported
+loss with `am doctor reconstruct --allow-state-loss --yes`; follow the
+[operator recovery procedure](OPERATOR_COOKBOOK.md#recover-from-an-archive-with-incomplete-mailbox-state-stateful)
+and retain the source and recovery evidence. Product/project links and other
+database-only state still require readable salvage or a suitable database
+backup; a recovery checkpoint does not replace a complete database backup.
 
 ## Repeated agent-profile conflicts (GH#375)
 

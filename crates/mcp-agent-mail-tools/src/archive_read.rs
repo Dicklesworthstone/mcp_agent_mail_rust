@@ -4,12 +4,13 @@
 //! readable live-only state into a disposable `SQLite` database.  This module
 //! gives every tool and resource in a process one owner for that work.  A
 //! snapshot is published only after indexed archive markers (including
-//! available cross-process epoch tokens) and exact live database generations
-//! taken before and after reconstruction agree, and its pool is incapable of
-//! mutation. These markers detect observed remote changes; they do not hold a
-//! cross-process mutation lease.
+//! available cross-process epoch tokens), durable recovery-journal revisions,
+//! and exact live database generations taken before and after reconstruction
+//! agree, and its pool is incapable of mutation. These markers detect observed
+//! remote changes; they do not hold a cross-process mutation lease.
 
 use asupersync::Cx;
+use mcp_agent_mail_db::recovery_state::RecoveryReadWitness;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{self, File, Metadata};
@@ -49,23 +50,31 @@ struct Scope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Generation {
     archive: mcp_agent_mail_storage::ArchiveReadGeneration,
+    recovery: Option<RecoveryReadWitness>,
     live: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CheapGeneration {
     archive: mcp_agent_mail_storage::ArchiveReadGeneration,
+    recovery: Option<RecoveryReadWitness>,
     live: [u8; 32],
 }
 
 pub struct SharedSnapshot {
     pool: mcp_agent_mail_db::DbPool,
+    receipt_state_preserved: bool,
+    recovery_checkpoint_present: bool,
     _directory: mcp_agent_mail_db::pool::CanonicalSnapshotTempDir,
 }
 
 impl SharedSnapshot {
     pub(crate) fn pool(&self) -> mcp_agent_mail_db::DbPool {
         self.pool.clone()
+    }
+
+    pub(crate) const fn has_preserved_receipt_state(&self) -> bool {
+        self.receipt_state_preserved
     }
 
     #[cfg(test)]
@@ -87,9 +96,18 @@ impl Decision {
             Self::Snapshot(snapshot) => Some(Arc::clone(snapshot)),
         }
     }
+
+    fn reusable_with(&self, recovery: Option<&RecoveryReadWitness>) -> bool {
+        recovery.is_some()
+            || match self {
+                Self::Live => true,
+                Self::Snapshot(snapshot) => !snapshot.recovery_checkpoint_present,
+            }
+    }
 }
 
 struct Ready {
+    build_token: u64,
     generation: Generation,
     cheap: CheapGeneration,
     decision: Decision,
@@ -497,6 +515,21 @@ fn archive_generation(
     )
 }
 
+fn recovery_revision(scope: &Scope) -> Option<RecoveryReadWitness> {
+    mcp_agent_mail_db::recovery_state::read_revision_witness(&scope.storage_root).unwrap_or_else(
+        |error| {
+            // This file controls cache reuse, not archive recovery authority.
+            // Fresh reconstruction still validates the checkpoint itself, so
+            // a missing/invalid revision must not prevent history inspection.
+            tracing::debug!(
+                %error,
+                "recovery journal revision unavailable; checkpoint snapshots require a fresh build"
+            );
+            None
+        },
+    )
+}
+
 /// Byte ranges of the `SQLite` file header that `FrankenSQLite` mutates on every
 /// open even when no page changes: the file change counter (24..28) and the
 /// version-valid-for counter (92..96). Measured during the GH#203 livelock on
@@ -589,6 +622,7 @@ fn exact_generation(scope: &Scope, deadline: Instant) -> Result<Generation, Acqu
     check_deadline(deadline, "archive generation")?;
     Ok(Generation {
         archive: archive_generation(scope)?,
+        recovery: recovery_revision(scope),
         live: hash_live(scope, true, deadline)?,
     })
 }
@@ -597,6 +631,7 @@ fn cheap_generation(scope: &Scope, deadline: Instant) -> Result<CheapGeneration,
     check_deadline(deadline, "archive generation")?;
     Ok(CheapGeneration {
         archive: archive_generation(scope)?,
+        recovery: recovery_revision(scope),
         live: hash_live(scope, false, deadline)?,
     })
 }
@@ -911,6 +946,8 @@ fn build_snapshot(
     .map_err(AcquireError::failed)?;
     Ok(Arc::new(SharedSnapshot {
         pool,
+        receipt_state_preserved: stats.has_receipt_state(),
+        recovery_checkpoint_present: stats.recovery_checkpoint_present,
         _directory: directory,
     }))
 }
@@ -997,13 +1034,17 @@ fn run_build(slot: &Slot, database_url: &str, build: &Build) -> Result<BuildOutp
             .as_ref()
             .filter(|ready| {
                 ready.generation == before
+                    && ready.decision.reusable_with(before.recovery.as_ref())
                     && ready.invalidation_epoch == build.invalidation_epoch
                     && ready.writer_epoch == build.writer_epoch
             })
             .map(|ready| ready.decision.clone());
         if let Some(decision) = reusable_decision {
             let cheap_after = cheap_generation(&slot.scope, build.deadline)?;
-            if cheap_after == cheap_before {
+            if cheap_after == cheap_before
+                && cheap_after.archive == before.archive
+                && cheap_after.recovery == before.recovery
+            {
                 return Ok(BuildOutput {
                     generation: before,
                     cheap: cheap_after,
@@ -1056,7 +1097,10 @@ fn run_build(slot: &Slot, database_url: &str, build: &Build) -> Result<BuildOutp
         // cheap reads. The published baseline is the post-probe `cheap_after`,
         // so the ready fast-path — which opens nothing — stays stable until a
         // durable write actually lands.
-        if before == after {
+        if before == after
+            && cheap_after.archive == after.archive
+            && cheap_after.recovery == after.recovery
+        {
             return Ok(BuildOutput {
                 generation: after,
                 cheap: cheap_after,
@@ -1102,6 +1146,7 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
                     && state.writers == 0 =>
             {
                 retired = state.ready.replace(Ready {
+                    build_token: build.token,
                     generation: output.generation,
                     cheap: output.cheap,
                     decision: output.decision,
@@ -1317,7 +1362,7 @@ fn exact_audit_interval() -> Duration {
 /// Best-effort: if the cheap generation cannot be computed, or the slot moved
 /// on underneath us, we simply leave the entry alone and the next read
 /// re-validates. It is never wrong to skip this, only slower.
-fn refresh_ready_audit(slot: &Arc<Slot>, deadline: Instant) {
+fn refresh_ready_audit(slot: &Arc<Slot>, expected: &Generation, deadline: Instant) {
     let Ok(cheap) = cheap_generation(&slot.scope, deadline) else {
         return;
     };
@@ -1325,7 +1370,11 @@ fn refresh_ready_audit(slot: &Arc<Slot>, deadline: Instant) {
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(ready) = state.ready.as_mut() {
+    if let Some(ready) = state.ready.as_mut()
+        && ready.generation == *expected
+        && cheap.archive == expected.archive
+        && cheap.recovery == expected.recovery
+    {
         ready.cheap = cheap;
         ready.exact_at = Instant::now();
     }
@@ -1342,6 +1391,10 @@ pub fn acquire_if_needed(
     }
     let slot = slot_for(scope(storage_root, sqlite_path)?)?;
     let caller_deadline = Instant::now() + BUILD_TIMEOUT;
+    // An older or failed journal publication has no reusable receipt witness.
+    // Deliver a fresh build to its current waiters once; a later request must
+    // reconstruct again instead of trusting that checkpoint indefinitely.
+    let mut completed_build_token = None;
     loop {
         if cx.is_cancel_requested() {
             return Err(AcquireError::Cancelled);
@@ -1364,6 +1417,10 @@ pub fn acquire_if_needed(
                 (ready.invalidation_epoch == epoch
                     && ready.writer_epoch == writer_epoch
                     && ready.archive_epoch == archive_epoch
+                    && (ready
+                        .decision
+                        .reusable_with(ready.generation.recovery.as_ref())
+                        || completed_build_token == Some(ready.build_token))
                     && state.writers == 0
                     && WRITERS_ACTIVE.load(Ordering::Acquire) == 0
                     && mcp_agent_mail_storage::archive_mutations_active() == 0)
@@ -1438,7 +1495,7 @@ pub fn acquire_if_needed(
                 if !cheap_fresh {
                     // Re-baseline so the next read can take the cheap path
                     // again rather than re-hashing content every time.
-                    refresh_ready_audit(&slot, caller_deadline);
+                    refresh_ready_audit(&slot, &expected_exact, caller_deadline);
                 }
                 return Ok(decision.snapshot());
             }
@@ -1480,7 +1537,7 @@ pub fn acquire_if_needed(
             build
         };
         match wait_for_build(&slot, &build, cx) {
-            Ok(()) => {}
+            Ok(()) => completed_build_token = Some(build.token),
             Err(AcquireError::Busy(_)) => {
                 wait_retry_slice(&slot);
             }
@@ -2872,6 +2929,8 @@ mod tests {
                         (Some(false), Some(10), Some(true)),
                         (None, Some(10), Some(true)),
                         (Some(true), Some(10), Some(true)),
+                        (Some(false), Some(10), Some(false)),
+                        (Some(true), Some(10), Some(false)),
                         (None, None, None),
                     ] {
                         let response = crate::fetch_inbox(
@@ -2887,24 +2946,33 @@ mod tests {
                             None,
                             mark_read,
                         )
-                        .await
-                        .expect("archive inbox remains readable");
-                        let messages: serde_json::Value =
-                            serde_json::from_str(&response).expect("inbox JSON");
-                        assert_eq!(messages.as_array().expect("inbox array").len(), 1);
-                        assert_eq!(messages[0]["id"], 1);
-                        assert_eq!(messages[0]["from"], "Alice");
-                        assert!(
-                            messages[0]["body_md"]
-                                .as_str()
-                                .expect("body")
-                                .contains("archive inbox body")
-                        );
-                        assert!(
-                            messages[0]["read_ts"].is_null(),
-                            "snapshot reads must not invent durable read receipts: {response}"
-                        );
-                        assert!(messages[0]["ack_ts"].is_null());
+                        .await;
+                        if unread_only.unwrap_or(false) {
+                            let error = response
+                                .expect_err("legacy archive cannot establish unread receipt state");
+                            let data = error.data.expect("structured recovery error");
+                            assert_eq!(data["error"]["type"], "RECOVERY_STATE_UNAVAILABLE");
+                            assert_eq!(data["error"]["recoverable"], true);
+                            assert_eq!(data["error"]["data"]["source"], "archive_snapshot");
+                        } else {
+                            let response = response.expect("archive history remains readable");
+                            let messages: serde_json::Value =
+                                serde_json::from_str(&response).expect("inbox JSON");
+                            assert_eq!(messages.as_array().expect("inbox array").len(), 1);
+                            assert_eq!(messages[0]["id"], 1);
+                            assert_eq!(messages[0]["from"], "Alice");
+                            assert!(
+                                messages[0]["body_md"]
+                                    .as_str()
+                                    .expect("body")
+                                    .contains("archive inbox body")
+                            );
+                            assert!(
+                                messages[0]["read_ts"].is_null(),
+                                "snapshot reads must not invent durable read receipts: {response}"
+                            );
+                            assert!(messages[0]["ack_ts"].is_null());
+                        }
                         assert_eq!(
                             fs::read(&signal).expect("archive read preserves the wakeup"),
                             signal_before
@@ -2923,6 +2991,156 @@ mod tests {
                 });
             },
         );
+        reset_for_test();
+    }
+
+    async fn fetch_checkpoint_fixture_unread(
+        ctx: &fastmcp::prelude::McpContext,
+    ) -> Vec<serde_json::Value> {
+        let response = crate::fetch_inbox(
+            ctx,
+            "/single-flight-project".to_string(),
+            "Alice".to_string(),
+            None,
+            None,
+            Some(10),
+            Some(true),
+            Some(true),
+            None,
+            None,
+            Some(false),
+        )
+        .await
+        .expect("validated checkpoint supports a fresh unread query");
+        serde_json::from_str(&response).expect("inbox messages")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn checkpoint_receipt_write_invalidates_cached_inbox_without_git_or_live_changes() {
+        if isolated_retirement_test() {
+            return;
+        }
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("receipt cache fixture");
+        let storage_root = directory.path().join("archive");
+        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        let retained_path = directory.path().join("retained-source.sqlite3");
+        write_archive_fixture_files(&storage_root);
+        fs::write(
+            storage_root.join(
+                "projects/single-flight-project/messages/2026/07/2026-07-19T00-00-00Z__hello__1.md",
+            ),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Alice\"],\"subject\":\"hello\",\"importance\":\"normal\",\"ack_required\":true,\"created_ts\":\"2026-07-19T00:00:00Z\"}\n---\n\narchive inbox body\n",
+        )
+        .expect("write recipient-bearing message");
+        mcp_agent_mail_db::reconstruct_from_archive(&retained_path, &storage_root)
+            .expect("retain a real source outside the configured live path");
+        let retained = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            retained_path.to_str().expect("retained source path"),
+        )
+        .expect("open retained source");
+        let agent_id = retained
+            .query_sync("SELECT id FROM agents WHERE name = 'Alice'", &[])
+            .expect("retained recipient")
+            .first()
+            .expect("recipient row")
+            .get_named::<i64>("id")
+            .expect("recipient id");
+        let manifest =
+            mcp_agent_mail_db::recovery_state::ensure_checkpoint(&retained, &storage_root)
+                .expect("checkpoint before the message is handled");
+        assert_eq!(manifest.receipts, 0);
+        assert!(!storage_root.join(".git").exists());
+        let live_before = snapshot_family(&sqlite_path);
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().expect("storage path")),
+                ("MCP_AGENT_MAIL_READ_SNAPSHOT_EXACT_AUDIT_MS", "30000"),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let cx = Cx::for_testing();
+                    let ctx = fastmcp::prelude::McpContext::new(cx.clone(), 1);
+                    let initial = fetch_checkpoint_fixture_unread(&ctx).await;
+                    assert_eq!(initial.len(), 1);
+                    let first = acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+                        .expect("read cache")
+                        .expect("archive snapshot");
+                    assert!(first.has_preserved_receipt_state());
+                    let cached = acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+                        .expect("unchanged cache")
+                        .expect("archive snapshot");
+                    assert!(Arc::ptr_eq(&first, &cached));
+                    let scope = scope(&storage_root, &sqlite_path).unwrap();
+                    let before = exact_generation(&scope, Instant::now() + BUILD_TIMEOUT).unwrap();
+                    let cheap_before =
+                        cheap_generation(&scope, Instant::now() + BUILD_TIMEOUT).unwrap();
+
+                    retained
+                        .execute_raw("UPDATE message_recipients SET read_ts = 1000000, ack_ts = 2000000")
+                        .expect("handle the message in retained source");
+                    mcp_agent_mail_db::recovery_state::persist_receipts(
+                        &retained,
+                        &storage_root,
+                        agent_id,
+                        &[1],
+                    )
+                    .expect("publish receipt without touching Git or configured live database");
+                    let retained_after = fs::read(&retained_path).unwrap();
+                    let handled = fetch_checkpoint_fixture_unread(&ctx).await;
+                    assert!(handled.is_empty(), "next read must not replay handled mail");
+                    let refreshed = acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+                        .expect("refreshed cache")
+                        .expect("archive snapshot");
+                    assert!(!Arc::ptr_eq(&first, &refreshed));
+                    let after = exact_generation(&scope, Instant::now() + BUILD_TIMEOUT).unwrap();
+                    let cheap_after =
+                        cheap_generation(&scope, Instant::now() + BUILD_TIMEOUT).unwrap();
+                    assert_eq!(before.archive, after.archive, "no Git/storage publication");
+                    assert_eq!(before.live, after.live, "configured live source is unchanged");
+                    assert_ne!(before.recovery, after.recovery);
+                    assert_ne!(cheap_before, cheap_after);
+
+                    let revision_path = storage_root
+                        .join(mcp_agent_mail_db::recovery_state::DIRECTORY)
+                        .join("read-revision.json");
+                    fs::rename(
+                        &revision_path,
+                        directory.path().join("retained-read-revision.json"),
+                    )
+                    .expect("retain revision while exercising an older checkpoint");
+                    let slot = slot_for(scope).unwrap();
+                    for malformed in [false, true] {
+                        if malformed {
+                            fs::write(&revision_path, b"invalid revision\n")
+                                .expect("seed malformed cache metadata");
+                        }
+                        let builds_before = slot.reconstructions.load(Ordering::Acquire);
+                        for new_builds in 1..=2 {
+                            let handled = fetch_checkpoint_fixture_unread(&ctx).await;
+                            assert_eq!(handled, [] as [serde_json::Value; 0]);
+                            assert_eq!(
+                                slot.reconstructions.load(Ordering::Acquire),
+                                builds_before + new_builds,
+                                "missing/malformed revision must allow fresh reads without cache reuse or a rebuild loop"
+                            );
+                        }
+                    }
+                    assert_eq!(fs::read(&retained_path).unwrap(), retained_after);
+                });
+            },
+        );
+        assert!(!storage_root.join(".git").exists());
+        assert_eq!(snapshot_family(&sqlite_path), live_before);
+        mcp_agent_mail_core::Config::reset_cached();
         reset_for_test();
     }
 

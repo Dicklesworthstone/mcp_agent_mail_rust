@@ -3566,6 +3566,7 @@ fn resolve_optional_agent_id(
 
 struct RobotDbHandle {
     conn: DbConn,
+    receipt_state_preserved: bool,
     _snapshot_dir: Option<mcp_agent_mail_db::pool::CanonicalSnapshotTempDir>,
 }
 
@@ -3573,6 +3574,7 @@ impl RobotDbHandle {
     fn open_local() -> Result<Self, CliError> {
         Ok(Self {
             conn: crate::open_db_sync_robot()?,
+            receipt_state_preserved: true,
             _snapshot_dir: None,
         })
     }
@@ -3580,6 +3582,7 @@ impl RobotDbHandle {
     fn open_local_attachments() -> Result<Self, CliError> {
         Ok(Self {
             conn: crate::open_db_sync_robot_attachments()?,
+            receipt_state_preserved: true,
             _snapshot_dir: None,
         })
     }
@@ -3599,21 +3602,34 @@ impl RobotDbHandle {
                     CliError::Other(format!("robot archive snapshot tempdir failed: {e}"))
                 })?;
         let db_path = snapshot_dir.path().join("robot-archive-snapshot.sqlite3");
-        mcp_agent_mail_db::reconstruct_from_archive(&db_path, storage_root).map_err(|e| {
-            CliError::Other(format!("robot archive snapshot reconstruction failed: {e}"))
-        })?;
+        let stats =
+            mcp_agent_mail_db::reconstruct_from_archive(&db_path, storage_root).map_err(|e| {
+                CliError::Other(format!("robot archive snapshot reconstruction failed: {e}"))
+            })?;
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
             .map_err(|e| CliError::Other(format!("robot archive snapshot open failed: {e}")))?;
         Ok(Self {
             conn,
+            receipt_state_preserved: stats.has_receipt_state(),
             _snapshot_dir: Some(snapshot_dir),
         })
+    }
+
+    fn require_receipt_state(&self) -> Result<(), CliError> {
+        if !self.receipt_state_preserved {
+            return Err(CliError::Other(
+                "RECOVERY_STATE_UNAVAILABLE: archive fallback cannot establish read/ack state; unread and overdue-ack inbox reads are unavailable until the mailbox is recovered. Unfiltered history remains available with --all."
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
     fn from_conn(conn: DbConn) -> Self {
         Self {
             conn,
+            receipt_state_preserved: true,
             _snapshot_dir: None,
         }
     }
@@ -6729,6 +6745,12 @@ fn render_local_inbox_result(
 ) -> Result<String, CliError> {
     let scope = resolve_robot_scope(project_flag, agent_flag)?;
     phase.mark("scope_resolution");
+    // Urgent robot inbox rows are also restricted to unread mail. Without
+    // --all, the default view is unread/awaiting acknowledgement, so every
+    // filtered lane requires authoritative receipt state before building rows.
+    if urgent || ack_overdue || !all {
+        scope.db.require_receipt_state()?;
+    }
     let (agent_id, agent_name_str) = scope.agent.clone().ok_or_else(|| {
         CliError::InvalidArgument(
             "agent required for inbox — use --agent or set AGENT_MAIL_AGENT/AGENT_NAME".to_string(),
@@ -26579,6 +26601,74 @@ mod tests {
             err_text.contains("temporarily busy")
                 || err_text.contains("mailbox activity lock is busy"),
             "unexpected error: {err_text}"
+        );
+    }
+
+    #[test]
+    fn robot_inbox_refuses_archive_receipt_filters_but_keeps_all_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("stale-mailbox.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().unwrap()),
+            ],
+            || {
+                crate::handle_migrate_with_database_url(&db_url).expect("seed empty live mailbox");
+                let message_dir = crate::seed_archive_mailbox_project(&storage_root);
+                crate::write_archive_mailbox_message(
+                    &message_dir,
+                    "msg-0001.md",
+                    1,
+                    "Alice",
+                    "Retained robot history",
+                    "urgent",
+                    "2026-03-22T00:00:00Z",
+                    "History without receipt authority.",
+                );
+
+                for (urgent, ack_overdue, unread) in [
+                    (false, false, false),
+                    (true, false, false),
+                    (false, true, false),
+                    (false, false, true),
+                ] {
+                    let error = render_local_inbox_result(
+                        "robot inbox",
+                        OutputFormat::Json,
+                        Some("ahead-project"),
+                        Some("Alice"),
+                        urgent,
+                        ack_overdue,
+                        unread,
+                        false,
+                        Some(10),
+                        false,
+                        TailLatencyPhaseRecorder::new("robot_inbox"),
+                    )
+                    .expect_err("filtered robot inbox cannot use archive-only receipts");
+                    assert!(error.to_string().contains("RECOVERY_STATE_UNAVAILABLE"));
+                }
+
+                let history = render_local_inbox_result(
+                    "robot inbox",
+                    OutputFormat::Json,
+                    Some("ahead-project"),
+                    Some("Alice"),
+                    false,
+                    false,
+                    false,
+                    true,
+                    Some(10),
+                    true,
+                    TailLatencyPhaseRecorder::new("robot_inbox"),
+                )
+                .expect("unfiltered robot history remains readable");
+                assert!(history.contains("Retained robot history"));
+                assert_eq!(crate::sqlite_message_stats(&db_path).0, 0);
+            },
         );
     }
 

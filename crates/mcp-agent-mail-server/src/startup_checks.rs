@@ -2417,7 +2417,10 @@ fn probe_database(config: &Config) -> ProbeResult {
 ///    `.bak.YYYYMMDD_HHMMSS[-NN]` file. Historical `.backup-*` generations
 ///    and `.recovery` WAL families are excluded until recovery can settle and
 ///    stage an unambiguous complete family.
-/// 2. If no healthy backup exists, reinitialize an empty database.
+/// 2. When an authoritative archive exists, reconstruct only if readable
+///    salvage preserves database-only coordination state. Archive-only
+///    candidates require an explicit operator decision before promotion.
+/// 3. Without durable archive state, use the non-archive recovery policy.
 ///
 /// Startup only fails if recovery itself fails. Successful recovery
 /// logs a warning and allows startup to continue.
@@ -2627,7 +2630,7 @@ pub fn probe_integrity(config: &Config) -> ProbeResult {
                     "Startup integrity recovery failed for {db_target}: {}",
                     classify_recovery_failure_root_cause(&err_str)
                 ),
-                fix: "Run `am doctor repair --yes`, then retry startup. If the database remains unhealthy, run `am doctor reconstruct --yes`."
+                fix: "Preserve the complete database family and archive. Run `am doctor repair --yes`, or inspect `am doctor reconstruct --dry-run --json` before rebuilding. If reconstruction reports unavailable read/ack, contact, or delivery-cursor state, restore a verified backup; `--allow-state-loss --yes` is an explicit operator acceptance of those losses, never an automatic retry."
                     .into(),
             })
         }
@@ -2924,8 +2927,11 @@ fn probe_recovery_attempt_count() -> u32 {
 ///    `.bak.YYYYMMDD_HHMMSS[-NN]` backup. Historical `.backup-*` generations
 ///    and `.recovery` WAL families are excluded until family-aware settlement
 ///    exists.
-/// 2. Reconstruct from the Git archive (recovers messages + agents)
-/// 3. Reinitialize an empty database (last resort)
+/// 2. Reconstruct from the Git archive with validated salvage or checkpoint authority.
+///
+/// A candidate without complete salvage or validated checkpoint authority is
+/// retained for operator review, never promoted automatically or replaced by
+/// an empty database.
 #[allow(dead_code)]
 fn attempt_probe_recovery(config: &Config) -> ProbeResult {
     #[cfg(test)]
@@ -4009,7 +4015,7 @@ mod tests {
     }
 
     #[test]
-    fn integrity_probe_missing_db_with_archive_runs_one_caller_owned_recovery() {
+    fn integrity_probe_missing_db_with_archive_refuses_after_one_caller_owned_recovery() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("missing-with-archive.sqlite3");
         let storage_root = temp.path().join("storage");
@@ -4040,9 +4046,13 @@ mod tests {
 
         reset_probe_recovery_attempt_count();
         let result = probe_integrity(&config);
+        let ProbeResult::Fail(failure) = result else {
+            panic!("missing DB with archive-only state must require operator review: {result:?}");
+        };
         assert!(
-            matches!(result, ProbeResult::Ok { name: "integrity" }),
-            "missing DB with durable archive state should recover: {result:?}"
+            failure.problem.contains("--allow-state-loss"),
+            "startup must explain why archive-only promotion was refused: {}",
+            failure.problem
         );
         assert_eq!(
             probe_recovery_attempt_count(),
@@ -4050,8 +4060,31 @@ mod tests {
             "a missing primary with archive state needs exactly one caller-owned recovery"
         );
 
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
-            .expect("open reconstructed database");
+        assert!(
+            !db_path.exists(),
+            "no replacement may become the live mailbox"
+        );
+        assert!(
+            !temp
+                .path()
+                .join(".mcp-agent-mail-recovery-receipts")
+                .exists(),
+            "neither archive-only nor blank promotion may publish a receipt"
+        );
+        let candidate = std::fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("missing-with-archive.sqlite3.reconstruct-failed-")
+                })
+            })
+            .expect("refused candidate remains available for inspection");
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(candidate.to_string_lossy().as_ref())
+                .expect("open retained reconstruction candidate");
         let rows = conn
             .query_sync(
                 "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
@@ -5430,7 +5463,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_integrity_recovers_corrupt_db_with_archive() {
+    fn probe_integrity_refuses_archive_only_recovery_of_corrupt_db() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("corrupt.db");
         let storage_root = dir.path().join("storage");
@@ -5452,10 +5485,43 @@ mod tests {
         config.database_url = format!("sqlite:///{}", db_path.display());
         config.storage_root = storage_root;
 
+        reset_probe_recovery_attempt_count();
         let result = probe_integrity(&config);
+        let ProbeResult::Fail(failure) = result else {
+            panic!("archive-only recovery must not silently reset the mailbox: {result:?}");
+        };
         assert!(
-            matches!(result, ProbeResult::Ok { .. }),
-            "probe_integrity should auto-recover corrupt DB; got: {result:?}"
+            failure.problem.contains("--allow-state-loss"),
+            "startup must retain the state-loss refusal: {}",
+            failure.problem
+        );
+        assert!(failure.fix.contains("--dry-run --json"));
+        assert!(failure.fix.contains("verified backup"));
+        assert_eq!(
+            probe_recovery_attempt_count(),
+            0,
+            "a terminal DB-owned refusal must not trigger a second server-owned recovery"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            b"not-a-sqlite-db",
+            "the unreadable source must remain available at its original path"
+        );
+        assert!(
+            !dir.path()
+                .join(".mcp-agent-mail-recovery-receipts")
+                .exists(),
+            "a refused candidate must not publish a promotion receipt"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("corrupt.db.reconstruct-failed-")),
+            "the completed but refused candidate must be retained for review"
         );
     }
 

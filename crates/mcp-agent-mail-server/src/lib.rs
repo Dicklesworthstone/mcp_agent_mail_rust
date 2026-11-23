@@ -22353,6 +22353,40 @@ mod tests {
     }
 
     #[test]
+    fn readiness_check_refuses_missing_sqlite_with_archive_only_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("existing-mailbox");
+        std::fs::create_dir_all(&project_dir).expect("create archive project");
+        let project_path = project_dir.join("project.json");
+        let project_bytes = br#"{"slug":"existing-mailbox","human_key":"/existing-mailbox"}"#;
+        std::fs::write(&project_path, project_bytes).expect("write project metadata");
+        let db_path = temp.path().join("missing.sqlite3");
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            integrity_check_on_startup: true,
+            ..mcp_agent_mail_core::Config::default()
+        };
+
+        let error = with_health_serving_env(&config, || readiness_check(&config))
+            .expect_err("readiness must refuse archive-only promotion without operator acceptance");
+        assert!(error.contains("--allow-state-loss"), "{error}");
+        assert!(
+            !db_path.exists(),
+            "readiness must not initialize a blank mailbox"
+        );
+        assert_eq!(std::fs::read(&project_path).unwrap(), project_bytes);
+        assert!(
+            !temp
+                .path()
+                .join(".mcp-agent-mail-recovery-receipts")
+                .exists(),
+            "readiness refusal must precede promotion"
+        );
+    }
+
+    #[test]
     fn readiness_check_tells_the_integrity_guard_when_its_startup_probe_ran() {
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_root = temp.path().join("storage");

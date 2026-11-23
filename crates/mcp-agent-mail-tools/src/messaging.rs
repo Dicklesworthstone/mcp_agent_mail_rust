@@ -5169,6 +5169,9 @@ pub async fn fetch_inbox(
             crate::tool_util::get_read_db_pool(ctx.cx()).await?
         }
     };
+    if unread || ack_overdue {
+        read_pool.require_receipt_state()?;
+    }
     let project = resolve_existing_project(ctx, &read_pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -6677,6 +6680,188 @@ mod tests {
             Outcome::Ok(agent) => agent,
             other => panic!("register_agent({name}, None) failed: {other:?}"),
         }
+    }
+
+    fn seed_handled_archive_inbox(
+        mailbox: &crate::test_support::IsolatedMailbox,
+        checkpoint: bool,
+    ) -> (std::path::PathBuf, Vec<u8>) {
+        let config = Config::from_env();
+        mcp_agent_mail_storage::ensure_archive_root(&config).expect("archive root");
+        let project = mailbox.storage_root.join("projects/archive-receipt-loss");
+        let messages = project.join("messages/2026/01");
+        std::fs::create_dir_all(&messages).unwrap();
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"human_key":"/archive-receipt-loss"}"#,
+        )
+        .unwrap();
+        for name in ["GreenCastle", "BlueLake"] {
+            let agent = project.join("agents").join(name);
+            std::fs::create_dir_all(&agent).unwrap();
+            std::fs::write(
+                agent.join("profile.json"),
+                json!({
+                    "name": name, "program": "test", "model": "test",
+                    "inception_ts": "2026-01-01T00:00:00Z",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            messages.join("2026-01-01T00-00-00Z__handled__1.md"),
+            "---json\n{\"id\":1,\"from\":\"GreenCastle\",\"to\":[\"BlueLake\"],\"cc\":[],\"bcc\":[],\"subject\":\"Already handled\",\"created\":\"2026-01-01T00:00:00Z\",\"ack_required\":true,\"attachments\":[]}\n---\n\nRetained history.\n",
+        )
+        .unwrap();
+        mcp_agent_mail_db::reconstruct_from_archive(&mailbox.database_path, &mailbox.storage_root)
+            .expect("seed the real mailbox before losing its live path");
+        let source =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(mailbox.database_path.to_str().unwrap())
+                .unwrap();
+        source
+            .execute_raw("UPDATE message_recipients SET read_ts = 1000000, ack_ts = 2000000")
+            .unwrap();
+        let receipts = source
+            .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].get_named::<i64>("read_ts").unwrap(), 1_000_000);
+        assert_eq!(receipts[0].get_named::<i64>("ack_ts").unwrap(), 2_000_000);
+        if checkpoint {
+            let manifest = mcp_agent_mail_db::recovery_state::ensure_checkpoint(
+                &source,
+                &mailbox.storage_root,
+            )
+            .expect("publish validated receipt checkpoint");
+            assert_eq!(manifest.receipts, 1);
+        }
+        drop(source);
+        let retained_source = mailbox.database_path.with_extension("retained.sqlite3");
+        std::fs::rename(&mailbox.database_path, &retained_source).unwrap();
+        let source_before = std::fs::read(&retained_source).unwrap();
+        (retained_source, source_before)
+    }
+
+    #[test]
+    fn fetch_inbox_archive_fallback_refuses_unknown_receipts_but_keeps_history() {
+        with_messaging_mailbox(&[], |mailbox| {
+            let (retained_source, source_before) = seed_handled_archive_inbox(mailbox, false);
+
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            runtime.block_on(async {
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                for (unread, overdue) in [(true, false), (false, true), (true, true)] {
+                    let error = fetch_inbox(
+                        &ctx,
+                        "/archive-receipt-loss".to_string(),
+                        "BlueLake".to_string(),
+                        None,
+                        None,
+                        Some(10),
+                        Some(true),
+                        Some(unread),
+                        Some(overdue),
+                        None,
+                        Some(true),
+                    )
+                    .await
+                    .expect_err("missing receipts must not redeliver previously handled mail");
+                    let data = error.data.expect("structured recovery error");
+                    assert_eq!(data["error"]["type"], "RECOVERY_STATE_UNAVAILABLE");
+                    assert_eq!(data["error"]["recoverable"], true);
+                    assert_eq!(data["error"]["data"]["source"], "archive_snapshot");
+                }
+                let history = fetch_inbox(
+                    &ctx,
+                    "/archive-receipt-loss".to_string(),
+                    "BlueLake".to_string(),
+                    None,
+                    None,
+                    Some(10),
+                    Some(true),
+                    Some(false),
+                    Some(false),
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect("unfiltered history remains readable");
+                let history: Value = serde_json::from_str(&history).unwrap();
+                assert_eq!(history.as_array().unwrap().len(), 1);
+                assert_eq!(history[0]["subject"], "Already handled");
+                assert!(
+                    history[0]["body_md"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Retained history.")
+                );
+            });
+            assert!(
+                !mailbox.database_path.exists(),
+                "reads must not promote a rebuild"
+            );
+            assert_eq!(std::fs::read(&retained_source).unwrap(), source_before);
+        });
+    }
+
+    #[test]
+    fn fetch_inbox_archive_checkpoint_preserves_receipt_filtered_reads() {
+        with_messaging_mailbox(&[], |mailbox| {
+            let (retained_source, source_before) = seed_handled_archive_inbox(mailbox, true);
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            runtime.block_on(async {
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let history = fetch_inbox(
+                    &ctx,
+                    "/archive-receipt-loss".to_string(),
+                    "BlueLake".to_string(),
+                    None,
+                    None,
+                    Some(10),
+                    Some(true),
+                    Some(false),
+                    Some(false),
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect("checkpoint-backed history remains readable without a live DB");
+                let history: Value = serde_json::from_str(&history).unwrap();
+                assert_eq!(history.as_array().unwrap().len(), 1);
+                assert_eq!(history[0]["subject"], "Already handled");
+                assert_eq!(history[0]["read_ts"], micros_to_iso(1_000_000));
+                assert_eq!(history[0]["ack_ts"], micros_to_iso(2_000_000));
+
+                for (unread, overdue) in [(true, false), (false, true), (true, true)] {
+                    let filtered = fetch_inbox(
+                        &ctx,
+                        "/archive-receipt-loss".to_string(),
+                        "BlueLake".to_string(),
+                        None,
+                        None,
+                        Some(10),
+                        Some(true),
+                        Some(unread),
+                        Some(overdue),
+                        None,
+                        Some(true),
+                    )
+                    .await
+                    .expect("validated checkpoint authorizes receipt-filtered history");
+                    let filtered: Value = serde_json::from_str(&filtered).unwrap();
+                    assert!(
+                        filtered.as_array().unwrap().is_empty(),
+                        "preserved receipts must prevent replaying already handled mail"
+                    );
+                }
+            });
+            assert!(
+                !mailbox.database_path.exists(),
+                "reads must not promote a rebuild"
+            );
+            assert_eq!(std::fs::read(&retained_source).unwrap(), source_before);
+        });
     }
 
     #[test]

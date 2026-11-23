@@ -6110,6 +6110,7 @@ fn startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstr
         "before doctor output should identify the archive-backed reconstruct fixture:\n{reconstruct_before_text}"
     );
 
+    let reconstruct_archive_before = snapshot_tree(&reconstruct_env.storage_root.join("projects"));
     let reconstruct_startup =
         run_startup_server_once_at_with_env(&reconstruct_env_vars, &reconstruct_project_path);
     write_text_artifact(
@@ -6127,13 +6128,150 @@ fn startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstr
         reconstruct_startup.stdout, reconstruct_startup.stderr
     );
     assert!(
-        reconstruct_startup_combined.contains("Automatic mailbox reconstruction completed"),
-        "startup output should show automatic reconstruction completion:\n{reconstruct_startup_combined}"
+        !reconstruct_startup.timed_out && reconstruct_startup.exit_code == Some(1),
+        "archive-only startup must refuse before serving:\n{reconstruct_startup_combined}"
+    );
+    assert!(
+        reconstruct_startup_combined.contains("--allow-state-loss")
+            && !reconstruct_startup_combined.contains("Automatic mailbox reconstruction completed"),
+        "startup must explain the required explicit recovery decision:\n{reconstruct_startup_combined}"
     );
     assert!(
         !reconstruct_startup_combined.contains("RefCell already borrowed")
             && !reconstruct_startup_combined.contains("panicked at"),
         "startup reconstruct replay must not panic:\n{reconstruct_startup_combined}"
+    );
+    assert!(
+        !reconstruct_env.db_path.exists(),
+        "refused startup must not publish a database with lost coordination state"
+    );
+    assert_eq!(
+        snapshot_tree(&reconstruct_env.storage_root.join("projects")),
+        reconstruct_archive_before,
+        "refused startup must preserve authoritative archive evidence"
+    );
+
+    // A retry with ordinary mutation confirmation must stay refused, even
+    // though startup retained an inspectable reconstruction candidate nearby.
+    let reconstruct_refused = run_am(
+        &reconstruct_env_vars,
+        Some(&reconstruct_project_path),
+        &["doctor", "reconstruct", "--yes", "--json"],
+        None,
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_refused.json",
+        &String::from_utf8_lossy(&reconstruct_refused.stdout),
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_refused.stderr.txt",
+        &String::from_utf8_lossy(&reconstruct_refused.stderr),
+    );
+    assert_eq!(reconstruct_refused.status.code(), Some(1));
+    let reconstruct_refused_json: Value = serde_json::from_slice(&reconstruct_refused.stdout)
+        .expect("refused reconstruct must produce a structured loss disclosure");
+    assert_eq!(reconstruct_refused_json["status"], "refused");
+    assert!(reconstruct_refused_json["salvage"].is_null());
+    assert_eq!(reconstruct_refused_json["salvage_outcome"], "archive_only");
+    assert_eq!(
+        reconstruct_refused_json["recovery_checkpoint_present"],
+        false
+    );
+    assert_eq!(reconstruct_refused_json["archived_receipts"], 0);
+    assert_eq!(reconstruct_refused_json["archived_contacts"], 0);
+    assert!(reconstruct_refused_json["delivery_cursor_reset_floor"].is_null());
+    assert!(reconstruct_refused_json["recovery_state_limitations"].is_array());
+    assert_eq!(reconstruct_refused_json["requires_lossy_recovery"], true);
+    assert_eq!(reconstruct_refused_json["allow_state_loss"], false);
+    assert_eq!(reconstruct_refused_json["actions_taken"], 0);
+    assert!(
+        !reconstruct_refused_json["state_loss_risks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(Path::new(reconstruct_refused_json["candidate_path"].as_str().unwrap()).is_file());
+    assert!(!reconstruct_env.db_path.exists());
+    assert_eq!(
+        snapshot_tree(&reconstruct_env.storage_root.join("projects")),
+        reconstruct_archive_before
+    );
+
+    // Explicit operator acceptance is the recovery path for this fixture;
+    // preserve all subsequent native health, search, and transport assertions.
+    let reconstruct_operator = run_am(
+        &reconstruct_env_vars,
+        Some(&reconstruct_project_path),
+        &[
+            "doctor",
+            "reconstruct",
+            "--yes",
+            "--allow-state-loss",
+            "--json",
+        ],
+        None,
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_operator.json",
+        &String::from_utf8_lossy(&reconstruct_operator.stdout),
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_operator.stderr.txt",
+        &String::from_utf8_lossy(&reconstruct_operator.stderr),
+    );
+    assert!(
+        reconstruct_operator.status.success(),
+        "explicit archive-only recovery must succeed:\n{}",
+        String::from_utf8_lossy(&reconstruct_operator.stderr)
+    );
+    let reconstruct_operator_json: Value =
+        serde_json::from_slice(&reconstruct_operator.stdout).expect("accepted reconstruct JSON");
+    assert_eq!(reconstruct_operator_json["status"], "ok");
+    assert_eq!(reconstruct_operator_json["requires_lossy_recovery"], true);
+    assert_eq!(reconstruct_operator_json["allow_state_loss"], true);
+    assert!(reconstruct_operator_json["salvage"].is_null());
+    assert_eq!(reconstruct_operator_json["salvage_outcome"], "archive_only");
+    assert_eq!(
+        reconstruct_operator_json["recovery_checkpoint_present"],
+        false
+    );
+    assert_eq!(reconstruct_operator_json["archived_receipts"], 0);
+    assert_eq!(reconstruct_operator_json["archived_contacts"], 0);
+    assert!(reconstruct_operator_json["delivery_cursor_reset_floor"].is_null());
+    assert!(reconstruct_operator_json["recovery_state_limitations"].is_array());
+    assert!(
+        !reconstruct_operator_json["state_loss_risks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(reconstruct_operator_json["recovered"]["messages"], 1);
+    assert!(
+        String::from_utf8_lossy(&reconstruct_operator.stderr)
+            .contains("WARNING: --allow-state-loss")
+    );
+
+    let reconstruct_restart =
+        run_startup_server_once_at_with_env(&reconstruct_env_vars, &reconstruct_project_path);
+    write_text_artifact(
+        &run_root,
+        "reconstruct_restart_stdout.txt",
+        &reconstruct_restart.stdout,
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_restart_stderr.txt",
+        &reconstruct_restart.stderr,
+    );
+    assert!(
+        !reconstruct_restart.timed_out && reconstruct_restart.exit_code == Some(0),
+        "the explicitly recovered mailbox must restart successfully:\n{}\n{}",
+        reconstruct_restart.stdout,
+        reconstruct_restart.stderr
     );
 
     let reconstruct_after = run_am(
@@ -6160,7 +6298,10 @@ fn startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstr
     );
     let reconstruct_after_json: Value = serde_json::from_slice(&reconstruct_after.stdout)
         .expect("reconstruct after doctor JSON should parse");
-    assert_doctor_mailbox_recovered(&reconstruct_after_json, "after startup reconstruct");
+    assert_doctor_mailbox_recovered(
+        &reconstruct_after_json,
+        "after explicit reconstruct and restart",
+    );
 
     let reconstruct_doctor_health = run_am(
         &reconstruct_env_vars,
@@ -6346,7 +6487,18 @@ fn startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstr
                 "exit_code": reconstruct_startup.exit_code,
                 "timed_out": reconstruct_startup.timed_out,
                 "reconstruct_completed": reconstruct_startup_combined.contains("Automatic mailbox reconstruction completed"),
+                "state_loss_refused": reconstruct_startup_combined.contains("--allow-state-loss"),
                 "refcell_panic_seen": reconstruct_startup_combined.contains("RefCell already borrowed"),
+            },
+            "reconstruct_operator": {
+                "exit_code": reconstruct_operator.status.code(),
+                "requires_lossy_recovery": reconstruct_operator_json["requires_lossy_recovery"],
+                "allow_state_loss": reconstruct_operator_json["allow_state_loss"],
+                "state_loss_risks": reconstruct_operator_json["state_loss_risks"],
+            },
+            "reconstruct_restart": {
+                "exit_code": reconstruct_restart.exit_code,
+                "timed_out": reconstruct_restart.timed_out,
             },
             "doctor": {
                 "before_healthy": before_json.get("healthy").and_then(Value::as_bool),
@@ -10002,6 +10154,14 @@ fn check_reconstruct_preview_reservations(ambiguous_source: bool, check_reseed: 
             )
         });
         assert_eq!(repaired_json["status"], "ok");
+        assert_eq!(repaired_json["salvage"]["status"], "ok");
+        for disclosure in [&preview_json, &repaired_json] {
+            assert_eq!(disclosure["salvage_outcome"], "merged");
+            assert_eq!(disclosure["requires_lossy_recovery"], false);
+            assert_eq!(disclosure["allow_state_loss"], false);
+            assert_eq!(disclosure["state_loss_risks"], json!([]));
+            assert!(disclosure["recovery_state_limitations"].is_array());
+        }
         assert!(
             String::from_utf8_lossy(&repaired.stderr)
                 .contains("Reconstructing database from archive at"),

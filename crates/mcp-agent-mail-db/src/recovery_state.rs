@@ -24,9 +24,11 @@ const MANIFEST_FILE: &str = "active.json";
 const BASELINE_FILE: &str = "baseline.jsonl";
 const SUPERSEDED_FILE: &str = "superseded.json";
 const LOCK_FILE: &str = ".state.lock";
+const READ_REVISION_FILE: &str = "read-revision.json";
 const SCHEMA_VERSION: u32 = 1;
 const BATCH_ROWS: usize = 256;
 const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_READ_REVISION_BYTES: u64 = 4096;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const ERROR_PREFIX: &str = "archive recovery state ";
 
@@ -35,8 +37,8 @@ static PENDING_ARCHIVE_PATHS: LazyLock<Mutex<BTreeMap<PathBuf, BTreeSet<String>>
 
 /// Hand completed state artifacts to the normal Git commit coalescer.
 ///
-/// Durable files remain recoverable if the process exits before this hint drains.
-/// Startup requeues the active generation from disk.
+/// Durable files remain recoverable even if the process exits before this hint drains;
+/// startup requeues the active generation without trusting an in-memory queue.
 pub fn note_pending_archive_paths(root: &Path, paths: impl IntoIterator<Item = String>) {
     let mut pending = PENDING_ARCHIVE_PATHS
         .lock()
@@ -120,6 +122,25 @@ pub struct Manifest {
     pub contacts: u64,
 }
 
+/// Opaque, bounded witness for reusing an archive read snapshot. Equality
+/// binds the completed publication token to its exact active checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryReadWitness {
+    manifest: Manifest,
+    revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadRevision {
+    schema_version: u32,
+    generation: String,
+    revision: String,
+    /// None invalidates old snapshots before any journal record can change.
+    /// An interrupted publication stays uncacheable until a successful retry.
+    manifest: Option<Manifest>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RecordDocument {
     schema_version: u32,
@@ -133,10 +154,12 @@ fn state_error(context: &str, error: impl std::fmt::Display) -> DbError {
     ))
 }
 
-/// Identify a failed durable recovery publication.
+/// Distinguish failed durable recovery publication from an ordinary best-effort
+/// database operation.
 ///
-/// The receipt may already have committed. After restoring archive access,
-/// retry the read or ACK to publish the original receipt timestamps.
+/// The database receipt may already have committed: after
+/// archive access is repaired, explicitly retry its read or ACK to finish
+/// publication without replacing the original receipt timestamps.
 #[must_use]
 pub fn is_publication_error(error: &DbError) -> bool {
     matches!(error, DbError::Internal(message) if message.starts_with(ERROR_PREFIX))
@@ -236,6 +259,14 @@ fn read_json<T: serde::de::DeserializeOwned>(
     directory: &JournalDirectory,
     name: &str,
 ) -> DbResult<Option<T>> {
+    read_json_bounded(directory, name, MAX_RECORD_BYTES)
+}
+
+fn read_json_bounded<T: serde::de::DeserializeOwned>(
+    directory: &JournalDirectory,
+    name: &str,
+    limit: u64,
+) -> DbResult<Option<T>> {
     let mut file = match directory.open_file(name, JournalFileMode::Read) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -243,10 +274,10 @@ fn read_json<T: serde::de::DeserializeOwned>(
     };
     let mut bytes = Vec::new();
     std::io::Read::by_ref(&mut file)
-        .take(MAX_RECORD_BYTES + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| state_error("read", error))?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
+    if bytes.len() as u64 > limit {
         return Err(state_error("read", "record exceeds bounded size limit"));
     }
     directory
@@ -280,6 +311,110 @@ fn read_manifest(directory: &JournalDirectory) -> DbResult<Option<Manifest>> {
         validate_manifest(manifest)?;
     }
     Ok(manifest)
+}
+
+fn read_revision(directory: &JournalDirectory) -> DbResult<Option<ReadRevision>> {
+    let revision =
+        read_json_bounded::<ReadRevision>(directory, READ_REVISION_FILE, MAX_READ_REVISION_BYTES)?;
+    if let Some(revision) = &revision {
+        generation_directory(&revision.generation)?;
+        generation_directory(&revision.revision)?;
+        if revision.schema_version != SCHEMA_VERSION {
+            return Err(state_error("read revision", "unsupported schema version"));
+        }
+        if let Some(manifest) = &revision.manifest {
+            validate_manifest(manifest)?;
+            if manifest.generation != revision.generation {
+                return Err(state_error(
+                    "read revision",
+                    "checkpoint generation mismatch",
+                ));
+            }
+        }
+    }
+    Ok(revision)
+}
+
+/// Read a constant-size cache witness without changing files or walking
+/// journal history.
+///
+/// A missing revision (older archives) or pending publication
+/// returns `None`: callers may rebuild for inspection but must not reuse a
+/// cached receipt snapshot. Malformed, unreadable or mismatched metadata is an
+/// error, never evidence that a previously cached snapshot remains current.
+pub fn read_revision_witness(root: &Path) -> DbResult<Option<RecoveryReadWitness>> {
+    let directory = match JournalDirectory::open(root, DIRECTORY, false) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(state_error("read revision directory", error)),
+    };
+    let Some(before) = read_revision(&directory)? else {
+        return Ok(None);
+    };
+    let Some(expected_manifest) = &before.manifest else {
+        return Ok(None);
+    };
+    let manifest =
+        read_json_bounded::<Manifest>(&directory, MANIFEST_FILE, MAX_READ_REVISION_BYTES)?
+            .ok_or_else(|| state_error("read revision", "active checkpoint is missing"))?;
+    validate_manifest(&manifest)?;
+    if read_revision(&directory)?.as_ref() != Some(&before) {
+        return Ok(None);
+    }
+    if &manifest != expected_manifest {
+        return Err(state_error(
+            "read revision",
+            "active checkpoint differs from the completed publication",
+        ));
+    }
+    Ok(Some(RecoveryReadWitness {
+        manifest,
+        revision: before.revision,
+    }))
+}
+
+fn write_revision(state: &LockedState, revision: &ReadRevision) -> DbResult<()> {
+    state.validate()?;
+    let bytes =
+        serde_json::to_vec(revision).map_err(|error| state_error("read revision encode", error))?;
+    state
+        .directory
+        .atomic_write(READ_REVISION_FILE, |file| file.write_all(&bytes))
+        .map_err(|error| state_error("read revision publication", error))?;
+    state.validate()
+}
+
+fn with_read_revision<T>(
+    state: &LockedState,
+    root: &Path,
+    generation: &str,
+    publish: impl FnOnce() -> DbResult<T>,
+) -> DbResult<T> {
+    // Validate existing authority before writing even an invalidation marker.
+    // In particular, a malformed manifest must retain its original evidence.
+    let active = read_manifest(&state.directory)?;
+    validate_checkpoint_generation(state, generation, active.as_ref())?;
+    let mut revision = ReadRevision {
+        schema_version: SCHEMA_VERSION,
+        generation: generation.to_string(),
+        revision: mcp_agent_mail_core::setup::generate_token()
+            .map_err(|error| state_error("read revision token", error))?,
+        manifest: None,
+    };
+    write_revision(state, &revision)?;
+    let result = publish()?;
+    let manifest = read_manifest(&state.directory)?
+        .ok_or_else(|| state_error("read revision", "publication has no active checkpoint"))?;
+    if manifest.generation != generation {
+        return Err(state_error(
+            "read revision",
+            "publication changed the active database generation",
+        ));
+    }
+    revision.manifest = Some(manifest);
+    write_revision(state, &revision)?;
+    note_pending_archive_paths(root, [format!("{DIRECTORY}/{READ_REVISION_FILE}")]);
+    Ok(result)
 }
 
 fn project(row: &Row, prefix: &str) -> DbResult<ProjectIdentity> {
@@ -405,8 +540,10 @@ fn record_name(record: &RecoveryRecord) -> DbResult<String> {
         ),
     };
     let identity = identity.map_err(|error| state_error("record identity", error))?;
-    let digest = hex::encode(Sha256::digest(identity));
-    Ok(format!("{kind}-{digest}.json"))
+    Ok(format!(
+        "{kind}-{}.json",
+        hex::encode(Sha256::digest(identity))
+    ))
 }
 
 fn validate_document(document: &RecordDocument, generation: &str) -> DbResult<()> {
@@ -700,25 +837,24 @@ fn publish_checkpoint(
     .map_err(|error| state_error("baseline snapshot", error))
 }
 
-fn checkpoint_locked(
+fn validate_checkpoint_generation(
     state: &LockedState,
-    conn: &impl SyncQuery,
-    root: &Path,
     generation: &str,
-) -> DbResult<Manifest> {
-    let active = read_manifest(&state.directory)?;
-    if let Some(manifest) = active.as_ref()
-        && manifest.generation == generation
-    {
-        // The baseline was atomically completed before this marker. Hot writes
-        // do not scan mailbox history or fsync an unchanged checkpoint.
-        state
-            .generation(generation, false)?
-            .open_file(BASELINE_FILE, JournalFileMode::Read)
-            .map_err(|error| state_error("active baseline", error))?;
-        return Ok(manifest.clone());
+    active: Option<&Manifest>,
+) -> DbResult<()> {
+    if active.is_some_and(|manifest| manifest.generation == generation) {
+        return Ok(());
     }
-    let directory = state.generation(generation, true)?;
+    state.validate()?;
+    let directory = match JournalDirectory::open(
+        &state.directory.directory_path(),
+        &generation_directory(generation)?,
+        false,
+    ) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(state_error("generation directory", error)),
+    };
     if read_json::<Manifest>(&directory, SUPERSEDED_FILE)?.is_some() {
         return Err(state_error(
             "checkpoint",
@@ -739,6 +875,29 @@ fn checkpoint_locked(
             ));
         }
     }
+    Ok(())
+}
+
+fn checkpoint_locked(
+    state: &LockedState,
+    conn: &impl SyncQuery,
+    root: &Path,
+    generation: &str,
+) -> DbResult<Manifest> {
+    let active = read_manifest(&state.directory)?;
+    if let Some(manifest) = active.as_ref()
+        && manifest.generation == generation
+    {
+        // The baseline was atomically completed before this marker. Hot writes
+        // do not scan mailbox history or fsync an unchanged checkpoint.
+        state
+            .generation(generation, false)?
+            .open_file(BASELINE_FILE, JournalFileMode::Read)
+            .map_err(|error| state_error("active baseline", error))?;
+        return Ok(manifest.clone());
+    }
+    validate_checkpoint_generation(state, generation, active.as_ref())?;
+    let directory = state.generation(generation, true)?;
     if let Some(previous) = active {
         // Record previous activation before changing active.json. An orphan
         // baseline created by an interrupted first publication has no such
@@ -785,53 +944,58 @@ fn checkpoint_locked(
 pub fn ensure_checkpoint(conn: &impl SyncQuery, root: &Path) -> DbResult<Manifest> {
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    let manifest = checkpoint_locked(&state, conn, root, &generation)?;
-    // Startup verifies pre-existing metadata too. Incremental publishers call
-    // checkpoint_locked directly and never rescan history on the hot path.
-    if visit_records(root, |_| Ok(()))?.as_ref() != Some(&manifest) {
-        return Err(state_error(
-            "startup checkpoint",
-            "completed generation disappeared during validation",
-        ));
-    }
-    queue_superseded_generations(&state, root)?;
-    let directory = state.generation(&generation, false)?;
-    note_pending_archive_paths(
-        root,
-        [
-            format!("{DIRECTORY}/{MANIFEST_FILE}"),
-            format!(
-                "{DIRECTORY}/{}/{BASELINE_FILE}",
-                generation_directory(&generation)?
-            ),
-        ],
-    );
-    for entry in std::fs::read_dir(directory.directory_path())
-        .map_err(|error| state_error("publication inventory", error))?
-    {
-        let name = entry
-            .map_err(|error| state_error("publication inventory", error))?
-            .file_name();
-        let Some(name) = name.to_str() else {
+    with_read_revision(&state, root, &generation, || {
+        let manifest = checkpoint_locked(&state, conn, root, &generation)?;
+        // Startup verifies pre-existing metadata too. Incremental publishers call
+        // checkpoint_locked directly and never rescan history on the hot path.
+        if visit_records(root, |_| Ok(()))?.as_ref() != Some(&manifest) {
             return Err(state_error(
-                "publication inventory",
-                "non-UTF-8 recovery filename",
+                "startup checkpoint",
+                "completed generation disappeared during validation",
             ));
-        };
-        if (name.starts_with("receipt-") || name.starts_with("contact-"))
-            && Path::new(name).extension().is_some_and(|ext| ext == "json")
-        {
-            note_pending_archive_paths(
-                root,
-                [format!(
-                    "{DIRECTORY}/{}/{name}",
-                    generation_directory(&generation)?
-                )],
-            );
         }
-    }
-    state.validate()?;
-    Ok(manifest)
+        queue_superseded_generations(&state, root)?;
+        let directory = state.generation(&generation, false)?;
+        note_pending_archive_paths(
+            root,
+            [
+                format!("{DIRECTORY}/{MANIFEST_FILE}"),
+                format!(
+                    "{DIRECTORY}/{}/{BASELINE_FILE}",
+                    generation_directory(&generation)?
+                ),
+            ],
+        );
+        for entry in std::fs::read_dir(directory.directory_path())
+            .map_err(|error| state_error("publication inventory", error))?
+        {
+            let name = entry
+                .map_err(|error| state_error("publication inventory", error))?
+                .file_name();
+            let Some(name) = name.to_str() else {
+                return Err(state_error(
+                    "publication inventory",
+                    "non-UTF-8 recovery filename",
+                ));
+            };
+            // Recovery filenames are a case-sensitive on-disk schema. A
+            // differently cased extension is not a canonical record.
+            #[allow(clippy::case_sensitive_file_extension_comparisons)]
+            if (name.starts_with("receipt-") || name.starts_with("contact-"))
+                && name.ends_with(".json")
+            {
+                note_pending_archive_paths(
+                    root,
+                    [format!(
+                        "{DIRECTORY}/{}/{name}",
+                        generation_directory(&generation)?
+                    )],
+                );
+            }
+        }
+        state.validate()?;
+        Ok(manifest)
+    })
 }
 
 fn queue_superseded_generations(state: &LockedState, root: &Path) -> DbResult<()> {
@@ -872,8 +1036,8 @@ pub fn checkpoint_all(conn: &impl SyncQuery, root: &Path) -> DbResult<Manifest> 
 
 /// Bind a Git commit's manifest and baseline to the same active generation.
 ///
-/// The storage publisher holds its own archive locks outside this function.
-/// State writers only enqueue paths and never call back into Git while locked.
+/// The storage publisher holds its own archive locks outside this function;
+/// state writers only enqueue paths and never call back into Git while locked.
 pub fn with_archive_publication<T>(
     root: &Path,
     pending: &[String],
@@ -907,6 +1071,9 @@ pub fn with_archive_publication<T>(
             generation_directory(&manifest.generation)?
         ));
     }
+    if read_revision(&state.directory)?.is_some() {
+        paths.insert(format!("{DIRECTORY}/{READ_REVISION_FILE}"));
+    }
     let result = publish(&paths.into_iter().collect::<Vec<_>>())?;
     state.validate()?;
     Ok(result)
@@ -925,35 +1092,37 @@ pub fn persist_receipts(
     }
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    checkpoint_locked(&state, conn, root, &generation)?;
-    let directory = state.generation(&generation, true)?;
-    crate::sync::with_read_snapshot(conn, || {
-        for shared in [false, true] {
-            for ids in message_ids.chunks(BATCH_ROWS) {
-                let placeholders = std::iter::repeat_n("?", ids.len())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let sql = format!(
-                    "{} WHERE r.agent_id = ? AND r.message_id IN ({placeholders}) \
+    with_read_revision(&state, root, &generation, || {
+        checkpoint_locked(&state, conn, root, &generation)?;
+        let directory = state.generation(&generation, true)?;
+        crate::sync::with_read_snapshot(conn, || {
+            for shared in [false, true] {
+                for ids in message_ids.chunks(BATCH_ROWS) {
+                    let placeholders = std::iter::repeat_n("?", ids.len())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let sql = format!(
+                        "{} WHERE r.agent_id = ? AND r.message_id IN ({placeholders}) \
                      AND (r.read_ts IS NOT NULL OR r.ack_ts IS NOT NULL)",
-                    receipt_select(shared),
-                );
-                let mut params = vec![Value::BigInt(agent_id)];
-                params.extend(ids.iter().copied().map(Value::BigInt));
-                for row in query(conn, &sql, &params)? {
-                    write_record(
-                        root,
-                        &directory,
-                        &generation,
-                        RecoveryRecord::Receipt(receipt(&row, shared)?),
-                    )?;
+                        receipt_select(shared),
+                    );
+                    let mut params = vec![Value::BigInt(agent_id)];
+                    params.extend(ids.iter().copied().map(Value::BigInt));
+                    for row in query(conn, &sql, &params)? {
+                        write_record(
+                            root,
+                            &directory,
+                            &generation,
+                            RecoveryRecord::Receipt(receipt(&row, shared)?),
+                        )?;
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
+        .map_err(|error| state_error("receipt snapshot", error))?;
+        state.validate()
     })
-    .map_err(|error| state_error("receipt snapshot", error))?;
-    state.validate()
 }
 
 /// Reconcile all committed receipts for one project's bulk mark-read operation.
@@ -969,46 +1138,48 @@ pub fn persist_project_receipts(
 ) -> DbResult<()> {
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    checkpoint_locked(&state, conn, root, &generation)?;
-    let directory = state.generation(&generation, true)?;
-    crate::sync::with_read_snapshot(conn, || {
-        for shared in [false, true] {
-            let mut last_message = i64::MIN;
-            loop {
-                let sql = format!(
-                    "{} WHERE r.agent_id = ? AND m.project_id = ? AND r.message_id > ? \
+    with_read_revision(&state, root, &generation, || {
+        checkpoint_locked(&state, conn, root, &generation)?;
+        let directory = state.generation(&generation, true)?;
+        crate::sync::with_read_snapshot(conn, || {
+            for shared in [false, true] {
+                let mut last_message = i64::MIN;
+                loop {
+                    let sql = format!(
+                        "{} WHERE r.agent_id = ? AND m.project_id = ? AND r.message_id > ? \
                      AND (r.read_ts IS NOT NULL OR r.ack_ts IS NOT NULL) \
                      ORDER BY r.message_id LIMIT {BATCH_ROWS}",
-                    receipt_select(shared),
-                );
-                let rows = query(
-                    conn,
-                    &sql,
-                    &[
-                        Value::BigInt(agent_id),
-                        Value::BigInt(project_id),
-                        Value::BigInt(last_message),
-                    ],
-                )?;
-                if rows.is_empty() {
-                    break;
-                }
-                for row in &rows {
-                    let receipt = receipt(row, shared)?;
-                    last_message = receipt.message_id;
-                    write_record(
-                        root,
-                        &directory,
-                        &generation,
-                        RecoveryRecord::Receipt(receipt),
+                        receipt_select(shared),
+                    );
+                    let rows = query(
+                        conn,
+                        &sql,
+                        &[
+                            Value::BigInt(agent_id),
+                            Value::BigInt(project_id),
+                            Value::BigInt(last_message),
+                        ],
                     )?;
+                    if rows.is_empty() {
+                        break;
+                    }
+                    for row in &rows {
+                        let receipt = receipt(row, shared)?;
+                        last_message = receipt.message_id;
+                        write_record(
+                            root,
+                            &directory,
+                            &generation,
+                            RecoveryRecord::Receipt(receipt),
+                        )?;
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
+        .map_err(|error| state_error("bulk receipt snapshot", error))?;
+        state.validate()
     })
-    .map_err(|error| state_error("bulk receipt snapshot", error))?;
-    state.validate()
 }
 
 /// Publish the current contact decision, reread while holding the publication
@@ -1022,32 +1193,34 @@ pub fn persist_contact(
 ) -> DbResult<()> {
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    checkpoint_locked(&state, conn, root, &generation)?;
-    let directory = state.generation(&generation, true)?;
-    crate::sync::with_read_snapshot(conn, || {
-        let rows = query(
-            conn,
-            &format!("{CONTACT_SELECT} WHERE l.a_agent_id = ? AND l.b_agent_id = ?"),
-            &[Value::BigInt(from_agent_id), Value::BigInt(to_agent_id)],
-        )?;
-        if rows.is_empty() {
-            return Err(state_error(
-                "contact publication",
-                "committed contact row is absent",
-            ));
-        }
-        for row in &rows {
-            write_record(
-                root,
-                &directory,
-                &generation,
-                RecoveryRecord::Contact(contact(row)?),
+    with_read_revision(&state, root, &generation, || {
+        checkpoint_locked(&state, conn, root, &generation)?;
+        let directory = state.generation(&generation, true)?;
+        crate::sync::with_read_snapshot(conn, || {
+            let rows = query(
+                conn,
+                &format!("{CONTACT_SELECT} WHERE l.a_agent_id = ? AND l.b_agent_id = ?"),
+                &[Value::BigInt(from_agent_id), Value::BigInt(to_agent_id)],
             )?;
-        }
-        Ok(())
+            if rows.is_empty() {
+                return Err(state_error(
+                    "contact publication",
+                    "committed contact row is absent",
+                ));
+            }
+            for row in &rows {
+                write_record(
+                    root,
+                    &directory,
+                    &generation,
+                    RecoveryRecord::Contact(contact(row)?),
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|error| state_error("contact snapshot", error))?;
+        state.validate()
     })
-    .map_err(|error| state_error("contact snapshot", error))?;
-    state.validate()
 }
 
 fn checked_baseline(generation: &JournalDirectory, manifest: &Manifest) -> DbResult<File> {
@@ -1055,7 +1228,7 @@ fn checked_baseline(generation: &JournalDirectory, manifest: &Manifest) -> DbRes
         .open_file(BASELINE_FILE, JournalFileMode::Read)
         .map_err(|error| state_error("baseline open", error))?;
     let mut digest = Sha256::new();
-    let mut buffer = vec![0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024].into_boxed_slice();
     loop {
         let size = baseline
             .read(&mut buffer)
@@ -1168,10 +1341,11 @@ fn visit_incremental_records(
     Ok(())
 }
 
-/// Visit the active generation's checked baseline, then its per-key updates.
+/// Visit the checked baseline first, followed by per-key updates from its one
+/// active generation.
 ///
-/// Missing legacy metadata returns `None`. Malformed or incomplete metadata
-/// causes recovery to return an error.
+/// Missing legacy metadata is `None`; malformed or incomplete
+/// metadata is an error and must never be promoted as a successful recovery.
 pub fn visit_records(
     root: &Path,
     mut visit: impl FnMut(RecoveryRecord) -> DbResult<()>,
@@ -1246,6 +1420,177 @@ mod tests {
         .unwrap()
         .unwrap();
         (manifest, records)
+    }
+
+    #[test]
+    fn read_revision_tracks_checkpoint_and_each_writer_without_git_publication() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(read_revision_witness(root.path()).unwrap(), None);
+        assert!(!root.path().join(DIRECTORY).exists());
+        let conn = database();
+        let baseline = ensure_checkpoint(&conn, root.path()).unwrap();
+        let mut previous = read_revision_witness(root.path()).unwrap().unwrap();
+        assert_eq!(previous.manifest, baseline);
+        assert_eq!(
+            read_revision_witness(root.path()).unwrap().as_ref(),
+            Some(&previous),
+            "read-only witness probes do not invalidate a snapshot"
+        );
+        assert_eq!(ensure_checkpoint(&conn, root.path()).unwrap(), baseline);
+        let next = read_revision_witness(root.path()).unwrap().unwrap();
+        assert_ne!(next, previous, "successful checkpoint has a fresh revision");
+        previous = next;
+
+        conn.execute_raw("UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41")
+            .unwrap();
+        persist_receipts(&conn, root.path(), 29, &[41]).unwrap();
+        let next = read_revision_witness(root.path()).unwrap().unwrap();
+        assert_ne!(
+            next, previous,
+            "direct receipt publication invalidates readers"
+        );
+        previous = next;
+        conn.execute_raw("UPDATE project_mailbox_receipts SET ack_ts = 555 WHERE message_id = 52")
+            .unwrap();
+        persist_project_receipts(&conn, root.path(), 19, 29).unwrap();
+        let next = read_revision_witness(root.path()).unwrap().unwrap();
+        assert_ne!(
+            next, previous,
+            "bulk receipt publication invalidates readers"
+        );
+        previous = next;
+        conn.execute_raw("UPDATE agent_links SET status = 'blocked', updated_ts = 7 WHERE id = 93")
+            .unwrap();
+        persist_contact(&conn, root.path(), 17, 29).unwrap();
+        let next = read_revision_witness(root.path()).unwrap().unwrap();
+        assert_ne!(next, previous, "contact publication invalidates readers");
+        assert_eq!(next.manifest, baseline);
+        assert!(!root.path().join(".git").exists());
+        assert!(
+            std::fs::metadata(root.path().join(DIRECTORY).join(READ_REVISION_FILE))
+                .unwrap()
+                .len()
+                < MAX_READ_REVISION_BYTES
+        );
+    }
+
+    #[test]
+    fn read_revision_stays_uncacheable_after_partial_publication_until_retry() {
+        struct FailShared<'a>(&'a crate::CanonicalDbConn);
+        impl SyncQuery for FailShared<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<Row>, sqlmodel_core::Error> {
+                if sql.contains("FROM project_mailbox_receipts r") {
+                    return Err(sqlmodel_core::Error::Custom(
+                        "injected shared receipt read failure".to_string(),
+                    ));
+                }
+                self.0.query_sync(sql, params)
+            }
+
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.0.execute_raw(sql)
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        let before = read_revision_witness(root.path()).unwrap().unwrap();
+        conn.execute_raw("UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41")
+            .unwrap();
+        let failure = persist_receipts(&FailShared(&conn), root.path(), 29, &[41]).unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("injected shared receipt read failure")
+        );
+        assert_eq!(read_revision_witness(root.path()).unwrap(), None);
+        let directory = JournalDirectory::open(root.path(), DIRECTORY, false).unwrap();
+        let pending = read_revision(&directory).unwrap().unwrap();
+        assert!(pending.manifest.is_none());
+        assert_ne!(pending.revision, before.revision);
+        assert!(records(root.path()).1.iter().any(|record| matches!(record,
+            RecoveryRecord::Receipt(receipt) if receipt.message_id == 41 && receipt.ack_ts == Some(444)
+        )), "the failure follows an actual durable per-key record change");
+        with_archive_publication(root.path(), &[], |paths| {
+            assert!(paths.contains(&format!("{DIRECTORY}/{READ_REVISION_FILE}")));
+            Ok(())
+        })
+        .unwrap();
+
+        persist_receipts(&conn, root.path(), 29, &[41]).unwrap();
+        let after = read_revision_witness(root.path()).unwrap().unwrap();
+        assert_ne!(after.revision, pending.revision);
+        assert_ne!(after, before);
+    }
+
+    #[test]
+    fn read_revision_refuses_malformed_oversized_and_mismatched_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        let directory = JournalDirectory::open(root.path(), DIRECTORY, false).unwrap();
+        let current = read_revision(&directory).unwrap().unwrap();
+        for bytes in [
+            b"malformed revision".to_vec(),
+            vec![b' '; usize::try_from(MAX_READ_REVISION_BYTES + 1).unwrap()],
+            serde_json::to_vec(&ReadRevision {
+                generation: "different-generation".to_string(),
+                ..current.clone()
+            })
+            .unwrap(),
+        ] {
+            directory
+                .atomic_write(READ_REVISION_FILE, |file| file.write_all(&bytes))
+                .unwrap();
+            assert!(read_revision_witness(root.path()).is_err());
+            assert_eq!(
+                std::fs::read(root.path().join(DIRECTORY).join(READ_REVISION_FILE)).unwrap(),
+                bytes,
+                "a read probe must preserve malformed revision evidence"
+            );
+        }
+        directory
+            .atomic_write(READ_REVISION_FILE, |file| {
+                file.write_all(&serde_json::to_vec(&current).unwrap())
+            })
+            .unwrap();
+        let mut mismatched = current.manifest.clone().unwrap();
+        mismatched.contacts += 1;
+        directory
+            .atomic_write(MANIFEST_FILE, |file| {
+                file.write_all(&serde_json::to_vec(&mismatched).unwrap())
+            })
+            .unwrap();
+        let failure = read_revision_witness(root.path()).unwrap_err();
+        assert!(failure.to_string().contains("active checkpoint differs"));
+    }
+
+    #[test]
+    fn older_checkpoints_remain_inspectable_without_a_cache_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        let manifest = ensure_checkpoint(&conn, root.path()).unwrap();
+        std::fs::rename(
+            root.path().join(DIRECTORY).join(READ_REVISION_FILE),
+            root.path().join("held-read-revision.json"),
+        )
+        .unwrap();
+        assert_eq!(read_revision_witness(root.path()).unwrap(), None);
+        assert_eq!(records(root.path()).0, manifest);
+        assert!(
+            !root
+                .path()
+                .join(DIRECTORY)
+                .join(READ_REVISION_FILE)
+                .exists()
+        );
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        assert!(read_revision_witness(root.path()).unwrap().is_some());
     }
 
     #[test]
@@ -1632,6 +1977,12 @@ mod tests {
                 .exists()
         );
         assert!(visit_records(incomplete.path(), |_| Ok(())).is_err());
+        assert_eq!(read_revision_witness(incomplete.path()).unwrap(), None);
+        corrupt_db
+            .execute_raw("INSERT INTO projects VALUES (7, 'sender-project', '/work/sender')")
+            .unwrap();
+        ensure_checkpoint(&corrupt_db, incomplete.path()).unwrap();
+        assert!(read_revision_witness(incomplete.path()).unwrap().is_some());
     }
 
     #[test]
@@ -1652,6 +2003,7 @@ mod tests {
             )
             .unwrap();
         let new = ensure_checkpoint(&replacement, root.path()).unwrap();
+        let replacement_revision = read_revision_witness(root.path()).unwrap();
         assert_ne!(old.generation, new.generation);
         let (_, restored) = records(root.path());
         assert!(restored.iter().all(|record| matches!(
@@ -1667,6 +2019,11 @@ mod tests {
         assert!(
             ensure_checkpoint(&first, root.path()).is_err(),
             "a stale database cannot silently reactivate superseded state"
+        );
+        assert_eq!(
+            read_revision_witness(root.path()).unwrap(),
+            replacement_revision,
+            "a superseded writer must not invalidate the active generation"
         );
     }
 
@@ -1709,9 +2066,33 @@ mod tests {
         with_archive_publication(root.path(), &[old_path], |paths| {
             assert!(paths.contains(&expected));
             assert!(paths.contains(&format!("{DIRECTORY}/{MANIFEST_FILE}")));
+            assert!(paths.contains(&format!("{DIRECTORY}/{READ_REVISION_FILE}")));
             Ok(())
         })
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_revision_symlink_refuses_reads_and_writes_without_touching_target() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        let revision = root.path().join(DIRECTORY).join(READ_REVISION_FILE);
+        std::fs::rename(&revision, root.path().join("held-read-revision.json")).unwrap();
+        let outside = root.path().join("outside-revision-evidence");
+        std::fs::write(&outside, b"preserve unrelated evidence").unwrap();
+        std::os::unix::fs::symlink(&outside, &revision).unwrap();
+        assert!(read_revision_witness(root.path()).is_err());
+        let before = records(root.path());
+        conn.execute_raw("UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41")
+            .unwrap();
+        assert!(persist_receipts(&conn, root.path(), 29, &[41]).is_err());
+        assert_eq!(records(root.path()), before);
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"preserve unrelated evidence"
+        );
     }
 
     #[cfg(unix)]

@@ -8707,6 +8707,36 @@ fn archive_has_real_projects(storage_root: &Path) -> bool {
         })
 }
 
+/// An absent project archive does not prove a new mailbox when coordination
+/// recovery evidence survives. Refuse before opening a fresh database, whose
+/// startup checkpoint would supersede that evidence with an empty generation.
+#[allow(clippy::result_large_err)]
+fn refuse_fresh_initialization_with_recovery_evidence(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<(), SqlError> {
+    if has_quarantined_primary_artifact(primary_path) {
+        return Err(SqlError::Custom(format!(
+            "database file {} is missing but quarantined recovery artifact(s) exist; refusing blank reinitialization without operator action",
+            primary_path.display()
+        )));
+    }
+    let recovery_state = storage_root.join(crate::recovery_state::DIRECTORY);
+    match std::fs::symlink_metadata(&recovery_state) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SqlError::Custom(format!(
+            "cannot prove archive recovery-state evidence is absent at {}: {error}; refusing fresh initialization for {}",
+            recovery_state.display(),
+            primary_path.display()
+        ))),
+        Ok(_) => Err(SqlError::Custom(format!(
+            "database file {} is missing but archive recovery-state evidence exists at {}; refusing fresh initialization that could supersede its checkpoint or cursor witness. Restore a verified backup or inspect `am doctor reconstruct --dry-run`",
+            primary_path.display(),
+            recovery_state.display()
+        ))),
+    }
+}
+
 #[must_use]
 pub fn archive_storage_root_is_authoritative_for_sqlite_path(
     storage_root: &Path,
@@ -8852,6 +8882,9 @@ fn reconcile_archive_state_before_init_with_owner(
     }
 
     if !archive_has_real_projects(storage_root) {
+        if !path_is_occupied(primary_path) {
+            refuse_fresh_initialization_with_recovery_evidence(primary_path, storage_root)?;
+        }
         return Ok(false);
     }
 
@@ -20275,15 +20308,24 @@ where
         }
         None => crate::reconstruct::reconstruct_from_archive(&candidate_path, storage_root),
     };
+    // GH#404: a readable candidate alone does not prove recovery of receipts,
+    // contacts, identities, or issued delivery cursors. Require completed
+    // salvage or a validated checkpoint with a recorded cursor ceiling before
+    // automatic recovery can replace the source generation. Route refusals
+    // through the ordinary failed-candidate preservation path.
+    let reconstruct_result = reconstruct_result.and_then(|stats| {
+        stats.require_recovery_state()?;
+        Ok(stats)
+    });
 
     if let Ok(stats) = &reconstruct_result
-        && !stats.recovery_checkpoint_present
-        && !stats.recovery_state_from_salvage
+        && !stats.recovery_state_limitations().is_empty()
     {
-        tracing::error!(
+        tracing::warn!(
             primary = %primary_path.display(),
             candidate = %candidate_path.display(),
-            "ARCHIVE-ONLY RECOVERY STATE LOSS: this legacy archive has no completed recovery-state checkpoint; historical read/ack receipts and contact links are unavailable. Restore a healthy backup to retain them. Delivery cursor continuity is not guaranteed without an archived ceiling."
+            limitations = ?stats.recovery_state_limitations(),
+            "archive checkpoint protects recorded mail state; unarchived database state still requires salvage or a backup"
         );
     }
 
@@ -21479,14 +21521,23 @@ fn ensure_sqlite_file_healthy_inner_with_timeout(
     )))
 }
 
-/// Like [`ensure_sqlite_file_healthy`], but attempts to reconstruct the
-/// database from the Git archive before falling back to a blank reinitialize.
+/// Like [`ensure_sqlite_file_healthy`], but uses the authoritative Git archive
+/// when recovery cannot restore a healthy backup.
+///
+/// Automatic reconstruction
+/// requires complete readable salvage or a validated recovery checkpoint with
+/// a recorded cursor ceiling. A candidate without this authority is retained
+/// for inspection and refused promotion.
 ///
 /// Recovery priority:
 /// 1. The freshest healthy exact `.bak` or published `.bak.*` backup file
 ///    (never a historical `.backup-*` generation or lone `.recovery` main)
-/// 2. Git archive reconstruction (recovers messages + agents)
-/// 3. Blank reinitialization (empty database)
+/// 2. Git archive reconstruction with complete salvage or checkpoint authority
+///
+/// A missing primary with no recovery evidence and no archived projects may
+/// proceed to normal fresh initialization. Failed archive recovery never falls
+/// through to blank reinitialization; state loss requires an explicit operator
+/// decision through `am doctor reconstruct --allow-state-loss --yes`.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::result_large_err)]
 pub fn ensure_sqlite_file_healthy_with_archive(
@@ -21523,8 +21574,14 @@ pub fn ensure_sqlite_file_healthy_with_archive(
             return reconcile_archive_state_keeping_healthy_primary(primary_path, storage_root);
         }
     } else if find_healthy_backup(primary_path).is_none()
-        && (!is_real_directory(storage_root) || !is_real_directory(&storage_root.join("projects")))
+        && (!is_real_directory(storage_root)
+            || !is_real_directory(&storage_root.join("projects"))
+            || std::fs::read_dir(storage_root.join("projects"))
+                .is_ok_and(|mut projects| projects.next().is_none()))
     {
+        // An absent primary and a provably empty archive still permit normal
+        // first initialization. An unreadable directory cannot prove emptiness.
+        refuse_fresh_initialization_with_recovery_evidence(primary_path, storage_root)?;
         return Ok(());
     }
 
@@ -21617,7 +21674,12 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
                 primary_path.display()
             )));
         }
-        if !is_real_directory(storage_root) || !is_real_directory(&storage_root.join("projects")) {
+        if !is_real_directory(storage_root)
+            || !is_real_directory(&storage_root.join("projects"))
+            || std::fs::read_dir(storage_root.join("projects"))
+                .is_ok_and(|mut projects| projects.next().is_none())
+        {
+            refuse_fresh_initialization_with_recovery_evidence(primary_path, storage_root)?;
             return Ok(());
         }
         let _bundle_dir =
@@ -21678,7 +21740,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "archive reconstruction failed; falling through to blank reinitialize"
+                "archive reconstruction failed; preserving recovery evidence"
             );
             e
         }
@@ -21703,12 +21765,12 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
         )));
     }
 
-    reinitialize_without_backup(primary_path, storage_root)?;
-    if sqlite_file_is_healthy(primary_path)? {
-        return Ok(());
-    }
+    // A missing primary is not fresh-start authority after an archive
+    // reconstruction was attempted. In particular, a GH#404 state-loss
+    // refusal must not fall through to promotion of an even emptier mailbox.
+    // Fresh initialization is handled before entering archive recovery.
     Err(SqlError::Custom(format!(
-        "all recovery strategies exhausted for {}",
+        "database file {} is missing and archive recovery did not produce an admissible candidate; refusing blank reinitialization to avoid data loss (reconstruction error: {reconstruct_error})",
         primary_path.display()
     )))
 }
@@ -33904,9 +33966,20 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(&wrong_storage_root).unwrap();
+        // An empty but readable mailbox provides provable DB-only state.
+        // Disable the incremental path below so acquire performs a real full
+        // reconstruction; a missing source now correctly refuses under GH#404.
+        let seed = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("create readable initial mailbox");
+        seed.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("create complete empty mailbox schema");
+        drop(seed);
 
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("STORAGE_ROOT", wrong_storage_root.to_str().unwrap())],
+            &[
+                ("STORAGE_ROOT", wrong_storage_root.to_str().unwrap()),
+                ("AM_ARCHIVE_DELTA_APPLY_MAX_MESSAGES", "0"),
+            ],
             || {
                 let config = DbPoolConfig {
                     database_url: format!("sqlite:///{}", db_path.display()),
@@ -33921,8 +33994,8 @@ mod tests {
                     &competing.message_id_allocator()
                 ));
                 assert!(
-                    !db_path.exists(),
-                    "first acquire must perform recovery itself"
+                    db_path.exists(),
+                    "first acquire must salvage the existing empty mailbox"
                 );
                 let rt = RuntimeBuilder::current_thread().build().unwrap();
                 let cx = Cx::for_testing();
@@ -36732,31 +36805,30 @@ mod tests {
     fn reconstruct_archive_into_candidate_preserves_existing_primary_on_activation_failure() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("test.db");
-        std::fs::write(&primary, b"live").expect("write primary");
 
         let storage_root = dir.path().join("storage");
         std::fs::create_dir_all(storage_root.join("projects/demo-project"))
             .expect("create project archive");
+        crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
+            .expect("seed a readable source for state-preserving recovery");
+        let source_before = std::fs::read(&primary).expect("read source generation");
 
-        // GH#208 re-scoped the promotion guard to refuse on identity loss
-        // only, so an unreadable primary no longer blocks activation by
-        // itself. The preservation contract under test needs a real
-        // activation failure, injected at the receipt boundary (br-uflow).
+        // The source is mergeable, so the candidate passes the GH#404
+        // state-loss guard and reaches the injected receipt failure.
         let err = reconstruct_archive_into_candidate_with_finalizer(
             &primary,
             &storage_root,
-            None,
+            Some(&primary),
             "20260218_120000_000",
             crate::forensics::finalize_recovery_receipt_with_injected_pre_rename_failure,
         )
         .expect_err("injected activation failure must preserve the existing primary");
 
         assert!(
-            err.to_string()
-                .contains("archive reconstruction failed for"),
+            err.to_string().contains("candidate promotion failed"),
             "unexpected error: {err}"
         );
-        assert_eq!(std::fs::read(&primary).unwrap(), b"live");
+        assert_eq!(std::fs::read(&primary).unwrap(), source_before);
         assert!(
             dir.path()
                 .join("test.db.reconstruct-failed-20260218_120000_000")
@@ -36789,11 +36861,13 @@ mod tests {
             r#"{"agent_name":"BlueFox","program":"codex","model":"gpt-5","registered_ts":"2026-07-17T00:00:00Z"}"#,
         )
         .expect("write agent profile");
+        crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
+            .expect("seed a readable source for state-preserving recovery");
 
         let failure = reconstruct_archive_into_candidate_with_finalizer(
             &primary,
             &storage_root,
-            None,
+            Some(&primary),
             "20260717_120000_000",
             crate::forensics::finalize_recovery_receipt_with_injected_post_rename_failure,
         )
@@ -37015,15 +37089,11 @@ mod tests {
         matches
     }
 
-    /// br-eudur (68f14df5): when the quarantined source is so damaged it
-    /// cannot even be probed as a SQLite database, there is no readable
-    /// DB-only coordination state to protect, and automatic recovery DEGRADES
-    /// to an archive-only rebuild instead of refusing and leaving the mailbox
-    /// dead (ts1 incident). The damaged source must survive as a quarantined
-    /// artifact for operator review. Probe failures that are NOT clearly
-    /// corruption (locks, permissions) still refuse fail-closed.
+    /// GH#404: corruption does not prove the absence of DB-only coordination
+    /// state. Preserve the source and candidate for an explicit operator
+    /// decision instead of automatically promoting an archive-only rebuild.
     #[test]
-    fn archive_recovery_degrades_to_archive_only_rebuild_without_readable_salvage() {
+    fn archive_recovery_refuses_archive_only_rebuild_without_readable_salvage() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let storage_root = dir.path().join("storage");
@@ -37047,11 +37117,45 @@ mod tests {
             "---json\n{\n  \"id\": 1,\n  \"subject\": \"Test\",\n  \"from_agent\": \"SwiftFox\",\n  \"importance\": \"normal\",\n  \"to\": [\"CalmLake\"],\n  \"cc\": [],\n  \"bcc\": [],\n  \"thread_id\": \"t1\",\n  \"in_reply_to\": null,\n  \"created_ts\": \"2026-01-15T10:05:00\"\n}\n---\n\nTest body\n",
         ).unwrap();
 
-        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
-            .expect("unprobeable salvage source must degrade to an archive-only rebuild");
+        let error = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("unprobeable salvage must not silently reset coordination state");
+        assert!(
+            error.to_string().contains("--allow-state-loss"),
+            "refusal must explain the explicit operator recovery path: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&primary).expect("read original primary"),
+            b"corrupted-data",
+            "the source must remain at its original path"
+        );
+        assert!(
+            !dir.path()
+                .join(".mcp-agent-mail-recovery-receipts")
+                .exists(),
+            "state-loss refusal must precede promotion receipt creation"
+        );
 
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref())
-            .expect("rebuilt primary must be a healthy SQLite database");
+        let candidate = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("storage.sqlite3.reconstruct-failed-")
+                })
+            })
+            .expect("refused candidate must be retained for inspection");
+        assert!(
+            !sqlite_backup_candidates(&primary).contains(&candidate),
+            "an unpromoted archive candidate must never become a backup authority"
+        );
+        assert!(
+            !sqlite_salvage_read_candidates(&primary).contains(&candidate),
+            "an unpromoted archive candidate must never become a salvage authority"
+        );
+        let conn = DbConn::open_file(candidate.to_string_lossy().as_ref())
+            .expect("retained candidate must be a readable SQLite database");
         let rows = conn
             .query_sync(
                 "SELECT (SELECT COUNT(*) FROM projects) AS projects, \
@@ -37063,23 +37167,18 @@ mod tests {
         assert_eq!(
             row.get_named::<i64>("projects").unwrap_or(0),
             1,
-            "archive project must be recovered into the rebuilt primary"
+            "archive project must remain inspectable in the refused candidate"
         );
         assert_eq!(
             row.get_named::<i64>("messages").unwrap_or(0),
             1,
-            "archive message must be recovered into the rebuilt primary"
+            "archive message must remain inspectable in the refused candidate"
         );
         drop(conn);
 
-        assert_ne!(
-            std::fs::read(&primary).expect("read rebuilt primary"),
-            b"corrupted-data",
-            "the live path must hold the rebuilt database, not the damaged source"
-        );
         assert!(
             !find_files_with_content(dir.path(), b"corrupted-data").is_empty(),
-            "the damaged source must be preserved as a quarantined artifact for operator review"
+            "source evidence must remain available for operator review"
         );
     }
 
@@ -37376,7 +37475,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_archive_state_before_init_reconstructs_missing_db() {
+    fn reconcile_archive_state_before_init_refuses_missing_db_without_salvage() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let storage_root = dir.path().join("storage");
@@ -37402,21 +37501,16 @@ mod tests {
         )
         .unwrap();
 
+        let error = reconcile_archive_state_before_init(&primary, &storage_root)
+            .expect_err("archive state alone cannot authorize a fresh mailbox generation");
         assert!(
-            reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
-            "missing db with archive state should reconstruct before init"
+            error.to_string().contains("--allow-state-loss"),
+            "unexpected refusal: {error}"
         );
-
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
-        let rows = conn
-            .query_sync(
-                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
-                &[],
-            )
-            .unwrap();
-        let row = rows.first().unwrap();
-        assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 1);
-        assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 7);
+        assert!(
+            !primary.exists(),
+            "pre-init reconciliation must not promote an archive-only candidate"
+        );
     }
 
     // ── #126 part (a): read-only intent guard ───────────────────────────
@@ -37483,9 +37577,9 @@ mod tests {
         )
         .unwrap();
 
-        // Without the guard this would reconstruct the primary db from the
-        // archive (mutation). With the guard it must return Ok(false) and
-        // leave the file untouched.
+        // Without the guard this would attempt reconstruction and refuse
+        // promotion without salvage. Read intent must return Ok(false)
+        // before constructing any candidate or recovery evidence.
         let _guard = ReadOnlyIntentGuard::enter();
         assert!(
             !reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
@@ -37518,7 +37612,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstruct_cache_hit_does_not_skip_missing_primary_activation() {
+    fn reconstruct_cache_hit_does_not_bypass_missing_primary_state_loss_refusal() {
         reset_recent_reconstruct_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
@@ -37536,14 +37630,17 @@ mod tests {
         stats.projects = 1;
         recent_reconstruct_store(&primary, Instant::now(), &inventory, &stats);
 
-        let rebuilt_stats =
-            reconstruct_sqlite_file_with_archive_salvage(&primary, &storage_root).unwrap();
+        let error = reconstruct_sqlite_file_with_archive_salvage(&primary, &storage_root)
+            .expect_err("a cached success cannot authorize a new archive-only generation");
 
         assert!(
-            primary.exists(),
-            "a cache hit must not report success while leaving a missing live sqlite file absent"
+            !primary.exists(),
+            "a missing source must remain absent when state-preserving recovery is unavailable"
         );
-        assert_eq!(rebuilt_stats.projects, 1);
+        assert!(
+            error.to_string().contains("--allow-state-loss"),
+            "unexpected refusal: {error}"
+        );
         reset_recent_reconstruct_cache_for_test();
     }
 
@@ -38053,7 +38150,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_recovery_rebuilds_project_only_archive_without_readable_salvage() {
+    fn archive_recovery_refuses_project_only_archive_without_readable_salvage() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let storage_root = dir.path().join("storage");
@@ -38067,38 +38164,24 @@ mod tests {
         .unwrap();
         std::fs::write(&primary, b"corrupted-data").unwrap();
 
-        // br-eudur: an unprobeable salvage source degrades to an archive-only
-        // rebuild even when the archive holds only project identity (no
-        // messages) — the candidate is non-empty, so promotion proceeds and
-        // the damaged source is preserved in quarantine.
-        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
-            .expect("project-only archive must rebuild when the salvage source is unprobeable");
-
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref())
-            .expect("rebuilt primary must be a healthy SQLite database");
-        let rows = conn
-            .query_sync(
-                "SELECT (SELECT COUNT(*) FROM projects) AS projects, \
-                        (SELECT COUNT(*) FROM messages) AS messages",
-                &[],
-            )
-            .expect("query rebuilt project-only state");
-        let row = rows.first().expect("rebuilt count row");
+        // A project-only archive cannot establish that the unreadable DB
+        // had no contacts, products, receipts, or issued cursors.
+        let error = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("project metadata cannot authorize silent loss of DB-only state");
         assert_eq!(
-            row.get_named::<i64>("projects").unwrap_or(0),
-            1,
-            "archive project identity must be recovered"
+            std::fs::read(&primary).expect("read preserved primary"),
+            b"corrupted-data",
+            "the source must remain at its original path"
         );
-        assert_eq!(
-            row.get_named::<i64>("messages").unwrap_or(-1),
-            0,
-            "a project-only archive rebuilds with no messages"
-        );
-        drop(conn);
-
         assert!(
-            !find_files_with_content(dir.path(), b"corrupted-data").is_empty(),
-            "the damaged source must be preserved as a quarantined artifact for operator review"
+            error.to_string().contains("--allow-state-loss"),
+            "unexpected refusal: {error}"
+        );
+        assert!(
+            !dir.path()
+                .join(".mcp-agent-mail-recovery-receipts")
+                .exists(),
+            "no promotion receipt may be created for the refused candidate"
         );
     }
 
@@ -39758,6 +39841,193 @@ mod tests {
     }
 
     #[test]
+    fn archive_recovery_missing_primary_with_empty_archive_allows_fresh_initialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect("a provably empty archive must not block a new mailbox");
+        ensure_sqlite_file_healthy_with_archive_inner(&primary, &storage_root)
+            .expect("admitted recovery must also recognize an empty fresh mailbox");
+        assert!(!reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
+        assert!(!primary.exists(), "normal initialization owns creation");
+        assert!(!has_quarantined_primary_artifact(&primary));
+        assert!(
+            !crate::recovery_breaker::breaker_sidecar_path(&primary).exists(),
+            "a fresh mailbox does not need a recovery attempt"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn archive_recovery_missing_primary_preserves_checkpoint_without_project_archives() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        fn snapshot(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>)> {
+            let mut result = Vec::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    let is_file = entry.file_type().unwrap().is_file();
+                    let bytes = if is_file {
+                        std::fs::read(&path).unwrap()
+                    } else {
+                        pending.push(path.clone());
+                        Vec::new()
+                    };
+                    result.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        is_file,
+                        bytes,
+                    ));
+                }
+            }
+            result.sort();
+            result
+        }
+
+        for projects_present in [false, true] {
+            for evidence in ["checkpoint", "malformed", "orphan", "cursor-only"] {
+                let dir = tempfile::tempdir().unwrap();
+                let primary = dir.path().join("storage.sqlite3");
+                let storage_root = dir.path().join("storage");
+                let recovery_state = storage_root.join("recovery-state");
+                std::fs::create_dir_all(&recovery_state).unwrap();
+                if projects_present {
+                    std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+                }
+                match evidence {
+                    "checkpoint" => {
+                        let source = crate::CanonicalDbConn::open_memory().unwrap();
+                        source.execute_raw(&schema::init_schema_sql_base()).unwrap();
+                        source
+                            .execute_sync(
+                                "INSERT INTO projects(id,slug,human_key,created_at) VALUES(41,'lost-project',?,1)",
+                                &[Value::Text(dir.path().join("lost-project").display().to_string())],
+                            )
+                            .unwrap();
+                        let manifest =
+                            crate::recovery_state::ensure_checkpoint(&source, &storage_root)
+                                .unwrap();
+                        assert_eq!(manifest.projects, 1);
+                        crate::reconstruct_state::record_issued_cursor(&storage_root, 70_000)
+                            .unwrap();
+                    }
+                    "malformed" => {
+                        std::fs::write(
+                            recovery_state.join("active.json"),
+                            b"incomplete checkpoint",
+                        )
+                        .unwrap();
+                    }
+                    "orphan" => {
+                        let generation = recovery_state.join("gorphan");
+                        std::fs::create_dir(&generation).unwrap();
+                        std::fs::write(generation.join("baseline.jsonl"), b"orphan baseline")
+                            .unwrap();
+                    }
+                    "cursor-only" => {
+                        crate::reconstruct_state::record_issued_cursor(&storage_root, 70_000)
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let before = snapshot(&storage_root);
+
+                for refusal in [
+                    ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+                        .expect_err("recovery evidence must block direct blank initialization"),
+                    ensure_sqlite_file_healthy_with_archive_inner(&primary, &storage_root)
+                        .expect_err("admitted recovery must preserve the existing checkpoint"),
+                    reconcile_archive_state_before_init(&primary, &storage_root).expect_err(
+                        "pool reconciliation must not classify recovery evidence as fresh",
+                    ),
+                ] {
+                    assert!(
+                        refusal
+                            .to_string()
+                            .contains("archive recovery-state evidence"),
+                        "{refusal}"
+                    );
+                }
+
+                let pool = DbPool::new(&DbPoolConfig {
+                    database_url: format!("sqlite:///{}", primary.display()),
+                    storage_root: Some(storage_root.clone()),
+                    min_connections: 1,
+                    max_connections: 1,
+                    warmup_connections: 0,
+                    ..Default::default()
+                })
+                .unwrap();
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                match runtime.block_on(pool.acquire(&Cx::for_testing())) {
+                    Outcome::Err(error) => assert!(
+                        error
+                            .to_string()
+                            .contains("archive recovery-state evidence"),
+                        "{error}"
+                    ),
+                    _ => panic!("pool initialization must refuse {evidence} recovery evidence"),
+                }
+                assert!(
+                    !path_is_occupied(&primary),
+                    "a refused startup must not create the primary"
+                );
+                assert_eq!(
+                    snapshot(&storage_root),
+                    before,
+                    "{evidence} evidence must remain exact"
+                );
+                assert!(!crate::recovery_breaker::breaker_sidecar_path(&primary).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn archive_recovery_missing_primary_refuses_archive_only_and_blank_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let seed = dir.path().join("separate-evidence.sqlite3");
+        let message_dir = seed_reconstructed_primary_from_archive(&seed, &storage_root);
+        let message_path = message_dir.join("2026-03-22T12-00-00Z__first__1.md");
+        let archive_before = std::fs::read(&message_path).unwrap();
+        let seed_before = std::fs::read(&seed).unwrap();
+
+        let error = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("missing source must not authorize archive-only or blank recovery");
+        let detail = error.to_string();
+        assert!(detail.contains("--allow-state-loss"), "{detail}");
+        assert!(
+            detail.contains("refusing blank reinitialization"),
+            "the refusal must retain the state-loss reason instead of initializing an empty database: {detail}"
+        );
+        assert!(!primary.exists(), "no replacement may be promoted");
+        assert_eq!(std::fs::read(&message_path).unwrap(), archive_before);
+        assert_eq!(std::fs::read(&seed).unwrap(), seed_before);
+        assert!(
+            !dir.path()
+                .join(".mcp-agent-mail-recovery-receipts")
+                .exists(),
+            "neither archive nor blank promotion may create a receipt"
+        );
+        assert!(
+            sqlite_backup_candidates(&primary).is_empty(),
+            "the refused candidate must not become a backup for the next startup"
+        );
+
+        let retry = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("a second startup must not turn the rejected candidate into authority");
+        assert!(retry.to_string().contains("quarantined recovery artifact"));
+        assert!(!primary.exists(), "retry must leave the primary absent");
+    }
+
+    #[test]
     fn archive_recovery_missing_primary_with_quarantined_artifact_is_not_treated_as_fresh_start() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
@@ -39768,6 +40038,7 @@ mod tests {
             b"quarantined-corrupt-db",
         )
         .unwrap();
+        crate::reconstruct_state::record_issued_cursor(&storage_root, 70_000).unwrap();
 
         let err = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
             .expect_err("quarantined corrupt artifacts should block blank reinit");

@@ -2699,6 +2699,11 @@ pub enum DoctorCommand {
         /// Auto-confirm (skip interactive prompt).
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Accept unavailable or incomplete coordination state during recovery:
+        /// read/ack receipts, contacts, delivery cursors, and identity continuity.
+        /// --yes alone never authorizes this loss. Prefer restoring a healthy backup.
+        #[arg(long)]
+        allow_state_loss: bool,
         /// Output JSON (shorthand for machine-readable output).
         #[arg(long)]
         json: bool,
@@ -9010,6 +9015,7 @@ fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
                 true,
                 false,
                 false,
+                false,
             )
         },
     )
@@ -11157,6 +11163,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
         DoctorCommand::Reconstruct {
             dry_run,
             yes,
+            allow_state_loss,
             json,
             allow_live_owner,
             take_ownership,
@@ -11168,6 +11175,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             allow_live_owner,
             take_ownership,
             reseed_receipt_chain,
+            allow_state_loss,
         ),
         DoctorCommand::Drain { format, json } => handle_doctor_drain(format, json),
         DoctorCommand::ArchiveScan { format, json } => handle_doctor_archive_scan(format, json),
@@ -16035,6 +16043,11 @@ fn recover_sqlite_file_with_storage_root_admitted(
                     );
                     None
                 }
+                DoctorSalvageAttempt::Refused { detail, .. } => {
+                    return Err(CliError::Other(format!(
+                        "automatic archive reconstruction refused; original database is untouched: {detail}"
+                    )));
+                }
             };
             // Reconstruct into a temp file so the original is untouched on failure.
             let temp_reconstruct = next_doctor_artifact_path(path, "reconstruct", "sqlite3");
@@ -16053,7 +16066,15 @@ fn recover_sqlite_file_with_storage_root_admitted(
                     if let DoctorSalvageAttempt::Succeeded(artifact) = &salvage_attempt {
                         stats.warnings.push(artifact.detail.clone());
                     }
+                    if let Err(error) = stats.require_recovery_state() {
+                        preserve_doctor_temp_sqlite_artifact(&temp_reconstruct);
+                        return Err(CliError::Other(format!(
+                            "automatic archive reconstruction refused; original database is untouched at {}: {error}",
+                            path.display()
+                        )));
+                    }
                     ftui_runtime::ftui_println!("Reconstruction complete: {}", stats);
+                    print_doctor_reconstruct_recovery_state(&stats);
                     if !stats.warnings.is_empty() {
                         for warning in &stats.warnings {
                             ftui_runtime::ftui_eprintln!("Warning: {warning}");
@@ -16979,6 +17000,7 @@ struct CanonicalSnapshotSource {
     actual_path: PathBuf,
     reported_path: PathBuf,
     kind: CanonicalSnapshotSourceKind,
+    receipt_state_preserved: bool,
     _snapshot_dir: Option<tempfile::TempDir>,
     _staged_family: Option<mcp_agent_mail_db::pool::SqliteHealthProbeSource>,
 }
@@ -16989,6 +17011,7 @@ impl std::fmt::Debug for CanonicalSnapshotSource {
             .field("actual_path", &self.actual_path)
             .field("reported_path", &self.reported_path)
             .field("kind", &self.kind)
+            .field("receipt_state_preserved", &self.receipt_state_preserved)
             .field(
                 "snapshot_dir",
                 &self._snapshot_dir.as_ref().map(tempfile::TempDir::path),
@@ -17039,6 +17062,7 @@ impl CanonicalSnapshotSource {
             actual_path: path.clone(),
             reported_path: path,
             kind: CanonicalSnapshotSourceKind::LiveSqlite,
+            receipt_state_preserved: true,
             _staged_family: None,
             _snapshot_dir: None,
         }
@@ -17062,7 +17086,7 @@ impl CanonicalSnapshotSource {
                 )
             },
         );
-        reconstruct.map_err(|e| {
+        let stats = reconstruct.map_err(|e| {
             CliError::Other(format!(
                 "{context} archive snapshot reconstruction failed: {e}"
             ))
@@ -17071,6 +17095,7 @@ impl CanonicalSnapshotSource {
             actual_path,
             reported_path,
             kind: CanonicalSnapshotSourceKind::ArchiveSnapshot,
+            receipt_state_preserved: stats.has_receipt_state(),
             _staged_family: None,
             _snapshot_dir: Some(snapshot_dir),
         })
@@ -17088,6 +17113,7 @@ impl CanonicalSnapshotSource {
             actual_path,
             reported_path,
             kind: CanonicalSnapshotSourceKind::LiveSnapshot,
+            receipt_state_preserved: true,
             _staged_family: None,
             _snapshot_dir: Some(snapshot_dir),
         })
@@ -17139,6 +17165,7 @@ impl CanonicalSnapshotSource {
             actual_path,
             reported_path,
             kind: CanonicalSnapshotSourceKind::StagedFamilyCopy,
+            receipt_state_preserved: true,
             _snapshot_dir: None,
             _staged_family: Some(staged),
         })
@@ -17154,6 +17181,16 @@ impl CanonicalSnapshotSource {
 
     fn uses_archive_snapshot(&self) -> bool {
         matches!(self.kind, CanonicalSnapshotSourceKind::ArchiveSnapshot)
+    }
+
+    fn require_receipt_state(&self) -> CliResult<()> {
+        if !self.receipt_state_preserved {
+            return Err(CliError::Other(
+                "RECOVERY_STATE_UNAVAILABLE: archive fallback cannot establish read/ack state; unread and pending-ack reads are unavailable until the mailbox is recovered. Unfiltered message history remains readable."
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn create_share_snapshot_context(
@@ -17608,13 +17645,17 @@ fn resolve_canonical_snapshot_source_with_database_url(
 
 struct CanonicalReadDb {
     conn: mcp_agent_mail_db::pool::GuardedReadOnlyConn,
-    _source: CanonicalSnapshotSource,
+    source: CanonicalSnapshotSource,
     _mailbox_read_locks: CliMailboxReadLocks,
 }
 
 impl CanonicalReadDb {
     fn conn(&self) -> &mcp_agent_mail_db::pool::GuardedReadOnlyConn {
         &self.conn
+    }
+
+    fn require_receipt_state(&self) -> CliResult<()> {
+        self.source.require_receipt_state()
     }
 }
 
@@ -17684,7 +17725,7 @@ fn open_db_sync_canonical_read_with_database_url(
     let conn = source.open_read_only(context)?;
     Ok(CanonicalReadDb {
         conn,
-        _source: source,
+        source,
         _mailbox_read_locks: mailbox_read_locks,
     })
 }
@@ -17847,7 +17888,7 @@ fn open_atc_explain_read_db_with_database_url(database_url: &str) -> CliResult<C
     let conn = source.open_read_only("ATC explain snapshot")?;
     Ok(CanonicalReadDb {
         conn,
-        _source: source,
+        source,
         _mailbox_read_locks: mailbox_read_locks,
     })
 }
@@ -17859,6 +17900,10 @@ struct CanonicalReadInboxDb {
 impl CanonicalReadInboxDb {
     fn conn(&self) -> &mcp_agent_mail_db::pool::GuardedReadOnlyConn {
         self.read_db.conn()
+    }
+
+    fn require_receipt_state(&self) -> CliResult<()> {
+        self.read_db.require_receipt_state()
     }
 }
 
@@ -21928,6 +21973,7 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
         Some(&config.storage_root),
         "acks",
     )?;
+    opened.require_receipt_state()?;
     handle_acks_with_conn(opened.conn(), action)
 }
 
@@ -34497,6 +34543,8 @@ fn is_reconstruct_promotion_refusal(err: &CliError) -> bool {
     let text = err.to_string();
     text.contains("reconstruction succeeded but final database promotion failed")
         || text.contains("would lose stable coordination keys")
+        || text.contains("reconstruction refused; original database is untouched")
+        || text.contains("automatic archive reconstruction refused")
 }
 
 fn doctor_archive_inventory_suffix(archive: &DoctorArchiveInventory) -> String {
@@ -52528,6 +52576,83 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn receipt_filtered_cli_reads_refuse_archive_only_fallback_but_keep_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing-mailbox.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Retained history",
+            "normal",
+            "2026-03-22T00:00:00Z",
+            "Archive cannot establish whether this message was already handled.",
+        );
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().unwrap()),
+            ],
+            || {
+                let error = check_inbox_direct(&CheckInboxDirectConfig {
+                    project_key: "ahead-project".to_string(),
+                    agent_name: "Alice".to_string(),
+                    limit: 10,
+                })
+                .expect_err("archive-only history cannot prove unread status");
+                assert!(error.to_string().contains("RECOVERY_STATE_UNAVAILABLE"));
+
+                for action in [
+                    AcksCommand::Pending {
+                        project: "ahead-project".to_string(),
+                        agent: "Alice".to_string(),
+                        limit: 10,
+                    },
+                    AcksCommand::Remind {
+                        project: "ahead-project".to_string(),
+                        agent: "Alice".to_string(),
+                        min_age_minutes: 0,
+                        limit: 10,
+                    },
+                    AcksCommand::Overdue {
+                        project: "ahead-project".to_string(),
+                        agent: "Alice".to_string(),
+                        ttl_minutes: 0,
+                        limit: 10,
+                    },
+                ] {
+                    let error = handle_acks(action)
+                        .expect_err("archive-only history cannot prove pending acknowledgements");
+                    assert!(error.to_string().contains("RECOVERY_STATE_UNAVAILABLE"));
+                }
+
+                let history = fetch_mail_inbox_direct_with_database_url(
+                    &db_url,
+                    "ahead-project",
+                    "Alice",
+                    false,
+                    None,
+                    10,
+                    true,
+                )
+                .expect("ordinary history remains available");
+                assert_eq!(history.len(), 1);
+                assert_eq!(history[0]["subject"], "Retained history");
+                assert_eq!(
+                    history[0]["body_md"],
+                    "Archive cannot establish whether this message was already handled.\n"
+                );
+                assert!(!db_path.exists(), "reads must not promote a fresh mailbox");
+            },
+        );
+    }
+
+    #[test]
     fn resolve_agent_id_for_inbox_check_is_case_insensitive() {
         let dir = tempfile::tempdir().unwrap();
         let __storage_root_str = dir.path().display().to_string();
@@ -57466,7 +57591,7 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
-    fn doctor_salvage_artifact_candidates_skip_sqlite_sidecars() {
+    fn doctor_salvage_artifact_candidates_skip_sidecars_and_unpromoted_rebuilds() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
         std::fs::write(&db_path, b"live").expect("write db");
@@ -57479,10 +57604,14 @@ http_headers = { Authorization = "Bearer secret" }
             .path()
             .join("storage.sqlite3.reconstruct-20260324_120001_000.sqlite3");
         let reconstruct_shm = sqlite_sidecar_path(&reconstruct, "-shm");
+        let refused = dir
+            .path()
+            .join("storage.sqlite3.reconstruct-failed-20260324_120002_000.sqlite3");
         std::fs::write(&quarantined, b"quarantined").expect("write quarantined");
         std::fs::write(&quarantined_wal, b"wal").expect("write wal sidecar");
         std::fs::write(&reconstruct, b"reconstruct").expect("write reconstruct");
         std::fs::write(&reconstruct_shm, b"shm").expect("write shm sidecar");
+        std::fs::write(&refused, b"refused candidate").expect("write refused rebuild");
 
         let paths: Vec<PathBuf> = doctor_salvage_artifact_candidates(&db_path)
             .into_iter()
@@ -57490,7 +57619,8 @@ http_headers = { Authorization = "Bearer secret" }
             .collect();
 
         assert!(paths.contains(&quarantined));
-        assert!(paths.contains(&reconstruct));
+        assert!(!paths.contains(&reconstruct));
+        assert!(!paths.contains(&refused));
         assert!(!paths.contains(&quarantined_wal));
         assert!(!paths.contains(&reconstruct_shm));
     }
@@ -63823,6 +63953,7 @@ http_headers = { Authorization = "Bearer secret" }
                     DoctorCommand::Reconstruct {
                         dry_run,
                         yes,
+                        allow_state_loss,
                         json,
                         allow_live_owner,
                         take_ownership,
@@ -63831,6 +63962,7 @@ http_headers = { Authorization = "Bearer secret" }
             } => {
                 assert!(!dry_run);
                 assert!(!yes);
+                assert!(!allow_state_loss);
                 assert!(!json);
                 assert!(
                     !allow_live_owner,
@@ -63861,6 +63993,7 @@ http_headers = { Authorization = "Bearer secret" }
             "--allow-live-owner",
             "--take-ownership",
             "--reseed-receipt-chain",
+            "--allow-state-loss",
         ])
         .unwrap();
         match cli.command.unwrap() {
@@ -63869,6 +64002,7 @@ http_headers = { Authorization = "Bearer secret" }
                     DoctorCommand::Reconstruct {
                         dry_run,
                         yes,
+                        allow_state_loss,
                         json,
                         allow_live_owner,
                         take_ownership,
@@ -63881,6 +64015,29 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(allow_live_owner);
                 assert!(take_ownership);
                 assert!(reseed_receipt_chain);
+                assert!(allow_state_loss);
+            }
+            _ => panic!("expected Doctor Reconstruct"),
+        }
+    }
+
+    #[test]
+    fn parse_doctor_reconstruct_yes_does_not_accept_state_loss() {
+        let cli = Cli::try_parse_from(["am", "doctor", "reconstruct", "--yes"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Reconstruct {
+                        yes,
+                        allow_state_loss,
+                        ..
+                    },
+            } => {
+                assert!(yes);
+                assert!(
+                    !allow_state_loss,
+                    "confirmation must not imply loss acceptance"
+                );
             }
             _ => panic!("expected Doctor Reconstruct"),
         }
@@ -70534,6 +70691,7 @@ startup_timeout_sec = 42
             true,
             false,
             false,
+            false,
         );
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -70561,6 +70719,7 @@ startup_timeout_sec = 42
             Some(&linked_storage),
             false,
             true,
+            false,
             false,
             false,
         )
@@ -70596,6 +70755,7 @@ startup_timeout_sec = 42
             Some(&storage_root),
             false,
             true,
+            false,
             false,
             false,
         )
@@ -70641,6 +70801,7 @@ startup_timeout_sec = 42
             true,
             false,
             false,
+            false,
         )
         .expect_err("symlinked destination parent should be rejected");
 
@@ -70671,6 +70832,7 @@ startup_timeout_sec = 42
             false,
             true,
             false,
+            false,
         );
         assert!(result.is_ok());
     }
@@ -70686,8 +70848,16 @@ startup_timeout_sec = 42
         let db_path = tmp.path().join("empty-json.sqlite3");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, true, true, false)
-            .expect("empty archive should emit a structured skip");
+        handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(tmp.path()),
+            true,
+            true,
+            true,
+            false,
+            false,
+        )
+        .expect("empty archive should emit a structured skip");
         let output = capture.drain_to_string();
         let payload: serde_json::Value =
             serde_json::from_str(output.trim()).expect("skip payload should be JSON");
@@ -70716,8 +70886,16 @@ startup_timeout_sec = 42
         let db_path = tmp.path().join("empty-archive-reconstruct.sqlite3");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), false, true, false, false)
-            .expect("empty archive should be a non-mutating skip");
+        handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(tmp.path()),
+            false,
+            true,
+            false,
+            false,
+            false,
+        )
+        .expect("empty archive should be a non-mutating skip");
         let output = capture.drain_to_string();
 
         assert!(
@@ -70728,6 +70906,325 @@ startup_timeout_sec = 42
             !db_path.exists(),
             "empty archive reconstruct should not create or swap a database"
         );
+    }
+
+    #[test]
+    fn doctor_reconstruct_requires_explicit_state_loss_acceptance_across_retries() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("storage.sqlite3");
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "2026-03-22T12-00-00Z__recover__1.md",
+            1,
+            "Alice",
+            "Recovered content",
+            "normal",
+            "2026-03-22T12:00:00Z",
+            "The archive cannot prove whether this message was already consumed.",
+        );
+        let damaged = b"damaged original mailbox; preserve as recovery evidence";
+        std::fs::write(&db_path, damaged).unwrap();
+
+        // The second real attempt must not treat the first rejected rebuild
+        // as readable salvage and thereby bypass the loss-acceptance gate.
+        for dry_run in [true, false, false] {
+            let capture = ftui_runtime::StdioCapture::install().unwrap();
+            let error = handle_doctor_reconstruct_with(
+                Some(&db_path),
+                Some(&storage_root),
+                dry_run,
+                true,
+                true,
+                false,
+                false,
+            )
+            .expect_err("--yes alone must refuse recovery without salvage or a checkpoint");
+            let output = capture.drain_to_string();
+            drop(capture);
+            assert!(error.to_string().contains("--allow-state-loss"), "{error}");
+            assert_eq!(std::fs::read(&db_path).unwrap(), damaged);
+            let payload: serde_json::Value = serde_json::from_str(
+                output
+                    .lines()
+                    .find(|line| line.starts_with('{'))
+                    .expect("JSON disclosure"),
+            )
+            .unwrap();
+            assert_eq!(payload["requires_lossy_recovery"], true);
+            assert_eq!(payload["allow_state_loss"], false);
+            assert_eq!(payload["salvage_outcome"], "archive_only");
+            assert_eq!(payload["recovery_checkpoint_present"], false);
+            assert_eq!(payload["archived_receipts"], 0);
+            assert_eq!(payload["archived_contacts"], 0);
+            assert!(payload["delivery_cursor_reset_floor"].is_null());
+            assert!(payload["recovery_state_limitations"].is_array());
+            assert!(payload["state_loss_risks"].as_array().unwrap().len() >= 4);
+            assert_eq!(payload["actions_taken"], 0);
+            if dry_run {
+                assert_eq!(payload["status"], "dry_run");
+                assert_eq!(payload["salvage"]["status"], "not_materializable");
+                assert_eq!(payload["candidate_validation"]["would_refuse"], true);
+            } else {
+                assert_eq!(payload["status"], "refused");
+                assert_eq!(payload["salvage"]["status"], "warn");
+                let candidate = Path::new(payload["candidate_path"].as_str().unwrap());
+                assert!(
+                    candidate.is_file(),
+                    "refused candidate must remain inspectable"
+                );
+                assert!(
+                    candidate
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains(".reconstruct-failed-")
+                );
+            }
+        }
+
+        for dry_run in [true, false] {
+            let capture = ftui_runtime::StdioCapture::install().unwrap();
+            handle_doctor_reconstruct_with(
+                Some(&db_path),
+                Some(&storage_root),
+                dry_run,
+                true,
+                true,
+                false,
+                true,
+            )
+            .expect("explicit acceptance permits a validated archive-only rebuild");
+            let output = capture.drain_to_string();
+            drop(capture);
+            let payload: serde_json::Value = serde_json::from_str(
+                output
+                    .lines()
+                    .find(|line| line.starts_with('{'))
+                    .expect("JSON disclosure"),
+            )
+            .unwrap();
+            assert_eq!(payload["requires_lossy_recovery"], true);
+            assert_eq!(payload["allow_state_loss"], true);
+            assert_eq!(payload["salvage_outcome"], "archive_only");
+            assert_eq!(payload["recovery_checkpoint_present"], false);
+            assert_eq!(payload["archived_receipts"], 0);
+            assert_eq!(payload["archived_contacts"], 0);
+            assert!(payload["delivery_cursor_reset_floor"].is_null());
+            assert!(payload["recovery_state_limitations"].is_array());
+            assert!(output.contains("WARNING: --allow-state-loss"));
+            if dry_run {
+                assert_eq!(payload["salvage"]["status"], "not_materializable");
+                assert_eq!(payload["candidate_validation"]["would_refuse"], false);
+                assert_eq!(std::fs::read(&db_path).unwrap(), damaged);
+            } else {
+                assert_eq!(payload["status"], "ok");
+                assert_eq!(payload["salvage"]["status"], "warn");
+                assert_eq!(payload["recovered"]["messages"], 1);
+            }
+        }
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    entry.file_name().to_string_lossy().contains(".corrupt-")
+                        && std::fs::read(entry.path()).is_ok_and(|bytes| bytes == damaged)
+                }),
+            "explicit recovery must preserve the damaged primary"
+        );
+    }
+
+    #[test]
+    fn doctor_reconstruct_accepts_checkpoint_and_cursor_witness_without_loss_override() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("storage.sqlite3");
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "checkpoint-message.md",
+            1,
+            "Alice",
+            "Checkpoint recovery",
+            "normal",
+            "2026-03-22T12:00:00Z",
+            "Read and acknowledgement state must survive without a database source.",
+        );
+        let bob = storage_root.join("projects/ahead-project/agents/Bob");
+        std::fs::create_dir_all(&bob).unwrap();
+        std::fs::write(
+            bob.join("profile.json"),
+            r#"{"name":"Bob","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+
+        // Keep the original outside salvage discovery. The checkpoint and
+        // cursor witness must be sufficient without reading this database.
+        let evidence = tmp.path().join("offline-evidence");
+        std::fs::create_dir_all(&evidence).unwrap();
+        let source_path = evidence.join("original.sqlite3");
+        mcp_agent_mail_db::reconstruct_from_archive(&source_path, &storage_root).unwrap();
+        let source =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(source_path.to_str().unwrap()).unwrap();
+        source
+            .execute_raw(
+                "UPDATE message_recipients SET read_ts=100, ack_ts=200 WHERE message_id=1; \
+                 INSERT INTO agent_links(a_project_id,a_agent_id,b_project_id,b_agent_id,status,reason,created_ts,updated_ts) \
+                 SELECT a.project_id,a.id,b.project_id,b.id,'approved','retained contact',10,20 \
+                 FROM agents a JOIN agents b ON b.project_id=a.project_id \
+                 WHERE a.name='Alice' AND b.name='Bob';",
+            )
+            .unwrap();
+        let identity = source
+            .query_sync("SELECT id, project_id FROM agents WHERE name='Alice'", &[])
+            .unwrap();
+        let agent_id = identity[0].get_named::<i64>("id").unwrap();
+        let project_id = identity[0].get_named::<i64>("project_id").unwrap();
+        mcp_agent_mail_db::recovery_state::ensure_checkpoint(&source, &storage_root).unwrap();
+        mcp_agent_mail_db::reconstruct_state::record_issued_cursor(&storage_root, 70_000).unwrap();
+        drop(source);
+        let source_before = std::fs::read(&source_path).unwrap();
+
+        for dry_run in [true, false] {
+            let capture = ftui_runtime::StdioCapture::install().unwrap();
+            handle_doctor_reconstruct_with(
+                Some(&db_path),
+                Some(&storage_root),
+                dry_run,
+                true,
+                true,
+                false,
+                false,
+            )
+            .expect("validated checkpoint and cursor witness permit default recovery");
+            let output = capture.drain_to_string();
+            drop(capture);
+            let payload: serde_json::Value =
+                serde_json::from_str(output.lines().find(|line| line.starts_with('{')).unwrap())
+                    .unwrap();
+            assert_eq!(payload["salvage_outcome"], "archive_only");
+            assert_eq!(payload["requires_lossy_recovery"], false);
+            assert_eq!(payload["allow_state_loss"], false);
+            assert_eq!(payload["state_loss_risks"], serde_json::json!([]));
+            assert_eq!(payload["recovery_checkpoint_present"], true);
+            assert_eq!(payload["archived_receipts"], 1);
+            assert_eq!(payload["archived_contacts"], 1);
+            assert_eq!(payload["delivery_cursor_reset_floor"], 70_001);
+            assert!(
+                !payload["recovery_state_limitations"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "checkpoint recovery must disclose residual limitations"
+            );
+            assert!(!output.contains("WARNING: --allow-state-loss"));
+            assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+            if dry_run {
+                assert_eq!(payload["candidate_validation"]["would_refuse"], false);
+                assert_eq!(payload["salvage"]["status"], "no_candidate");
+                assert!(!db_path.exists(), "preview must not publish the database");
+            } else {
+                assert_eq!(payload["status"], "ok");
+                assert!(payload["salvage"].is_null());
+            }
+        }
+
+        let rebuilt =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let receipts = rebuilt
+            .query_sync(
+                "SELECT read_ts,ack_ts FROM message_recipients WHERE message_id=1 AND agent_id=?",
+                &[mcp_agent_mail_db::sqlmodel::Value::BigInt(agent_id)],
+            )
+            .unwrap();
+        assert_eq!(receipts[0].get_named::<i64>("read_ts").unwrap(), 100);
+        assert_eq!(receipts[0].get_named::<i64>("ack_ts").unwrap(), 200);
+        let contacts = rebuilt
+            .query_sync("SELECT status,reason FROM agent_links", &[])
+            .unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            contacts[0].get_named::<String>("status").unwrap(),
+            "approved"
+        );
+        assert_eq!(
+            contacts[0].get_named::<String>("reason").unwrap(),
+            "retained contact"
+        );
+        assert!(matches!(
+            mcp_agent_mail_db::sync::inbox_delivery_events_from_conn(
+                &rebuilt,
+                project_id,
+                agent_id,
+                Some(70_000),
+                10,
+            ),
+            Err(mcp_agent_mail_db::sync::InboxDeliveryEventError::CursorExpired { .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn doctor_reconstruct_state_loss_override_cannot_bypass_source_admission() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("storage.sqlite3");
+        seed_archive_mailbox_project(&storage_root);
+        let source = tmp
+            .path()
+            .join("storage.sqlite3.corrupt-20260324_120000_000");
+        let alias = tmp.path().join("source-hardlink.sqlite3");
+        let source_bytes = b"source requiring exclusive private admission";
+        std::fs::write(&source, source_bytes).unwrap();
+        std::fs::hard_link(&source, &alias).unwrap();
+
+        for dry_run in [true, false] {
+            let capture = ftui_runtime::StdioCapture::install().unwrap();
+            let error = handle_doctor_reconstruct_with(
+                Some(&db_path),
+                Some(&storage_root),
+                dry_run,
+                true,
+                true,
+                false,
+                true,
+            )
+            .expect_err("loss acceptance must not weaken salvage source admission");
+            let output = capture.drain_to_string();
+            drop(capture);
+            assert!(error.to_string().contains("hard links"), "{error}");
+            assert!(
+                error.to_string().contains("cannot override source safety"),
+                "{error}"
+            );
+            assert!(
+                !db_path.exists(),
+                "source refusal must not activate a candidate"
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+            assert_eq!(std::fs::read(&alias).unwrap(), source_bytes);
+            if dry_run {
+                let payload: serde_json::Value = serde_json::from_str(
+                    output.lines().find(|line| line.starts_with('{')).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(payload["salvage"]["would_refuse"], true);
+                assert!(payload["salvage_outcome"].is_null());
+                assert_eq!(payload["candidate_validation"]["would_refuse"], true);
+                assert_eq!(payload["actions_taken"], 0);
+            }
+        }
     }
 
     #[test]
@@ -70754,7 +71251,17 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", env_db_url.as_str()),
                 ("STORAGE_ROOT", env_storage_root_text.as_str()),
             ],
-            || handle_doctor_reconstruct_locked(&db_url, &storage_root, false, true, true),
+            || {
+                handle_doctor_reconstruct_locked_full(
+                    &db_url,
+                    &storage_root,
+                    false,
+                    true,
+                    true,
+                    false,
+                    true,
+                )
+            },
         );
         let output = capture.drain_to_string();
 
@@ -70923,8 +71430,15 @@ startup_timeout_sec = 42
 
         let db_path = tmp.path().join("reconstructed.db");
 
-        let result =
-            handle_doctor_reconstruct_with(Some(&db_path), Some(storage), false, true, true, false);
+        let result = handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(storage),
+            false,
+            true,
+            true,
+            false,
+            true,
+        );
         assert!(result.is_ok(), "reconstruct failed: {result:?}");
         assert!(db_path.exists(), "reconstructed DB file should exist");
 
@@ -70998,6 +71512,7 @@ startup_timeout_sec = 42
                     true,
                     true,
                     false,
+                    false,
                 );
                 let output = capture.drain_to_string();
                 assert!(result.is_ok(), "reconstruct failed: {result:?}");
@@ -71010,6 +71525,8 @@ startup_timeout_sec = 42
                 let value: serde_json::Value =
                     serde_json::from_str(payload).expect("parse reconstruct json output");
                 assert_eq!(value["salvage"]["status"], "ok");
+                assert_eq!(value["salvage_outcome"], "merged");
+                assert_eq!(value["requires_lossy_recovery"], false);
                 // A Franken-admitted current database (namespace pair present)
                 // is exported through a guarded private snapshot; a family
                 // without namespace authority is read directly. Either way
@@ -71072,7 +71589,7 @@ startup_timeout_sec = 42
     /// GH#312: the live database still opens and its coordination tables read
     /// cleanly, but full `integrity_check` *raises* "database disk image is
     /// malformed" on a torn page instead of reporting rows. `am doctor
-    /// reconstruct --yes` used to rebuild a clean candidate and then refuse to
+    /// reconstruct --yes --allow-state-loss` used to rebuild a clean candidate and then refuse to
     /// promote it because the promotion receipt could not classify the corrupt
     /// source ("semantic snapshot succeeded but full integrity_check failed"),
     /// leaving a `reconstruct-failed-*` artifact on every retry until the
@@ -71156,6 +71673,7 @@ startup_timeout_sec = 42
                     true,
                     true,
                     false,
+                    true,
                 );
                 let output = capture.drain_to_string();
                 assert!(
@@ -71263,6 +71781,7 @@ startup_timeout_sec = 42
                     true,
                     true,
                     false,
+                    false,
                 );
                 let output = capture.drain_to_string();
                 assert!(result.is_ok(), "reconstruct failed: {result:?}");
@@ -71279,6 +71798,8 @@ startup_timeout_sec = 42
                 let value: serde_json::Value =
                     serde_json::from_str(payload).expect("parse reconstruct json output");
                 assert_eq!(value["salvage"]["status"], "ok");
+                assert_eq!(value["salvage_outcome"], "merged");
+                assert_eq!(value["requires_lossy_recovery"], false);
                 assert!(
                     value["salvage"]["detail"]
                         .as_str()
@@ -71925,6 +72446,7 @@ startup_timeout_sec = 42
             false,
             true,
             false,
+            true,
         )
         .expect("dry run should succeed");
         let output = capture.drain_to_string();
@@ -72308,7 +72830,7 @@ startup_timeout_sec = 42
                     .expect("query private salvage snapshot");
                 assert_eq!(rows.len(), 1);
             }
-            DoctorSalvageAttempt::Failed(detail) => {
+            DoctorSalvageAttempt::Failed(detail) | DoctorSalvageAttempt::Refused { detail, .. } => {
                 panic!("expected readable salvage source, got failure: {detail}");
             }
         }
@@ -72332,7 +72854,7 @@ startup_timeout_sec = 42
                     artifact.detail
                 );
             }
-            DoctorSalvageAttempt::Failed(detail) => {
+            DoctorSalvageAttempt::Failed(detail) | DoctorSalvageAttempt::Refused { detail, .. } => {
                 assert!(
                     detail.contains("could not be opened directly")
                         || detail.contains("failed a direct sqlite probe")
@@ -72414,7 +72936,7 @@ startup_timeout_sec = 42
                     artifact.detail
                 );
             }
-            DoctorSalvageAttempt::Failed(detail) => {
+            DoctorSalvageAttempt::Failed(detail) | DoctorSalvageAttempt::Refused { detail, .. } => {
                 panic!("expected backup salvage fallback, got failure: {detail}");
             }
         }
@@ -72458,7 +72980,7 @@ startup_timeout_sec = 42
                     artifact.detail
                 );
             }
-            DoctorSalvageAttempt::Failed(detail) => {
+            DoctorSalvageAttempt::Failed(detail) | DoctorSalvageAttempt::Refused { detail, .. } => {
                 panic!("expected backup salvage fallback, got failure: {detail}");
             }
         }
@@ -72506,7 +73028,7 @@ startup_timeout_sec = 42
                     artifact.detail
                 );
             }
-            DoctorSalvageAttempt::Failed(detail) => {
+            DoctorSalvageAttempt::Failed(detail) | DoctorSalvageAttempt::Refused { detail, .. } => {
                 panic!("expected backup salvage fallback, got failure: {detail}");
             }
         }
@@ -72554,7 +73076,7 @@ startup_timeout_sec = 42
                     artifact.detail
                 );
             }
-            DoctorSalvageAttempt::Failed(detail) => {
+            DoctorSalvageAttempt::Failed(detail) | DoctorSalvageAttempt::Refused { detail, .. } => {
                 panic!("expected backup salvage fallback, got failure: {detail}");
             }
         }
@@ -73134,7 +73656,7 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
                 ("STORAGE_ROOT", storage_root_text.as_str()),
             ],
-            || handle_doctor_reconstruct(true, true, false, true, false, false),
+            || handle_doctor_reconstruct(true, true, false, true, false, false, false),
         );
         let output = capture.drain_to_string();
 
@@ -87522,6 +88044,33 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn recover_sqlite_file_refuses_archive_only_state_loss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("storage.sqlite3");
+        seed_archive_mailbox_project(&storage_root);
+        let damaged = b"original unreadable mailbox with unknown DB-only state";
+        std::fs::write(&db_path, damaged).unwrap();
+
+        let error = recover_sqlite_file_with_storage_root(&db_path, Some(&storage_root))
+            .expect_err("automatic recovery must not accept loss of DB-only state");
+        assert!(error.to_string().contains("--allow-state-loss"), "{error}");
+        assert_eq!(std::fs::read(&db_path).unwrap(), damaged);
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".reconstruct-failed-")
+                }),
+            "automatic refusal must retain the unpromoted candidate"
+        );
+    }
+
+    #[test]
     fn recover_sqlite_file_fails_closed_without_backup_or_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage_root = dir.path().join("storage");
@@ -95374,6 +95923,7 @@ fn handle_doctor_repair_with_options(
                 yes,
                 false,
                 false,
+                false,
             );
         }
         if dry_run {
@@ -95428,6 +95978,7 @@ fn handle_doctor_repair_with_options(
                     Some(storage_root),
                     false,
                     yes,
+                    false,
                     false,
                     false,
                 );
@@ -95509,6 +96060,7 @@ fn handle_doctor_repair_with_options(
                         yes,
                         false,
                         false,
+                        false,
                     );
                 }
                 ftui_runtime::ftui_println!(
@@ -95537,6 +96089,7 @@ fn handle_doctor_repair_with_options(
                         Some(storage_root),
                         false,
                         yes,
+                        false,
                         false,
                         false,
                     );
@@ -95628,6 +96181,7 @@ fn handle_doctor_repair_with_options(
                 yes,
                 false,
                 false,
+                false,
             );
         }
         Err(error) => {
@@ -95676,6 +96230,7 @@ fn handle_doctor_repair_with_options(
                 Some(storage_root),
                 false,
                 yes,
+                false,
                 false,
                 false,
             );
@@ -95978,6 +96533,7 @@ fn handle_doctor_reconstruct(
     allow_live_owner: bool,
     take_ownership: bool,
     reseed_receipt_chain: bool,
+    allow_state_loss: bool,
 ) -> CliResult<()> {
     if reseed_receipt_chain && !dry_run && !yes {
         return Err(CliError::InvalidArgument(
@@ -96007,6 +96563,7 @@ fn handle_doctor_reconstruct(
         yes,
         json,
         reseed_receipt_chain,
+        allow_state_loss,
     )
 }
 
@@ -96039,7 +96596,15 @@ fn handle_doctor_reconstruct_locked(
     yes: bool,
     json: bool,
 ) -> CliResult<()> {
-    handle_doctor_reconstruct_locked_full(database_url, storage_root, dry_run, yes, json, false)
+    handle_doctor_reconstruct_locked_full(
+        database_url,
+        storage_root,
+        dry_run,
+        yes,
+        json,
+        false,
+        false,
+    )
 }
 
 fn handle_doctor_reconstruct_locked_full(
@@ -96049,6 +96614,7 @@ fn handle_doctor_reconstruct_locked_full(
     yes: bool,
     json: bool,
     reseed_receipt_chain: bool,
+    allow_state_loss: bool,
 ) -> CliResult<()> {
     let db_path = doctor_reconstruct_db_path_from_database_url(database_url)?;
     handle_doctor_reconstruct_locked_with_path(
@@ -96058,6 +96624,7 @@ fn handle_doctor_reconstruct_locked_full(
         yes,
         json,
         reseed_receipt_chain,
+        allow_state_loss,
     )
 }
 
@@ -96068,6 +96635,7 @@ fn handle_doctor_reconstruct_locked_with_path(
     yes: bool,
     json: bool,
     reseed_receipt_chain: bool,
+    allow_state_loss: bool,
 ) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
@@ -96117,6 +96685,7 @@ fn handle_doctor_reconstruct_locked_with_path(
         yes,
         json,
         dry_run && reseed_receipt_chain,
+        allow_state_loss,
     )
 }
 
@@ -96487,8 +97056,52 @@ struct DoctorSalvageArtifact {
 
 #[derive(Debug)]
 enum DoctorSalvageAttempt {
+    /// Unrecoverable data permits an explicitly accepted archive-only rebuild.
     Failed(String),
+    /// Admission failures never authorize replacement, including with an override.
+    Refused {
+        source: PathBuf,
+        detail: String,
+    },
     Succeeded(DoctorSalvageArtifact),
+}
+
+fn doctor_salvage_source_error(
+    source: &Path,
+    operation: &str,
+    error: impl std::fmt::Display,
+) -> DoctorSalvageAttempt {
+    DoctorSalvageProbeFailure::from_error(operation, error).into_attempt(source)
+}
+
+#[derive(Debug)]
+enum DoctorSalvageProbeFailure {
+    Unrecoverable(String),
+    Refused(String),
+}
+
+impl DoctorSalvageProbeFailure {
+    fn from_error(operation: &str, error: impl std::fmt::Display) -> Self {
+        let message = error.to_string();
+        let detail = format!("{operation}: {message}");
+        if is_sqlite_corruption_error_message(&message) {
+            Self::Unrecoverable(detail)
+        } else {
+            Self::Refused(detail)
+        }
+    }
+
+    fn into_attempt(self, source: &Path) -> DoctorSalvageAttempt {
+        match self {
+            Self::Unrecoverable(detail) => {
+                DoctorSalvageAttempt::Failed(format!("{}: {detail}", source.display()))
+            }
+            Self::Refused(detail) => DoctorSalvageAttempt::Refused {
+                source: source.to_path_buf(),
+                detail,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96585,10 +97198,13 @@ fn attempt_readable_sqlite_salvage_source(
             ) {
                 Ok(source) => Some(source),
                 Err(error) => {
-                    return DoctorSalvageAttempt::Failed(format!(
-                        "{label} {} could not be materialized through guarded live FrankenSQLite access: {error}",
-                        sqlite_path.display()
-                    ));
+                    return doctor_salvage_source_error(
+                        sqlite_path,
+                        &format!(
+                            "{label} could not be materialized through guarded live FrankenSQLite access"
+                        ),
+                        error,
+                    );
                 }
             }
         }
@@ -96607,10 +97223,11 @@ fn attempt_readable_sqlite_salvage_source(
                 ) {
                     Ok(source) => Some(source),
                     Err(error) => {
-                        return DoctorSalvageAttempt::Failed(format!(
-                            "{label} {} could not be staged as a private family copy: {error}",
-                            sqlite_path.display()
-                        ));
+                        return doctor_salvage_source_error(
+                            sqlite_path,
+                            &format!("{label} could not be staged as a private family copy"),
+                            error,
+                        );
                     }
                 }
             }
@@ -96625,60 +97242,66 @@ fn attempt_readable_sqlite_salvage_source(
         match std::fs::symlink_metadata(readable_path) {
             Ok(metadata) if metadata.file_type().is_file() && metadata.nlink() == 1 => {}
             Ok(metadata) => {
-                return DoctorSalvageAttempt::Failed(format!(
-                    "{label} {} has {} hard links or is not a regular file and cannot be proven private",
-                    readable_path.display(),
-                    metadata.nlink()
-                ));
+                return DoctorSalvageAttempt::Refused {
+                    source: sqlite_path.to_path_buf(),
+                    detail: format!(
+                        "{label} {} has {} hard links or is not a regular file and cannot be proven private",
+                        readable_path.display(),
+                        metadata.nlink()
+                    ),
+                };
             }
             Err(error) => {
-                return DoctorSalvageAttempt::Failed(format!(
-                    "{label} {} could not be inspected before private canonical salvage: {error}",
-                    readable_path.display()
-                ));
+                return DoctorSalvageAttempt::Refused {
+                    source: sqlite_path.to_path_buf(),
+                    detail: format!(
+                        "{label} {} could not be inspected before private canonical salvage: {error}",
+                        readable_path.display()
+                    ),
+                };
             }
         }
     }
     let Some(readable_path_text) = readable_path.to_str() else {
-        return DoctorSalvageAttempt::Failed(format!(
-            "{label} {} cannot be represented as an exact UTF-8 SQLite path",
-            sqlite_path.display()
-        ));
+        return DoctorSalvageAttempt::Refused {
+            source: sqlite_path.to_path_buf(),
+            detail: format!(
+                "{label} {} cannot be represented as an exact UTF-8 SQLite path",
+                sqlite_path.display()
+            ),
+        };
     };
     let config = sqlmodel_sqlite::SqliteConfig::file(readable_path_text.to_string())
         .flags(sqlmodel_sqlite::OpenFlags::read_only());
     let conn = match mcp_agent_mail_db::CanonicalDbConn::open(&config) {
         Ok(conn) => conn,
         Err(error) => {
-            return DoctorSalvageAttempt::Failed(format!(
-                "{label} {} could not be opened for private canonical salvage read: {error}",
-                readable_path.display()
-            ));
+            return doctor_salvage_source_error(
+                sqlite_path,
+                &format!("{label} could not be opened for private canonical salvage read"),
+                error,
+            );
         }
     };
     if let Err(error) = conn.execute_raw("PRAGMA query_only = ON;") {
-        return DoctorSalvageAttempt::Failed(format!(
-            "{label} {} could not enforce private canonical query-only mode: {error}",
-            readable_path.display()
-        ));
+        return doctor_salvage_source_error(
+            sqlite_path,
+            &format!("{label} could not enforce private canonical query-only mode"),
+            error,
+        );
     }
     if let Err(error) = conn.query_sync("SELECT COUNT(*) AS cnt FROM sqlite_master", &[]) {
-        return DoctorSalvageAttempt::Failed(format!(
-            "{label} {} failed a private canonical salvage probe: {error}",
-            readable_path.display()
-        ));
+        return doctor_salvage_source_error(
+            sqlite_path,
+            &format!("{label} failed a private canonical salvage probe"),
+            error,
+        );
     }
     if let Err(error) = probe_doctor_salvage_quick_check(&conn, sqlite_path) {
-        return DoctorSalvageAttempt::Failed(format!(
-            "{label} {} failed a canonical salvage quick_check: {error}",
-            sqlite_path.display()
-        ));
+        return error.into_attempt(sqlite_path);
     }
     if let Err(error) = probe_doctor_salvage_tables(&conn, sqlite_path) {
-        return DoctorSalvageAttempt::Failed(format!(
-            "{label} {} failed a canonical salvage table scan: {error}",
-            sqlite_path.display()
-        ));
+        return error.into_attempt(sqlite_path);
     }
 
     let detail = match source_kind {
@@ -96702,38 +97325,42 @@ fn attempt_readable_sqlite_salvage_source(
 fn probe_doctor_salvage_quick_check(
     conn: &mcp_agent_mail_db::CanonicalDbConn,
     sqlite_path: &Path,
-) -> Result<(), String> {
-    #[cfg(not(test))]
-    let _ = sqlite_path;
-
+) -> Result<(), DoctorSalvageProbeFailure> {
     #[cfg(test)]
     if should_fail_doctor_salvage_quick_check(sqlite_path) {
-        return Err("simulated quick_check corruption".to_string());
+        return Err(DoctorSalvageProbeFailure::Unrecoverable(
+            "simulated quick_check corruption".to_string(),
+        ));
     }
 
     match sqlite_conn_quick_check_ok_canonical(conn) {
         Ok(true) => Ok(()),
-        Ok(false) => Err("PRAGMA quick_check did not return ok".to_string()),
-        Err(error) => Err(error.to_string()),
+        Ok(false) => Err(DoctorSalvageProbeFailure::Unrecoverable(format!(
+            "{} failed a canonical salvage quick_check: PRAGMA quick_check did not return ok",
+            sqlite_path.display()
+        ))),
+        Err(error) => Err(DoctorSalvageProbeFailure::from_error(
+            "canonical salvage quick_check failed",
+            error,
+        )),
     }
 }
 
 fn probe_doctor_salvage_tables(
     conn: &mcp_agent_mail_db::CanonicalDbConn,
     sqlite_path: &Path,
-) -> Result<(), String> {
+) -> Result<(), DoctorSalvageProbeFailure> {
     #[cfg(not(test))]
     let _ = sqlite_path;
-
     let mut found_salvage_table = false;
     for table in DOCTOR_SALVAGE_PROBE_TABLES {
         let exists_sql = format!(
             "SELECT 1 AS exists_flag FROM sqlite_master \
              WHERE type = 'table' AND name = '{table}' LIMIT 1"
         );
-        let exists = conn
-            .query_sync(&exists_sql, &[])
-            .map_err(|error| format!("check {table} existence: {error}"))?;
+        let exists = conn.query_sync(&exists_sql, &[]).map_err(|error| {
+            DoctorSalvageProbeFailure::from_error(&format!("check {table} existence"), error)
+        })?;
         if exists.is_empty() {
             continue;
         }
@@ -96741,17 +97368,20 @@ fn probe_doctor_salvage_tables(
 
         #[cfg(test)]
         if should_fail_doctor_salvage_table_scan(sqlite_path, table) {
-            return Err(format!(
+            return Err(DoctorSalvageProbeFailure::Unrecoverable(format!(
                 "scan {table}: Query error: database disk image is malformed"
-            ));
+            )));
         }
 
         let scan_sql = format!("SELECT COUNT(*) AS row_count FROM {table}");
-        conn.query_sync(&scan_sql, &[])
-            .map_err(|error| format!("scan {table}: {error}"))?;
+        conn.query_sync(&scan_sql, &[]).map_err(|error| {
+            DoctorSalvageProbeFailure::from_error(&format!("scan {table}"), error)
+        })?;
     }
     if !found_salvage_table {
-        return Err("no expected Agent Mail salvage tables were present".to_string());
+        return Err(DoctorSalvageProbeFailure::Unrecoverable(
+            "no expected Agent Mail salvage tables were present".to_string(),
+        ));
     }
     Ok(())
 }
@@ -96854,11 +97484,10 @@ fn doctor_salvage_artifact_candidates(
             "standalone salvage artifact",
             os_string_with_suffix(file_name, ".salvage-"),
         ),
-        (
-            "reconstruct artifact",
-            os_string_with_suffix(file_name, ".reconstruct-"),
-        ),
     ];
+    // Unpromoted .reconstruct-* files, including .reconstruct-failed-*,
+    // cannot attest prior database-only state. Reusing a refused archive-only
+    // candidate as salvage would otherwise authorize the same loss on retry.
     let sidecar_suffixes = SQLITE_RECOVERY_SIDECAR_SUFFIXES.map(OsString::from);
 
     for (label, prefix) in prefixed_groups {
@@ -96911,6 +97540,7 @@ fn attempt_best_doctor_salvage_artifact_from_candidates(
             DoctorSalvageAttempt::Failed(detail) => {
                 failures.push(detail);
             }
+            refusal @ DoctorSalvageAttempt::Refused { .. } => return refusal,
         }
     }
 
@@ -96970,8 +97600,8 @@ enum DoctorReconstructSalvagePreview {
     NotMaterializable(String),
     /// The candidate validates and its DB-only rows would be merged.
     WouldMerge(PathBuf),
-    /// The candidate is corrupt/unreadable; the rebuild degrades to
-    /// archive-only and still promotes.
+    /// The candidate is corrupt/unreadable; archive-only promotion needs
+    /// validated checkpoint authority or explicit acceptance of unprotected state.
     WouldDegradeToArchiveOnly { source: PathBuf, detail: String },
     /// The real command would refuse on this candidate.
     WouldRefuse { source: PathBuf, detail: String },
@@ -97045,6 +97675,12 @@ fn doctor_reconstruct_salvage_preview(
         Some(DoctorSalvageAttempt::Failed(detail)) => {
             DoctorReconstructSalvagePreview::NotMaterializable(detail.clone())
         }
+        Some(DoctorSalvageAttempt::Refused { source, detail }) => {
+            DoctorReconstructSalvagePreview::WouldRefuse {
+                source: source.clone(),
+                detail: detail.clone(),
+            }
+        }
         Some(DoctorSalvageAttempt::Succeeded(artifact)) => {
             let source = artifact.reported_path.clone();
             match mcp_agent_mail_db::classify_salvage_source(&artifact.db_path) {
@@ -97062,6 +97698,29 @@ fn doctor_reconstruct_salvage_preview(
     }
 }
 
+/// Keep the legacy source description separate from the completed merge outcome.
+fn doctor_reconstruct_salvage_result_json(
+    attempt: Option<&DoctorSalvageAttempt>,
+) -> serde_json::Value {
+    match attempt {
+        Some(DoctorSalvageAttempt::Succeeded(artifact)) => serde_json::json!({
+            "status": "ok",
+            "detail": artifact.detail,
+            "db_path": artifact.reported_path.display().to_string(),
+        }),
+        Some(DoctorSalvageAttempt::Failed(detail)) => serde_json::json!({
+            "status": "warn",
+            "detail": detail,
+        }),
+        Some(DoctorSalvageAttempt::Refused { source, detail }) => serde_json::json!({
+            "status": "refused",
+            "detail": detail,
+            "db_path": source.display().to_string(),
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// Build the actual archive/salvage candidate in both preview and repair modes.
 /// The caller chooses a fresh scratch path; this never promotes a generation.
 fn build_doctor_reconstruct_candidate(
@@ -97069,10 +97728,16 @@ fn build_doctor_reconstruct_candidate(
     storage_root: &Path,
     salvage_attempt: Option<&DoctorSalvageAttempt>,
 ) -> CliResult<mcp_agent_mail_db::ReconstructStats> {
-    let salvage_db_path = salvage_attempt.and_then(|attempt| match attempt {
-        DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
-        DoctorSalvageAttempt::Failed(_) => None,
-    });
+    let salvage_db_path = match salvage_attempt {
+        Some(DoctorSalvageAttempt::Succeeded(artifact)) => Some(artifact.db_path.as_path()),
+        Some(DoctorSalvageAttempt::Refused { source, detail }) => {
+            return Err(CliError::Other(format!(
+                "salvage source {} failed admission; --allow-state-loss cannot override source safety: {detail}",
+                source.display()
+            )));
+        }
+        Some(DoctorSalvageAttempt::Failed(_)) | None => None,
+    };
     let reconstruct = salvage_db_path.map_or_else(
         || mcp_agent_mail_db::reconstruct_from_archive(candidate_path, storage_root),
         |private_salvage_db_path| {
@@ -97109,6 +97774,51 @@ fn build_doctor_reconstruct_candidate(
     Ok(stats)
 }
 
+fn doctor_reconstruct_state_policy(
+    stats: &mcp_agent_mail_db::ReconstructStats,
+    allow_state_loss: bool,
+) -> CliResult<()> {
+    if !allow_state_loss {
+        stats
+            .require_recovery_state()
+            .map_err(|error| CliError::Other(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn warn_doctor_reconstruct_state_loss(stats: &mcp_agent_mail_db::ReconstructStats) {
+    ftui_runtime::ftui_eprintln!(
+        "WARNING: --allow-state-loss accepts unavailable or incomplete recovery state."
+    );
+    for risk in stats.recovery_state_loss_risks() {
+        ftui_runtime::ftui_eprintln!("  State loss risk: {risk}");
+    }
+}
+
+fn print_doctor_reconstruct_recovery_state(stats: &mcp_agent_mail_db::ReconstructStats) {
+    ftui_runtime::ftui_println!(
+        "  Recovery checkpoint: {}",
+        if stats.recovery_checkpoint_present {
+            "validated"
+        } else {
+            "absent"
+        }
+    );
+    ftui_runtime::ftui_println!(
+        "  Archived state restored: {} receipt record(s), {} contact record(s)",
+        stats.archived_receipts,
+        stats.archived_contacts
+    );
+    if let Some(floor) = stats.delivery_cursor_reset_floor {
+        ftui_runtime::ftui_println!(
+            "  Delivery cursor reset floor: {floor}; older cursors expire and require resynchronization"
+        );
+    }
+    for limitation in stats.recovery_state_limitations() {
+        ftui_runtime::ftui_println!("  Recovery limitation: {limitation}");
+    }
+}
+
 fn handle_doctor_reconstruct_with(
     db_path_override: Option<&Path>,
     storage_root_override: Option<&Path>,
@@ -97116,6 +97826,7 @@ fn handle_doctor_reconstruct_with(
     yes: bool,
     json: bool,
     preview_reseed_broken_chain: bool,
+    allow_state_loss: bool,
 ) -> CliResult<()> {
     // Caller must acquire mailbox activity locks before invoking this helper
     // because it can replace the live SQLite file and reconcile archive state.
@@ -97238,28 +97949,31 @@ fn handle_doctor_reconstruct_with(
         let candidate_path = scratch.path().join("candidate.sqlite3");
         let salvage_attempt = doctor_reconstruct_salvage_attempt(&db_path);
         let salvage_preview = doctor_reconstruct_salvage_preview(salvage_attempt.as_ref());
-        let candidate = build_doctor_reconstruct_candidate(
+        let recovered = build_doctor_reconstruct_candidate(
             &candidate_path,
             &storage_root,
             salvage_attempt.as_ref(),
-        )
-        .and_then(|recovered| {
-            let continuity = mcp_agent_mail_db::forensics::validate_recovery_candidate_continuity(
-                &storage_root,
-                &db_path,
-                path_is_real_file(&db_path).then_some(db_path.as_path()),
-                &candidate_path,
-                preview_reseed_broken_chain,
-            )
-            .map_err(|error| CliError::Other(error.to_string()))?;
-            Ok((recovered, continuity))
-        });
+        );
+        let candidate = recovered
+            .as_ref()
+            .map_err(|error| CliError::Other(error.to_string()))
+            .and_then(|stats| {
+                doctor_reconstruct_state_policy(stats, allow_state_loss)?;
+                mcp_agent_mail_db::forensics::validate_recovery_candidate_continuity(
+                    &storage_root,
+                    &db_path,
+                    path_is_real_file(&db_path).then_some(db_path.as_path()),
+                    &candidate_path,
+                    preview_reseed_broken_chain,
+                )
+                .map_err(|error| CliError::Other(error.to_string()))
+            });
         let validation = match &candidate {
-            Ok((recovered, continuity)) => serde_json::json!({
+            Ok(continuity) => serde_json::json!({
                 "status": "valid", "would_refuse": false,
                 "recovered": continuity,
-                "parse_errors": recovered.parse_errors,
-                "warnings": recovered.warnings,
+                "parse_errors": recovered.as_ref().ok().map(|stats| stats.parse_errors),
+                "warnings": recovered.as_ref().ok().map(|stats| &stats.warnings),
             }),
             Err(error) => serde_json::json!({
                 "status": "would_refuse", "would_refuse": true, "detail": error.to_string(),
@@ -97283,6 +97997,15 @@ fn handle_doctor_reconstruct_with(
                         "unparseable_canonical_message_files": stats.unparseable_canonical_message_files,
                     },
                     "salvage": salvage_preview.to_json(),
+                    "salvage_outcome": recovered.as_ref().ok().map(|stats| &stats.salvage),
+                    "recovery_checkpoint_present": recovered.as_ref().ok().map(|stats| stats.recovery_checkpoint_present),
+                    "archived_receipts": recovered.as_ref().ok().map(|stats| stats.archived_receipts),
+                    "archived_contacts": recovered.as_ref().ok().map(|stats| stats.archived_contacts),
+                    "delivery_cursor_reset_floor": recovered.as_ref().ok().and_then(|stats| stats.delivery_cursor_reset_floor),
+                    "recovery_state_limitations": recovered.as_ref().ok().map(|stats| stats.recovery_state_limitations()),
+                    "requires_lossy_recovery": recovered.as_ref().ok().map(|stats| stats.requires_lossy_recovery()),
+                    "state_loss_risks": recovered.as_ref().ok().map(|stats| stats.recovery_state_loss_risks()),
+                    "allow_state_loss": allow_state_loss,
                     "candidate_validation": validation,
                     "would_reseed_receipt_chain": preview_reseed_broken_chain,
                     "actions_taken": 0,
@@ -97312,6 +98035,9 @@ fn handle_doctor_reconstruct_with(
             }
             ftui_runtime::ftui_println!("  Database path: {}", db_path.display());
             ftui_runtime::ftui_println!("  Salvage:       {}", salvage_preview.summary());
+            if let Ok(recovered) = &recovered {
+                print_doctor_reconstruct_recovery_state(recovered);
+            }
             match &candidate {
                 Ok(_) => ftui_runtime::ftui_println!(
                     "  Candidate:     passed full integrity and promotion continuity checks"
@@ -97319,6 +98045,12 @@ fn handle_doctor_reconstruct_with(
                 Err(error) => ftui_runtime::ftui_println!("  Candidate:     WOULD REFUSE: {error}"),
             }
             ftui_runtime::ftui_println!("No mailbox changes made; no candidate promoted.");
+        }
+        if allow_state_loss
+            && let Ok(stats) = &recovered
+            && stats.requires_lossy_recovery()
+        {
+            warn_doctor_reconstruct_state_loss(stats);
         }
         return candidate.map(|_| ());
     }
@@ -97389,6 +98121,52 @@ fn handle_doctor_reconstruct_with(
     let stats =
         build_doctor_reconstruct_candidate(&temp_db_path, &storage_root, salvage_attempt.as_ref())?;
 
+    // Judge the completed candidate, not the source preview: a source can
+    // become unreadable or its merge can roll back after initial admission.
+    if let Err(error) = doctor_reconstruct_state_policy(&stats, allow_state_loss) {
+        let quarantine = quarantine_refused_reconstruct_candidate(&db_path, &temp_db_path);
+        let candidate_path = match &quarantine {
+            Ok(Some(path)) => path.as_path(),
+            _ => temp_db_path.as_path(),
+        };
+        let quarantine_error = quarantine.as_ref().err();
+        if json {
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::json!({
+                    "status": "refused",
+                    "detail": error.to_string(),
+                    "db_path": db_path.display().to_string(),
+                    "candidate_path": candidate_path.display().to_string(),
+                    "quarantine_error": quarantine_error,
+                    "salvage": doctor_reconstruct_salvage_result_json(salvage_attempt.as_ref()),
+                    "salvage_outcome": stats.salvage,
+                    "recovery_checkpoint_present": stats.recovery_checkpoint_present,
+                    "archived_receipts": stats.archived_receipts,
+                    "archived_contacts": stats.archived_contacts,
+                    "delivery_cursor_reset_floor": stats.delivery_cursor_reset_floor,
+                    "recovery_state_limitations": stats.recovery_state_limitations(),
+                    "requires_lossy_recovery": stats.requires_lossy_recovery(),
+                    "state_loss_risks": stats.recovery_state_loss_risks(),
+                    "allow_state_loss": allow_state_loss,
+                    "actions_taken": 0,
+                })
+            );
+        } else {
+            print_doctor_reconstruct_recovery_state(&stats);
+        }
+        return Err(CliError::Other(format!(
+            "reconstruction refused; original database is untouched; candidate preserved at {}{}: {error}",
+            candidate_path.display(),
+            quarantine_error.map_or_else(String::new, |detail| format!(
+                " (quarantine failed: {detail})"
+            ))
+        )));
+    }
+    if stats.requires_lossy_recovery() {
+        warn_doctor_reconstruct_state_loss(&stats);
+    }
+
     mcp_agent_mail_db::promote_recovery_candidate(&db_path, &temp_db_path, &storage_root).map_err(
         |err| {
             // br-fx7sx: a refused promotion errors strictly pre-receipt-commit,
@@ -97457,18 +98235,6 @@ fn handle_doctor_reconstruct_with(
     };
 
     if json {
-        let salvage_json = match &salvage_attempt {
-            Some(DoctorSalvageAttempt::Succeeded(artifact)) => serde_json::json!({
-                "status": "ok",
-                "detail": artifact.detail,
-                "db_path": artifact.reported_path.display().to_string(),
-            }),
-            Some(DoctorSalvageAttempt::Failed(detail)) => serde_json::json!({
-                "status": "warn",
-                "detail": detail,
-            }),
-            None => serde_json::Value::Null,
-        };
         ftui_runtime::ftui_println!(
             "{}",
             serde_json::json!({
@@ -97488,7 +98254,16 @@ fn handle_doctor_reconstruct_with(
                     "salvaged_messages": stats.salvaged_messages,
                     "salvaged_recipients": stats.salvaged_recipients,
                 },
-                "salvage": salvage_json,
+                "salvage": doctor_reconstruct_salvage_result_json(salvage_attempt.as_ref()),
+                "salvage_outcome": stats.salvage,
+                "recovery_checkpoint_present": stats.recovery_checkpoint_present,
+                "archived_receipts": stats.archived_receipts,
+                "archived_contacts": stats.archived_contacts,
+                "delivery_cursor_reset_floor": stats.delivery_cursor_reset_floor,
+                "recovery_state_limitations": stats.recovery_state_limitations(),
+                "requires_lossy_recovery": stats.requires_lossy_recovery(),
+                "state_loss_risks": stats.recovery_state_loss_risks(),
+                "allow_state_loss": allow_state_loss,
                 "warning_count": stats.warnings.len(),
                 "warning_report_path": warning_report_path,
                 "warnings": stats.warnings,
@@ -97496,6 +98271,7 @@ fn handle_doctor_reconstruct_with(
         );
     } else {
         ftui_runtime::ftui_println!("Reconstruction complete: {stats}");
+        print_doctor_reconstruct_recovery_state(&stats);
         if let Some(DoctorSalvageAttempt::Succeeded(artifact)) = &salvage_attempt {
             ftui_runtime::ftui_println!("Salvage: {}", artifact.detail);
         }
@@ -100394,6 +101170,7 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
 
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
     let read_db = open_db_sync_mail_inbox_with_database_url_and_path(&database_url)?;
+    read_db.require_receipt_state()?;
     let project_id = crate::context::resolve_project(read_db.conn(), &config.project_key)?.id;
     let agent_id =
         resolve_agent_id_for_inbox_check(read_db.conn(), project_id, &config.agent_name)?;
