@@ -190,12 +190,31 @@ def mcp_post(url: str, session: str | None, rid: int, method: str, params: dict 
     with urllib.request.urlopen(req, timeout=timeout) as r:
         sid = r.headers.get("Mcp-Session-Id")
         raw = r.read().decode()
-    if raw.lstrip().startswith("{"):
-        return json.loads(raw), sid
-    for line in raw.splitlines():
-        if line.startswith("data:"):
-            return json.loads(line[5:].strip()), sid
-    raise RuntimeError(f"unparseable response: {raw[:300]}")
+    bodies = (raw,) if raw.lstrip().startswith("{") else (
+        line[5:].strip() for line in raw.splitlines() if line.startswith("data:")
+    )
+    for data in bodies:
+        response = json.loads(data)
+        if (
+            not isinstance(response, dict)
+            or response.get("jsonrpc") != "2.0"
+            or type(response.get("id")) is not int
+            or response["id"] != rid
+        ):
+            continue
+        if method == "initialize":
+            result = response.get("result")
+            if (
+                "error" in response
+                or not isinstance(result, dict)
+                or not isinstance(result.get("protocolVersion"), str)
+                or not result["protocolVersion"]
+                or not isinstance(result.get("capabilities"), dict)
+                or not isinstance(result.get("serverInfo"), dict)
+            ):
+                raise RuntimeError(f"MCP initialize failed: {response}")
+        return response, sid
+    raise RuntimeError(f"no correlated MCP response for {method} id {rid}")
 
 
 def tool_result(resp: dict) -> tuple[bool, object]:

@@ -76,6 +76,40 @@ class StartupTests(unittest.TestCase):
         health.assert_called_once_with(f'http://127.0.0.1:{arm.port}/healthz', timeout=2)
         initialize.assert_called_once()
 
+    def test_worker_session_does_not_dispatch_after_failed_initialize(self):
+        cases = (
+            ({'id': 1, 'error': {'code': -32602, 'message': 'invalid initialize params'}},
+             'MCP initialize failed'),
+            ({'id': 1, 'result': {}}, 'MCP initialize failed'),
+            ({'id': 2, 'result': {'protocolVersion': '2025-06-18', 'capabilities': {},
+                                  'serverInfo': {'name': 'test-server'}}}, 'MCP response for initialize id 1'),
+        )
+        for response, message in cases:
+            with self.subTest(response=response), patch.object(smoke.urllib.request, 'urlopen') as request:
+                reply = request.return_value.__enter__.return_value
+                reply.headers = {'Mcp-Session-Id': 'unconfirmed-session'}
+                reply.read.return_value = json.dumps({'jsonrpc': '2.0', **response}).encode()
+                session = smoke.Session('http://127.0.0.1/mcp/')
+                with self.assertRaisesRegex(RuntimeError, message):
+                    session.call('health_check', {})
+                request.assert_called_once()
+                self.assertFalse(session.initialized)
+                self.assertIsNone(session.sid)
+
+    def test_initialize_selects_correlated_response_from_event_stream(self):
+        notice = {'jsonrpc': '2.0', 'method': 'notifications/message', 'params': {'data': 'ready'}}
+        result = {'jsonrpc': '2.0', 'id': 1, 'result': {
+            'protocolVersion': '2025-06-18', 'capabilities': {}, 'serverInfo': {'name': 'test-server'},
+        }}
+        with patch.object(smoke.urllib.request, 'urlopen') as request:
+            reply = request.return_value.__enter__.return_value
+            reply.headers = {'Mcp-Session-Id': 'confirmed-session'}
+            reply.read.return_value = ''.join(f'data: {json.dumps(event)}\n\n' for event in (notice, result)).encode()
+            response, session = smoke.mcp_post('http://127.0.0.1/mcp/', None, 1, 'initialize', {}, 5)
+
+        self.assertEqual(response, result)
+        self.assertEqual(session, 'confirmed-session')
+
 
 class ClassifyCallTests(unittest.TestCase):
     def test_success_is_ok(self):
