@@ -882,6 +882,27 @@ pub mod tool_util {
                 ),
             ),
             DbError::InvalidArgument {
+                field: field @ ("agent_credential_mismatch" | "agent_credential_unavailable"),
+                message,
+            } => legacy_tool_error(
+                if field == "agent_credential_mismatch" {
+                    "SENDER_TOKEN_MISMATCH"
+                } else {
+                    "SENDER_TOKEN_UNAVAILABLE"
+                },
+                message.clone(),
+                false,
+                db_error_data(
+                    classification,
+                    &failure_envelope,
+                    json!({
+                        "field": "sender_token",
+                        "error_detail": message,
+                        "phase": "credential_authorization",
+                    }),
+                ),
+            ),
+            DbError::InvalidArgument {
                 field: field @ ("cross_project_contact_blocked" | "cross_project_contact_required"),
                 message,
             } => legacy_tool_error(
@@ -3374,6 +3395,23 @@ body
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
             assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_preserves_bearer_admission_errors() {
+            for (field, code) in [
+                ("agent_credential_mismatch", "SENDER_TOKEN_MISMATCH"),
+                ("agent_credential_unavailable", "SENDER_TOKEN_UNAVAILABLE"),
+            ] {
+                let err = db_error_to_mcp_error(DbError::invalid(field, "Credential refused."));
+                assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+                assert_eq!(err.message, "Credential refused.");
+                let data = err.data.expect("credential refusal envelope");
+                assert_eq!(data["error"]["type"], code);
+                assert_eq!(data["error"]["recoverable"], false);
+                assert_eq!(data["error"]["data"]["field"], "sender_token");
+                assert_eq!(data["error"]["data"]["phase"], "credential_authorization");
+            }
         }
 
         #[test]

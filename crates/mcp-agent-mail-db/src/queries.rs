@@ -9183,6 +9183,7 @@ pub async fn create_message_with_recipients_topic(
         project_mailbox,
         None,
         None,
+        None,
     )
     .await
     {
@@ -9281,9 +9282,73 @@ pub async fn create_message_with_recipients_idempotent_topic(
         recipients,
         project_mailbox,
         None,
+        None,
         Some(claim),
     )
     .await
+}
+
+/// A caller-supplied bearer credential bound to one canonical agent identity.
+///
+/// Keep this proof transient: it is neither archived nor included in an
+/// idempotency fingerprint, and deliberately has no `Debug` implementation.
+/// A successful earlier read is not authority for a later write transaction.
+#[derive(Clone, Copy)]
+pub struct AgentCredentialProof<'a> {
+    pub project_id: i64,
+    pub agent_name: &'a str,
+    pub registration_token: &'a str,
+}
+
+/// Revalidate bearer ownership in the transaction that uses it. Callers must
+/// roll back on refusal. No secret is included in diagnostics or persisted.
+async fn ensure_agent_credential_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+    proof: AgentCredentialProof<'_>,
+) -> Outcome<(), DbError> {
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT name, registration_token FROM agents WHERE id = ? AND project_id = ? LIMIT 1",
+            &[Value::BigInt(agent_id), Value::BigInt(proof.project_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    };
+    let current_name = rows.first().and_then(|row| match row.get(0) {
+        Some(Value::Text(name)) => Some(name.as_str()),
+        _ => None,
+    });
+    if current_name != Some(proof.agent_name) || proof.registration_token.is_empty() {
+        return Outcome::Err(DbError::invalid(
+            "agent_credential_mismatch",
+            "The supplied credential no longer belongs to the current agent identity.",
+        ));
+    }
+    let stored = rows.first().and_then(|row| match row.get(1) {
+        Some(Value::Text(token)) if !token.is_empty() => Some(token.as_str()),
+        _ => None,
+    });
+    let Some(stored) = stored else {
+        return Outcome::Err(DbError::invalid(
+            "agent_credential_unavailable",
+            "The agent has no active registration token. The supplied credential cannot authorize this operation.",
+        ));
+    };
+    if !mcp_agent_mail_core::setup::constant_time_str_eq(proof.registration_token, stored) {
+        return Outcome::Err(DbError::invalid(
+            "agent_credential_mismatch",
+            "The supplied credential no longer matches the agent's current registration token.",
+        ));
+    }
+    Outcome::Ok(())
 }
 
 /// The source project of a user message delivered into another project.
@@ -9296,13 +9361,15 @@ pub struct CrossProjectMessageScope {
     pub sender_project_id: i64,
 }
 
-/// Create a message with transaction-bound cross-project contact authorization.
+/// Create a message with transaction-bound bearer and contact authorization.
 ///
-/// User-facing qualified sends and replies pass `cross_project`. Internal
-/// contact-request notices use the ordinary creation functions because their
-/// purpose is to request approval that does not yet exist. Same-project policy
-/// stays with its existing tool-layer rules. An existing idempotency result is
-/// returned before checking current contact permission: replay creates no mail.
+/// User-facing sends and replies pass their supplied `credential`, if any.
+/// Bearer authority is checked before both fresh writes and idempotent replays.
+/// Qualified sends additionally pass `cross_project`. Internal contact-request
+/// notices use the ordinary creation functions because their purpose is to
+/// request approval that does not yet exist. Same-project contact policy stays
+/// with its existing tool-layer rules. An existing idempotency result is returned
+/// before checking current contact permission: replay creates no mail.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn create_message_with_recipients_guarded(
     cx: &Cx,
@@ -9320,6 +9387,7 @@ pub async fn create_message_with_recipients_guarded(
     recipients: &[(i64, &str)], // (agent_id, kind)
     project_mailbox: Option<&str>,
     cross_project: Option<CrossProjectMessageScope>,
+    credential: Option<AgentCredentialProof<'_>>,
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
     if let Some(scope) = cross_project
@@ -9456,6 +9524,7 @@ pub async fn create_message_with_recipients_guarded(
                     recipients,
                     project_mailbox,
                     cross_project,
+                    credential,
                     now,
                     archive_seed,
                     idempotency,
@@ -9914,6 +9983,7 @@ async fn create_message_with_recipients_tx(
     recipients: &[(i64, &str)],
     project_mailbox: Option<&str>,
     cross_project: Option<CrossProjectMessageScope>,
+    credential: Option<AgentCredentialProof<'_>>,
     now: i64,
     archive_seed: Option<i64>,
     idempotency: Option<IdempotencyClaim<'_>>,
@@ -9921,6 +9991,17 @@ async fn create_message_with_recipients_tx(
 ) -> Outcome<Option<IdempotentOutcome<MessageRow>>, DbError> {
     // Use MVCC concurrent transaction for page-level parallelism.
     try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
+
+    // A caller may have waited behind attachment work, pool acquisition or
+    // another message since preflight. Recheck in every MVCC attempt, before
+    // even pruning idempotency records or replaying a committed result.
+    if let Some(proof) = credential {
+        try_in_tx!(
+            cx,
+            tracked,
+            ensure_agent_credential_in_tx(cx, tracked, sender_id, proof).await
+        );
+    }
 
     // Idempotency check (br-idempotency-keys-mutating-tools-h0x9k): if this call
     // carries a client key, resolve it BEFORE writing anything. A matching
@@ -10316,6 +10397,18 @@ pub async fn lookup_idempotency_result<T: DeserializeOwned>(
     pool: &DbPool,
     claim: IdempotencyClaim<'_>,
 ) -> Outcome<Option<std::result::Result<T, IdempotencyConflict>>, DbError> {
+    lookup_idempotency_result_with_credential(cx, pool, claim, None).await
+}
+
+/// Look up a committed result and, when supplied, authorize its bearer in the
+/// same read snapshot. A credential revoked while a request waited after
+/// preflight cannot disclose an old result or a conflicting claim.
+pub async fn lookup_idempotency_result_with_credential<T: DeserializeOwned>(
+    cx: &Cx,
+    pool: &DbPool,
+    claim: IdempotencyClaim<'_>,
+    credential: Option<(i64, AgentCredentialProof<'_>)>,
+) -> Outcome<Option<std::result::Result<T, IdempotencyConflict>>, DbError> {
     run_read_with_mvcc_retry(cx, "lookup_idempotency_result", || async {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(conn) => conn,
@@ -10332,6 +10425,13 @@ pub async fn lookup_idempotency_result<T: DeserializeOwned>(
                 &tracked,
                 map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await)
             );
+            if let Some((agent_id, proof)) = credential {
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    ensure_agent_credential_in_tx(cx, &tracked, agent_id, proof).await
+                );
+            }
             let rows = try_in_tx!(
                 cx,
                 &tracked,
@@ -31853,6 +31953,7 @@ mod tests {
             recipients,
             None,
             scope,
+            None,
             claim,
         )
         .await
@@ -31904,6 +32005,7 @@ mod tests {
                     &recipients,
                     None,
                     Some(CrossProjectMessageScope { sender_project_id: source }),
+                    None,
                     Some(IdempotencyClaim {
                         project_id: source,
                         tool: "send_message",

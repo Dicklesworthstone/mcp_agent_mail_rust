@@ -2576,6 +2576,22 @@ async fn verify_current_sender(
     )
 }
 
+/// Bind a supplied credential to the canonical sender for the eventual
+/// database admission. Session and trusted-local tokenless calls keep their
+/// existing authorization; an explicitly supplied bearer is always rechecked.
+fn sender_credential_proof<'a>(
+    sender: &'a mcp_agent_mail_db::AgentRow,
+    sender_token: Option<&'a str>,
+) -> Option<mcp_agent_mail_db::queries::AgentCredentialProof<'a>> {
+    sender_token
+        .filter(|token| !token.is_empty())
+        .map(|registration_token| mcp_agent_mail_db::queries::AgentCredentialProof {
+            project_id: sender.project_id,
+            agent_name: &sender.name,
+            registration_token,
+        })
+}
+
 /// Mark a session-verified send so audit and diagnostics can tell it from a
 /// token-verified one (`"sender_verification": "session"`).
 fn with_sender_proof_marker(response_json: String, proof: SenderProof) -> String {
@@ -2973,11 +2989,17 @@ async fn try_replay_message(
         key,
         fingerprint,
     };
+    #[cfg(test)]
+    tests::run_before_message_replay_hook();
     match db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::lookup_idempotency_result::<mcp_agent_mail_db::MessageRow>(
+        mcp_agent_mail_db::queries::lookup_idempotency_result_with_credential::<
+            mcp_agent_mail_db::MessageRow,
+        >(
             ctx.cx(),
             &pool,
             claim,
+            sender_credential_proof(&sender, sender_token)
+                .map(|proof| (sender.id.unwrap_or(0), proof)),
         )
         .await,
     )? {
@@ -3869,6 +3891,7 @@ effective_free_bytes={free}"
             &recipient_refs,
             project_mailbox.as_ref().map(|mailbox| mailbox.kind),
             cross_project,
+            sender_credential_proof(&sender, sender_token.as_deref()),
             claim,
         )
         .await,
@@ -4810,65 +4833,46 @@ effective_free_bytes={free}"
         .iter()
         .map(|(id, kind)| (*id, kind.as_str()))
         .collect();
-    // Idempotency (br-idempotency-keys-mutating-tools-h0x9k): route through the
-    // idempotent DB entry point when a key was supplied. A matching prior key
-    // replays the original reply (skipping the index/notification/archive side
-    // effects below, at-most-once); a differing payload is a typed conflict.
-    let (reply, idempotent_replay) = if let Some(fingerprint) = idempotency_fingerprint.as_deref() {
-        let key = idempotency_key.as_deref().unwrap_or_default();
-        let claim = mcp_agent_mail_db::IdempotencyClaim {
+    let claim = idempotency_fingerprint.as_deref().map(|fingerprint| {
+        mcp_agent_mail_db::IdempotencyClaim {
             project_id,
             tool: "reply_message",
-            key,
+            key: idempotency_key.as_deref().unwrap_or_default(),
             fingerprint,
-        };
-        match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent_topic(
-                ctx.cx(),
-                &pool,
-                project_id,
-                sender_id,
-                &subject,
-                &final_body,
-                Some(&thread_id),
-                original.topic.as_deref(),
-                Some(message_id),
-                &importance_val,
-                ack_required.unwrap_or(original.ack_required != 0),
-                &attachments_json,
-                &recipient_refs,
-                None,
-                claim,
-            )
-            .await,
-        )? {
-            mcp_agent_mail_db::IdempotentOutcome::Fresh(row) => (row, false),
-            mcp_agent_mail_db::IdempotentOutcome::Replayed(row) => (row, true),
-            mcp_agent_mail_db::IdempotentOutcome::Conflict(info) => {
-                return Err(crate::idempotency::idempotency_conflict_error(&info));
-            }
         }
-    } else {
-        let row = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_topic(
-                ctx.cx(),
-                &pool,
-                project_id,
-                sender_id,
-                &subject,
-                &final_body,
-                Some(&thread_id),
-                original.topic.as_deref(),
-                Some(message_id),
-                &importance_val,
-                ack_required.unwrap_or(original.ack_required != 0),
-                &attachments_json,
-                &recipient_refs,
-                None,
-            )
-            .await,
-        )?;
-        (row, false)
+    });
+    #[cfg(test)]
+    tests::run_before_message_admission_hook();
+    // Ordinary replies need the same final bearer check as sends and
+    // cross-project replies. A cached preflight verdict cannot outlive a
+    // credential rotation while attachment processing or pool waits run.
+    let (reply, idempotent_replay) = match db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::create_message_with_recipients_guarded(
+            ctx.cx(),
+            &pool,
+            project_id,
+            sender_id,
+            &subject,
+            &final_body,
+            Some(&thread_id),
+            original.topic.as_deref(),
+            Some(message_id),
+            &importance_val,
+            ack_required.unwrap_or(original.ack_required != 0),
+            &attachments_json,
+            &recipient_refs,
+            None,
+            None,
+            sender_credential_proof(&sender, sender_token.as_deref()),
+            claim,
+        )
+        .await,
+    )? {
+        mcp_agent_mail_db::IdempotentOutcome::Fresh(row) => (row, false),
+        mcp_agent_mail_db::IdempotentOutcome::Replayed(row) => (row, true),
+        mcp_agent_mail_db::IdempotentOutcome::Conflict(info) => {
+            return Err(crate::idempotency::idempotency_conflict_error(&info));
+        }
     };
 
     if idempotent_replay {
@@ -6599,6 +6603,15 @@ mod tests {
     std::thread_local! {
         static BEFORE_MESSAGE_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
+        static BEFORE_MESSAGE_REPLAY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_before_message_replay_hook() {
+        let hook = BEFORE_MESSAGE_REPLAY.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub(super) fn run_before_message_admission_hook() {
@@ -6613,6 +6626,7 @@ mod tests {
     impl Drop for MessageAdmissionHookGuard {
         fn drop(&mut self) {
             BEFORE_MESSAGE_ADMISSION.with(|slot| *slot.borrow_mut() = None);
+            BEFORE_MESSAGE_REPLAY.with(|slot| *slot.borrow_mut() = None);
         }
     }
 
@@ -8304,6 +8318,234 @@ mod tests {
                 );
             });
         });
+    }
+
+    async fn bearer_admission_call(
+        ctx: &McpContext,
+        project: &ProjectRow,
+        sender: &AgentRow,
+        recipient: &AgentRow,
+        reply_to: Option<i64>,
+        token: Option<&str>,
+        key: Option<&str>,
+    ) -> McpResult<String> {
+        let body = "Bearer authority must still be current at admission.".to_string();
+        if let Some(parent) = reply_to {
+            reply_message(
+                ctx,
+                project.human_key.clone(),
+                parent,
+                sender.name.clone(),
+                body,
+                Some(vec![recipient.name.clone()]),
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                Some(false),
+                token.map(str::to_string),
+                key.map(str::to_string),
+            )
+            .await
+        } else {
+            send_message(
+                ctx,
+                project.human_key.clone(),
+                sender.name.clone(),
+                vec![recipient.name.clone()],
+                "Credential admission".to_string(),
+                body,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                Some(false),
+                token.map(str::to_string),
+                key.map(str::to_string),
+            )
+            .await
+        }
+    }
+
+    async fn bearer_admission_counts(cx: &Cx, pool: &DbPool) -> [i64; 4] {
+        let conn = pool.acquire(cx).await.into_result().expect("count connection");
+        ["messages", "message_recipients", "inbox_delivery_events", "idempotency_keys"]
+            .map(|table| {
+                conn.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                    .expect("message admission counts")[0]
+                    .get_as::<i64>(0)
+                    .expect("integer count")
+            })
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn send_reply_and_replay_recheck_bearer_after_tool_preflight() {
+        const ORIGINAL_TOKEN: &str = "admission-original-bearer";
+        const ROTATED_TOKEN: &str = "admission-rotated-bearer";
+        with_messaging_mailbox(
+            &[
+                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+                ("MESSAGING_SESSION_IDENTITY", "false"),
+                ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
+            ],
+            |mailbox| {
+                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let pool = get_db_pool().expect("private test mailbox");
+                    let project =
+                        ensure_project_row(&cx, &pool, "/data/projects/bearer-admission").await;
+                    let sender =
+                        register_agent_row(&cx, &pool, project.id.unwrap(), "BlueLake").await;
+                    let recipient =
+                        register_agent_row(&cx, &pool, project.id.unwrap(), "RedFox").await;
+                    let original = queries::create_message_with_recipients(
+                        &cx, &pool, project.id.unwrap(), recipient.id.unwrap(),
+                        "Parent", "Reply to this message", None, "normal", true, "[]",
+                        &[(sender.id.unwrap(), "to")],
+                    )
+                    .await
+                    .into_result()
+                    .expect("reply parent");
+
+                    for replacement in [Some(ROTATED_TOKEN), None] {
+                        let transition = if replacement.is_some() { "rotate" } else { "revoke" };
+                        for (mode, is_reply, keyed, replay) in [
+                            ("send", false, false, false),
+                            ("keyed_send", false, true, false),
+                            ("reply", true, false, false),
+                            ("keyed_reply", true, true, false),
+                            ("send_replay", false, true, true),
+                            ("reply_replay", true, true, true),
+                        ] {
+                            queries::update_agent_registration_token(
+                                &cx, &pool, sender.id.unwrap(), ORIGINAL_TOKEN,
+                            )
+                            .await
+                            .into_result()
+                            .expect("restore credential for preflight");
+                            let key = keyed.then(|| format!("bearer-{mode}-{transition}"));
+                            let parent = is_reply.then_some(original.id.unwrap());
+                            let first = if replay {
+                                let json = bearer_admission_call(
+                                    &ctx, &project, &sender, &recipient, parent,
+                                    Some(ORIGINAL_TOKEN), key.as_deref(),
+                                )
+                                .await
+                                .expect("seed committed idempotency result");
+                                Some(serde_json::from_str::<Value>(&json).expect("seed receipt"))
+                            } else {
+                                None
+                            };
+                            let before = bearer_admission_counts(&cx, &pool).await;
+                            let writer = mcp_agent_mail_db::DbConn::open_file(
+                                mailbox.database_path.to_str().expect("database path"),
+                            )
+                            .expect("independent credential writer");
+                            let called = std::rc::Rc::new(std::cell::Cell::new(false));
+                            let observed = std::rc::Rc::clone(&called);
+                            let agent_id = sender.id.unwrap();
+                            let hook: Box<dyn FnOnce()> = Box::new(move || {
+                                writer.execute_sync(
+                                    "UPDATE agents SET registration_token = ? WHERE id = ?",
+                                    &[
+                                        replacement.map_or(sqlmodel_core::Value::Null, |token| {
+                                            sqlmodel_core::Value::Text(token.to_string())
+                                        }),
+                                        sqlmodel_core::Value::BigInt(agent_id),
+                                    ],
+                                )
+                                .expect("commit credential change after preflight");
+                                let rows = writer.query_sync(
+                                    "SELECT registration_token FROM agents WHERE id = ?",
+                                    &[sqlmodel_core::Value::BigInt(agent_id)],
+                                )
+                                .expect("read committed credential");
+                                let stored = match rows[0].get(0) {
+                                    Some(sqlmodel_core::Value::Text(token)) => Some(token.as_str()),
+                                    Some(sqlmodel_core::Value::Null) => None,
+                                    _ => panic!("unexpected credential value"),
+                                };
+                                assert_eq!(stored, replacement);
+                                observed.set(true);
+                                mcp_agent_mail_db::close_db_conn(
+                                    writer, "bearer-admission test writer",
+                                );
+                            });
+                            let _hook_guard = MessageAdmissionHookGuard;
+                            if replay {
+                                BEFORE_MESSAGE_REPLAY.with(|slot| {
+                                    assert!(slot.borrow().is_none());
+                                    *slot.borrow_mut() = Some(hook);
+                                });
+                            } else {
+                                BEFORE_MESSAGE_ADMISSION.with(|slot| {
+                                    assert!(slot.borrow().is_none());
+                                    *slot.borrow_mut() = Some(hook);
+                                });
+                            }
+
+                            let error = bearer_admission_call(
+                                &ctx, &project, &sender, &recipient, parent,
+                                Some(ORIGINAL_TOKEN), key.as_deref(),
+                            )
+                            .await
+                            .expect_err("a revoked or rotated bearer must not authorize mail");
+                            assert!(called.get(), "{mode}/{transition} must pass preflight");
+                            assert_eq!(
+                                crate::tool_util::tool_error_code(&error),
+                                Some(if replacement.is_some() {
+                                    "SENDER_TOKEN_MISMATCH"
+                                } else {
+                                    "SENDER_TOKEN_UNAVAILABLE"
+                                }),
+                                "{mode}/{transition}: {error:?}",
+                            );
+                            let diagnostic = format!("{error:?}");
+                            assert!(!diagnostic.contains(ORIGINAL_TOKEN));
+                            assert!(!diagnostic.contains(ROTATED_TOKEN));
+                            assert_eq!(
+                                bearer_admission_counts(&cx, &pool).await,
+                                before,
+                                "{mode}/{transition} must not publish mail, recipients, events or keys",
+                            );
+
+                            // The refusal must not poison the key or revoke trusted-local
+                            // access. A current bearer (or a tokenless local caller after
+                            // revocation) can still perform the same operation.
+                            let accepted = bearer_admission_call(
+                                &ctx, &project, &sender, &recipient, parent,
+                                replacement, key.as_deref(),
+                            )
+                            .await
+                            .expect("current authorization remains usable");
+                            let accepted: Value =
+                                serde_json::from_str(&accepted).expect("accepted receipt");
+                            assert_eq!(accepted["verified_sender"], replacement.is_some());
+                            if let Some(first) = first {
+                                assert_eq!(accepted["idempotent_replay"], true);
+                                assert_eq!(
+                                    accepted["deliveries"][0]["payload"]["id"],
+                                    first["deliveries"][0]["payload"]["id"],
+                                );
+                                assert_eq!(bearer_admission_counts(&cx, &pool).await, before);
+                            } else {
+                                assert!(accepted.get("idempotent_replay").is_none());
+                            }
+                        }
+                    }
+                });
+            },
+        );
     }
 
     #[test]
