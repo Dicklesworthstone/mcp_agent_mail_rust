@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -125,6 +126,25 @@ class ClassifyCallTests(unittest.TestCase):
 
 
 class KillWindowTests(unittest.TestCase):
+    def test_deliberate_sigkill_requires_a_running_server(self):
+        root = Path(tempfile.mkdtemp(prefix='am-release-crash-status-'))
+        arm = smoke.Arm('crash-status', Path(sys.executable), root)
+
+        with subprocess.Popen([sys.executable, '-c', 'pass']) as process:
+            self.assertEqual(process.wait(timeout=5), 0)
+            arm.proc = process
+            checks = []
+            self.assertFalse(arm.kill_for_recovery(checks))
+            self.assertEqual(smoke.verdict(checks), 'FAIL')
+            self.assertEqual(checks[0]['detail'], 'running_before=False exit_code=0')
+
+        with subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']) as process:
+            arm.proc = process
+            checks = []
+            self.assertTrue(arm.kill_for_recovery(checks))
+            self.assertEqual(smoke.verdict(checks), 'PASS')
+            self.assertEqual(checks[0]['detail'], f'running_before=True exit_code={-signal.SIGKILL}')
+
     def test_call_in_flight_at_the_kill_is_excused(self):
         self.assertTrue(smoke.in_kill_window(start=95.0, end=100.5, kill_t=100.0, restarted_t=102.0))
 

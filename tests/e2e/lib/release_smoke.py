@@ -821,6 +821,14 @@ class Arm:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def kill_for_recovery(self, checks: list) -> bool:
+        running = self.alive()
+        self.kill(signal.SIGKILL)
+        exit_code = self.proc.returncode if self.proc is not None else None
+        return check(checks, "server exits from the deliberate SIGKILL",
+                     running and exit_code == -signal.SIGKILL,
+                     f"running_before={running} exit_code={exit_code}")
+
     def pid(self) -> int:
         assert self.proc is not None
         return self.proc.pid
@@ -1130,7 +1138,7 @@ def phase_storm(arm: Arm, state: dict, c: list) -> dict:
 def phase_crash(arm: Arm, state: dict, c: list) -> dict:
     st = storm(arm, state, STORM_THREADS, 40)
     time.sleep(6)
-    arm.kill(signal.SIGKILL)
+    killed = arm.kill_for_recovery(c)
     res = join(st)
     arm.start()
     seen: set = set()
@@ -1140,7 +1148,8 @@ def phase_crash(arm: Arm, state: dict, c: list) -> dict:
         if isinstance(inbox, list):
             seen |= {m.get("id") for m in inbox}
     missing = sorted(set(res["acked"]) - seen)
-    check(c, f"all {len(res['acked'])} acknowledged ids survive SIGKILL", not missing,
+    recovery = "survive SIGKILL" if killed else "are present after restart"
+    check(c, f"all {len(res['acked'])} acknowledged ids {recovery}", not missing,
           f"missing={missing[:10]}")
     # Informational: right after a restart the server honestly reports that no
     # full check has run in this process yet; the gate uses an independent one.
@@ -1452,7 +1461,9 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
     lock = threading.Lock()
     stop = threading.Event()
     restarting = threading.Event()
-    clock = {"kill_t": None, "restarted_t": None}
+    restart_attempt_t = None
+    kill_t = None
+    restarted_t = None
     send_workload = {proj: {"shared_attempts": 0, "unique_attempts": 0,
                             "shared_ok": 0, "unique_ok": 0} for proj in projects}
 
@@ -1546,16 +1557,17 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
     restart_error = None
     while time.time() - started < SWARM_SECS:
         time.sleep(SOAK_WINDOW_SECS)
-        if clock["kill_t"] is None and time.time() >= kill_at:
+        if restart_attempt_t is None and time.time() >= kill_at:
             restarting.set()
-            clock["kill_t"] = time.time()
-            arm.kill(signal.SIGKILL)
+            restart_attempt_t = time.time()
+            if arm.kill_for_recovery(c):
+                kill_t = restart_attempt_t
             try:
                 arm.start()
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                 restart_error = f"{type(error).__name__}: {error}"
                 break
-            clock["restarted_t"] = time.time()
+            restarted_t = time.time()
             restarting.clear()
             segments.append([])
             continue
@@ -1581,7 +1593,11 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
         first_ack = first_send_ack_at
         acked_count = len(acked)
     extra.update(swarm_log_gaps(read_log_since(arm.server_log, log_offset),
-                                started, stopped, clock["kill_t"]))
+                                started, stopped, kill_t))
+    extra["restart_attempt_s"] = round(restart_attempt_t - started, 1) if restart_attempt_t else None
+    extra["kill_at_s"] = round(kill_t - started, 1) if kill_t else None
+    extra["restart_s"] = (round(restarted_t - restart_attempt_t, 2)
+                          if restarted_t and restart_attempt_t else None)
     extra["first_successful_send_s"] = round(first_ack - started, 3) if first_ack is not None else None
     extra["acked_sends"] = acked_count
     # Every call, so a latency tail can be placed in time (restart, backup, checkpoint).
@@ -1594,7 +1610,7 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
     if active_clients or restart_error is not None:
         extra.update(active_client_threads=active_clients, quiet_interval_observed=False)
         return extra
-    stats = swarm_tool_stats(records, clock["kill_t"], clock["restarted_t"])
+    stats = swarm_tool_stats(records, kill_t, restarted_t)
     if sparse_conflicts:
         check(c, "each project acknowledges repeated shared and unique thread traffic",
               all(s["shared_ok"] >= 2 and s["unique_ok"] >= 1 for s in send_workload.values()),
@@ -1638,14 +1654,12 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
         present = set()
         detail = f"{type(ex).__name__}: {ex}"
     lost = sorted(set(acked) - present)
-    check(c, f"all {len(acked)} acknowledged swarm sends survive SIGKILL", acked and not lost,
+    recovery = "survive SIGKILL" if kill_t else "are present after restart"
+    check(c, f"all {len(acked)} acknowledged swarm sends {recovery}", acked and not lost,
           f"lost={lost[:10]}")
     arm.start()
     extra.update({
         "agents_registered": len(agents), "load_secs": round(load_secs, 1),
-        "kill_at_s": round(clock["kill_t"] - started, 1) if clock["kill_t"] else None,
-        "restart_s": (round(clock["restarted_t"] - clock["kill_t"], 2)
-                      if clock["kill_t"] and clock["restarted_t"] else None),
         "sends_per_s": round(len(acked) / load_secs, 2),
         "tools": stats, "tool_error_samples": error_samples, "sqlite_fds_max": fds_max,
         "send_workload": send_workload,
