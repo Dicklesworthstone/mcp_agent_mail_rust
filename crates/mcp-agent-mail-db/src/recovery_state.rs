@@ -130,6 +130,12 @@ pub struct RecoveryReadWitness {
     revision: String,
 }
 
+impl RecoveryReadWitness {
+    pub(crate) fn matches_manifest(&self, manifest: &Manifest) -> bool {
+        &self.manifest == manifest
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadRevision {
@@ -386,6 +392,7 @@ fn write_revision(state: &LockedState, revision: &ReadRevision) -> DbResult<()> 
 
 fn with_read_revision<T>(
     state: &LockedState,
+    conn: &impl SyncQuery,
     root: &Path,
     generation: &str,
     publish: impl FnOnce() -> DbResult<T>,
@@ -394,6 +401,21 @@ fn with_read_revision<T>(
     // In particular, a malformed manifest must retain its original evidence.
     let active = read_manifest(&state.directory)?;
     validate_checkpoint_generation(state, generation, active.as_ref())?;
+    let previous_revision = read_revision(&state.directory)?;
+    if let Some(expected) = previous_revision
+        .as_ref()
+        .and_then(|revision| revision.manifest.as_ref())
+        && active.as_ref() != Some(expected)
+    {
+        return Err(state_error(
+            "read revision",
+            "active checkpoint differs from the completed publication",
+        ));
+    }
+    let reconcile_pending = active.is_some()
+        && previous_revision
+            .as_ref()
+            .is_none_or(|revision| revision.manifest.is_none());
     let mut revision = ReadRevision {
         schema_version: SCHEMA_VERSION,
         generation: generation.to_string(),
@@ -402,6 +424,13 @@ fn with_read_revision<T>(
         manifest: None,
     };
     write_revision(state, &revision)?;
+    if reconcile_pending {
+        // A successful write to a different key must not erase evidence that
+        // an earlier receipt/contact publication stopped partway through.
+        // Reconcile all mutable state only after an interrupted or legacy
+        // publication; the healthy selected-key path remains bounded.
+        reconcile_incomplete_publication(state, conn, root, generation)?;
+    }
     let result = publish()?;
     let manifest = read_manifest(&state.directory)?
         .ok_or_else(|| state_error("read revision", "publication has no active checkpoint"))?;
@@ -699,7 +728,10 @@ fn checkpoint_identities(conn: &impl SyncQuery, writer: &mut BaselineWriter<'_>)
     Ok(())
 }
 
-fn checkpoint_receipts(conn: &impl SyncQuery, writer: &mut BaselineWriter<'_>) -> DbResult<()> {
+fn visit_current_receipts(
+    conn: &impl SyncQuery,
+    visit: &mut impl FnMut(RecoveryRecord) -> DbResult<()>,
+) -> DbResult<()> {
     for shared in [false, true] {
         let mut last_agent = i64::MIN;
         let mut last_message = i64::MIN;
@@ -726,14 +758,17 @@ fn checkpoint_receipts(conn: &impl SyncQuery, writer: &mut BaselineWriter<'_>) -
                 let receipt = receipt(row, shared)?;
                 last_agent = receipt.agent.id;
                 last_message = receipt.message_id;
-                writer.push(RecoveryRecord::Receipt(receipt))?;
+                visit(RecoveryRecord::Receipt(receipt))?;
             }
         }
     }
     Ok(())
 }
 
-fn checkpoint_contacts(conn: &impl SyncQuery, writer: &mut BaselineWriter<'_>) -> DbResult<()> {
+fn visit_current_contacts(
+    conn: &impl SyncQuery,
+    visit: &mut impl FnMut(RecoveryRecord) -> DbResult<()>,
+) -> DbResult<()> {
     let mut last_id = i64::MIN;
     loop {
         let rows = query(
@@ -747,13 +782,25 @@ fn checkpoint_contacts(conn: &impl SyncQuery, writer: &mut BaselineWriter<'_>) -
         for row in &rows {
             let contact = contact(row)?;
             last_id = contact.id;
-            writer.push(RecoveryRecord::Contact(contact))?;
+            visit(RecoveryRecord::Contact(contact))?;
         }
     }
     Ok(())
 }
 
 fn verify_checkpoint_counts(conn: &impl SyncQuery, manifest: &Manifest) -> DbResult<()> {
+    verify_recovery_counts(
+        conn,
+        &[
+            ("projects", manifest.projects),
+            ("agents", manifest.agents),
+            ("receipts", manifest.receipts),
+            ("contacts", manifest.contacts),
+        ],
+    )
+}
+
+fn verify_recovery_counts(conn: &impl SyncQuery, written_counts: &[(&str, u64)]) -> DbResult<()> {
     let counts = query(
         conn,
         "SELECT (SELECT COUNT(*) FROM projects) AS projects, \
@@ -766,12 +813,7 @@ fn verify_checkpoint_counts(conn: &impl SyncQuery, manifest: &Manifest) -> DbRes
     let counts = counts
         .first()
         .ok_or_else(|| state_error("baseline counts", "missing count row"))?;
-    for (column, written) in [
-        ("projects", manifest.projects),
-        ("agents", manifest.agents),
-        ("receipts", manifest.receipts),
-        ("contacts", manifest.contacts),
-    ] {
+    for &(column, written) in written_counts {
         let actual: i64 = counts
             .get_named(column)
             .map_err(|error| state_error("baseline counts", error))?;
@@ -806,8 +848,8 @@ fn stream_checkpoint(
         digest: Sha256::new(),
     };
     checkpoint_identities(conn, &mut writer)?;
-    checkpoint_receipts(conn, &mut writer)?;
-    checkpoint_contacts(conn, &mut writer)?;
+    visit_current_receipts(conn, &mut |record| writer.push(record))?;
+    visit_current_contacts(conn, &mut |record| writer.push(record))?;
     verify_checkpoint_counts(conn, &writer.manifest)?;
     writer.manifest.baseline_sha256 = hex::encode(writer.digest.finalize());
     Ok(writer.manifest)
@@ -939,12 +981,44 @@ fn checkpoint_locked(
     Ok(manifest)
 }
 
+/// Complete interrupted publications from one live database snapshot before
+/// any later writer can publish a reusable, authoritative revision.
+fn reconcile_incomplete_publication(
+    state: &LockedState,
+    conn: &impl SyncQuery,
+    root: &Path,
+    generation: &str,
+) -> DbResult<()> {
+    checkpoint_locked(state, conn, root, generation)?;
+    let directory = state.generation(generation, false)?;
+    crate::sync::with_read_snapshot(conn, || {
+        let mut receipts = 0u64;
+        visit_current_receipts(conn, &mut |record| {
+            write_record(root, &directory, generation, record)?;
+            receipts += 1;
+            Ok(())
+        })?;
+        let mut contacts = 0u64;
+        visit_current_contacts(conn, &mut |record| {
+            write_record(root, &directory, generation, record)?;
+            contacts += 1;
+            Ok(())
+        })?;
+        // The baseline may predate new projects/agents. Check the two mutable
+        // state lanes against their raw table counts so missing identity joins
+        // cannot turn a partial refresh into completed publication authority.
+        verify_recovery_counts(conn, &[("receipts", receipts), ("contacts", contacts)])
+    })
+    .map_err(|error| state_error("incomplete publication reconciliation", error))?;
+    state.validate()
+}
+
 /// Publish the initial consistent baseline unless this generation already has
 /// one. The generation's incremental snapshots remain authoritative thereafter.
 pub fn ensure_checkpoint(conn: &impl SyncQuery, root: &Path) -> DbResult<Manifest> {
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    with_read_revision(&state, root, &generation, || {
+    with_read_revision(&state, conn, root, &generation, || {
         let manifest = checkpoint_locked(&state, conn, root, &generation)?;
         // Startup verifies pre-existing metadata too. Incremental publishers call
         // checkpoint_locked directly and never rescan history on the hot path.
@@ -1092,7 +1166,7 @@ pub fn persist_receipts(
     }
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    with_read_revision(&state, root, &generation, || {
+    with_read_revision(&state, conn, root, &generation, || {
         checkpoint_locked(&state, conn, root, &generation)?;
         let directory = state.generation(&generation, true)?;
         crate::sync::with_read_snapshot(conn, || {
@@ -1138,7 +1212,7 @@ pub fn persist_project_receipts(
 ) -> DbResult<()> {
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    with_read_revision(&state, root, &generation, || {
+    with_read_revision(&state, conn, root, &generation, || {
         checkpoint_locked(&state, conn, root, &generation)?;
         let directory = state.generation(&generation, true)?;
         crate::sync::with_read_snapshot(conn, || {
@@ -1193,7 +1267,7 @@ pub fn persist_contact(
 ) -> DbResult<()> {
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    with_read_revision(&state, root, &generation, || {
+    with_read_revision(&state, conn, root, &generation, || {
         checkpoint_locked(&state, conn, root, &generation)?;
         let directory = state.generation(&generation, true)?;
         crate::sync::with_read_snapshot(conn, || {
@@ -1526,6 +1600,169 @@ mod tests {
         let after = read_revision_witness(root.path()).unwrap().unwrap();
         assert_ne!(after.revision, pending.revision);
         assert_ne!(after, before);
+    }
+
+    #[test]
+    fn interrupted_receipt_publication_is_reconciled_before_unrelated_success() {
+        for retry in ["contact", "startup", "receipt"] {
+            let root = tempfile::tempdir().unwrap();
+            let conn = database();
+            let baseline = ensure_checkpoint(&conn, root.path()).unwrap();
+            conn.execute_raw(
+                "UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41; \
+                 UPDATE project_mailbox_receipts SET ack_ts = 555 WHERE message_id = 52; \
+                 UPDATE agent_links SET status = 'blocked', updated_ts = 15; \
+                 INSERT INTO projects VALUES (31, 'new-project', '/work/new'); \
+                 INSERT INTO agents VALUES (37, 31, 'GreenLake'); \
+                 CREATE TEMP VIEW project_mailbox_receipts AS \
+                 SELECT * FROM missing_shared_receipts;",
+            )
+            .unwrap();
+            let failure = persist_receipts(&conn, root.path(), 29, &[41, 52])
+                .expect_err("the real shared query fails after direct publication");
+            assert!(
+                failure.to_string().contains("receipt snapshot"),
+                "{failure}"
+            );
+            assert_eq!(read_revision_witness(root.path()).unwrap(), None);
+            assert!(records(root.path()).1.iter().any(|record| matches!(
+                record,
+                RecoveryRecord::Receipt(receipt)
+                    if receipt.message_id == 41 && receipt.ack_ts == Some(444)
+            )));
+            let shared = conn
+                .query_sync(
+                    "SELECT ack_ts FROM main.project_mailbox_receipts WHERE message_id = 52",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(shared[0].get_named::<i64>("ack_ts").unwrap(), 555);
+
+            let failure = persist_contact(&conn, root.path(), 17, 29)
+                .expect_err("an unrelated write must not seal incomplete receipts");
+            assert!(
+                failure
+                    .to_string()
+                    .contains("incomplete publication reconciliation"),
+                "{failure}"
+            );
+            assert_eq!(read_revision_witness(root.path()).unwrap(), None);
+            conn.execute_raw("DROP VIEW temp.project_mailbox_receipts")
+                .unwrap();
+
+            match retry {
+                "contact" => persist_contact(&conn, root.path(), 17, 29),
+                "startup" => ensure_checkpoint(&conn, root.path()).map(|_| ()),
+                // Retrying only the direct message must also settle the
+                // earlier failure for the different shared message.
+                _ => persist_receipts(&conn, root.path(), 29, &[41]),
+            }
+            .unwrap();
+            let witness = read_revision_witness(root.path()).unwrap().unwrap();
+            assert!(witness.matches_manifest(&baseline));
+            let (manifest, recovered) = records(root.path());
+            assert_eq!(manifest, baseline, "repair retains the original baseline");
+            for (id, shared, expected_ack) in [(41, false, 444), (52, true, 555)] {
+                let latest = recovered
+                    .iter()
+                    .rev()
+                    .find_map(|record| match record {
+                        RecoveryRecord::Receipt(receipt)
+                            if receipt.message_id == id && receipt.shared == shared =>
+                        {
+                            Some(receipt)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(latest.ack_ts, Some(expected_ack), "{retry}");
+            }
+            let latest = recovered
+                .iter()
+                .rev()
+                .find_map(|record| match record {
+                    RecoveryRecord::Contact(contact) if contact.id == 93 => Some(contact),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(latest.status, "blocked", "{retry}");
+            assert_eq!(
+                latest.updated_ts, 15,
+                "clock order must not restore approval"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_publication_cannot_hide_receipts_with_missing_identity_joins() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        conn.execute_raw(
+            "UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41; \
+             CREATE TEMP VIEW project_mailbox_receipts AS \
+             SELECT * FROM missing_shared_receipts;",
+        )
+        .unwrap();
+        persist_receipts(&conn, root.path(), 29, &[41]).unwrap_err();
+        conn.execute_raw(
+            "DROP VIEW temp.project_mailbox_receipts; \
+             INSERT INTO project_mailbox_receipts VALUES (63, 29, 600, 700);",
+        )
+        .unwrap();
+
+        let failure = persist_contact(&conn, root.path(), 17, 29)
+            .expect_err("an omitted identity join must retain incomplete authority");
+        assert!(
+            failure
+                .to_string()
+                .contains("refusing incomplete identity joins"),
+            "{failure}"
+        );
+        assert_eq!(read_revision_witness(root.path()).unwrap(), None);
+        conn.execute_raw("INSERT INTO messages VALUES (63, 19, 300, 'Restored message identity')")
+            .unwrap();
+        persist_contact(&conn, root.path(), 17, 29).unwrap();
+        assert!(read_revision_witness(root.path()).unwrap().is_some());
+        assert!(records(root.path()).1.iter().any(|record| matches!(
+            record,
+            RecoveryRecord::Receipt(receipt)
+                if receipt.message_id == 63 && receipt.ack_ts == Some(700)
+        )));
+    }
+
+    #[test]
+    fn complete_publications_keep_selected_receipt_and_contact_writes_bounded() {
+        struct RefuseFullScan<'a>(&'a crate::CanonicalDbConn);
+        impl SyncQuery for RefuseFullScan<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<Row>, sqlmodel_core::Error> {
+                if sql.contains("ORDER BY r.agent_id, r.message_id")
+                    || sql.contains("WHERE l.id > ?")
+                    || sql.contains("AS receipts")
+                {
+                    return Err(sqlmodel_core::Error::Custom(
+                        "healthy selected writes must not scan all recovery state".to_string(),
+                    ));
+                }
+                self.0.query_sync(sql, params)
+            }
+
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.0.execute_raw(sql)
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        let guarded = RefuseFullScan(&conn);
+        persist_receipts(&guarded, root.path(), 29, &[41]).unwrap();
+        persist_contact(&guarded, root.path(), 17, 29).unwrap();
+        assert!(read_revision_witness(root.path()).unwrap().is_some());
     }
 
     #[test]

@@ -618,6 +618,9 @@ pub struct ReconstructStats {
     pub archived_contacts: usize,
     /// Whether a complete coordination-state baseline was validated.
     pub recovery_checkpoint_present: bool,
+    /// Whether the baseline and incremental records were replayed under one
+    /// unchanged, completed publication witness.
+    pub recovery_checkpoint_complete: bool,
     /// Whether a readable database supplied the authoritative mutable state.
     pub recovery_state_from_salvage: bool,
     /// Archive-only recovery expires prior issued cursors below this floor.
@@ -795,14 +798,16 @@ impl ReconstructStats {
         match self.salvage {
             ReconstructionSalvage::Merged => false,
             ReconstructionSalvage::ArchiveOnly => {
-                !self.recovery_checkpoint_present || self.delivery_cursor_reset_floor.is_none()
+                !self.recovery_checkpoint_present
+                    || !self.recovery_checkpoint_complete
+                    || self.delivery_cursor_reset_floor.is_none()
             }
             ReconstructionSalvage::Incomplete => true,
         }
     }
 
     /// Whether receipt-filtered snapshots have validated receipt authority.
-    /// They do not issue delivery cursors, so a valid archive checkpoint can
+    /// They do not issue delivery cursors, so a completed archive publication can
     /// support these reads even when promotion lacks a cursor witness.
     #[must_use]
     pub const fn has_receipt_state(&self) -> bool {
@@ -814,7 +819,8 @@ impl ReconstructStats {
         }
         matches!(self.salvage, ReconstructionSalvage::Merged)
             || (matches!(self.salvage, ReconstructionSalvage::ArchiveOnly)
-                && self.recovery_checkpoint_present)
+                && self.recovery_checkpoint_present
+                && self.recovery_checkpoint_complete)
     }
 
     /// State whose continuity cannot be established from the completed result.
@@ -834,6 +840,7 @@ impl ReconstructStats {
             }
             if matches!(self.salvage, ReconstructionSalvage::ArchiveOnly)
                 && self.recovery_checkpoint_present
+                && self.recovery_checkpoint_complete
             {
                 if self.delivery_cursor_reset_floor.is_none() {
                     risks.push("issued inbox delivery cursors and sequence continuity (no archived cursor ceiling)");
@@ -871,9 +878,10 @@ impl ReconstructStats {
     pub fn require_recovery_state(&self) -> DbResult<()> {
         if self.requires_lossy_recovery() {
             return Err(DbError::Sqlite(format!(
-                "archive recovery requires explicit state-loss acceptance: {:?} salvage (checkpoint={}, cursor_reset_floor={:?}) cannot establish continuity of {}; refusing to promote this candidate. Restore a verified backup or inspect `am doctor reconstruct --dry-run`; only an operator may accept these losses with `am doctor reconstruct --allow-state-loss --yes`",
+                "archive recovery requires explicit state-loss acceptance: {:?} salvage (checkpoint={}, publication_complete={}, cursor_reset_floor={:?}) cannot establish continuity of {}; refusing to promote this candidate. Restore a verified backup or inspect `am doctor reconstruct --dry-run`; only an operator may accept these losses with `am doctor reconstruct --allow-state-loss --yes`",
                 self.salvage,
                 self.recovery_checkpoint_present,
+                self.recovery_checkpoint_complete,
                 self.delivery_cursor_reset_floor,
                 self.recovery_state_loss_risks().join("; ")
             )));
@@ -1030,8 +1038,14 @@ impl std::fmt::Display for ReconstructStats {
         if self.recovery_checkpoint_present {
             write!(
                 f,
-                "; restored {} archived receipt records and {} contact records",
-                self.archived_receipts, self.archived_contacts
+                "; restored {} archived receipt records and {} contact records (publication {})",
+                self.archived_receipts,
+                self.archived_contacts,
+                if self.recovery_checkpoint_complete {
+                    "complete"
+                } else {
+                    "incomplete"
+                }
             )?;
         }
         if let Some(floor) = self.delivery_cursor_reset_floor {
@@ -2250,9 +2264,15 @@ fn restore_archived_coordination_state(
     stats.archived_receipts = recovered_state.receipts;
     stats.archived_contacts = recovered_state.contacts;
     stats.recovery_checkpoint_present = recovered_state.checkpoint_present;
+    stats.recovery_checkpoint_complete = recovered_state.checkpoint_complete;
     stats.delivery_cursor_reset_floor = recovered_state.cursor_reset_floor;
     if !recovered_state.checkpoint_present && !stats.recovery_state_from_salvage {
         stats.push_warning(LEGACY_RECOVERY_STATE_WARNING.to_string());
+    } else if !recovered_state.checkpoint_complete && !stats.recovery_state_from_salvage {
+        stats.push_warning(
+            "Archive recovery baseline is present, but receipt/contact publication is incomplete, unavailable, or changed during replay; receipt-filtered reads and automatic promotion remain unavailable."
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -10731,6 +10751,7 @@ mod tests {
             archived_receipts: 0,
             archived_contacts: 0,
             recovery_checkpoint_present: false,
+            recovery_checkpoint_complete: false,
             recovery_state_from_salvage: false,
             delivery_cursor_reset_floor: None,
             duplicate_canonical_message_files: 0,
@@ -10764,25 +10785,58 @@ mod tests {
 
     #[test]
     fn reconstruct_stats_distinguish_receipt_authority_from_promotion_authority() {
-        for (salvage, checkpoint, floor, receipt_authority, promotion_authority) in [
+        for (salvage, checkpoint, complete, floor, receipt_authority, promotion_authority) in [
             (
                 ReconstructionSalvage::ArchiveOnly,
+                false,
                 false,
                 None,
                 false,
                 false,
             ),
-            (ReconstructionSalvage::ArchiveOnly, true, None, true, false),
             (
                 ReconstructionSalvage::ArchiveOnly,
+                true,
+                false,
+                Some(0),
+                false,
+                false,
+            ),
+            (
+                ReconstructionSalvage::ArchiveOnly,
+                true,
+                true,
+                None,
+                true,
+                false,
+            ),
+            (
+                ReconstructionSalvage::ArchiveOnly,
+                true,
                 true,
                 Some(0),
                 true,
                 true,
             ),
-            (ReconstructionSalvage::Merged, false, None, true, true),
+            (
+                ReconstructionSalvage::Merged,
+                false,
+                false,
+                None,
+                true,
+                true,
+            ),
+            (
+                ReconstructionSalvage::Merged,
+                true,
+                false,
+                Some(0),
+                true,
+                true,
+            ),
             (
                 ReconstructionSalvage::Incomplete,
+                true,
                 true,
                 Some(0),
                 false,
@@ -10792,6 +10846,7 @@ mod tests {
             let stats = ReconstructStats {
                 salvage,
                 recovery_checkpoint_present: checkpoint,
+                recovery_checkpoint_complete: complete,
                 delivery_cursor_reset_floor: floor,
                 ..ReconstructStats::default()
             };
@@ -10820,6 +10875,7 @@ mod tests {
                 let stats = ReconstructStats {
                     salvage,
                     recovery_checkpoint_present: true,
+                    recovery_checkpoint_complete: true,
                     delivery_cursor_reset_floor: Some(0),
                     salvaged_rows_skipped_unmapped: skipped,
                     salvaged_placeholder_senders: placeholders,

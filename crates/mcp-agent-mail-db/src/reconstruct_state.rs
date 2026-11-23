@@ -231,6 +231,7 @@ pub(crate) struct RestoredState {
     pub receipts: usize,
     pub contacts: usize,
     pub checkpoint_present: bool,
+    pub checkpoint_complete: bool,
     pub cursor_reset_floor: Option<i64>,
 }
 
@@ -400,8 +401,10 @@ fn restore_contact(
     Ok(())
 }
 
-/// Apply a validated complete checkpoint followed by its latest per-key
-/// records. All writes belong to the candidate's existing transaction: a bad
+/// Apply a validated baseline followed by its latest per-key records. Receipt
+/// authority additionally requires an unchanged, completed publication witness
+/// around the replay. Missing or invalid witnesses still permit inspection.
+/// All writes belong to the candidate's existing transaction: a bad
 /// record or a different checkpoint from identity discovery makes the whole
 /// candidate ineligible for promotion. Compare explicit absence too, before
 /// changing delivery cursor state.
@@ -423,6 +426,9 @@ pub(crate) fn restore(
         )
         .map_err(error)?;
     }
+    let publication_before = crate::recovery_state::read_revision_witness(storage_root)
+        .ok()
+        .flatten();
     let manifest = crate::recovery_state::visit_records(storage_root, |record| {
         match record {
             RecoveryRecord::Project(project) => {
@@ -464,6 +470,14 @@ pub(crate) fn restore(
         ));
     }
     restored.checkpoint_present = manifest.is_some();
+    let publication_after = crate::recovery_state::read_revision_witness(storage_root)
+        .ok()
+        .flatten();
+    restored.checkpoint_complete = manifest.as_ref().is_some_and(|manifest| {
+        publication_before.as_ref().is_some_and(|before| {
+            before.matches_manifest(manifest) && publication_after.as_ref() == Some(before)
+        })
+    });
     if reset_cursors {
         restored.cursor_reset_floor = reset_archive_cursors(conn, storage_root)?;
     } else {
@@ -889,6 +903,132 @@ mod tests {
             checkpoint_before,
             "inspection must not modify the recovery authority"
         );
+    }
+
+    fn reconstructed_receipt_state(path: &Path) -> (i64, Option<i64>, Option<i64>) {
+        let conn = CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT (SELECT COUNT(*) FROM messages) AS messages, \
+                 (SELECT ack_ts FROM message_recipients WHERE message_id=4000 AND agent_id=121) AS direct_ack, \
+                 (SELECT ack_ts FROM project_mailbox_receipts WHERE message_id=4001 AND agent_id=121) AS shared_ack",
+                &[],
+            )
+            .unwrap();
+        (
+            rows[0].get_named("messages").unwrap(),
+            rows[0].get_named("direct_ack").unwrap(),
+            rows[0].get_named("shared_ack").unwrap(),
+        )
+    }
+
+    #[test]
+    fn interrupted_receipt_publication_keeps_history_without_granting_receipt_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("archive");
+        archive(&root);
+        let source = directory.path().join("original.sqlite3");
+        crate::reconstruct::reconstruct_from_archive(&source, &root).unwrap();
+        let conn = CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+        crate::recovery_state::ensure_checkpoint(&conn, &root).unwrap();
+        record_issued_cursor(&root, 70_000).unwrap();
+        conn.execute_raw(
+            "UPDATE message_recipients SET read_ts=100,ack_ts=200 WHERE message_id=4000 AND agent_id=121; \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) VALUES(4001,121,300,400);",
+        )
+        .unwrap();
+
+        // The real direct SELECT and durable write succeed first. Only the
+        // following shared SELECT sees this connection-local broken view;
+        // both committed receipt rows remain intact in the main database.
+        conn.execute_raw(
+            "CREATE TEMP VIEW project_mailbox_receipts AS SELECT * FROM gh406_unavailable_receipts",
+        )
+        .unwrap();
+        let failure = crate::recovery_state::persist_receipts(&conn, &root, 121, &[4000, 4001])
+            .expect_err("shared receipt publication must fail after the direct write");
+        assert!(
+            failure.to_string().contains("gh406_unavailable_receipts"),
+            "{failure}"
+        );
+        assert_eq!(
+            reconstructed_receipt_state(&source),
+            (2, Some(200), Some(400))
+        );
+        assert!(
+            crate::recovery_state::read_revision_witness(&root)
+                .unwrap()
+                .is_none()
+        );
+        let revision_path = root.join(CURSOR_DIRECTORY).join("read-revision.json");
+        let pending_revision = std::fs::read(&revision_path).unwrap();
+
+        let inspection = directory.path().join("incomplete.sqlite3");
+        let stats = crate::reconstruct::reconstruct_from_archive(&inspection, &root)
+            .expect("an interrupted publication must still permit history inspection");
+        assert_eq!(stats.messages, 2);
+        assert!(stats.recovery_checkpoint_present);
+        assert!(!stats.recovery_checkpoint_complete);
+        assert!(!stats.has_receipt_state());
+        assert!(stats.requires_lossy_recovery());
+        assert!(stats.require_recovery_state().is_err());
+        assert_eq!(
+            reconstructed_receipt_state(&inspection),
+            (2, Some(200), None),
+            "the direct ACK was published; the committed shared ACK was not"
+        );
+        assert_eq!(std::fs::read(&revision_path).unwrap(), pending_revision);
+
+        conn.execute_raw("DROP VIEW temp.project_mailbox_receipts")
+            .unwrap();
+        crate::recovery_state::persist_receipts(&conn, &root, 121, &[4000, 4001]).unwrap();
+        let complete = directory.path().join("complete.sqlite3");
+        let stats = crate::reconstruct::reconstruct_from_archive(&complete, &root).unwrap();
+        assert!(stats.recovery_checkpoint_present);
+        assert!(stats.recovery_checkpoint_complete);
+        assert!(stats.has_receipt_state());
+        stats
+            .require_recovery_state()
+            .expect("successful retry restores receipt and promotion authority");
+        assert_eq!(
+            reconstructed_receipt_state(&complete),
+            (2, Some(200), Some(400))
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_publication_witness_preserves_inspection_without_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("archive");
+        archive(&root);
+        let source = directory.path().join("original.sqlite3");
+        crate::reconstruct::reconstruct_from_archive(&source, &root).unwrap();
+        let conn = CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+        crate::recovery_state::ensure_checkpoint(&conn, &root).unwrap();
+        record_issued_cursor(&root, 70_000).unwrap();
+        let revision = root.join(CURSOR_DIRECTORY).join("read-revision.json");
+        let complete_revision = std::fs::read(&revision).unwrap();
+
+        for (label, malformed) in [("missing", false), ("malformed", true)] {
+            std::fs::rename(
+                &revision,
+                directory.path().join(format!("{label}-revision.json")),
+            )
+            .unwrap();
+            if malformed {
+                std::fs::write(&revision, b"{partial").unwrap();
+            }
+            let candidate = directory.path().join(format!("{label}.sqlite3"));
+            let stats = crate::reconstruct::reconstruct_from_archive(&candidate, &root)
+                .expect("invalid publication evidence must not block valid historical messages");
+            assert_eq!(stats.messages, 2);
+            assert!(stats.recovery_checkpoint_present);
+            assert!(!stats.recovery_checkpoint_complete);
+            assert!(!stats.has_receipt_state());
+            assert!(stats.require_recovery_state().is_err());
+            assert_eq!(reconstructed_receipt_state(&candidate), (2, None, None));
+            std::fs::write(&revision, &complete_revision).unwrap();
+        }
     }
 
     #[test]

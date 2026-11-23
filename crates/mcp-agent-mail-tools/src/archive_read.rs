@@ -518,9 +518,10 @@ fn archive_generation(
 fn recovery_revision(scope: &Scope) -> Option<RecoveryReadWitness> {
     mcp_agent_mail_db::recovery_state::read_revision_witness(&scope.storage_root).unwrap_or_else(
         |error| {
-            // This file controls cache reuse, not archive recovery authority.
-            // Fresh reconstruction still validates the checkpoint itself, so
-            // a missing/invalid revision must not prevent history inspection.
+            // Missing or invalid publication evidence still permits history
+            // inspection. Fresh reconstruction independently requires matching
+            // completed witnesses around replay before granting receipt
+            // authority, and checkpoint snapshots cannot be reused here.
             tracing::debug!(
                 %error,
                 "recovery journal revision unavailable; checkpoint snapshots require a fresh build"

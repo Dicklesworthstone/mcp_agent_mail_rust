@@ -98428,8 +98428,10 @@ fn warn_doctor_reconstruct_state_loss(stats: &mcp_agent_mail_db::ReconstructStat
 fn print_doctor_reconstruct_recovery_state(stats: &mcp_agent_mail_db::ReconstructStats) {
     ftui_runtime::ftui_println!(
         "  Recovery checkpoint: {}",
-        if stats.recovery_checkpoint_present {
-            "validated"
+        if stats.recovery_checkpoint_complete {
+            "validated and complete"
+        } else if stats.recovery_checkpoint_present {
+            "baseline validated; publication incomplete"
         } else {
             "absent"
         }
@@ -98629,6 +98631,7 @@ fn handle_doctor_reconstruct_with(
                     "salvage": salvage_preview.to_json(),
                     "salvage_outcome": recovered.as_ref().ok().map(|stats| &stats.salvage),
                     "recovery_checkpoint_present": recovered.as_ref().ok().map(|stats| stats.recovery_checkpoint_present),
+                    "recovery_checkpoint_complete": recovered.as_ref().ok().map(|stats| stats.recovery_checkpoint_complete),
                     "archived_receipts": recovered.as_ref().ok().map(|stats| stats.archived_receipts),
                     "archived_contacts": recovered.as_ref().ok().map(|stats| stats.archived_contacts),
                     "delivery_cursor_reset_floor": recovered.as_ref().ok().and_then(|stats| stats.delivery_cursor_reset_floor),
@@ -98772,6 +98775,7 @@ fn handle_doctor_reconstruct_with(
                     "salvage": doctor_reconstruct_salvage_result_json(salvage_attempt.as_ref()),
                     "salvage_outcome": stats.salvage,
                     "recovery_checkpoint_present": stats.recovery_checkpoint_present,
+                    "recovery_checkpoint_complete": stats.recovery_checkpoint_complete,
                     "archived_receipts": stats.archived_receipts,
                     "archived_contacts": stats.archived_contacts,
                     "delivery_cursor_reset_floor": stats.delivery_cursor_reset_floor,
@@ -98887,6 +98891,7 @@ fn handle_doctor_reconstruct_with(
                 "salvage": doctor_reconstruct_salvage_result_json(salvage_attempt.as_ref()),
                 "salvage_outcome": stats.salvage,
                 "recovery_checkpoint_present": stats.recovery_checkpoint_present,
+                "recovery_checkpoint_complete": stats.recovery_checkpoint_complete,
                 "archived_receipts": stats.archived_receipts,
                 "archived_contacts": stats.archived_contacts,
                 "delivery_cursor_reset_floor": stats.delivery_cursor_reset_floor,
