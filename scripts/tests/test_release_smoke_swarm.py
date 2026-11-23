@@ -107,6 +107,36 @@ class KillWindowTests(unittest.TestCase):
         self.assertFalse(smoke.in_kill_window(start=1.0, end=2.0, kill_t=None, restarted_t=None))
 
 
+class SwarmLogTests(unittest.TestCase):
+    def test_silence_uses_phase_edges_and_pre_kill_window(self):
+        log = '\n'.join([
+            '1970-01-01T00:01:39Z  INFO before load',
+            '1970-01-01T00:01:45Z  WARN flush failed',
+            'untimestamped continuation',
+            '1970-01-01T00:05:10Z  INFO after restart',
+            '1970-01-01T00:05:16Z  INFO request',
+            '1970-01-01T00:05:31Z  INFO after load',
+        ])
+
+        self.assertEqual(smoke.swarm_log_gaps(log, 100, 330, 300), {
+            'swarm_log_events': 3,
+            'longest_log_silence_s': 205,
+            'longest_pre_kill_log_silence_s': 195,
+        })
+        self.assertEqual(smoke.swarm_log_gaps('', 100, 330, None), {
+            'swarm_log_events': 0,
+            'longest_log_silence_s': 230,
+            'longest_pre_kill_log_silence_s': None,
+        })
+
+    def test_server_log_offset_counts_bytes(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'server.log'
+            prefix = 'INFO — before load\n'.encode()
+            path.write_bytes(prefix + b'WARN first line in load\n')
+            self.assertEqual(smoke.read_log_since(path, len(prefix)), 'WARN first line in load\n')
+
+
 class ToolStatsTests(unittest.TestCase):
     def records(self):
         recs = [('file_reservation_paths', float(i), float(i) + 0.1, 'ok', '') for i in range(98)]

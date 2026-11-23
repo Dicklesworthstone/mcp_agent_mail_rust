@@ -34,6 +34,7 @@ readiness and runs the same phases:
                  window, send/reserve/release p99 under budget with zero
                  30 s dispatch timeouts or tool errors, no connection errors
                  outside the kill window, and archive convergence after load.
+                 Report time to first acknowledged send and server-log silence.
   archive_contention (optional) a second full-strength swarm with recurring
                  thread digests interleaved with unique threads across the
                  same 3 projects. Retains every swarm gate and independently
@@ -1336,6 +1337,37 @@ def drain_stalled_windows(samples: list) -> list:
     return bad
 
 
+def swarm_log_gaps(log_text: str, started: float, stopped: float,
+                   killed: float | None) -> dict:
+    """Measure silence within load, including the edges of the observation window."""
+    timestamps = []
+    for line in log_text.splitlines():
+        timestamp = line.partition(" ")[0]
+        if not timestamp.endswith("Z"):
+            continue
+        try:
+            stamp = datetime.fromisoformat(timestamp[:-1] + "+00:00").timestamp()
+        except ValueError:
+            continue
+        if started <= stamp <= stopped:
+            timestamps.append(stamp)
+    timestamps.sort()
+
+    def longest_gap(end: float) -> float:
+        points = [started, *(stamp for stamp in timestamps if stamp < end), end]
+        return round(max(b - a for a, b in zip(points, points[1:])), 3)
+
+    return {"swarm_log_events": len(timestamps),
+            "longest_log_silence_s": longest_gap(stopped),
+            "longest_pre_kill_log_silence_s": longest_gap(killed) if killed is not None else None}
+
+
+def read_log_since(path: Path, offset: int) -> str:
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        return stream.read().decode(errors="replace")
+
+
 def error_code(payload: object) -> str:
     text = json.dumps(payload, default=str)
     m = re.search(r'"type":\s*"([A-Z_]+)"', text)
@@ -1395,6 +1427,7 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
     records: list = []
     error_samples: dict = {}  # "tool CODE" -> up to 3 truncated error payloads
     acked: list = []
+    first_send_ack_at = None
     lock = threading.Lock()
     stop = threading.Event()
     restarting = threading.Event()
@@ -1403,6 +1436,7 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
                             "shared_ok": 0, "unique_ok": 0} for proj in projects}
 
     def timed(sess: Session, tool: str, args: dict) -> tuple[bool, object] | None:
+        nonlocal first_send_ack_at
         if stop.is_set():
             return None  # do not launch another read after the load stops
         send_kind = None
@@ -1421,9 +1455,15 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
         outcome = classify_call(e, p)
         code = error_code(p) if outcome != "ok" else ""
         with lock:
-            records.append((tool, t0, time.time(), outcome, code))
+            finished = time.time()
+            records.append((tool, t0, finished, outcome, code))
             if send_kind and outcome == "ok":
                 send_workload[args["project_key"]][send_kind + "_ok"] += 1
+                mid = deliveries_id(p)
+                if mid is not None:
+                    acked.append(mid)
+                    if first_send_ack_at is None or finished < first_send_ack_at:
+                        first_send_ack_at = finished
             if code:  # a code alone cannot name the failing site; keep a few payloads
                 kept = error_samples.setdefault(f"{tool} {code}", [])
                 if len(kept) < 3:
@@ -1453,11 +1493,6 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
                 sess = Session(arm.url)
                 time.sleep(0.5)
                 continue
-            if not r[0]:
-                mid = deliveries_id(r[1])
-                if mid is not None:
-                    with lock:
-                        acked.append(mid)
             r = timed(sess, "fetch_inbox", {"project_key": proj, "agent_name": me, "limit": 10})
             if r is not None and not r[0] and isinstance(r[1], list):
                 for m in r[1][:3]:
@@ -1487,13 +1522,18 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
     zombies_max = 0
     unobserved = 0
     kill_at = started + SWARM_SECS / 2
+    restart_error = None
     while time.time() - started < SWARM_SECS:
         time.sleep(SOAK_WINDOW_SECS)
         if clock["kill_t"] is None and time.time() >= kill_at:
             restarting.set()
             clock["kill_t"] = time.time()
             arm.kill(signal.SIGKILL)
-            arm.start()
+            try:
+                arm.start()
+            except Exception as error:
+                restart_error = f"{type(error).__name__}: {error}"
+                break
             clock["restarted_t"] = time.time()
             restarting.clear()
             segments.append([])
@@ -1506,6 +1546,7 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
                                  h["queues"]["wbq"]["depth"]))
         except Exception:  # a server too sick to answer health is judged by its windows
             unobserved += 1
+    stopped = time.time()
     stop.set()
     clients_deadline = time.monotonic() + 120
     for t in threads:
@@ -1513,15 +1554,25 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
     active_clients = sum(t.is_alive() for t in threads)
     check(c, "all swarm clients stop before the quiet interval", active_clients == 0,
           {"active_client_threads": active_clients})
-    if active_clients:
-        extra.update(active_client_threads=active_clients, quiet_interval_observed=False)
-        return extra  # no quiet or archive-convergence claim from a live client
     load_secs = time.time() - started
+    with lock:
+        completed_calls = records.copy()
+        first_ack = first_send_ack_at
+        acked_count = len(acked)
+    extra.update(swarm_log_gaps(read_log_since(arm.server_log, log_offset),
+                                started, stopped, clock["kill_t"]))
+    extra["first_successful_send_s"] = round(first_ack - started, 3) if first_ack is not None else None
+    extra["acked_sends"] = acked_count
     # Every call, so a latency tail can be placed in time (restart, backup, checkpoint).
     with (arm.root / "out" / f"{phase_name}_calls.jsonl").open("w") as f:
-        for tool, start, end, outcome, code in records:
+        for tool, start, end, outcome, code in completed_calls:
             f.write(json.dumps([tool, round(start - started, 3), round(end - start, 3),
                                 outcome, code]) + "\n")
+    if restart_error is not None:
+        check(c, "server restarts after deliberate SIGKILL", False, restart_error)
+    if active_clients or restart_error is not None:
+        extra.update(active_client_threads=active_clients, quiet_interval_observed=False)
+        return extra
     stats = swarm_tool_stats(records, clock["kill_t"], clock["restarted_t"])
     if sparse_conflicts:
         check(c, "each project acknowledges repeated shared and unique thread traffic",
@@ -1548,7 +1599,7 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
     ok, detail = arm.wait_converged(CONVERGE_SECS, 10, client_threads=threads)
     check(c, f"archive converges to DB after the swarm without client reads "
              f"(<= {CONVERGE_SECS}s)", ok, detail)
-    log_text = arm.server_log.read_text(errors="replace")[log_offset:]
+    log_text = read_log_since(arm.server_log, log_offset)
     restarts = [m for m in HTTP_RESTART_MARKERS if m in log_text]
     check(c, "zero HTTP server restarts and no EMFILE", not restarts and not has_emfile(log_text),
           {"markers": restarts, "emfile": has_emfile(log_text)})
@@ -1574,7 +1625,7 @@ def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = Fals
         "kill_at_s": round(clock["kill_t"] - started, 1) if clock["kill_t"] else None,
         "restart_s": (round(clock["restarted_t"] - clock["kill_t"], 2)
                       if clock["kill_t"] and clock["restarted_t"] else None),
-        "acked_sends": len(acked), "sends_per_s": round(len(acked) / load_secs, 2),
+        "sends_per_s": round(len(acked) / load_secs, 2),
         "tools": stats, "tool_error_samples": error_samples, "sqlite_fds_max": fds_max,
         "send_workload": send_workload,
         "zombies_max": zombies_max, "wbq_samples": [len(s) for s in segments],
