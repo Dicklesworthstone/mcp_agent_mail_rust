@@ -192,6 +192,8 @@ pub(super) fn prepare_source_rows(id: i64, rows: &[Row]) -> Result<PreparedMessa
     let mut message = json!({
         "id": id,
         "from": sender,
+        "sender_project": text("sender_project_key")?,
+        "sender_project_slug": text("sender_project_slug")?,
         "to": routing["to"],
         "cc": routing["cc"],
         "bcc": routing["bcc"],
@@ -376,7 +378,7 @@ fn routing_from_rows(rows: &[Row], id: i64, project_id: i64) -> Result<Value, St
 mod tests {
     use super::super::{
         ReconcileCursor, ReconcileResult, read_surviving_message, reconcile_message_batch,
-        reconcile_prepared,
+        reconcile_prepared, validate_surviving_message,
     };
     use super::*;
     use mcp_agent_mail_core::Config;
@@ -430,11 +432,16 @@ ORDER BY row_kind, recipient_id";
     fn assert_source_rows_equal(expected: &[Row], actual: &[Row]) {
         assert_eq!(actual.len(), expected.len());
         for (expected, actual) in expected.iter().zip(actual) {
-            for column in 0..24 {
+            // Preserve every field of the pre-GH#404 projection. New snapshots
+            // additionally compare the sender's project key and slug; legacy
+            // controls intentionally retain their original 24-column shape.
+            let expected_columns = expected.values().count();
+            assert!(matches!(expected_columns, 24 | 26));
+            assert_eq!(actual.values().count(), 26);
+            for column in 0..expected_columns {
                 assert!(expected.get(column).is_some());
                 assert_eq!(actual.get(column), expected.get(column), "column {column}");
             }
-            assert!(actual.get(24).is_none());
         }
     }
 
@@ -1120,6 +1127,8 @@ ORDER BY row_kind, recipient_id";
                 "project",
                 "/project/é",
                 "OrangeHill",
+                "/foreign",
+                "foreign",
                 "thread-π",
                 "µ",
                 "{}",
@@ -1128,14 +1137,23 @@ ORDER BY row_kind, recipient_id";
             .map(str::len)
             .sum();
             let required = i64::try_from(required).unwrap();
+            let sender_project_bytes = i64::try_from("/foreignforeign".len()).unwrap();
             for limit in [required - 1, required, required + 1] {
                 let params = [
                     901_i64.into(),
                     limit.into(),
                     MAX_RECIPIENT_NAME_BYTES.into(),
                 ];
+                // The new identity columns spend their UTF-8 bytes in the
+                // same bounded payload. The unchanged legacy control receives
+                // only the budget for its original fields.
+                let legacy_params = [
+                    901_i64.into(),
+                    (limit - sender_project_bytes).into(),
+                    MAX_RECIPIENT_NAME_BYTES.into(),
+                ];
                 let expected = conn
-                    .query_sync(&source_sql_with_limit(LEGACY_SOURCE_SQL), &params)
+                    .query_sync(&source_sql_with_limit(LEGACY_SOURCE_SQL), &legacy_params)
                     .unwrap();
                 let actual = conn
                     .query_sync(&source_sql_with_limit(SOURCE_SQL), &params)
@@ -1149,6 +1167,8 @@ ORDER BY row_kind, recipient_id";
                     let prepared = prepare_source_rows(901, &actual).unwrap();
                     assert_eq!(prepared.body, "Body λ🙂");
                     assert_eq!(prepared.message["project"], "/project/é");
+                    assert_eq!(prepared.message["sender_project"], "/foreign");
+                    assert_eq!(prepared.message["sender_project_slug"], "foreign");
                 }
             }
             // Optional fields have zero cost when absent, including the
@@ -1165,7 +1185,14 @@ ORDER BY row_kind, recipient_id";
                 .unwrap();
             assert_source_rows_equal(
                 &conn
-                    .query_sync(&source_sql_with_limit(LEGACY_SOURCE_SQL), &params)
+                    .query_sync(
+                        &source_sql_with_limit(LEGACY_SOURCE_SQL),
+                        &[
+                            901_i64.into(),
+                            (reduced - sender_project_bytes).into(),
+                            MAX_RECIPIENT_NAME_BYTES.into(),
+                        ],
+                    )
                     .unwrap(),
                 &actual,
             );
@@ -1406,6 +1433,14 @@ ORDER BY row_kind, recipient_id";
             );
             assert_eq!(rows[0].get_named::<i64>("sender_id").unwrap(), 201);
             assert_eq!(rows[0].get_named::<i64>("sender_project_id").unwrap(), 201);
+            assert_eq!(
+                rows[0].get_named::<String>("sender_project_key").unwrap(),
+                "/foreign"
+            );
+            assert_eq!(
+                rows[0].get_named::<String>("sender_project_slug").unwrap(),
+                "foreign"
+            );
             assert_eq!(rows[1].get_named::<i64>("recipient_read_ts").unwrap(), 7);
             assert_eq!(rows[1].get_named::<i64>("recipient_ack_ts").unwrap(), 11);
             assert_eq!(
@@ -1459,6 +1494,8 @@ ORDER BY row_kind, recipient_id";
                 "project",
                 "/project",
                 "OrangeHill",
+                "/foreign",
+                "foreign",
                 "thread-λ",
                 "部署",
                 "{}",
@@ -1923,5 +1960,122 @@ ORDER BY row_kind, recipient_id";
             expected.push("reply_to");
             assert_eq!(keys(&reply.message), expected);
         });
+    }
+
+    #[test]
+    fn gh404_surviving_sender_project_metadata_is_validated_when_present() {
+        fixture(|cx, pool, _| {
+            let prepared = prepare_message(cx, pool, 901).unwrap();
+            for key in ["sender_project", "sender_project_slug"] {
+                let mut conflicting = prepared.message.clone();
+                conflicting[key] = json!("another-project");
+                let error = validate_surviving_message(&prepared, &conflicting, &prepared.body)
+                    .expect_err("an explicit conflicting sender identity cannot authorize repair");
+                assert!(error.contains(key));
+            }
+            let mut legacy = prepared.message.clone();
+            let fields = legacy.as_object_mut().unwrap();
+            fields.remove("sender_project");
+            fields.remove("sender_project_slug");
+            validate_surviving_message(&prepared, &legacy, &prepared.body)
+                .expect("historical archives may omit sender project metadata");
+        });
+    }
+
+    #[test]
+    fn gh404_repaired_message_accepts_delayed_tool_bundle_with_sender_identity() {
+        for reply_to in [None, Some(7_i64)] {
+            fixture(|cx, pool, config| {
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                if reply_to.is_some() {
+                    conn.execute_raw(
+                        "UPDATE messages SET thread_id='root', archive_metadata_json='{\"reply_to\":7}' WHERE id=901",
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute_raw("UPDATE messages SET archive_metadata_json='{}' WHERE id=901")
+                        .unwrap();
+                }
+                drop(conn);
+                let prepared = prepare_message(cx, pool, 901).unwrap();
+
+                // Independently render the envelope emitted by send/reply.
+                // The sender belongs to /foreign while delivery belongs to
+                // /project; using destination metadata here cannot pass.
+                let mut queued = json!({
+                    "id": 901,
+                    "from": "OrangeHill",
+                    "sender_project": "/foreign",
+                    "sender_project_slug": "foreign",
+                    "to": ["GreenStone"],
+                    "cc": ["GoldLeaf"],
+                    "bcc": ["RedFox"],
+                    "subject": "Contact handoff",
+                    "created": mcp_agent_mail_db::micros_to_iso(1_000_000),
+                    "thread_id": reply_to.map(|_| "root"),
+                    "topic": null,
+                    "project": "/project",
+                    "project_slug": "project",
+                    "importance": "normal",
+                    "ack_required": true,
+                    "attachments": [],
+                });
+                if let Some(parent) = reply_to {
+                    queued["reply_to"] = json!(parent);
+                }
+
+                // Recovery wins the race and writes the immutable canonical
+                // file before the queued tool write reaches storage.
+                assert_eq!(
+                    reconcile_prepared(config, &prepared).unwrap().files_created,
+                    5
+                );
+                let archive = crate::ensure_archive(config, "project").unwrap();
+                let paths = crate::message_paths_for_bundle(
+                    &archive,
+                    &queued,
+                    "OrangeHill",
+                    &prepared.recipients,
+                )
+                .unwrap()
+                .0;
+                let before = [&paths.canonical, &paths.outbox]
+                    .into_iter()
+                    .chain(&paths.inbox)
+                    .map(|path| (path, std::fs::read(path).unwrap()))
+                    .collect::<Vec<_>>();
+                crate::write_message_bundle(
+                    &archive,
+                    config,
+                    &queued,
+                    "Keep this body.",
+                    "OrangeHill",
+                    &prepared.recipients,
+                    &[],
+                    None,
+                )
+                .expect("a delayed tool bundle must match the repaired canonical bytes");
+
+                // Keep the collision guard strict: a different explicit
+                // sender identity must still fail without changing evidence.
+                queued["sender_project"] = json!("/project");
+                let conflict = crate::write_message_bundle(
+                    &archive,
+                    config,
+                    &queued,
+                    "Keep this body.",
+                    "OrangeHill",
+                    &prepared.recipients,
+                    &[],
+                    None,
+                )
+                .expect_err("conflicting sender project must remain an immutable collision");
+                assert!(conflict.to_string().contains("canonical message id 901"));
+                for (path, bytes) in before {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                }
+                crate::flush_async_commits();
+            });
+        }
     }
 }

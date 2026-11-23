@@ -59,7 +59,8 @@ fn parse_enabled(raw: Option<&str>) -> bool {
 const SOURCE_SQL: &str = "SELECT a.id, a.name, a.program, a.model, a.task_description, \
                 a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
                 a.reaper_exempt, a.retired_at, d.deregistered_at, \
-                p.slug AS project_slug, p.human_key AS project_key \
+                p.slug AS project_slug, p.human_key AS project_key, \
+                a.project_id, p.created_at AS project_created_at \
          FROM (SELECT id, project_id, name, program, model, task_description, \
                       inception_ts, last_active_ts, attachments_policy, contact_policy, \
                       reaper_exempt, retired_at FROM agents WHERE id = ?1) a \
@@ -135,6 +136,8 @@ pub struct AgentReconcileReport {
 #[derive(Debug, PartialEq)]
 struct AgentSource {
     id: i64,
+    project_id: i64,
+    project_created_at: i64,
     project_slug: String,
     project_key: String,
     profile: Value,
@@ -348,6 +351,8 @@ fn read_source_connection_inner(conn: &DbConn, id: i64) -> Result<AgentSource, F
         return Err("agent reaper exemption is not boolean".into());
     }
     let profile = json!({
+        "id": id,
+        "project_id": row.get_named::<i64>("project_id").map_err(source_error)?,
         "name": name,
         "program": text("program")?,
         "model": text("model")?,
@@ -369,6 +374,10 @@ fn read_source_connection_inner(conn: &DbConn, id: i64) -> Result<AgentSource, F
     }
     Ok(AgentSource {
         id,
+        project_id: row.get_named::<i64>("project_id").map_err(source_error)?,
+        project_created_at: row
+            .get_named::<i64>("project_created_at")
+            .map_err(source_error)?,
         project_slug,
         project_key,
         profile,
@@ -975,8 +984,11 @@ mod tests {
         for (actual, previous) in actual.iter().zip(&previous) {
             let actual = actual.values().collect::<Vec<_>>();
             let previous = previous.values().collect::<Vec<_>>();
-            assert_eq!(actual, previous, "source {id}");
-            assert_eq!(actual.len(), 14);
+            // GH#404 appends numeric recovery identity to the old fourteen
+            // fields; retain exact parity for every original projected value.
+            assert_eq!(actual.len(), 16);
+            assert_eq!(previous.len(), 14);
+            assert_eq!(&actual[..14], previous, "source {id}");
         }
         actual
     }
@@ -1211,11 +1223,14 @@ mod tests {
             }
             let source = read_source_connection(&conn, 101).unwrap();
             assert_eq!(source.id, 101);
+            assert_eq!(source.project_id, 101);
+            assert_eq!(source.project_created_at, 1);
             assert_eq!(source.project_slug, "project");
             assert_eq!(source.project_key, "/project");
             assert_eq!(
                 source.profile,
                 json!({
+                    "id": 101, "project_id": 101,
                     "name": "BlueLake", "program": "test", "model": "test",
                     "task_description": "coordination",
                     "inception_ts": timestamp(1_000_000).unwrap(),

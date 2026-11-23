@@ -248,7 +248,12 @@ fn merged_bytes(
     committed: Option<&Artifact>,
     profile: bool,
 ) -> crate::Result<Vec<u8>> {
-    let project = json!({ "slug": source.project_slug, "human_key": source.project_key });
+    let project = json!({
+        "id": source.project_id,
+        "slug": source.project_slug,
+        "human_key": source.project_key,
+        "created_at": source.project_created_at,
+    });
     serialized_metadata(&merge_metadata(
         committed,
         working,

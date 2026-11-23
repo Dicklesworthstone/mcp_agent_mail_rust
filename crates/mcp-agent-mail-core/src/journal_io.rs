@@ -14,6 +14,7 @@
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Access to one journal entry. No mode truncates existing contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,8 @@ pub enum JournalFileMode {
     Read,
     Lock,
     Append,
+    /// Create a new file, refusing to reuse any occupied name.
+    CreateNew,
 }
 
 /// Retains both the selected root and its no-follow journal subdirectory.
@@ -133,6 +136,60 @@ impl JournalDirectory {
         self.validate_binding()
     }
 
+    /// Publish a complete replacement through retained directory handles.
+    ///
+    /// The writer may stream a large checkpoint into the private temporary
+    /// file. Its bytes are synced before the atomic rename; the directory is
+    /// synced and its binding rechecked before success. Failed temporary files
+    /// are retained for diagnosis, and existing destination aliases are refused.
+    pub fn atomic_write(
+        &self,
+        name: &str,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        validate_entry_name(name)?;
+        self.validate_binding()?;
+        match self.open_file(name, JournalFileMode::Read) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut temporary = None;
+        for _ in 0..128 {
+            let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let temporary_name = format!(".{name}.{}.{nonce}.pending", std::process::id());
+            match self.open_file(&temporary_name, JournalFileMode::CreateNew) {
+                Ok(file) => {
+                    temporary = Some((temporary_name, file));
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let (temporary_name, mut file) = temporary.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not claim a new recovery checkpoint temporary file",
+            )
+        })?;
+        write(&mut file)?;
+        file.sync_all()?;
+        self.validate_file(&temporary_name, &file)?;
+        // Recheck a previously absent destination too. A rename replaces a
+        // symlink rather than following it, but authority loss is still an
+        // error, not permission to discard another actor's replacement.
+        match self.open_file(name, JournalFileMode::Read) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        rename_file_at(&self.directory, &temporary_name, name)?;
+        self.sync()?;
+        self.validate_file(name, &file)
+    }
+
     /// The absolute spelling frozen when this directory was opened.
     #[must_use]
     pub fn directory_path(&self) -> PathBuf {
@@ -240,6 +297,7 @@ fn open_file_at(parent: &File, name: &str, mode: JournalFileMode) -> io::Result<
         JournalFileMode::Read => OFlag::O_RDONLY,
         JournalFileMode::Lock => OFlag::O_RDWR | OFlag::O_CREAT,
         JournalFileMode::Append => OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_APPEND,
+        JournalFileMode::CreateNew => OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
     };
     openat(
         parent,
@@ -249,6 +307,11 @@ fn open_file_at(parent: &File, name: &str, mode: JournalFileMode) -> io::Result<
     )
     .map(File::from)
     .map_err(io::Error::from)
+}
+
+#[cfg(unix)]
+fn rename_file_at(parent: &File, source: &str, destination: &str) -> io::Result<()> {
+    rustix::fs::renameat(parent, source, parent, destination).map_err(io::Error::from)
 }
 
 #[cfg(windows)]
@@ -290,10 +353,19 @@ fn open_file_at(parent: &File, name: &str, mode: JournalFileMode) -> io::Result<
         JournalFileMode::Append => {
             options.append(true).create(true);
         }
+        JournalFileMode::CreateNew => {
+            options.write(true).create_new(true);
+        }
     }
     parent
         .open_with(name, &options)
         .map(cap_std::fs::File::into_std)
+}
+
+#[cfg(windows)]
+fn rename_file_at(parent: &File, source: &str, destination: &str) -> io::Result<()> {
+    let directory = cap_std::fs::Dir::from_std_file(parent.try_clone()?);
+    directory.rename(source, &directory, destination)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -312,6 +384,14 @@ fn open_directory_at(_parent: &File, _name: &str, _create: bool) -> io::Result<F
 #[cfg(not(any(unix, windows)))]
 fn open_file_at(_parent: &File, _name: &str, _mode: JournalFileMode) -> io::Result<File> {
     open_root(Path::new(""))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_file_at(_parent: &File, _source: &str, _destination: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "handle-bound atomic journal publication is unsupported on this platform",
+    ))
 }
 
 #[cfg(test)]
@@ -352,6 +432,31 @@ mod tests {
         let mut actual = String::new();
         file.read_to_string(&mut actual).unwrap();
         assert_eq!(actual, "first\nsecond\n");
+    }
+
+    #[test]
+    fn atomic_publication_retains_previous_file_when_streaming_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = JournalDirectory::open(root.path(), DIRECTORY, true).unwrap();
+        journal
+            .atomic_write("checkpoint.jsonl", |file| file.write_all(b"complete\n"))
+            .unwrap();
+        let error = journal.atomic_write("checkpoint.jsonl", |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("injected writer failure"))
+        });
+        assert!(error.is_err());
+        assert_eq!(
+            std::fs::read(journal.directory_path().join("checkpoint.jsonl")).unwrap(),
+            b"complete\n"
+        );
+        journal
+            .atomic_write("checkpoint.jsonl", |file| file.write_all(b"replacement\n"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(journal.directory_path().join("checkpoint.jsonl")).unwrap(),
+            b"replacement\n"
+        );
     }
 
     #[test]

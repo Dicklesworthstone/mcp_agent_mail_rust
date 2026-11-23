@@ -10852,7 +10852,7 @@ async fn initialize_sqlite_file_once_with_authorities(
         }
     }
 
-    match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
+    let initialized = match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
         ok @ Outcome::Ok(()) => {
             if sqlite_path != ":memory:"
                 && let Some(authority) = sqlite_authority
@@ -10917,8 +10917,20 @@ async fn initialize_sqlite_file_once_with_authorities(
                 // startup: another process may be migrating the same fresh
                 // file, and one immediate retry lands inside its migration
                 // (br-wp4am). Skip corruption probes; back off until it ends.
-                return retry_sqlite_init_while_busy(cx, sqlite_path, run_migrations, first_err)
-                    .await;
+                let retry =
+                    retry_sqlite_init_while_busy(cx, sqlite_path, run_migrations, first_err).await;
+                if run_migrations
+                    && matches!(retry, Outcome::Ok(()))
+                    && let Err(error) = checkpoint_recovery_state_after_init(
+                        sqlite_path,
+                        storage_root,
+                        sqlite_authority,
+                        storage_root_authority,
+                    )
+                {
+                    return Outcome::Err(error);
+                }
+                return retry;
             }
 
             if sqlite_path != ":memory:"
@@ -10929,7 +10941,69 @@ async fn initialize_sqlite_file_once_with_authorities(
             }
             run_sqlite_init_once(cx, sqlite_path, run_migrations).await
         }
+    };
+    // Explicit nonmigrating/diagnostic pools can expose only a historical base
+    // schema. They do not authorize startup writes to migration-only tables.
+    if run_migrations
+        && matches!(initialized, Outcome::Ok(()))
+        && let Err(error) = checkpoint_recovery_state_after_init(
+            sqlite_path,
+            storage_root,
+            sqlite_authority,
+            storage_root_authority,
+        )
+    {
+        return Outcome::Err(error);
     }
+    initialized
+}
+
+/// Capture pre-upgrade coordination state before the first live checkout. The
+/// archive checkpoint is written once per database generation; subsequent
+/// receipt/contact mutations maintain bounded per-key records (GH#404).
+#[allow(clippy::result_large_err)]
+fn checkpoint_recovery_state_after_init(
+    sqlite_path: &str,
+    storage_root: &Path,
+    sqlite_authority: Option<&FrozenDirectoryAuthority>,
+    storage_root_authority: Option<&FrozenDirectoryAuthority>,
+) -> Result<(), SqlError> {
+    if sqlite_path == ":memory:" {
+        return Ok(());
+    }
+    for authority in [sqlite_authority, storage_root_authority]
+        .into_iter()
+        .flatten()
+    {
+        authority.verify("archive recovery checkpoint precheck")?;
+    }
+    let conn = crate::guard_db_conn(
+        open_sqlite_file_with_lock_retry(sqlite_path)?,
+        "archive recovery checkpoint initialization",
+    );
+    if crate::queries::db_generation_id_conn(&conn).is_none() {
+        let generation = mcp_agent_mail_core::setup::generate_token()
+            .map_err(|error| SqlError::Custom(format!("recovery checkpoint identity: {error}")))?;
+        conn.execute_sync(
+            "INSERT OR IGNORE INTO db_identity(singleton, generation_id) VALUES (0, ?)",
+            &[Value::Text(generation)],
+        )?;
+    }
+    crate::reconstruct_state::checkpoint_cursor(&*conn, storage_root)
+        .and_then(|()| crate::recovery_state::ensure_checkpoint(&*conn, storage_root))
+        .map(|_| ())
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "sqlite init stage=archive_recovery_checkpoint failed: {error}"
+            ))
+        })?;
+    for authority in [sqlite_authority, storage_root_authority]
+        .into_iter()
+        .flatten()
+    {
+        authority.verify("archive recovery checkpoint postcheck")?;
+    }
+    Ok(())
 }
 
 /// Check whether an error message indicates `SQLite` file corruption.
@@ -20201,6 +20275,17 @@ where
         }
         None => crate::reconstruct::reconstruct_from_archive(&candidate_path, storage_root),
     };
+
+    if let Ok(stats) = &reconstruct_result
+        && !stats.recovery_checkpoint_present
+        && !stats.recovery_state_from_salvage
+    {
+        tracing::error!(
+            primary = %primary_path.display(),
+            candidate = %candidate_path.display(),
+            "ARCHIVE-ONLY RECOVERY STATE LOSS: this legacy archive has no completed recovery-state checkpoint; historical read/ack receipts and contact links are unavailable. Restore a healthy backup to retain them. Delivery cursor continuity is not guaranteed without an archived ceiling."
+        );
+    }
 
     match reconstruct_result {
         Ok(stats) => match sqlite_recovery_candidate_passes_full_integrity_check(&candidate_path) {

@@ -18,6 +18,63 @@
 - `integrity-check` (SQLite + archive)
 - `doctor repair` (wraps the above with backups)
 
+## Archive-only coordination recovery (GH#404)
+
+Current builds checkpoint existing read/ack receipts, shared-mailbox receipts,
+contact decisions and project/agent ID mappings during healthy database
+initialization. The checkpoint lives in `STORAGE_ROOT/recovery-state/`: an
+atomic manifest names one database generation and the checksum of its streamed
+baseline. Later read/ack and contact mutations publish bounded per-key records
+before reporting success. The archive publisher commits the manifest, its
+baseline and changed records to Git together. Keep this directory with the
+project/message archive when copying or backing up the mailbox.
+Restoring a superseded database generation requires its matching archive
+checkpoint; otherwise reconstruct a fresh database from the active archive.
+
+If a consuming inbox fetch returns `RECOVERY_STATE_UNAVAILABLE`, its read may
+already be committed in the database. Repair archive access, then explicitly
+retry `mark_message_read` or `acknowledge_message` for the affected IDs to finish
+publishing the recovery record. Retrying these operations preserves the
+original receipt timestamp.
+
+Reconstruction validates the baseline, generation and record identities before
+restoring mutable state. A missing or inconsistent record that has been named
+by the checkpoint is a recovery error, not permission to silently discard the
+state. Direct and project-mailbox receipts remain separate. Contact blocks and
+expiry metadata survive, including changes made after the initial checkpoint.
+Recorded project and agent IDs are preserved; conflicting identity evidence
+refuses recovery rather than linking a receipt to a different actor.
+
+All project profiles are discovered before messages are replayed. New message
+envelopes identify the sender's project explicitly. For historical envelopes,
+a unique matching real profile can resolve a cross-project participant;
+ambiguous names are reported rather than guessed. Archives without the needed
+profile or identity evidence cannot reconstruct information that was never
+saved.
+
+Delivery cursors are positions in a delivery ledger, not message IDs. A readable
+salvage database retains its ledger and cursor history. Archive-only recovery
+cannot reproduce that history, so it advances the rebuilt ledger above the
+durable ceiling of issued cursors and returns `CURSOR_EXPIRED` for prior
+positions, including a watcher at the former tail or an inbox that is now
+empty. This prevents sequence reuse and the misleading `CURSOR_AHEAD` failure.
+Clients should handle the explicit reset using the advertised resume floor or
+request a new current position (`position_now` / `am inbox-events
+--position-now`) after reconciling their own processing state. Do not substitute
+a message ID for a delivery cursor.
+During an active recovery promotion, cursor issuance, consuming inbox fetches
+and ACK replay briefly return a retryable `RESOURCE_BUSY` response; retry after
+promotion completes. A non-consuming inbox peek remains available.
+
+An older archive with no completed recovery-state checkpoint still cannot
+recover historical read/ack receipts or contact decisions. The reconstruction
+report warns about this loss, and automatic promotion emits an error-level
+summary. Upgrade while the database is healthy so its existing state can be
+checkpointed. If corruption and state loss have already occurred, restore a
+healthy pre-incident database backup when available. Product/project links and
+other database-only state still require readable salvage; the new checkpoint
+does not claim to replace a complete database backup.
+
 ## Repeated agent-profile conflicts (GH#375)
 
 An `agent_archive_reconcile_deferred` warning with `transient=false` can mean

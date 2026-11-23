@@ -2698,7 +2698,7 @@ impl ArchiveRetryBacklog {
                 op
             }
         };
-        match write_op_sync(&op) {
+        match archive_backlog_write_op(&op) {
             Ok(()) => {
                 self.mark_front_for_retirement(ArchiveBacklogRetirement::Resolved);
                 drop(op);
@@ -2879,6 +2879,79 @@ impl ArchiveRetryBacklog {
             }
         }
     }
+}
+
+/// A journal written before sender-project metadata was introduced can outlive
+/// the process that queued it. Repair may have already materialized the same
+/// message with those additive fields. Adopt that canonical envelope only for
+/// backlog replay; ordinary immutable-message checks remain byte-strict.
+fn archive_backlog_canonical_replay(op: &WriteOp) -> Option<WriteOp> {
+    let WriteOp::MessageBundle {
+        project_slug,
+        config,
+        message_json,
+        body_md,
+        sender,
+        recipients,
+        ..
+    } = op
+    else {
+        return None;
+    };
+    const SENDER_PROJECT_FIELDS: [&str; 2] = ["sender_project", "sender_project_slug"];
+    if SENDER_PROJECT_FIELDS
+        .iter()
+        .any(|&key| message_json.get(key).is_some())
+    {
+        return None;
+    }
+    positive_message_id(message_json)?;
+    let archive = open_archive(config, project_slug).ok()??;
+    let paths = message_paths_for_bundle(&archive, message_json, sender, recipients)
+        .ok()?
+        .0;
+    let (canonical, body) = read_message_file_inner(&paths.canonical, true).ok()?;
+    if body != *body_md {
+        return None;
+    }
+    let mut legacy = canonical.clone();
+    for key in SENDER_PROJECT_FIELDS {
+        let value = canonical.get(key)?;
+        value.as_str().filter(|value| !value.is_empty())?;
+        // Retain every other field's original position as well as value.
+        let _ = legacy.as_object_mut()?.shift_remove(key);
+    }
+    if serde_json::to_vec(&legacy).ok()? != serde_json::to_vec(message_json).ok()? {
+        return None;
+    }
+    let content = render_message_bundle_content(&canonical, body_md).ok()?;
+    let _existing =
+        existing_immutable_message_copy(&paths.canonical, content.as_bytes(), false).ok()??;
+
+    // The normal writer checks this exact canonical again under its publication
+    // locks and derives every full/redacted mirror from the same envelope. An
+    // unavailable, changed, or conflicting copy never authorizes an overwrite.
+    let mut replay = op.clone();
+    if let WriteOp::MessageBundle { message_json, .. } = &mut replay {
+        *message_json = canonical;
+    }
+    Some(replay)
+}
+
+fn archive_backlog_write_op(op: &WriteOp) -> Result<()> {
+    let replay = archive_backlog_canonical_replay(op);
+    let result = write_op_sync(replay.as_ref().unwrap_or(op));
+    if replay.is_none()
+        && matches!(&result, Err(StorageError::InvalidPath(message))
+            if message.starts_with("canonical message id "))
+        && let Some(replay) = archive_backlog_canonical_replay(op)
+    {
+        // Repair can publish between the optimistic read and the writer's
+        // locked check. Recheck once in this attempt: even a journal on its
+        // final retry must not dead-letter an otherwise identical legacy op.
+        return write_op_sync(&replay);
+    }
+    result
 }
 
 /// Releases an unpublished/rejected claim on early return or unwind. Once its
@@ -7387,6 +7460,11 @@ fn coalescer_pool_worker(
             return;
         }
 
+        // DB receipt/contact mutations have no dependency on the storage
+        // crate. Their durable files enter Git here, including when no new
+        // message arrives to wake the archive queue (GH#404).
+        publish_pending_recovery_state();
+
         // Phase 2: Pick a repo via LRS (least-recently-serviced) scheduling
         loop {
             let max_batch_size = configured_coalescer_batch_size();
@@ -8607,8 +8685,49 @@ pub fn enqueue_async_commit(
 /// Call this in tests, during graceful shutdown, or before reading git history
 /// that depends on recent writes.
 pub fn flush_async_commits() {
+    publish_pending_recovery_state();
     if let Some(coalescer) = COMMIT_COALESCER.get() {
         coalescer.flush_sync();
+    }
+}
+
+/// Commit each recovery publication as one consistent generation. Holding the
+/// DB-owned publication lock keeps an active manifest and its baseline in the
+/// same Git commit; temporary files and lock files never enter the tree.
+fn publish_pending_recovery_state() {
+    for (root, paths) in mcp_agent_mail_db::recovery_state::take_pending_archive_paths() {
+        // A healthy database may be checkpointed before the first archive is
+        // initialized. Retain that work; never manufacture a Git repository
+        // merely because a database read opened its recovery state.
+        if !root.join(".git").exists() {
+            if root.exists() {
+                mcp_agent_mail_db::recovery_state::note_pending_archive_paths(&root, paths);
+            }
+            continue;
+        }
+        // Match ordinary archive writers: enter the global publication fence
+        // before retaining recovery's state lock. A busy archive must not
+        // consume the receipt/contact writers' bounded lock budget. Nested
+        // commit guards on this thread reuse the outer mutation lease.
+        let _mutation = ArchiveMutationGuard::begin_at(&root);
+        let result = mcp_agent_mail_db::recovery_state::with_archive_publication(
+            &root,
+            &paths,
+            |publication| {
+                let references = publication.iter().map(String::as_str).collect::<Vec<_>>();
+                commit_paths_with_retry(
+                    &root,
+                    &Config::get(),
+                    "Preserve mailbox recovery state",
+                    &references,
+                )
+                .map_err(|error| mcp_agent_mail_db::DbError::Internal(error.to_string()))
+            },
+        );
+        if let Err(error) = result {
+            tracing::warn!(root = %root.display(), %error, "recovery state Git publication deferred");
+            mcp_agent_mail_db::recovery_state::note_pending_archive_paths(&root, paths);
+        }
     }
 }
 
@@ -10111,16 +10230,24 @@ pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
 
 /// Persist stable project metadata used by DB reconstruction.
 ///
-/// Writes `projects/{slug}/project.json` containing the canonical `human_key`.
+/// Writes `projects/{slug}/project.json` containing the canonical identity,
+/// including the database ID needed to preserve recovery cursors and links.
 /// If the file already exists with identical content, this is a no-op.
 pub fn write_project_metadata_with_config(
     archive: &ProjectArchive,
     config: &Config,
     human_key: &str,
+    project_id: i64,
+    created_at: i64,
 ) -> Result<()> {
     if !Path::new(human_key).is_absolute() {
         return Err(StorageError::InvalidPath(
             "project human_key must be an absolute path".to_string(),
+        ));
+    }
+    if project_id <= 0 {
+        return Err(StorageError::InvalidPath(
+            "archived project id must be positive".to_string(),
         ));
     }
 
@@ -10128,8 +10255,10 @@ pub fn write_project_metadata_with_config(
     let project_root = archive_project_root_checked(archive)?;
     let metadata_path = project_root.join("project.json");
     let metadata = serde_json::json!({
+        "id": project_id,
         "slug": archive.slug,
         "human_key": human_key,
+        "created_at": created_at,
     });
 
     // Avoid needless commits when ensure_project is called repeatedly.
@@ -11390,9 +11519,11 @@ pub fn message_paths(
 /// bytes. The tool-side writers and the DB-to-archive reconciler must therefore
 /// render a message identically. Otherwise a reconciler repair that races a
 /// still-queued write turns that write into a durability failure.
-pub const MESSAGE_ARCHIVE_ENVELOPE_KEYS: [&str; 14] = [
+pub const MESSAGE_ARCHIVE_ENVELOPE_KEYS: [&str; 16] = [
     "id",
     "from",
+    "sender_project",
+    "sender_project_slug",
     "to",
     "cc",
     "bcc",
@@ -16907,8 +17038,18 @@ fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
         private_repo.set_index(&mut index)?;
         reset_index_to_head(&private_repo, &mut index)?;
 
-        // Respect .gitignore, add all changes under the workdir.
-        index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
+        // Recovery state has its own publication lock and must bind active.json
+        // to one complete baseline. Keep its previously committed tree intact;
+        // the dedicated publisher handles new state and excludes runtime locks
+        // and interrupted temporary files even under coalescer overload.
+        let mut include_path = |path: &Path, _matched: &[u8]| {
+            i32::from(path.starts_with(mcp_agent_mail_db::recovery_state::DIRECTORY))
+        };
+        index.add_all(
+            ["*"].iter(),
+            IndexAddOption::DEFAULT,
+            Some(&mut include_path),
+        )?;
 
         Ok(Some(index.write_tree()?))
     })?;
@@ -18966,7 +19107,7 @@ mod tests {
         let config = test_config(tmp.path());
         let archive = ensure_archive(&config, "proj").unwrap();
 
-        write_project_metadata_with_config(&archive, &config, "/tmp/proj").unwrap();
+        write_project_metadata_with_config(&archive, &config, "/tmp/proj", 42, 123).unwrap();
         let metadata_path = archive.root.join("project.json");
         assert!(metadata_path.exists());
 
@@ -18974,9 +19115,176 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
         assert_eq!(metadata["slug"], "proj");
         assert_eq!(metadata["human_key"], "/tmp/proj");
+        assert_eq!(metadata["id"], 42);
+        assert_eq!(metadata["created_at"], 123);
 
         // Rewriting with the same data should remain a no-op and still succeed.
-        write_project_metadata_with_config(&archive, &config, "/tmp/proj").unwrap();
+        write_project_metadata_with_config(&archive, &config, "/tmp/proj", 42, 123).unwrap();
+    }
+
+    #[test]
+    fn gh404_flush_commits_complete_recovery_state_without_runtime_files() {
+        const CHILD: &str = "AM_TEST_GH404_RECOVERY_PUBLICATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The pending recovery queue and commit workers are process-wide.
+            // Other parallel libtests must not consume this test's publication
+            // before we can assert that one commit contains the entire state.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::gh404_flush_commits_complete_recovery_state_without_runtime_files",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "recovery publication failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use mcp_agent_mail_db::recovery_state::{self, RecoveryRecord};
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp.path().join("archive"));
+        let archive = ensure_archive(&config, "receiver").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let before = repo.head().unwrap().target().unwrap();
+        assert!(COMMIT_COALESCER.get().is_none());
+
+        // Use the actual canonical schema and durable publication APIs. The
+        // baseline intentionally precedes the read/ACK and contact decision.
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_memory().unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES \
+             (7,'sender','/work/sender',1),(19,'receiver','/work/receiver',1); \
+             INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES \
+             (17,7,'BlueLake','codex','test',1,1),(29,19,'RedFox','codex','test',1,1); \
+             INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) VALUES \
+             (41,19,17,'Publication regression','Retain receipt state',100); \
+             INSERT INTO message_recipients(message_id,agent_id,kind) VALUES (41,29,'to'); \
+             INSERT INTO agent_links(id,a_project_id,a_agent_id,b_project_id,b_agent_id,status,reason,created_ts,updated_ts) \
+             VALUES (93,7,17,19,29,'pending','review',10,20);",
+        )
+        .unwrap();
+        let manifest = recovery_state::ensure_checkpoint(&conn, &config.storage_root).unwrap();
+        conn.execute_raw(
+            "UPDATE message_recipients SET read_ts=111,ack_ts=222 WHERE message_id=41; \
+             UPDATE agent_links SET status='blocked',updated_ts=30 WHERE id=93;",
+        )
+        .unwrap();
+        recovery_state::persist_receipts(&conn, &config.storage_root, 29, &[41]).unwrap();
+        recovery_state::persist_contact(&conn, &config.storage_root, 17, 29).unwrap();
+        mcp_agent_mail_db::reconstruct_state::record_issued_cursor(&config.storage_root, 321)
+            .unwrap();
+        drop(conn);
+
+        let generation = format!("recovery-state/g{}", manifest.generation);
+        let generation_path = config.storage_root.join(&generation);
+        let mut expected = vec![
+            "recovery-state/active.json".to_string(),
+            "recovery-state/delivery-cursor.json".to_string(),
+            format!("{generation}/baseline.jsonl"),
+        ];
+        for entry in fs::read_dir(&generation_path).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if name.starts_with("receipt-") || name.starts_with("contact-") {
+                expected.push(format!("{generation}/{name}"));
+            }
+        }
+        assert_eq!(expected.len(), 5, "baseline plus both incremental records");
+        let untracked = [
+            "recovery-state/.state.lock".to_string(),
+            "recovery-state/delivery-cursor.lock".to_string(),
+            "recovery-state/.active.json.incomplete.tmp".to_string(),
+            format!("{generation}/.receipt-incomplete.tmp"),
+            "recovery-state/unpublished.json".to_string(),
+        ];
+        assert!(config.storage_root.join(&untracked[0]).is_file());
+        assert!(config.storage_root.join(&untracked[1]).is_file());
+        for path in &untracked[2..] {
+            fs::write(config.storage_root.join(path), b"unfinished publication").unwrap();
+        }
+        assert_eq!(repo.head().unwrap().target().unwrap(), before);
+
+        // A one-shot CLI flush must publish even without starting workers or
+        // receiving a later message that could wake the ordinary queue.
+        flush_async_commits();
+        assert!(COMMIT_COALESCER.get().is_none());
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(commit.parent_id(0).unwrap(), before);
+        let tree = commit.tree().unwrap();
+        for path in &expected {
+            let entry = tree.get_path(Path::new(path)).unwrap();
+            assert_eq!(
+                repo.find_blob(entry.id()).unwrap().content(),
+                fs::read(config.storage_root.join(path)).unwrap(),
+                "committed recovery bytes for {path}"
+            );
+        }
+        for path in &untracked {
+            assert!(
+                tree.get_path(Path::new(path)).is_err(),
+                "runtime file {path}"
+            );
+        }
+
+        // The overload fallback snapshots ordinary archive files but cannot
+        // bypass the recovery publisher or accidentally commit runtime state.
+        fs::write(
+            config.storage_root.join("publication-control.txt"),
+            b"ordinary archive file",
+        )
+        .unwrap();
+        commit_all(&repo, &config, "overload publication regression").unwrap();
+        let overload = repo.head().unwrap().peel_to_commit().unwrap();
+        let overload_tree = overload.tree().unwrap();
+        assert!(
+            overload_tree
+                .get_path(Path::new("publication-control.txt"))
+                .is_ok()
+        );
+        for path in &untracked {
+            assert!(
+                overload_tree.get_path(Path::new(path)).is_err(),
+                "runtime file {path}"
+            );
+        }
+
+        // A fresh checkout contains the entire proof independently of the
+        // source database and working files, including the latest decisions.
+        let recovered_root = tmp.path().join("recovered");
+        let cloned =
+            Repository::clone(config.storage_root.to_str().unwrap(), &recovered_root).unwrap();
+        drop(cloned);
+        let mut records = Vec::new();
+        let recovered_manifest = recovery_state::visit_records(&recovered_root, |record| {
+            records.push(record);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered_manifest, manifest);
+        assert!(records.iter().any(|record| matches!(record,
+            RecoveryRecord::Receipt(receipt)
+                if receipt.message_id == 41 && receipt.agent.id == 29
+                    && receipt.read_ts == Some(111) && receipt.ack_ts == Some(222)
+        )));
+        assert!(
+            matches!(records.iter().rev().find(|record| matches!(record, RecoveryRecord::Contact(_))),
+                Some(RecoveryRecord::Contact(contact)) if contact.status == "blocked"
+            )
+        );
+        let cursor: serde_json::Value = serde_json::from_slice(
+            &fs::read(recovered_root.join("recovery-state/delivery-cursor.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cursor["issued_through"], 321);
     }
 
     #[test]
@@ -18988,7 +19296,7 @@ mod tests {
         let forged_root = tmp.path().join("outside-project");
 
         archive.root = forged_root.clone();
-        write_project_metadata_with_config(&archive, &config, "/tmp/proj").unwrap();
+        write_project_metadata_with_config(&archive, &config, "/tmp/proj", 1, 1).unwrap();
 
         assert!(real_root.join("project.json").exists());
         assert!(
@@ -19054,7 +19362,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp.path().join("archive"));
         let archive = ensure_archive(&config, "profile-publication").unwrap();
-        write_project_metadata_with_config(&archive, &config, "/profile-publication").unwrap();
+        write_project_metadata_with_config(&archive, &config, "/profile-publication", 1, 1)
+            .unwrap();
 
         // Capture the actual mutable WBQ operation before deregistration. Its
         // producer can be delayed after committing SQLite but before enqueue,
@@ -29463,6 +29772,245 @@ mod tests {
     }
 
     #[test]
+    fn gh404_legacy_backlog_replay_preserves_repaired_sender_identity() {
+        const CHILD: &str = "AM_TEST_GH404_LEGACY_BACKLOG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::gh404_legacy_backlog_replay_preserves_repaired_sender_identity",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "legacy backlog replay failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use recovery::message_reconcile::database::{ReconcileCursor, reconcile_message_batch};
+        for repair_during_replay in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &tmp.path().join("mail.sqlite3"),
+                ),
+                storage_root: tmp.path().join("archive"),
+                ..Config::default()
+            };
+            let pool = DbPool::new(&DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                ..DbPoolConfig::default()
+            })
+            .unwrap();
+            let cx = Cx::for_testing();
+            let conn = match fastmcp_core::block_on(pool.acquire(&cx)) {
+                Outcome::Ok(conn) => conn,
+                _ => panic!("acquire legacy backlog source"),
+            };
+            conn.execute_raw(
+                "INSERT INTO projects(id,slug,human_key,created_at) VALUES \
+                 (7,'sender','/work/sender',1),(19,'receiver','/work/receiver',1); \
+                 INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES \
+                 (17,7,'BlueLake','test','test',1,1),(29,19,'RedFox','test','test',1,1), \
+                 (30,19,'GreenStone','test','test',1,1),(31,19,'GoldLeaf','test','test',1,1); \
+                 INSERT INTO messages(id,project_id,sender_id,subject,body_md,importance,ack_required,created_ts,archive_metadata_json) \
+                 VALUES (41,19,17,'Legacy backlog','Keep this body.','normal',1,1000000,'{}'); \
+                 INSERT INTO message_recipients(message_id,agent_id,kind) VALUES \
+                 (41,29,'to'),(41,30,'cc'),(41,31,'bcc');",
+            )
+            .unwrap();
+            drop(conn);
+
+            // This is the complete, independently written pre-upgrade envelope,
+            // persisted before repair or replay rather than derived from the
+            // new renderer by stripping its fields.
+            let legacy = serde_json::json!({
+                "id": 41,
+                "from": "BlueLake",
+                "to": ["RedFox"],
+                "cc": ["GreenStone"],
+                "bcc": ["GoldLeaf"],
+                "subject": "Legacy backlog",
+                "created": micros_to_iso(1_000_000),
+                "thread_id": null,
+                "topic": null,
+                "project": "/work/receiver",
+                "project_slug": "receiver",
+                "importance": "normal",
+                "ack_required": true,
+                "attachments": [],
+            });
+            assert_eq!(legacy.as_object().unwrap().len(), 14);
+            let recipients = vec![
+                "RedFox".to_string(),
+                "GreenStone".to_string(),
+                "GoldLeaf".to_string(),
+            ];
+            let op = WriteOp::MessageBundle {
+                project_slug: "receiver".to_string(),
+                config: config.clone(),
+                message_json: legacy.clone(),
+                body_md: "Keep this body.".to_string(),
+                sender: "BlueLake".to_string(),
+                recipients: recipients.clone(),
+                extra_paths: vec![],
+            };
+            let journal = archive_backlog_journal_write(&op, None).unwrap();
+            assert!(journal.durable);
+            let journal_bytes = fs::read(&journal.path).unwrap();
+            let archive = ensure_archive(&config, "receiver").unwrap();
+            let paths = message_paths_for_bundle(&archive, &legacy, "BlueLake", &recipients)
+                .unwrap()
+                .0;
+            assert!(!paths.canonical.exists());
+            let copies = [paths.canonical.clone(), paths.outbox.clone()]
+                .into_iter()
+                .chain(paths.inbox.clone())
+                .collect::<Vec<_>>();
+            let repaired_bytes = Arc::new(Mutex::new(Vec::new()));
+            let repair = {
+                let pool = pool.clone();
+                let config = config.clone();
+                let copies = copies.clone();
+                let repaired_bytes = Arc::clone(&repaired_bytes);
+                move || {
+                    let cx = Cx::for_testing();
+                    let mut cursor =
+                        ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+                    let report = reconcile_message_batch(
+                        &cx,
+                        &pool,
+                        &config,
+                        &mut cursor,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                    assert_eq!(report.repaired, 1);
+                    assert_eq!(report.deferred, 0);
+                    *repaired_bytes.lock().unwrap() = copies
+                        .into_iter()
+                        .map(|path| {
+                            let bytes = fs::read(&path).unwrap();
+                            (path, bytes)
+                        })
+                        .collect::<Vec<_>>();
+                }
+            };
+
+            // Use the same lazy journal hydration and drain used at restart,
+            // with no background thread to make either ordering accidental.
+            let backlog = ArchiveRetryBacklog::new();
+            assert_eq!(
+                backlog.push_recovered(&config, vec![journal.path.clone()]),
+                1
+            );
+            backlog.queue.lock().unwrap().front_mut().unwrap().attempts =
+                ARCHIVE_BACKLOG_MAX_ATTEMPTS - 1;
+            if repair_during_replay {
+                // The first optimistic read sees no canonical. Repair wins
+                // immediately before the normal writer checks the path, on
+                // the journal's final permitted attempt.
+                WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                    assert!(slot.borrow().is_none());
+                    *slot.borrow_mut() = Some(Box::new(repair));
+                });
+            } else {
+                repair();
+            }
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::Materialized
+            ));
+            assert_eq!(backlog.depth.load(Ordering::Relaxed), 0);
+            assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+            assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+            assert!(!durability_degraded());
+            assert!(!journal.path.exists());
+            let resolved = journal
+                .path
+                .parent()
+                .unwrap()
+                .join("resolved")
+                .join(journal.path.file_name().unwrap());
+            assert_eq!(fs::read(resolved).unwrap(), journal_bytes);
+
+            let before = repaired_bytes.lock().unwrap();
+            assert_eq!(before.len(), 5);
+            for (path, bytes) in before.iter() {
+                assert_eq!(fs::read(path).unwrap(), *bytes);
+                let (message, body) = read_message_file(path).unwrap();
+                assert_eq!(message.as_object().unwrap().len(), 16);
+                assert_eq!(message["sender_project"], "/work/sender");
+                assert_eq!(message["sender_project_slug"], "sender");
+                assert_eq!(body, "Keep this body.");
+                if paths.inbox.contains(path) {
+                    assert_eq!(message["bcc"], serde_json::json!([]));
+                }
+            }
+
+            // Compatibility belongs only to backlog replay. An ordinary
+            // writer still refuses even this otherwise equivalent old bundle.
+            assert!(
+                write_message_bundle(
+                    &archive,
+                    &config,
+                    &legacy,
+                    "Keep this body.",
+                    "BlueLake",
+                    &recipients,
+                    &[],
+                    None,
+                )
+                .is_err()
+            );
+            for key in ["sender_project", "sender_project_slug"] {
+                let mut conflicting = op.clone();
+                if let WriteOp::MessageBundle { message_json, .. } = &mut conflicting {
+                    message_json[key] = serde_json::json!("another-project");
+                }
+                assert!(archive_backlog_canonical_replay(&conflicting).is_none());
+                let conflict = archive_backlog_journal_write(&conflicting, None).unwrap();
+                assert_eq!(backlog.push_recovered(&config, vec![conflict.path]), 1);
+                backlog.queue.lock().unwrap().front_mut().unwrap().attempts =
+                    ARCHIVE_BACKLOG_MAX_ATTEMPTS - 1;
+                assert!(matches!(
+                    backlog.drain_step(),
+                    ArchiveBacklogDrainStep::DeadLettered
+                ));
+            }
+            for changed_field in ["body", "topic"] {
+                let mut conflicting = op.clone();
+                if let WriteOp::MessageBundle {
+                    message_json,
+                    body_md,
+                    ..
+                } = &mut conflicting
+                {
+                    if changed_field == "body" {
+                        body_md.push('\n');
+                    } else {
+                        message_json["topic"] = serde_json::json!("different-topic");
+                    }
+                }
+                assert!(archive_backlog_canonical_replay(&conflicting).is_none());
+            }
+            for (path, bytes) in before.iter() {
+                assert_eq!(fs::read(path).unwrap(), *bytes);
+            }
+            flush_async_commits();
+        }
+    }
+
+    #[test]
     fn archive_backlog_push_without_durable_journal_reports_ephemeral() {
         // br-ack-fast durability gap: when the journal cannot be written, push
         // must report QueuedEphemeral (NOT Queued) so callers never treat a
@@ -34897,7 +35445,8 @@ mod tests {
         let archive = ensure_archive(&config, "generation-metadata").unwrap();
         let before = archive_read_generation(&archive.repo_root).unwrap();
 
-        write_project_metadata_with_config(&archive, &config, "/tmp/generation-metadata").unwrap();
+        write_project_metadata_with_config(&archive, &config, "/tmp/generation-metadata", 1, 1)
+            .unwrap();
 
         let after = archive_read_generation(&archive.repo_root).unwrap();
         assert_ne!(before, after);

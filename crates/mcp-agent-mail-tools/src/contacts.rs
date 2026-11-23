@@ -544,6 +544,7 @@ pub(crate) async fn request_contact_with_intro(
             &pool,
             &from_row,
             &to_row,
+            &project,
             &target_project_row,
             &subject,
             &body_md,
@@ -574,6 +575,7 @@ async fn send_contact_notice(
     pool: &mcp_agent_mail_db::DbPool,
     from_row: &mcp_agent_mail_db::AgentRow,
     to_row: &mcp_agent_mail_db::AgentRow,
+    source_project: &mcp_agent_mail_db::ProjectRow,
     target_project: &mcp_agent_mail_db::ProjectRow,
     subject: &str,
     body_md: &str,
@@ -629,6 +631,8 @@ async fn send_contact_notice(
         &all_recipient_names,
         &target_project.human_key,
         &target_project.slug,
+        &source_project.human_key,
+        &source_project.slug,
     );
 
     try_write_message_archive(
@@ -703,6 +707,7 @@ pub(crate) async fn send_contact_approved_notice(
         &pool,
         &from_row,
         &to_row,
+        &source_project,
         &target_project,
         &subject,
         &body_md,

@@ -22136,7 +22136,13 @@ fn handle_contacts(action: ContactsCommand) -> CliResult<()> {
         let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
         let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
         let conn = open_db_sync_while_holding_mailbox_lock()?;
-        return handle_contacts_with_conn(&conn, action);
+        let root = cfg.resolved_storage_root();
+        let recovery_root = (cfg
+            .sqlite_path()
+            .map_err(|error| CliError::Other(format!("bad database URL: {error}")))?
+            != ":memory:")
+            .then_some(root.as_path());
+        return handle_contacts_with_conn_and_recovery(&conn, action, recovery_root);
     }
 
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
@@ -22158,6 +22164,14 @@ fn handle_contacts(action: ContactsCommand) -> CliResult<()> {
 fn handle_contacts_with_conn(
     conn: &mcp_agent_mail_db::DbConn,
     action: ContactsCommand,
+) -> CliResult<()> {
+    handle_contacts_with_conn_and_recovery(conn, action, None)
+}
+
+fn handle_contacts_with_conn_and_recovery(
+    conn: &mcp_agent_mail_db::DbConn,
+    action: ContactsCommand,
+    recovery_root: Option<&Path>,
 ) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
 
@@ -22249,6 +22263,11 @@ fn handle_contacts_with_conn(
                 .and_then(|row| row.get_named::<i64>("expires_ts").ok())
                 .map(mcp_agent_mail_db::timestamps::micros_to_iso);
 
+            if let Some(root) = recovery_root {
+                mcp_agent_mail_db::recovery_state::persist_contact(conn, root, from_id, to_id)
+                    .map_err(|error| CliError::Other(error.to_string()))?;
+            }
+
             let result = serde_json::json!({
                 "from": from_agent.clone(),
                 "to": to_agent.clone(),
@@ -22314,6 +22333,11 @@ fn handle_contacts_with_conn(
                     "no contact request from `{from_agent}` to `{agent_name}` in project \
                      `{project_key}`; nothing to respond to"
                 )));
+            }
+
+            if let Some(root) = recovery_root {
+                mcp_agent_mail_db::recovery_state::persist_contact(conn, root, from_id, to_id)
+                    .map_err(|error| CliError::Other(error.to_string()))?;
             }
 
             let result = serde_json::json!({
@@ -82020,6 +82044,63 @@ startup_timeout_sec = 42
     // ── Contacts integration tests ───────────────────────────────────────
 
     #[test]
+    fn gh404_direct_contacts_preserve_the_latest_decision() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("archive");
+        let conn = seed_acks_and_reservations_db(&directory.path().join("mailbox.sqlite3"));
+        mcp_agent_mail_db::recovery_state::ensure_checkpoint(&conn, &root).unwrap();
+        let _capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_contacts_with_conn_and_recovery(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: "durable direct request".to_string(),
+                ttl_seconds: 3600,
+                format: None,
+                json: true,
+            },
+            Some(&root),
+        )
+        .unwrap();
+        for accept in [true, false] {
+            handle_contacts_with_conn_and_recovery(
+                &conn,
+                ContactsCommand::Respond {
+                    project_key: "test-proj".to_string(),
+                    agent_name: "RedFox".to_string(),
+                    from_agent: "BlueLake".to_string(),
+                    accept,
+                    reject: !accept,
+                    ttl_seconds: 3600,
+                    format: None,
+                    json: true,
+                },
+                Some(&root),
+            )
+            .unwrap();
+        }
+        let mut contacts = Vec::new();
+        mcp_agent_mail_db::recovery_state::visit_records(&root, |record| {
+            if let mcp_agent_mail_db::recovery_state::RecoveryRecord::Contact(contact) = record {
+                contacts.push(contact);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].status, "blocked");
+        assert_eq!(contacts[0].from.name, "BlueLake");
+        assert_eq!(contacts[0].to.name, "RedFox");
+        assert_eq!(contacts[0].reason, "durable direct request");
+        assert!(contacts[0].expires_ts.is_some());
+    }
+
+    #[test]
     fn integration_contacts_request_creates_link() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -100145,8 +100226,8 @@ fn inbox_events_page_from_direct(
 fn inbox_events_direct(
     config: &InboxEventsDirectConfig,
 ) -> Result<InboxEventsPage, InboxEventsReadError> {
-    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let read_db = open_db_sync_mail_inbox_with_database_url_and_path(&database_url)
+    let pool_config = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let read_db = open_db_sync_mail_inbox_with_database_url_and_path(&pool_config.database_url)
         .map_err(InboxEventsReadError::Other)?;
     let project = crate::context::resolve_project(read_db.conn(), &config.project_key)
         .map_err(InboxEventsReadError::Other)?;
@@ -100164,15 +100245,43 @@ fn inbox_events_direct(
         config.limit,
     );
     match page {
-        Ok(page) => Ok(inbox_events_page_from_direct(page, config.position_now)),
+        Ok(page) => {
+            let storage_root = pool_config.storage_root.as_deref().ok_or_else(|| {
+                InboxEventsReadError::Other(CliError::Other(
+                    "inbox-events requires the configured archive root to protect its cursor"
+                        .to_string(),
+                ))
+            })?;
+            mcp_agent_mail_db::reconstruct_state::record_issued_cursor(
+                storage_root,
+                page.tail_cursor,
+            )
+            .map_err(|error| InboxEventsReadError::Other(CliError::Other(error.to_string())))?;
+            Ok(inbox_events_page_from_direct(page, config.position_now))
+        }
         Err(mcp_agent_mail_db::sync::InboxDeliveryEventError::CursorExpired {
             after,
             oldest_available,
-        }) => Err(InboxEventsReadError::CursorExpired {
-            after,
-            oldest_available_cursor: oldest_available,
-        }),
+        }) => {
+            if let Some(storage_root) = pool_config.storage_root.as_deref() {
+                mcp_agent_mail_db::reconstruct_state::record_issued_cursor(
+                    storage_root,
+                    oldest_available.saturating_sub(1),
+                )
+                .map_err(|error| InboxEventsReadError::Other(CliError::Other(error.to_string())))?;
+            }
+            Err(InboxEventsReadError::CursorExpired {
+                after,
+                oldest_available_cursor: oldest_available,
+            })
+        }
         Err(mcp_agent_mail_db::sync::InboxDeliveryEventError::CursorAhead { after, tail }) => {
+            if let Some(storage_root) = pool_config.storage_root.as_deref() {
+                mcp_agent_mail_db::reconstruct_state::record_issued_cursor(storage_root, tail)
+                    .map_err(|error| {
+                        InboxEventsReadError::Other(CliError::Other(error.to_string()))
+                    })?;
+            }
             Err(InboxEventsReadError::CursorAhead {
                 after,
                 tail_cursor: tail,

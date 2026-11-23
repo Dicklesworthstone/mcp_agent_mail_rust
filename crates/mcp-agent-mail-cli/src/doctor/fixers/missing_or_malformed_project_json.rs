@@ -26,12 +26,12 @@
 //! supply for free:
 //!
 //! - **Invalid + canonical_human_key=Some**: the malformed
-//!   `project.json` is rewritten via `Op::WriteFile` to the
-//!   canonical shape
-//!   `{"slug": "<slug>", "human_key": "<canonical_human_key>"}`
-//!   (matching `storage::write_project_metadata_with_config`'s
-//!   serialization: `serde_json::to_string_pretty`, no trailing
-//!   newline, mode 0o644). The chokepoint backs up the original
+//!   `project.json` has its canonical `slug` and `human_key`
+//!   repaired via the file transformation chokepoint. Parseable
+//!   numeric recovery identity (`id`, `created_at`) and extension
+//!   fields survive; malformed JSON starts with the known fields.
+//!   Serialization remains pretty JSON, no trailing newline,
+//!   mode 0o644. The chokepoint backs up the original
 //!   malformed bytes verbatim, so `am doctor undo <run-id>`
 //!   restores the pre-fix state byte-identically.
 //! - **Missing**: skipped. The detector only knows
@@ -54,7 +54,7 @@
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
-use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
+use crate::doctor::mutate::{MutateContext, MutateError, transform_file};
 use mcp_agent_mail_db::archive_anomaly::{
     ArchiveAnomalyKind, ArchiveAnomalyReport, scan_archive_anomalies,
 };
@@ -154,7 +154,7 @@ impl MissingOrMalformedProjectJsonFinding {
                         "For each Invalid entry without canonical_human_key: read the `detail` field. Either configure the DB so the scan can populate canonical_human_key (then re-run the auto-fix), or edit `path` manually to fix the JSON / add the missing required field.",
                         "Re-run `am doctor fix --only fm-archive-state-files-missing-or-malformed-project-json --list` to confirm the anomaly is gone.",
                     ],
-                    "note": "Auto-fix produces `{\"slug\": \"<slug>\", \"human_key\": \"<canonical_human_key>\"}` matching `storage::write_project_metadata_with_config`'s serialization (to_string_pretty, no trailing newline, mode 0o644).",
+                    "note": "Auto-fix repairs slug and human_key while preserving numeric recovery identity and extension fields from parseable JSON. Malformed JSON is rebuilt from the known required fields (pretty JSON, no trailing newline, mode 0o644).",
                 },
             }),
             remediation: FindingRemediation {
@@ -223,8 +223,8 @@ pub fn detect(inputs: &DetectInputs) -> Vec<MissingOrMalformedProjectJsonFinding
 
 /// Fixer. Iterates the finding's problems; for each
 /// `Invalid + canonical_human_key=Some` entry, routes through
-/// `mutate()` with `Op::WriteFile` carrying the canonical
-/// reconstructed JSON. Missing entries and Invalid entries
+/// `transform_file()` to repair required identity fields while
+/// preserving all other parseable metadata. Missing entries and Invalid entries
 /// without canonical_human_key are counted as `actions_skipped`
 /// (they require operator-supplied truth and stay manual per
 /// the module docstring).
@@ -253,29 +253,22 @@ pub fn fix(
             actions_skipped += 1;
             continue;
         }
-        let canonical = serde_json::json!({
-            "slug": slug,
-            "human_key": human_key,
-        });
-        // Match `storage::write_json`: `to_string_pretty` with
-        // no trailing newline. Any byte difference vs the
-        // server's writer would surface as diff churn.
-        let new_body = match serde_json::to_string_pretty(&canonical) {
-            Ok(s) => s,
-            Err(_) => {
-                actions_skipped += 1;
-                continue;
-            }
-        };
-        mutate(
-            ctx,
-            path,
-            Op::WriteFile {
-                content: new_body.into_bytes(),
-                mode: PROJECT_JSON_MODE,
-            },
-        )?;
-        actions_taken += 1;
+        // Transform the live bytes under the mutation lock. Numeric IDs
+        // introduced for recovery must not disappear when repairing an
+        // unrelated required field, and extensions belong to the operator.
+        let action = transform_file(ctx, path, PROJECT_JSON_MODE, |bytes| {
+            let mut metadata =
+                serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(bytes)
+                    .unwrap_or_default();
+            metadata.insert("slug".to_string(), serde_json::json!(slug));
+            metadata.insert("human_key".to_string(), serde_json::json!(human_key));
+            Ok(Some(serde_json::to_vec_pretty(&metadata)?))
+        })?;
+        if action.is_some() {
+            actions_taken += 1;
+        } else {
+            actions_skipped += 1;
+        }
     }
     Ok(FixOutcome {
         actions_taken,
@@ -614,10 +607,8 @@ mod tests {
         assert_eq!(post, "not json");
     }
 
-    /// Positive: Invalid with absolute canonical_human_key →
-    /// rewrite via Op::WriteFile, sibling fields go away (this
-    /// is a CLEAN reconstruction; the canonical project.json
-    /// shape is `{slug, human_key}` only).
+    /// Invalid JSON cannot supply trustworthy additional fields; repair it
+    /// from the canonical slug and absolute human key supplied by detection.
     #[test]
     fn fixer_rewrites_invalid_with_canonical_path() {
         use std::fs;
@@ -644,6 +635,34 @@ mod tests {
             parsed.get("human_key").and_then(|v| v.as_str()),
             Some("/workspaces/demo")
         );
+    }
+
+    #[test]
+    fn fixer_preserves_recovery_identity_and_extensions() {
+        use std::fs;
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("project.json");
+        fs::write(
+            &path,
+            r#"{"id":73,"created_at":17,"slug":"demo","extension":{"owner":"team"}}"#,
+        )
+        .unwrap();
+        let ctx = ctx_for(&td, "2026-11-23T00-00-00Z__proj_recovery_identity");
+        let finding = MissingOrMalformedProjectJsonFinding {
+            problems: vec![ProjectJsonProblem::Invalid {
+                path: path.clone(),
+                slug: "demo".to_string(),
+                canonical_human_key: Some("/workspaces/demo".to_string()),
+                detail: "missing human_key field".to_string(),
+            }],
+        };
+        let outcome = fix(&ctx, &finding).unwrap();
+        assert_eq!((outcome.actions_taken, outcome.actions_skipped), (1, 0));
+        let metadata: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(metadata["id"], 73);
+        assert_eq!(metadata["created_at"], 17);
+        assert_eq!(metadata["human_key"], "/workspaces/demo");
+        assert_eq!(metadata["extension"], serde_json::json!({"owner":"team"}));
     }
 
     /// Mixed problems: only Invalid-with-canonical entries get

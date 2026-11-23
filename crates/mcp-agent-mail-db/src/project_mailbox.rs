@@ -1175,19 +1175,45 @@ pub fn mark_project_mailbox_read_batch_sync_conn(
 /// Open `sqlite_path` and run [`mark_project_mailbox_read_batch_sync_conn`].
 pub fn mark_project_mailbox_read_batch_sync(
     sqlite_path: &str,
+    storage_root: &std::path::Path,
     agent_id: i64,
     message_ids: &[i64],
 ) -> Result<Option<ProjectMailboxReadBatch>, DbError> {
     if message_ids.is_empty() {
         return Ok(None);
     }
+    // The direct SQLite path has no pooled writer lease. Exclude recovery
+    // before opening the file, and retain admission through archive publication.
+    let _write_activity = if sqlite_path == ":memory:" {
+        None
+    } else {
+        Some(
+            crate::write_barrier::try_begin_write_activity().ok_or_else(|| {
+                DbError::ResourceBusy(
+                    "shared inbox read receipt is blocked by recovery admission; retry".to_string(),
+                )
+            })?,
+        )
+    };
     let conn = DbConn::open_file(sqlite_path.to_string())
         .map_err(|error| DbError::Sqlite(error.to_string()))?;
     let _ = conn.execute_raw(&format!(
         "PRAGMA busy_timeout = {}",
         mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS
     ));
-    let result = mark_project_mailbox_read_batch_sync_conn(&conn, agent_id, message_ids);
+    let result =
+        mark_project_mailbox_read_batch_sync_conn(&conn, agent_id, message_ids).and_then(|batch| {
+            // Repeated reads also finish a prior failed post-commit publication.
+            if sqlite_path != ":memory:" {
+                crate::recovery_state::persist_receipts(
+                    &conn,
+                    storage_root,
+                    agent_id,
+                    message_ids,
+                )?;
+            }
+            Ok(batch)
+        });
     crate::close_db_conn(conn, "mark_project_mailbox_read_batch_sync connection");
     result
 }

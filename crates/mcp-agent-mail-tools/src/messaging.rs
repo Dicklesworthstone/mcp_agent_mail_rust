@@ -132,10 +132,14 @@ pub(crate) fn notice_archive_json(
     to: &[String],
     project_key: &str,
     project_slug: &str,
+    sender_project_key: &str,
+    sender_project_slug: &str,
 ) -> serde_json::Value {
     json!({
         "id": message.id.unwrap_or(0),
         "from": from,
+        "sender_project": sender_project_key,
+        "sender_project_slug": sender_project_slug,
         "to": to,
         "cc": [],
         "bcc": [],
@@ -3978,6 +3982,8 @@ effective_free_bytes={free}"
             let mut msg_json = serde_json::json!({
                 "id": message_id,
                 "from": &sender.name,
+                "sender_project": &project.human_key,
+                "sender_project_slug": &project.slug,
                 "to": &envelope_to,
                 "cc": &envelope_cc,
                 "bcc": &resolved_bcc_recipients,
@@ -4956,6 +4962,8 @@ effective_free_bytes={free}"
             let msg_json = serde_json::json!({
                 "id": reply_id,
                 "from": &sender.name,
+                "sender_project": &project.human_key,
+                "sender_project_slug": &project.slug,
                 "to": &resolved_to,
                 "cc": &resolved_cc_recipients,
                 "bcc": &resolved_bcc_recipients,
@@ -5282,8 +5290,9 @@ pub async fn fetch_inbox(
     // Auto-mark fetched messages as read.
     // Agents consistently fail to call mark_message_read explicitly, so
     // fetching IS reading. Acknowledgement remains explicit through
-    // acknowledge_message. Best-effort: errors are logged but don't fail the
-    // fetch.
+    // acknowledge_message. Ordinary database errors remain best-effort. A
+    // recovery publication failure must fail the fetch: the database receipt
+    // may already have changed, and an unread-only retry would skip that row.
     //
     // Uses batch UPDATE (single transaction) instead of N individual
     // mark_message_read calls — ~80% latency reduction for typical 20-message
@@ -5299,11 +5308,36 @@ pub async fn fetch_inbox(
     let live_sqlite_path = read_pool.live_sqlite_path();
     if consumes && !messages.is_empty() {
         let (ids, shared_ids) = unread_receipt_targets(&messages);
+        // These IDs were resolved from this read pool. Keep its generation
+        // authoritative until both receipt lanes and their recovery records
+        // have been published, including the direct-connection writeback.
+        // Nested admission must never wait while this outer lease is counted.
+        let _receipt_write = if live_sqlite_path.is_some_and(|path| path != ":memory:")
+            && (!ids.is_empty() || !shared_ids.is_empty())
+        {
+            let guard =
+                mcp_agent_mail_db::write_barrier::try_begin_write_activity().ok_or_else(|| {
+                    db_error_to_mcp_error(DbError::ResourceBusy(
+                        "inbox read receipt publication is blocked by recovery admission; retry"
+                            .to_string(),
+                    ))
+                })?;
+            if read_pool.is_closed() {
+                return Err(db_error_to_mcp_error(DbError::ResourceBusy(
+                    "inbox read pool was retired by recovery; retry against the current mailbox"
+                        .to_string(),
+                )));
+            }
+            Some(guard)
+        } else {
+            None
+        };
         if let Some(live_sqlite_path) = live_sqlite_path
             && !shared_ids.is_empty()
         {
             match mcp_agent_mail_db::project_mailbox::mark_project_mailbox_read_batch_sync(
                 live_sqlite_path,
+                read_pool.storage_root(),
                 agent_id,
                 &shared_ids,
             ) {
@@ -5311,6 +5345,9 @@ pub async fn fetch_inbox(
                     apply_auto_read_timestamp(&mut messages, &batch.message_ids, batch.read_ts);
                 }
                 Ok(None) => {}
+                Err(error) if mcp_agent_mail_db::recovery_state::is_publication_error(&error) => {
+                    return Err(auto_read_recovery_error(error, &shared_ids));
+                }
                 Err(e) => tracing::warn!(
                     agent_id = agent_id,
                     count = shared_ids.len(),
@@ -5322,6 +5359,7 @@ pub async fn fetch_inbox(
         if let Some(live_sqlite_path) = live_sqlite_path {
             match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,
+                read_pool.storage_root(),
                 agent_id,
                 &ids,
             ) {
@@ -5333,6 +5371,9 @@ pub async fn fetch_inbox(
                 Ok(None) => {
                     mcp_agent_mail_db::read_cache()
                         .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
+                }
+                Err(error) if mcp_agent_mail_db::recovery_state::is_publication_error(&error) => {
+                    return Err(auto_read_recovery_error(error, &ids));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -5546,8 +5587,9 @@ pub async fn fetch_inbox_events(
     // Cursor delivery is a durable database contract. Do not use the
     // archive-reconstruction read pool here: an archive snapshot has no
     // independent event sequence and would turn a degraded source into a
-    // dishonest empty monitor page. Query-only reads must not wait for writer
-    // admission or bootstrap recovery just to observe committed deliveries.
+    // dishonest empty monitor page. Reads do not wait for writer admission or
+    // bootstrap recovery. Cursor issuance takes a brief nonblocking recovery
+    // lease; active promotion returns a retryable busy response.
     ensure_request_live(ctx)?;
     let pool = get_coalescer_bypass_read_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
@@ -5743,6 +5785,18 @@ pub async fn get_message_delivery_receipt(
     }
     serde_json::to_string(&response)
         .map_err(|error| McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}")))
+}
+
+fn auto_read_recovery_error(error: DbError, message_ids: &[i64]) -> McpError {
+    legacy_tool_error(
+        "RECOVERY_STATE_UNAVAILABLE",
+        format!(
+            "Inbox read receipts may already have committed, but their recovery state could not be preserved. \
+             After restoring archive access, retry mark_message_read or acknowledge_message for the supplied message IDs. {error}"
+        ),
+        true,
+        json!({ "message_ids": message_ids, "read_may_have_committed": true }),
+    )
 }
 
 /// The fetched rows that still need this agent's read receipt, as
@@ -6223,8 +6277,10 @@ fn ack_status_response(
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
-/// A committed ACK is a read, even while recovery owns write admission. Only
-/// conclusive receipts, conflicts and actor authorization refusals return here.
+/// A committed ACK preserves its original receipt without a new SQL mutation.
+/// Its recovery publication still needs nonblocking write admission; active
+/// promotion defers the replay so it cannot omit a successful response's state.
+/// Conclusive conflicts and actor authorization refusals remain ordinary reads.
 /// An unavailable read must preserve the admitted path's durable outage queue;
 /// it does not establish that the key is absent. That path rechecks the claim
 /// atomically with the acknowledgement before accepting any fresh mutation.
@@ -6286,6 +6342,20 @@ async fn try_replay_ack(
     };
     match receipt {
         Some(Ok((read_ts, ack_ts))) => {
+            let archived = mcp_agent_mail_db::queries::archive_message_receipts_for_recovery(
+                ctx.cx(),
+                &pool,
+                agent.id.unwrap_or(0),
+                &[message_id],
+            )
+            .await;
+            match archived {
+                Outcome::Err(error @ DbError::ResourceBusy(_)) => {
+                    return Err(db_error_to_mcp_error(error));
+                }
+                Outcome::Err(_) => return Ok(None),
+                other => db_outcome_to_mcp_result(other)?,
+            }
             ack_status_response(message_id, read_ts, ack_ts, true).map(Some)
         }
         Some(Err(conflict)) => Err(crate::idempotency::idempotency_conflict_error(&conflict)),
@@ -6717,6 +6787,239 @@ mod tests {
                     assert_eq!(pending.is_empty(), mark_read.unwrap_or(true));
                 }
             });
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fetch_inbox_refuses_failed_recovery_publication_after_auto_read_commit() {
+        with_messaging_mailbox(&[], |mailbox| {
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let pool = DbPool::new(&DbPoolConfig {
+                    database_url: mailbox.database_url.clone(),
+                    storage_root: Some(mailbox.storage_root.clone()),
+                    ..DbPoolConfig::default()
+                })
+                .expect("live database pool");
+                let project = ensure_project_row(&cx, &pool, "/inbox-recovery-failure").await;
+                let project_id = project.id.unwrap();
+                let sender = register_agent_row(&cx, &pool, project_id, "RedFox").await;
+                let recipient = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                let agent_id = recipient.id.unwrap();
+                let active = mailbox.storage_root.join("recovery-state/active.json");
+                let manifest = std::fs::read(&active).expect("completed recovery checkpoint");
+
+                for shared in [false, true] {
+                    let recipients = if shared { vec![] } else { vec![(agent_id, "to")] };
+                    let message_id = queries::create_message_with_recipients_topic(
+                        &cx, &pool, project_id, sender.id.unwrap(),
+                        "auto-read recovery failure", "body", None, None, None,
+                        "normal", false, "[]", &recipients, shared.then_some("to"),
+                    )
+                    .await.into_result().expect("seed unread message").id.unwrap();
+                    // Warm the query-only inbox pool while the checkpoint is
+                    // valid so the injected fault exercises postcommit writeback.
+                    fetch_inbox(
+                        &ctx, project.human_key.clone(), recipient.name.clone(),
+                        None, None, None, None, Some(true), None, None, Some(false),
+                    )
+                    .await.expect("warm inbox without reading");
+                    std::fs::write(&active, b"invalid recovery manifest").unwrap();
+                    let failure = fetch_inbox(
+                        &ctx, project.human_key.clone(), recipient.name.clone(),
+                        None, None, None, None, Some(true), None, None, Some(true),
+                    )
+                    .await.expect_err("recovery publication cannot be best-effort success");
+                    assert_eq!(
+                        crate::tool_util::tool_error_code(&failure),
+                        Some("RECOVERY_STATE_UNAVAILABLE")
+                    );
+                    assert!(failure.message.contains("may already have committed"));
+                    assert!(failure.message.contains("retry mark_message_read"));
+                    std::fs::write(&active, &manifest).unwrap();
+
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    let table = if shared { "project_mailbox_receipts" } else { "message_recipients" };
+                    let rows = conn.query_sync(
+                        &format!("SELECT read_ts, ack_ts FROM {table} WHERE agent_id = ? AND message_id = ?"),
+                        &[sqlmodel_core::Value::BigInt(agent_id), sqlmodel_core::Value::BigInt(message_id)],
+                    ).unwrap();
+                    let committed: i64 = rows[0].get_named("read_ts").unwrap();
+                    assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+                    drop(conn);
+                    let retried = queries::mark_message_read(&cx, &pool, agent_id, message_id)
+                        .await.into_result().expect("explicit retry completes publication");
+                    assert_eq!(retried, committed);
+                    let mut preserved = false;
+                    mcp_agent_mail_db::recovery_state::visit_records(&mailbox.storage_root, |record| {
+                        if let mcp_agent_mail_db::recovery_state::RecoveryRecord::Receipt(receipt) = record {
+                            preserved |= receipt.message_id == message_id
+                                && receipt.shared == shared
+                                && receipt.read_ts == Some(committed);
+                        }
+                        Ok(())
+                    }).unwrap();
+                    assert!(preserved, "explicit retry must durably preserve the committed receipt");
+                }
+            });
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn gh404_consuming_inbox_defers_both_receipt_lanes_during_promotion() {
+        const CHILD: &str = "AM_TEST_GH404_CONSUMING_INBOX_PROMOTION_CHILD";
+        const PROJECT: &str = "/inbox-recovery-admission";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, name)
+                .output()
+                .expect("run isolated consuming inbox admission test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "consuming inbox admission failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        async fn fetch(ctx: &McpContext, consume: bool) -> McpResult<String> {
+            fetch_inbox(
+                ctx,
+                PROJECT.to_string(),
+                "BlueLake".to_string(),
+                None,
+                None,
+                Some(10),
+                Some(true),
+                None,
+                None,
+                None,
+                Some(consume),
+            )
+            .await
+        }
+
+        with_messaging_mailbox(&[], |mailbox| {
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            let (agent_id, message_ids) = runtime.block_on(async {
+                let cx = Cx::current().expect("fixture context");
+                let pool = DbPool::new(&DbPoolConfig::from_env()).expect("fixture pool");
+                let project = ensure_project_row(&cx, &pool, PROJECT).await;
+                let agent = register_agent_row(&cx, &pool, project.id.unwrap(), "BlueLake").await;
+                let sender = register_agent_row(&cx, &pool, project.id.unwrap(), "RedFox").await;
+                let agent_id = agent.id.unwrap();
+                let mut message_ids = Vec::new();
+                for shared in [false, true] {
+                    let recipients = if shared {
+                        vec![]
+                    } else {
+                        vec![(agent_id, "to")]
+                    };
+                    message_ids.push(
+                        queries::create_message_with_recipients_topic(
+                            &cx,
+                            &pool,
+                            project.id.unwrap(),
+                            sender.id.unwrap(),
+                            "promotion receipt",
+                            "body",
+                            None,
+                            None,
+                            None,
+                            "normal",
+                            false,
+                            "[]",
+                            &recipients,
+                            shared.then_some("to"),
+                        )
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .id
+                        .unwrap(),
+                    );
+                }
+                (agent_id, message_ids)
+            });
+            let _read_pool = crate::tool_util::get_live_read_db_pool().expect("retain read pool");
+            let ctx = McpContext::new(Cx::for_testing(), 1);
+            runtime
+                .block_on(fetch(&ctx, false))
+                .expect("warm a non-consuming read");
+            let owner = mcp_agent_mail_db::write_barrier::try_acquire_promotion_barrier_if_idle()
+                .expect("hold recovery promotion");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("reader runtime");
+                let ctx = McpContext::new(Cx::for_testing(), 2);
+                done_tx.send(runtime.block_on(fetch(&ctx, true))).unwrap();
+            });
+            let refused = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+            let conn =
+                mcp_agent_mail_db::DbConn::open_file(mailbox.database_path.to_str().unwrap())
+                    .expect("inspect persisted state");
+            let direct = conn
+                .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                .unwrap();
+            let shared = conn
+                .query_sync("SELECT read_ts, ack_ts FROM project_mailbox_receipts", &[])
+                .unwrap();
+            let writers = mcp_agent_mail_db::write_barrier::active_writer_count();
+            drop(conn);
+            drop(owner);
+            reader.join().expect("consuming read exits");
+            assert_eq!(
+                crate::tool_error_code(
+                    &refused.expect("consuming read must not wait").unwrap_err()
+                ),
+                Some("RESOURCE_BUSY"),
+            );
+            assert_eq!(writers, 0);
+            assert_eq!(direct.len(), 1);
+            assert_eq!(direct[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+            assert_eq!(direct[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+            assert!(
+                shared.is_empty(),
+                "promotion must prevent lazy shared receipts too"
+            );
+            let retried: Value = serde_json::from_str(
+                &runtime
+                    .block_on(fetch(&ctx, true))
+                    .expect("retry once promotion ends"),
+            )
+            .unwrap();
+            assert_eq!(retried.as_array().unwrap().len(), 2);
+            assert!(
+                retried
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|message| message["read_ts"].is_string())
+            );
+            let mut preserved = HashSet::new();
+            mcp_agent_mail_db::recovery_state::visit_records(&mailbox.storage_root, |record| {
+                if let mcp_agent_mail_db::recovery_state::RecoveryRecord::Receipt(receipt) = record
+                    && receipt.agent.id == agent_id
+                    && receipt.read_ts.is_some()
+                {
+                    preserved.insert(receipt.message_id);
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(message_ids.iter().all(|id| preserved.contains(id)));
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
         });
     }
 
@@ -8325,7 +8628,47 @@ mod tests {
                     during, before,
                     "observation must preserve activity and receipts"
                 );
-                let first: Value = serde_json::from_str(completed[0].1.as_ref().unwrap()).unwrap();
+                for (case, result) in completed.iter().take(4) {
+                    assert_eq!(
+                        crate::tool_error_code(result.as_ref().unwrap_err()),
+                        Some("RESOURCE_BUSY"),
+                        "cursor case {case} must refuse issuance during promotion",
+                    );
+                }
+                // Cursor responses publish recovery metadata. Retry after
+                // recovery releases admission, without opening a cached
+                // writer pool.
+                let retried = runtime.block_on(async {
+                    let mut results = Vec::new();
+                    for case in 0..4 {
+                        let ctx = McpContext::with_state(
+                            Cx::for_testing(),
+                            case + 100,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        crate::session_identity::bind(&ctx, project_id, recipient_id, "BlueLake");
+                        let after = match case {
+                            1 => Some(cursors[0]),
+                            2 => None,
+                            3 => Some(cursors[1] + 1),
+                            _ => Some(0),
+                        };
+                        results.push(
+                            fetch_inbox_events(
+                                &ctx,
+                                PROJECT.to_string(),
+                                " bluelake ".to_string(),
+                                after,
+                                Some(1),
+                                Some(case == 2),
+                            )
+                            .await,
+                        );
+                    }
+                    results
+                });
+                assert_eq!(mcp_agent_mail_db::get_cached_pool(&cfg).is_some(), warm);
+                let first: Value = serde_json::from_str(retried[0].as_ref().unwrap()).unwrap();
                 assert_eq!(first["events"].as_array().unwrap().len(), 1);
                 assert_eq!(first["events"][0]["message_id"], messages[0]);
                 assert_eq!(first["events"][0]["from"], "GreenStone");
@@ -8333,17 +8676,17 @@ mod tests {
                 assert_eq!(first["next_cursor"], cursors[0]);
                 assert_eq!(first["tail_cursor"], cursors[1]);
                 assert_eq!(first["has_more"], true);
-                let next: Value = serde_json::from_str(completed[1].1.as_ref().unwrap()).unwrap();
+                let next: Value = serde_json::from_str(retried[1].as_ref().unwrap()).unwrap();
                 assert_eq!(next["events"].as_array().unwrap().len(), 1);
                 assert_eq!(next["events"][0]["message_id"], messages[1]);
                 assert_eq!(next["next_cursor"], cursors[1]);
                 assert_eq!(next["has_more"], false);
-                let tail: Value = serde_json::from_str(completed[2].1.as_ref().unwrap()).unwrap();
+                let tail: Value = serde_json::from_str(retried[2].as_ref().unwrap()).unwrap();
                 assert_eq!(tail["events"], json!([]));
                 assert_eq!(tail["next_cursor"], cursors[1]);
                 assert_eq!(tail["has_more"], false);
                 assert_eq!(
-                    crate::tool_error_code(completed[3].1.as_ref().unwrap_err()),
+                    crate::tool_error_code(retried[3].as_ref().unwrap_err()),
                     Some("CURSOR_AHEAD")
                 );
                 assert_eq!(
@@ -8414,7 +8757,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn committed_ack_retries_remain_read_only_while_recovery_holds_admission() {
+    fn committed_ack_retries_defer_recovery_publication_while_recovery_holds_admission() {
         // The promotion barrier is process-wide. A private process also lets
         // the cold-pool case prove that receipt reads never bootstrap writers.
         const CHILD: &str = "AM_TEST_ACK_RECEIPT_ADMISSION_CHILD";
@@ -8690,11 +9033,11 @@ mod tests {
                 assert_eq!(journal_during_recovery, journal_before);
                 assert_eq!(completed.len(), 6);
                 assert_eq!(finished_while_recovery_owned, 6);
-                let replay: Value = serde_json::from_str(completed[0].1.as_ref().unwrap()).unwrap();
-                assert_eq!(replay["message_id"], messages[0]);
-                assert_eq!(replay["idempotent_replay"], true);
-                assert_eq!(replay["read_at"], micros_to_iso(timestamps[0].0));
-                assert_eq!(replay["acknowledged_at"], micros_to_iso(timestamps[0].1));
+                assert_eq!(
+                    crate::tool_error_code(completed[0].1.as_ref().unwrap_err()),
+                    Some("RESOURCE_BUSY"),
+                    "a replay cannot publish recovery state across the promotion snapshot"
+                );
                 for (_, result) in &completed[1..3] {
                     assert_eq!(
                         crate::tool_error_code(result.as_ref().unwrap_err()),
@@ -8715,6 +9058,22 @@ mod tests {
                 let ctx =
                     McpContext::with_state(Cx::for_testing(), 7, fastmcp_core::SessionState::new());
                 crate::session_identity::bind(&ctx, project_id, recipient_id, "BlueLake");
+                let replay: Value = serde_json::from_str(
+                    &runtime
+                        .block_on(acknowledge_message(
+                            &ctx,
+                            PROJECT.to_string(),
+                            "BlueLake".to_string(),
+                            messages[0],
+                            Some(KEY.to_string()),
+                        ))
+                        .expect("replay publishes once promotion releases admission"),
+                )
+                .unwrap();
+                assert_eq!(replay["message_id"], messages[0]);
+                assert_eq!(replay["idempotent_replay"], true);
+                assert_eq!(replay["read_at"], micros_to_iso(timestamps[0].0));
+                assert_eq!(replay["acknowledged_at"], micros_to_iso(timestamps[0].1));
                 for (message, key) in [
                     (messages[3], "fresh-ack-receipt"),
                     (messages[2], EXPIRED_KEY),
@@ -13474,6 +13833,8 @@ mod tests {
             &["CrimsonLake".to_string()],
             "/proj2",
             "proj2",
+            "/sender-project",
+            "sender-project",
         );
         let keys: Vec<&str> = envelope
             .as_object()
@@ -13485,6 +13846,8 @@ mod tests {
         // mcp-agent-mail-storage); a notice without `topic` once collided with
         // its repaired copy and latched archive durability.
         assert_eq!(keys, mcp_agent_mail_storage::MESSAGE_ARCHIVE_ENVELOPE_KEYS);
+        assert_eq!(envelope["sender_project"], "/sender-project");
+        assert_eq!(envelope["sender_project_slug"], "sender-project");
         assert_eq!(envelope["topic"], Value::Null);
         assert_eq!(envelope["created"], "2026-10-20T18:09:10.137117Z");
     }

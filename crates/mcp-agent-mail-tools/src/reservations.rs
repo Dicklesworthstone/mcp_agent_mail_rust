@@ -3869,6 +3869,8 @@ pub async fn force_release_file_reservation(
                     &all_recipient_names,
                     &project.human_key,
                     &project.slug,
+                    &project.human_key,
+                    &project.slug,
                 );
 
                 try_write_message_archive(

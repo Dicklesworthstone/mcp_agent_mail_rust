@@ -743,6 +743,18 @@ fn validate_surviving_message(
             ));
         }
     }
+    // Historical writers omitted sender project identity. When an archive
+    // does carry it, it must identify the DB sender rather than the delivery
+    // project or another same-named agent.
+    for key in ["sender_project", "sender_project_slug"] {
+        if let Some(observed) = observed.get(key)
+            && expected.message.get(key) != Some(observed)
+        {
+            return Err(format!(
+                "surviving archive {key} conflicts with live sender identity; preserved"
+            ));
+        }
+    }
     for key in ["topic", "thread_id"] {
         if observed.get(key).unwrap_or(&Value::Null) != &expected.message[key] {
             return Err(format!(

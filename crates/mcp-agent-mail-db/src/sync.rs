@@ -1534,6 +1534,7 @@ fn mark_messages_read_batch_sync_conn(
 /// direct SQLite transaction is more reliable than the pooled async path.
 pub fn mark_messages_read_batch_sync(
     sqlite_path: &str,
+    storage_root: &std::path::Path,
     agent_id: i64,
     message_ids: &[i64],
 ) -> Result<Option<MarkMessagesReadBatch>, DbError> {
@@ -1541,8 +1542,33 @@ pub fn mark_messages_read_batch_sync(
         return Ok(None);
     }
 
+    // This operational path bypasses the async write pool. Hold admission
+    // from before opening the live file through the durable recovery record,
+    // so promotion cannot snapshot between the database and archive writes.
+    let _write_activity = if sqlite_path == ":memory:" {
+        None
+    } else {
+        Some(
+            crate::write_barrier::try_begin_write_activity().ok_or_else(|| {
+                DbError::ResourceBusy(
+                    "inbox read receipt is blocked by recovery admission; retry".to_string(),
+                )
+            })?,
+        )
+    };
     let conn = open_sync_conn(sqlite_path)?;
-    let result = mark_messages_read_batch_sync_conn(&conn, agent_id, message_ids);
+    let result =
+        mark_messages_read_batch_sync_conn(&conn, agent_id, message_ids).and_then(|batch| {
+            if sqlite_path != ":memory:" {
+                crate::recovery_state::persist_receipts(
+                    &conn,
+                    storage_root,
+                    agent_id,
+                    message_ids,
+                )?;
+            }
+            Ok(batch)
+        });
     crate::close_db_conn(conn, "mark_messages_read_batch_sync connection");
     result
 }
@@ -4957,7 +4983,7 @@ mod tests {
             .to_str()
             .expect("temporary sqlite path should be valid UTF-8");
 
-        let read_ts = mark_messages_read_batch_sync(sqlite_path_str, 42, &[])
+        let read_ts = mark_messages_read_batch_sync(sqlite_path_str, dir.path(), 42, &[])
             .expect("empty batch is a no-op");
         assert_eq!(read_ts, None);
 
@@ -4965,5 +4991,64 @@ mod tests {
             !sqlite_path.exists(),
             "empty mark-read batch should not create or open a live DB"
         );
+    }
+
+    #[test]
+    fn gh404_sync_receipts_refuse_promotion_before_opening_the_live_database() {
+        const CHILD: &str = "AM_TEST_GH404_SYNC_RECEIPT_PROMOTION_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, name)
+                .output()
+                .expect("run isolated receipt admission test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "receipt admission failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let direct_path = directory.path().join("direct.sqlite3");
+        let shared_path = directory.path().join("shared.sqlite3");
+        let archive = directory.path().join("archive");
+        let owner = crate::write_barrier::try_acquire_promotion_barrier_if_idle()
+            .expect("own recovery promotion");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let paths = (direct_path.clone(), shared_path.clone(), archive.clone());
+        let reader = std::thread::spawn(move || {
+            let direct =
+                mark_messages_read_batch_sync(paths.0.to_str().unwrap(), &paths.2, 42, &[1]);
+            let shared = crate::project_mailbox::mark_project_mailbox_read_batch_sync(
+                paths.1.to_str().unwrap(),
+                &paths.2,
+                42,
+                &[1],
+            );
+            done_tx
+                .send([direct.map(|_| ()), shared.map(|_| ())])
+                .unwrap();
+        });
+        let results = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let created_before_release =
+            direct_path.exists() || shared_path.exists() || archive.exists();
+        let active_writers = crate::write_barrier::active_writer_count();
+        drop(owner);
+        reader.join().expect("receipt writer exits");
+
+        for result in results.expect("receipt writeback must promptly refuse active promotion") {
+            assert!(matches!(result, Err(DbError::ResourceBusy(_))));
+        }
+        assert!(
+            !created_before_release,
+            "refusal must not open or create database/archive files"
+        );
+        assert_eq!(active_writers, 0, "refusal must not leak write activity");
     }
 }

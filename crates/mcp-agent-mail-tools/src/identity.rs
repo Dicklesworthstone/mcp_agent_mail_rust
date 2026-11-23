@@ -1831,6 +1831,8 @@ pub fn agent_archive_profile_json(
     deregistered_at: Option<i64>,
 ) -> serde_json::Value {
     json!({
+        "id": agent.id,
+        "project_id": agent.project_id,
         "name": agent.name,
         "program": agent.program,
         "model": agent.model,
@@ -3075,6 +3077,8 @@ Check that all parameters have valid values."
                 &archive,
                 config,
                 &row.human_key,
+                row.id.unwrap_or(0),
+                row.created_at,
             ) {
                 tracing::warn!(
                     "Failed to persist project metadata for project '{}': {e}",

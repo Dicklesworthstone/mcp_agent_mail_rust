@@ -2971,6 +2971,8 @@ mod auth_route_hardening_regression_suite {
                     &archive,
                     &config,
                     &real_project.human_key,
+                    real_project.id.unwrap(),
+                    real_project.created_at,
                 )
                 .expect("archive metadata should persist");
 
@@ -3039,6 +3041,8 @@ mod auth_route_hardening_regression_suite {
                     &archive,
                     &config,
                     &real_project.human_key,
+                    real_project.id.unwrap(),
+                    real_project.created_at,
                 )
                 .expect("archive metadata should persist");
 
@@ -3083,7 +3087,7 @@ mod auth_route_hardening_regression_suite {
                 let config = Config::from_env();
                 let archive =
                     storage::ensure_archive(&config, "demo").expect("archive should initialize");
-                storage::write_project_metadata_with_config(&archive, &config, "/tmp/demo")
+                storage::write_project_metadata_with_config(&archive, &config, "/tmp/demo", 1, 1)
                     .expect("archive metadata should persist");
 
                 let outside = dir.path().join("outside-project.json");

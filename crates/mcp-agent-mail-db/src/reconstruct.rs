@@ -10,10 +10,12 @@
 //! - **Messages** — from `messages/{YYYY}/{MM}/*.md` files (JSON frontmatter)
 //! - **Message recipients** — from the `to`, `cc`, `bcc` arrays in frontmatter
 //!
-//! Archive-only reconstruction will be missing:
-//! - `read_ts` / `ack_ts` on `message_recipients` (no archive artifact for these)
-//! - `agent_links` / contacts (handshake state not archived)
-//! - `products` / `product_project_links` (not archived)
+//! A versioned recovery-state checkpoint and subsequent per-key records restore
+//! direct/shared read/ack receipts, contact decisions and numeric identities.
+//! A durable issued-cursor ceiling makes an archive-only ledger reset explicit
+//! to watchers instead of reusing their old delivery sequence numbers (GH#404).
+//! Legacy archives without that state report the loss prominently. Products
+//! and product-project links still require a readable salvage database.
 //!
 //! Recovery flows that have a readable salvage database merge those DB-only rows
 //! back into the reconstructed mailbox so contact and product-bus state is
@@ -88,6 +90,8 @@ const DB_MESSAGE_ID_BATCH_ROWS: usize = 4096;
 /// counted in [`ReconstructStats::suppressed_warnings`] instead of itemized;
 /// all numeric counters remain exact.
 const MAX_ITEMIZED_WARNINGS: usize = 10_000;
+
+const LEGACY_RECOVERY_STATE_WARNING: &str = "Archive has no completed recovery-state checkpoint: historical read/ack receipts and contact links cannot be recovered from these files. Restore a healthy backup to retain that state; old delivery cursors may also require resynchronization.";
 
 /// Read an archive text artifact with a bounded-memory cap (see
 /// [`MAX_ARCHIVE_ARTIFACT_BYTES`]). Returns an `InvalidData` error if the file
@@ -577,6 +581,16 @@ pub struct ReconstructStats {
     /// Number of shared-mailbox read/ack receipts restored from a salvaged
     /// database (GH#282).
     pub salvaged_project_mailbox_receipts: usize,
+    /// Read/ack records restored from the durable recovery archive.
+    pub archived_receipts: usize,
+    /// Contact records restored from the durable recovery archive.
+    pub archived_contacts: usize,
+    /// Whether a complete coordination-state baseline was validated.
+    pub recovery_checkpoint_present: bool,
+    /// Whether a readable database supplied the authoritative mutable state.
+    pub recovery_state_from_salvage: bool,
+    /// Archive-only recovery expires prior issued cursors below this floor.
+    pub delivery_cursor_reset_floor: Option<i64>,
     /// Number of duplicate canonical archive files skipped because their
     /// positive frontmatter `id` had already been recovered within the same
     /// project.
@@ -636,6 +650,10 @@ pub struct ReconstructStats {
     // evidence that an original parent retained its ID.
     generated_archive_message_ids: HashSet<i64>,
     ambiguous_canonical_parent_ids: HashSet<(i64, i64)>,
+    // Only archived profiles can authorize a cross-project name lookup. A
+    // placeholder inferred from an earlier message must never become evidence
+    // that another project's same-named sender or recipient was that agent.
+    archived_profile_agent_ids: HashSet<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -865,6 +883,19 @@ impl std::fmt::Display for ReconstructStats {
                 f,
                 "; restored {} project mailbox deliveries ({} salvaged receipts)",
                 self.project_mailbox_deliveries, self.salvaged_project_mailbox_receipts
+            )?;
+        }
+        if self.recovery_checkpoint_present {
+            write!(
+                f,
+                "; restored {} archived receipt records and {} contact records",
+                self.archived_receipts, self.archived_contacts
+            )?;
+        }
+        if let Some(floor) = self.delivery_cursor_reset_floor {
+            write!(
+                f,
+                "; delivery cursors below {floor} explicitly expired after archive-only recovery"
             )?;
         }
         if self.suppressed_warnings > 0 {
@@ -1632,6 +1663,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         db_path,
         storage_root,
         false,
+        true,
         &mut ReservationReplayProvenance::default(),
     )
 }
@@ -1699,6 +1731,7 @@ fn reconstruct_from_archive_impl(
     db_path: &Path,
     storage_root: &Path,
     create_empty_target: bool,
+    replay_recovery_state: bool,
     reservation_provenance: &mut ReservationReplayProvenance,
 ) -> DbResult<ReconstructStats> {
     let mut stats = ReconstructStats::default();
@@ -1874,17 +1907,42 @@ fn reconstruct_from_archive_impl(
         // phantom fresh-id rows that collide after live-DB salvage.
         let mut seen_reservation_identities: HashMap<ReservationIdentity, i64> = HashMap::new();
 
-        // Phase 1: Replay projects discovered before opening the target DB.
+        // Reserve recorded IDs before allocating any legacy ID-less identity.
+        // Otherwise a lexically earlier legacy project/profile could consume
+        // the explicit ID of a later artifact (GH#404).
+        let identity_ids = ArchivedIdentityIds::read(storage_root)?;
+        let recorded_project_ids =
+            reserve_archived_identity_ids(&conn, &project_dirs, &identity_ids)?;
+
+        // Phase 1: Replay every project's identity and profiles before any
+        // message. Cross-project senders may sort after their delivery project.
         for (slug, project_path) in &project_dirs {
-            let now = crate::now_micros();
-            let human_key = read_project_human_key(project_path, slug, &mut stats);
+            let mut human_key = read_project_human_key(project_path, slug, &mut stats);
+            let metadata = read_optional_identity_metadata(&project_path.join("project.json"));
+            let mut archived_id = recorded_project_ids.get(slug).copied();
+            if let Some(identity) = identity_ids.projects.get(slug) {
+                if !is_synthetic_project_placeholder(slug, &human_key)
+                    && human_key != identity.human_key
+                {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct: project {slug} conflicts with its recovery identity"
+                    )));
+                }
+                human_key.clone_from(&identity.human_key);
+                archived_id = reconcile_archived_identity_id(archived_id, identity.id, "project")?;
+            }
+            let created_at = metadata
+                .as_ref()
+                .and_then(|metadata| parse_ts_from_json(metadata, "created_at"))
+                .unwrap_or_else(crate::now_micros);
 
             conn.execute_sync(
-                "INSERT OR IGNORE INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
                 &[
+                    archived_id.map_or(Value::Null, Value::BigInt),
                     Value::Text(slug.clone()),
                     Value::Text(human_key.clone()),
-                    Value::BigInt(now),
+                    Value::BigInt(created_at),
                 ],
             )
             .map_err(|e| DbError::Sqlite(format!("reconstruct: insert project {slug}: {e}")))?;
@@ -1892,13 +1950,24 @@ fn reconstruct_from_archive_impl(
             let pid = query_last_insert_or_existing_id(&conn, "projects", "slug", slug)?;
             stats.projects += 1;
 
-            // Phase 2: Discover agents for this project
+            // Profiles carry the only reliable legacy cross-project identity
+            // evidence. Discover them globally before creating placeholders.
             let agents_dir = project_path.join("agents");
             if is_real_directory(&agents_dir) {
-                discover_agents(&conn, &agents_dir, pid, &mut agent_ids, &mut stats)?;
+                discover_agents(
+                    &conn,
+                    &agents_dir,
+                    pid,
+                    Some(&identity_ids),
+                    &mut agent_ids,
+                    &mut stats,
+                )?;
             }
+        }
 
-            // Phase 2b: Recover archived file reservations so robot/status reads can
+        for (slug, project_path) in &project_dirs {
+            let pid = query_last_insert_or_existing_id(&conn, "projects", "slug", slug)?;
+            // Phase 2: Recover archived file reservations so robot/status reads can
             // rebuild the same project-scoped lease view from the archive alone.
             let reservations_dir = project_path.join("file_reservations");
             if is_real_directory(&reservations_dir) {
@@ -1963,6 +2032,10 @@ fn reconstruct_from_archive_impl(
         // before any reconstructed metadata becomes durable authority.
         invalidate_unresolved_archive_reply_parents(&conn, &mut stats)?;
 
+        if replay_recovery_state {
+            restore_archived_coordination_state(&conn, storage_root, true, &mut stats)?;
+        }
+
         // ATC telemetry now lives in a dedicated sidecar DB (atc.sqlite3) that
         // is NOT part of the Git archive (br-bvq1x.11.7). Reconstruct rebuilds
         // the primary mailbox DB from the archive and intentionally materializes
@@ -1992,6 +2065,36 @@ fn reconstruct_from_archive_impl(
     stats.finalize_cross_project_canonical_collision_warnings();
     tracing::info!(%stats, "database reconstruction from archive complete");
     Ok(stats)
+}
+
+fn restore_archived_coordination_state(
+    conn: &DbConn,
+    storage_root: &Path,
+    reset_cursors: bool,
+    stats: &mut ReconstructStats,
+) -> DbResult<()> {
+    let recovered_state = crate::reconstruct_state::restore(conn, storage_root, reset_cursors)?;
+    // Recovery candidates intentionally omit the legacy receipt triggers.
+    // Recount after both salvage and archive receipts so direct readers of the
+    // reconstructed file see the restored unread/ACK state before pool startup.
+    conn.execute_raw(
+        "DELETE FROM inbox_stats; \
+         INSERT INTO inbox_stats(agent_id,total_count,unread_count,ack_pending_count,last_message_ts) \
+         SELECT r.agent_id, COUNT(*), \
+                SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END), \
+                SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END), \
+                MAX(m.created_ts) \
+         FROM message_recipients r JOIN messages m ON m.id = r.message_id GROUP BY r.agent_id",
+    )
+    .map_err(|error| DbError::Sqlite(format!("reconstruct recovery inbox counts: {error}")))?;
+    stats.archived_receipts = recovered_state.receipts;
+    stats.archived_contacts = recovered_state.contacts;
+    stats.recovery_checkpoint_present = recovered_state.checkpoint_present;
+    stats.delivery_cursor_reset_floor = recovered_state.cursor_reset_floor;
+    if !recovered_state.checkpoint_present && !stats.recovery_state_from_salvage {
+        stats.push_warning(LEGACY_RECOVERY_STATE_WARNING.to_string());
+    }
+    Ok(())
 }
 
 /// Compact only the privately owned candidate, after its writes have committed
@@ -2239,6 +2342,7 @@ pub fn reconstruct_from_archive_with_live_salvage(
                     db_path,
                     storage_root,
                     true,
+                    true,
                     &mut ReservationReplayProvenance::default(),
                 )?;
                 stats.push_warning(format!(
@@ -2306,6 +2410,7 @@ fn reconstruct_from_archive_with_salvage(
         db_path,
         storage_root,
         salvage_db_path.is_some(),
+        salvage_for_merge.is_none(),
         &mut reservation_provenance,
     )?;
     if let Some(message) = unreadable_salvage {
@@ -2325,6 +2430,21 @@ fn reconstruct_from_archive_with_salvage(
                 // The merge is committed. A finalization failure must never be
                 // treated as source corruption with a rolled-back transaction:
                 // this candidate already carries DB-only coordination state.
+                stats.recovery_state_from_salvage = true;
+                conn.execute_raw("BEGIN IMMEDIATE").map_err(|error| {
+                    DbError::Sqlite(format!("reconstruct salvage recovery state: {error}"))
+                })?;
+                if let Err(error) =
+                    restore_archived_coordination_state(&conn, storage_root, false, &mut stats)
+                {
+                    let _ = conn.execute_raw("ROLLBACK");
+                    return Err(error);
+                }
+                conn.execute_raw("COMMIT").map_err(|error| {
+                    DbError::Sqlite(format!(
+                        "reconstruct salvage recovery state commit: {error}"
+                    ))
+                })?;
                 finalize_reconstruction_candidate(conn, db_path, "reconstruct salvage")?;
             }
             Err(error) => {
@@ -2338,6 +2458,27 @@ fn reconstruct_from_archive_with_salvage(
                          keeping archive-only candidate so doctor can promote a heal",
                         salvage_db_path.display()
                     ));
+                    let conn = DbConn::open_file(db_path.to_str().ok_or_else(|| {
+                        DbError::Sqlite("reconstruct candidate path is not UTF-8".to_string())
+                    })?)
+                    .map_err(|error| {
+                        DbError::Sqlite(format!("reconstruct candidate recovery state: {error}"))
+                    })?;
+                    conn.execute_raw("BEGIN IMMEDIATE")
+                        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+                    if let Err(error) =
+                        restore_archived_coordination_state(&conn, storage_root, true, &mut stats)
+                    {
+                        let _ = conn.execute_raw("ROLLBACK");
+                        return Err(error);
+                    }
+                    conn.execute_raw("COMMIT")
+                        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+                    finalize_reconstruction_candidate(
+                        conn,
+                        db_path,
+                        "reconstruct archive-only recovery state",
+                    )?;
                 } else {
                     return Err(DbError::Sqlite(format!(
                         "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
@@ -2440,6 +2581,7 @@ fn discover_agents(
     conn: &DbConn,
     agents_dir: &Path,
     project_id: i64,
+    identity_ids: Option<&ArchivedIdentityIds>,
     agent_ids: &mut HashMap<(i64, String), i64>,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
@@ -2582,11 +2724,51 @@ fn discover_agents(
         )
         .or(legacy_deregistered_at);
 
+        let archived_id = if let Some(identity_ids) = identity_ids {
+            if archived_identity_field(Some(&profile), "project_id", "agent project")?
+                .is_some_and(|id| id != project_id)
+            {
+                return Err(DbError::Sqlite(format!(
+                    "reconstruct: archived agent {agent_name} belongs to a conflicting project id"
+                )));
+            }
+            let archived_id = archived_identity_id(Some(&profile), "agent")?;
+            identity_ids
+                .agents
+                .get(&(project_id, agent_name.to_ascii_lowercase()))
+                .map_or(Ok(archived_id), |id| {
+                    reconcile_archived_identity_id(archived_id, *id, "agent")
+                })?
+        } else {
+            None
+        };
+        // A duplicate recorded ID is contradictory evidence, not permission to
+        // collapse unrelated profiles through INSERT OR IGNORE. The normal
+        // name deduplication remains for legacy case aliases.
+        if let Some(id) = archived_id {
+            let occupied = conn
+                .query_sync(
+                    "SELECT project_id, name FROM agents WHERE id = ?",
+                    &[Value::BigInt(id)],
+                )
+                .map_err(|error| DbError::Sqlite(format!("inspect archived agent id: {error}")))?;
+            if let Some(row) = occupied.first()
+                && (row.get_named::<i64>("project_id").ok() != Some(project_id)
+                    || row
+                        .get_named::<String>("name")
+                        .is_ok_and(|name| !name.eq_ignore_ascii_case(&agent_name)))
+            {
+                return Err(DbError::Sqlite(format!(
+                    "reconstruct: archived agent id {id} is claimed by conflicting identities"
+                )));
+            }
+        }
         conn.execute_sync(
             "INSERT OR IGNORE INTO agents \
-             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, retired_at, reaper_exempt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, retired_at, reaper_exempt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
+                archived_id.map_or(Value::Null, Value::BigInt),
                 Value::BigInt(project_id),
                 Value::Text(agent_name.clone()),
                 Value::Text(program),
@@ -2610,6 +2792,11 @@ fn discover_agents(
             "name",
             &agent_name,
         )?;
+        if archived_id.is_some_and(|id| id != aid) {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: archived agent {agent_name} has conflicting numeric ids"
+            )));
+        }
         if let Some(deregistered_at) = deregistered_at {
             conn.execute_sync(
                 "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
@@ -2623,6 +2810,7 @@ fn discover_agents(
             })?;
         }
         agent_ids.insert((project_id, agent_name), aid);
+        stats.archived_profile_agent_ids.insert(aid);
         stats.agents += 1;
     }
 
@@ -2793,8 +2981,14 @@ fn parse_and_insert_message(
         stats,
     );
 
-    // Ensure sender agent exists
-    let sender_id = ensure_agent_exists(conn, project_id, &sender_name, agent_ids)?;
+    let sender_id = resolve_archive_message_agent(
+        conn,
+        project_id,
+        &sender_name,
+        json_str(&msg, "sender_project").or_else(|| json_str(&msg, "sender_project_slug")),
+        agent_ids,
+        stats,
+    )?;
 
     let (recipients_json, to_names, cc_names, bcc_names) =
         normalize_archive_recipients_json(&msg, &file_path.display().to_string(), stats);
@@ -2990,7 +3184,8 @@ fn parse_and_insert_message(
             )? {
                 continue;
             }
-            let aid = ensure_agent_exists(conn, project_id, name, agent_ids)?;
+            let aid =
+                resolve_archive_message_agent(conn, project_id, name, None, agent_ids, stats)?;
             insert_recipient(conn, message_id, aid, kind)?;
             stats.recipients += 1;
         }
@@ -3189,7 +3384,83 @@ fn validated_recovered_archive_metadata(
     )
 }
 
+/// Resolve an archived message participant using project-qualified evidence,
+/// then local identity, then one unambiguous archived profile elsewhere.
+/// Legacy envelopes omit sender project information, but a global profile pass
+/// still recovers the common cross-project case without inventing an agent.
+fn resolve_archive_message_agent(
+    conn: &DbConn,
+    project_id: i64,
+    raw_name: &str,
+    explicit_project: Option<&str>,
+    agent_ids: &mut HashMap<(i64, String), i64>,
+    stats: &mut ReconstructStats,
+) -> DbResult<i64> {
+    let qualified = raw_name
+        .strip_prefix("project:")
+        .and_then(|rest| rest.rsplit_once('#').map(|(project, name)| (name, project)))
+        .or_else(|| raw_name.split_once('@'));
+    let (name, qualified_project) = qualified.map_or((raw_name, None), |(name, project)| {
+        (name.trim(), Some(project.trim()))
+    });
+    let explicit_project = explicit_project.or(qualified_project);
+    if name.is_empty() || explicit_project.is_some_and(|project| project.trim().is_empty()) {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct: empty project-qualified agent identity {raw_name:?}"
+        )));
+    }
+    if let Some(project) = explicit_project {
+        let rows = conn
+            .query_sync(
+                "SELECT id FROM projects WHERE slug = ? OR human_key = ?",
+                &[
+                    Value::Text(project.to_string()),
+                    Value::Text(project.to_string()),
+                ],
+            )
+            .map_err(|error| DbError::Sqlite(format!("resolve archived agent project: {error}")))?;
+        let [row] = rows.as_slice() else {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct: agent {name:?} names missing or ambiguous project {project:?}"
+            )));
+        };
+        let explicit_id = row
+            .get_named::<i64>("id")
+            .map_err(|error| DbError::Sqlite(format!("decode archived agent project: {error}")))?;
+        return ensure_agent_exists(conn, explicit_id, name, agent_ids);
+    }
+
+    if let Some((_, id)) = agent_ids
+        .iter()
+        .find(|((pid, candidate), _)| *pid == project_id && candidate.eq_ignore_ascii_case(name))
+    {
+        return Ok(*id);
+    }
+    let candidates: BTreeSet<i64> = agent_ids
+        .iter()
+        .filter(|((_, candidate), id)| {
+            candidate.eq_ignore_ascii_case(name) && stats.archived_profile_agent_ids.contains(*id)
+        })
+        .map(|(_, id)| *id)
+        .collect();
+    if candidates.len() == 1 {
+        return Ok(*candidates.first().expect("one archived profile"));
+    }
+    if candidates.len() > 1 {
+        stats.push_warning(format!(
+            "Archive participant {name:?} is ambiguous across {} other projects; \
+             retained a local placeholder instead of assigning another agent's identity",
+            candidates.len()
+        ));
+    }
+    ensure_agent_exists(conn, project_id, name, agent_ids)
+}
+
 /// Ensure an agent row exists, creating a placeholder if needed.
+///
+/// Reservations are project-local and use this directly. Message identities
+/// must first use `resolve_archive_message_agent` because a real cross-project
+/// participant must never be replaced by a same-named local placeholder.
 fn ensure_agent_exists(
     conn: &DbConn,
     project_id: i64,
@@ -4147,6 +4418,24 @@ fn message_identity_already_present(
     subject: &str,
 ) -> DbResult<bool> {
     Ok(message_identity_existing_id(conn, project_id, created_ts, subject)?.is_some())
+}
+
+fn restore_salvaged_sender_identity(
+    conn: &DbConn,
+    message_id: i64,
+    mapped_sender: Option<i64>,
+) -> DbResult<()> {
+    // A matching message's readable source can disambiguate legacy envelopes
+    // that stored only a bare sender name. Missing source identities still
+    // leave the archive sender untouched; never fabricate a dedup placeholder.
+    if let Some(sender_id) = mapped_sender {
+        conn.execute_sync(
+            "UPDATE messages SET sender_id = ? WHERE id = ?",
+            &[Value::BigInt(sender_id), Value::BigInt(message_id)],
+        )
+        .map_err(|error| DbError::Sqlite(format!("restore salvaged sender: {error}")))?;
+    }
+    Ok(())
 }
 
 fn message_project_id(conn: &DbConn, message_id: i64) -> DbResult<Option<i64>> {
@@ -6341,12 +6630,22 @@ fn merge_salvaged_database(
                     // same salvage row a new identity on every recovery and
                     // prevent matching the archive copy (br-r6awv).
                     let source_created_ts = row.get_named::<i64>("created_ts").unwrap_or(0);
+                    let source_sender_id = row.get_named::<i64>("sender_id").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode sender_id for message {source_message_id}: {e}"
+                        ))
+                    })?;
                     if let Some((existing_pid, existing_created_ts, existing_subject)) =
                         message_row_identity(&target_conn, source_message_id)?
                         && existing_pid == target_project_id
                         && existing_created_ts == source_created_ts
                         && existing_subject == source_subject
                     {
+                        restore_salvaged_sender_identity(
+                            &target_conn,
+                            source_message_id,
+                            agent_id_map.get(&source_sender_id).copied(),
+                        )?;
                         message_id_map.insert(source_message_id, source_message_id);
                         continue;
                     }
@@ -6362,15 +6661,15 @@ fn merge_salvaged_database(
                         source_created_ts,
                         &source_subject,
                     )? {
+                        restore_salvaged_sender_identity(
+                            &target_conn,
+                            existing_id,
+                            agent_id_map.get(&source_sender_id).copied(),
+                        )?;
                         message_id_map.insert(source_message_id, existing_id);
                         continue;
                     }
 
-                    let source_sender_id = row.get_named::<i64>("sender_id").map_err(|e| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: decode sender_id for message {source_message_id}: {e}"
-                    ))
-                })?;
                     // #219: a sender identity missing from the salvage source
                     // must not drop the message (that is real content) and
                     // must not wedge the recovery. Substitute a placeholder
@@ -6379,13 +6678,9 @@ fn merge_salvaged_database(
                     let target_sender_id = if let Some(mapped) =
                         agent_id_map.get(&source_sender_id).copied()
                     {
-                        if agent_project_id(&target_conn, mapped)? != Some(target_project_id) {
-                            stats.push_warning(format!(
-                                "skipped salvaged message {source_message_id}: sender {source_sender_id} maps outside project {source_project_id} (cross-generation artifact); the canonical archive copy is authoritative"
-                            ));
-                            stats.salvaged_rows_skipped_unmapped += 1;
-                            continue;
-                        }
+                        // Cross-project sends retain the sender's real home
+                        // project. Its presence in agent_id_map, not equality
+                        // with the delivery project, establishes identity.
                         mapped
                     } else {
                         let placeholder_name = format!("unknown-agent-{source_sender_id}");
@@ -6628,12 +6923,6 @@ fn merge_salvaged_database(
                         stats.salvaged_rows_skipped_unmapped += 1;
                         continue;
                     };
-                    let target_agent_project_id = agent_project_id(&target_conn, target_agent_id)?
-                    .ok_or_else(|| {
-                        DbError::Sqlite(format!(
-                            "reconstruct salvage: mapped target agent {target_agent_id} is missing"
-                        ))
-                    })?;
                     let Some(target_message_id) = message_id_map.get(&source_message_id).copied()
                     else {
                         stats.push_warning(format!(
@@ -6642,22 +6931,9 @@ fn merge_salvaged_database(
                         stats.salvaged_rows_skipped_unmapped += 1;
                         continue;
                     };
-                    let target_message_project_id = message_project_id(
-                    &target_conn,
-                    target_message_id,
-                )?
-                .ok_or_else(|| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: mapped target message {target_message_id} is missing"
-                    ))
-                })?;
-                    if target_agent_project_id != target_message_project_id {
-                        stats.push_warning(format!(
-                            "skipped salvaged recipient state for message {source_message_id}: agent {source_agent_id} maps outside the message project (cross-generation artifact)"
-                        ));
-                        stats.salvaged_rows_skipped_unmapped += 1;
-                        continue;
-                    }
+                    // Contact-handshake threads can retain recipients from
+                    // another project (GH#251). Both stable identity mappings
+                    // must exist, but their home projects need not be equal.
                     let raw_kind = row.get_named::<String>("kind").ok();
                     let kind = normalize_salvaged_recipient_kind(
                         raw_kind.as_deref(),
@@ -6911,28 +7187,8 @@ fn merge_salvaged_database(
             )));
         }
 
-        let cross_project_recipients = target_conn
-            .query_sync(
-                "SELECT mr.message_id AS message_id, mr.agent_id AS agent_id \
-                 FROM message_recipients mr \
-                 JOIN messages m ON m.id = mr.message_id \
-                 JOIN agents a ON a.id = mr.agent_id \
-                 WHERE m.project_id <> a.project_id LIMIT 1",
-                &[],
-            )
-            .map_err(|e| {
-                DbError::Sqlite(format!(
-                    "reconstruct salvage: verify recipient ownership: {e}"
-                ))
-            })?;
-        if let Some(row) = cross_project_recipients.first() {
-            let message_id = row.get_named::<i64>("message_id").unwrap_or_default();
-            let agent_id = row.get_named::<i64>("agent_id").unwrap_or_default();
-            return Err(DbError::Sqlite(format!(
-                "reconstruct salvage: recipient agent {agent_id} is attached to message {message_id} from another project; refusing promotion"
-            )));
-        }
-
+        // Foreign keys check existence without rejecting legal cross-project
+        // senders/recipients merely because their home differs from delivery.
         let foreign_key_failures = target_conn
             .query_sync("PRAGMA foreign_key_check", &[])
             .map_err(|e| {
@@ -6974,6 +7230,195 @@ fn merge_salvaged_database(
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct ArchivedIdentityIds {
+    projects: HashMap<String, crate::recovery_state::ProjectIdentity>,
+    agents: HashMap<(i64, String), i64>,
+    project_owners: HashMap<i64, String>,
+    agent_owners: HashMap<i64, (i64, String)>,
+}
+
+impl ArchivedIdentityIds {
+    fn read(storage_root: &Path) -> DbResult<Self> {
+        use crate::recovery_state::RecoveryRecord;
+        let mut ids = Self::default();
+        crate::recovery_state::visit_records(storage_root, |record| {
+            match record {
+                RecoveryRecord::Project(project) => ids.project(project)?,
+                RecoveryRecord::Agent(agent) => ids.agent(agent)?,
+                RecoveryRecord::Receipt(receipt) => {
+                    ids.project(receipt.message_project)?;
+                    ids.agent(receipt.agent)?;
+                }
+                RecoveryRecord::Contact(contact) => {
+                    ids.agent(contact.from)?;
+                    ids.agent(contact.to)?;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    fn project(&mut self, project: crate::recovery_state::ProjectIdentity) -> DbResult<()> {
+        if project.id <= 0
+            || project.slug.is_empty()
+            || !Path::new(&project.human_key).is_absolute()
+            || self
+                .projects
+                .get(&project.slug)
+                .is_some_and(|old| *old != project)
+            || self
+                .project_owners
+                .get(&project.id)
+                .is_some_and(|slug| *slug != project.slug)
+        {
+            return Err(DbError::Sqlite(
+                "reconstruct: invalid or conflicting recovery project identity".to_string(),
+            ));
+        }
+        self.project_owners.insert(project.id, project.slug.clone());
+        self.projects.insert(project.slug.clone(), project);
+        Ok(())
+    }
+
+    fn agent(&mut self, agent: crate::recovery_state::AgentIdentity) -> DbResult<()> {
+        self.project(agent.project.clone())?;
+        let key = (agent.project.id, agent.name.to_ascii_lowercase());
+        if agent.id <= 0
+            || agent.name.trim().is_empty()
+            || self.agents.get(&key).is_some_and(|id| *id != agent.id)
+            || self
+                .agent_owners
+                .get(&agent.id)
+                .is_some_and(|owner| *owner != key)
+        {
+            return Err(DbError::Sqlite(
+                "reconstruct: invalid or conflicting recovery agent identity".to_string(),
+            ));
+        }
+        self.agent_owners.insert(agent.id, key.clone());
+        self.agents.insert(key, agent.id);
+        Ok(())
+    }
+}
+
+fn reconcile_archived_identity_id(
+    metadata_id: Option<i64>,
+    checkpoint_id: i64,
+    kind: &str,
+) -> DbResult<Option<i64>> {
+    if metadata_id.is_some_and(|id| id != checkpoint_id) {
+        return Err(DbError::Sqlite(format!(
+            "reconstruct: archived {kind} id conflicts with its recovery identity"
+        )));
+    }
+    Ok(Some(checkpoint_id))
+}
+
+fn read_optional_identity_metadata(path: &Path) -> Option<serde_json::Value> {
+    read_archive_text_capped(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+}
+
+fn archived_identity_id(metadata: Option<&serde_json::Value>, kind: &str) -> DbResult<Option<i64>> {
+    archived_identity_field(metadata, "id", kind)
+}
+
+fn archived_identity_field(
+    metadata: Option<&serde_json::Value>,
+    field: &str,
+    kind: &str,
+) -> DbResult<Option<i64>> {
+    let Some(id) = metadata.and_then(|metadata| metadata.get(field)) else {
+        return Ok(None);
+    };
+    if id.is_null() {
+        return Ok(None);
+    }
+    id.as_i64().filter(|id| *id > 0).map(Some).ok_or_else(|| {
+        DbError::Sqlite(format!(
+            "reconstruct: archived {kind} id must be a positive integer"
+        ))
+    })
+}
+
+fn reserve_archived_identity_ids(
+    conn: &DbConn,
+    projects: &[(String, PathBuf)],
+    identities: &ArchivedIdentityIds,
+) -> DbResult<HashMap<String, i64>> {
+    let mut project_floor = identities
+        .projects
+        .values()
+        .map(|project| project.id)
+        .max()
+        .unwrap_or(0);
+    let mut agent_floor = identities.agents.values().copied().max().unwrap_or(0);
+    let mut project_ids = HashMap::new();
+    let mut project_owners = identities.project_owners.clone();
+    for (slug, path) in projects {
+        let metadata = read_optional_identity_metadata(&path.join("project.json"));
+        let mut project_id = archived_identity_id(metadata.as_ref(), "project")?;
+        if let Some(identity) = identities.projects.get(slug) {
+            project_id = reconcile_archived_identity_id(project_id, identity.id, "project")?;
+        }
+        let agents = path.join("agents");
+        if is_real_directory(&agents)
+            && let Ok(entries) = std::fs::read_dir(agents)
+        {
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
+                }
+                let profile = read_optional_identity_metadata(&entry.path().join("profile.json"));
+                agent_floor =
+                    agent_floor.max(archived_identity_id(profile.as_ref(), "agent")?.unwrap_or(0));
+                // An updated profile may outlive older/missing project.json.
+                // Its foreign key is useful numeric evidence, but every
+                // profile and the completed checkpoint must agree on it.
+                if let Some(id) =
+                    archived_identity_field(profile.as_ref(), "project_id", "agent project")?
+                {
+                    project_id = reconcile_archived_identity_id(project_id, id, "project")?;
+                }
+            }
+        }
+        if let Some(id) = project_id {
+            if project_owners.get(&id).is_some_and(|owner| owner != slug) {
+                return Err(DbError::Sqlite(format!(
+                    "reconstruct: archived project id {id} is claimed by conflicting identities"
+                )));
+            }
+            project_owners.insert(id, slug.clone());
+            project_ids.insert(slug.clone(), id);
+            project_floor = project_floor.max(id);
+        }
+    }
+    for (table, floor) in [("projects", project_floor), ("agents", agent_floor)] {
+        if floor == 0 {
+            continue;
+        }
+        conn.execute_sync(
+            "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = ?",
+            &[Value::BigInt(floor), Value::Text(table.to_string())],
+        )
+        .map_err(|error| DbError::Sqlite(format!("reserve archived {table} ids: {error}")))?;
+        conn.execute_sync(
+            "INSERT INTO sqlite_sequence (name, seq) SELECT ?, ? \
+             WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ?)",
+            &[
+                Value::Text(table.to_string()),
+                Value::BigInt(floor),
+                Value::Text(table.to_string()),
+            ],
+        )
+        .map_err(|error| DbError::Sqlite(format!("reserve archived {table} ids: {error}")))?;
+    }
+    Ok(project_ids)
+}
 
 /// Load canonical `human_key` from `project.json` when available.
 ///
@@ -7539,6 +7984,26 @@ fn apply_delta_in_transaction(
     let mut projects_added = 0usize;
     let mut candidate_files: Vec<(i64, PathBuf, i64, String)> = Vec::new();
 
+    // Existing live identities are authoritative during an incremental apply;
+    // they need not have missing messages of their own to resolve a foreign
+    // sender. Placeholders created later in this apply never enter this set.
+    for row in conn
+        .query_sync("SELECT id, project_id, name FROM agents", &[])
+        .map_err(|error| DbError::Sqlite(format!("incremental apply: inspect agents: {error}")))?
+    {
+        let id = row.get_named::<i64>("id").map_err(|error| {
+            DbError::Sqlite(format!("incremental apply: decode agent id: {error}"))
+        })?;
+        let project_id = row.get_named::<i64>("project_id").map_err(|error| {
+            DbError::Sqlite(format!("incremental apply: decode agent project: {error}"))
+        })?;
+        let name = row.get_named::<String>("name").map_err(|error| {
+            DbError::Sqlite(format!("incremental apply: decode agent name: {error}"))
+        })?;
+        agent_ids.insert((project_id, name), id);
+        stats.archived_profile_agent_ids.insert(id);
+    }
+
     for (slug, project_path) in project_dirs {
         let messages_dir = project_path.join("messages");
         let mut project_files = Vec::new();
@@ -7591,7 +8056,7 @@ fn apply_delta_in_transaction(
         let pid = query_last_insert_or_existing_id(conn, "projects", "slug", slug)?;
         let agents_dir = project_path.join("agents");
         if is_real_directory(&agents_dir) {
-            discover_agents(conn, &agents_dir, pid, &mut agent_ids, &mut stats)?;
+            discover_agents(conn, &agents_dir, pid, None, &mut agent_ids, &mut stats)?;
         }
         for (id, file) in project_files {
             candidate_files.push((id, file, pid, slug.clone()));
@@ -7732,6 +8197,361 @@ fn collect_message_files_with_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_recovery_identity_fixture(
+        storage: &Path,
+        slug: &str,
+        project_id: Option<i64>,
+        agents: &[(&str, Option<i64>)],
+    ) {
+        let project = storage.join("projects").join(slug);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": project_id, "slug": slug, "human_key": format!("/{slug}"),
+                "created_at": 17,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for (name, id) in agents {
+            let directory = project.join("agents").join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("profile.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "id": id, "project_id": project_id, "name": name,
+                    "program": "codex-cli", "model": "test-model",
+                    "inception_ts": 20, "last_active_ts": 30,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_recovery_identity_message(
+        storage: &Path,
+        slug: &str,
+        id: i64,
+        sender: &str,
+        recipients: &[&str],
+        sender_project: Option<&str>,
+    ) {
+        let directory = storage.join("projects").join(slug).join("messages/2026/11");
+        std::fs::create_dir_all(&directory).unwrap();
+        let message = serde_json::json!({
+            "id": id, "from": sender, "sender_project": sender_project,
+            "to": recipients, "cc": [], "bcc": [], "created_ts": 100 + id,
+            "subject": format!("identity message {id}"), "attachments": [],
+        });
+        std::fs::write(
+            directory.join(format!("2026-11-22T00-00-00Z__identity__{id}.md")),
+            format!("---json\n{message}\n---\n\nidentity body {id}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gh404_archive_preserves_ids_and_cross_project_participants() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = directory.path().join("archive");
+        // Legacy identity sorts first; its generated IDs must not consume a
+        // later project's explicit IDs, regardless of profile walk order.
+        write_recovery_identity_fixture(&storage, "a-legacy", None, &[("Legacy", None)]);
+        write_recovery_identity_fixture(
+            &storage,
+            "b-delivery",
+            Some(7),
+            &[("Recipient", Some(98)), ("Duplicate", Some(101))],
+        );
+        write_recovery_identity_fixture(
+            &storage,
+            "z-sender",
+            Some(42),
+            &[("Sender", Some(99)), ("Duplicate", Some(102))],
+        );
+        write_recovery_identity_message(&storage, "b-delivery", 1, "Sender", &["Recipient"], None);
+        write_recovery_identity_message(&storage, "b-delivery", 2, "Recipient", &["Sender"], None);
+        write_recovery_identity_message(
+            &storage,
+            "b-delivery",
+            3,
+            "Duplicate",
+            &["Recipient"],
+            Some("/z-sender"),
+        );
+        write_recovery_identity_message(
+            &storage,
+            "b-delivery",
+            4,
+            "Recipient",
+            &["Duplicate@z-sender", "project:b-delivery#Recipient"],
+            None,
+        );
+        write_recovery_identity_message(&storage, "b-delivery", 5, "sender", &["Recipient"], None);
+        let target = directory.path().join("reconstructed.db");
+        let stats = reconstruct_from_archive(&target, &storage).unwrap();
+        assert_eq!(
+            (
+                stats.projects,
+                stats.agents,
+                stats.messages,
+                stats.parse_errors
+            ),
+            (3, 5, 5, 0)
+        );
+        let conn = DbConn::open_file(target.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT id, created_at FROM projects WHERE slug='z-sender'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 42);
+        assert_eq!(rows[0].get_named::<i64>("created_at").unwrap(), 17);
+        assert!(
+            conn.query_sync("SELECT id FROM projects WHERE slug='a-legacy'", &[])
+                .unwrap()[0]
+                .get_named::<i64>("id")
+                .unwrap()
+                > 42
+        );
+        assert!(
+            conn.query_sync("SELECT id FROM agents WHERE name='Legacy'", &[])
+                .unwrap()[0]
+                .get_named::<i64>("id")
+                .unwrap()
+                > 102
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT m.id, m.project_id, m.sender_id, mr.agent_id FROM messages m \
+             JOIN message_recipients mr ON mr.message_id=m.id ORDER BY m.id, mr.agent_id",
+                &[],
+            )
+            .unwrap();
+        let recovered: Vec<(i64, i64, i64, i64)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_named("id").unwrap(),
+                    row.get_named("project_id").unwrap(),
+                    row.get_named("sender_id").unwrap(),
+                    row.get_named("agent_id").unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            recovered,
+            [
+                (1, 7, 99, 98),
+                (2, 7, 98, 99),
+                (3, 7, 102, 98),
+                (4, 7, 98, 98),
+                (4, 7, 98, 102),
+                (5, 7, 99, 98)
+            ]
+        );
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) AS n FROM agents", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            5
+        );
+        assert!(
+            conn.query_sync("SELECT id FROM agents WHERE program='unknown'", &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            conn.query_sync("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn gh404_archive_does_not_guess_an_ambiguous_foreign_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = directory.path().join("archive");
+        write_recovery_identity_fixture(&storage, "a-delivery", Some(1), &[("Local", Some(10))]);
+        write_recovery_identity_fixture(&storage, "b-peer", Some(2), &[("Shared", Some(20))]);
+        write_recovery_identity_fixture(&storage, "c-peer", Some(3), &[("Shared", Some(30))]);
+        write_recovery_identity_message(&storage, "a-delivery", 1, "Shared", &["Local"], None);
+        let target = directory.path().join("reconstructed.db");
+        let stats = reconstruct_from_archive(&target, &storage).unwrap();
+        assert_eq!(stats.messages, 1, "retain content despite uncertain sender");
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ambiguous across 2"))
+        );
+        let conn = DbConn::open_file(target.to_str().unwrap()).unwrap();
+        let rows = conn.query_sync(
+            "SELECT a.id, a.project_id, a.program FROM messages m JOIN agents a ON a.id=m.sender_id", &[],
+        ).unwrap();
+        assert!(rows[0].get_named::<i64>("id").unwrap() > 30);
+        assert_eq!(rows[0].get_named::<i64>("project_id").unwrap(), 1);
+        assert_eq!(rows[0].get_named::<String>("program").unwrap(), "unknown");
+    }
+
+    #[test]
+    fn gh404_archive_rejects_conflicting_recorded_agent_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = directory.path().join("archive");
+        write_recovery_identity_fixture(&storage, "first", Some(1), &[("Alice", Some(7))]);
+        write_recovery_identity_fixture(&storage, "second", Some(2), &[("Bob", Some(7))]);
+        let error = reconstruct_from_archive(&directory.path().join("candidate.db"), &storage)
+            .expect_err("two different agents cannot silently collapse onto one numeric ID");
+        assert!(
+            error.to_string().contains("conflicting identities"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gh404_archive_preserves_profile_project_ids_and_rejects_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = directory.path().join("archive");
+        write_recovery_identity_fixture(&storage, "a-legacy", None, &[("Legacy", None)]);
+        write_recovery_identity_fixture(&storage, "z-project", Some(42), &[("Sender", Some(99))]);
+        let project_metadata = storage.join("projects/z-project/project.json");
+        std::fs::write(
+            &project_metadata,
+            r#"{"slug":"z-project","human_key":"/z-project"}"#,
+        )
+        .unwrap();
+        let target = directory.path().join("candidate.db");
+        reconstruct_from_archive(&target, &storage).unwrap();
+        let conn = DbConn::open_file(target.to_str().unwrap()).unwrap();
+        let projects = conn
+            .query_sync("SELECT id FROM projects ORDER BY slug", &[])
+            .unwrap();
+        assert!(projects[0].get_named::<i64>("id").unwrap() > 42);
+        assert_eq!(projects[1].get_named::<i64>("id").unwrap(), 42);
+        let agents = conn
+            .query_sync("SELECT id, project_id FROM agents WHERE name='Sender'", &[])
+            .unwrap();
+        assert_eq!(agents[0].get_named::<i64>("id").unwrap(), 99);
+        assert_eq!(agents[0].get_named::<i64>("project_id").unwrap(), 42);
+        drop(conn);
+
+        std::fs::write(
+            project_metadata,
+            r#"{"id":43,"slug":"z-project","human_key":"/z-project"}"#,
+        )
+        .unwrap();
+        let error = reconstruct_from_archive(&directory.path().join("conflicting.db"), &storage)
+            .expect_err("project metadata and profile foreign keys must agree");
+        assert!(
+            error.to_string().contains("project id conflicts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gh404_checkpoint_restores_ids_missing_from_legacy_profiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = directory.path().join("archive");
+        write_recovery_identity_fixture(&storage, "a-delivery", None, &[("Recipient", None)]);
+        write_recovery_identity_fixture(&storage, "z-sender", None, &[("Sender", None)]);
+        write_recovery_identity_message(&storage, "a-delivery", 1, "Sender", &["Recipient"], None);
+        let source =
+            DbConn::open_file(directory.path().join("source.db").to_str().unwrap()).unwrap();
+        source.execute_raw(&schema::init_schema_sql_base()).unwrap();
+        source.execute_raw(
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES \
+             (73,'a-delivery','/a-delivery',17),(42,'z-sender','/z-sender',17); \
+             INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES \
+             (88,73,'Recipient','codex-cli','test-model',20,30),(19,42,'Sender','codex-cli','test-model',20,30);",
+        ).unwrap();
+        crate::recovery_state::ensure_checkpoint(&source, &storage).unwrap();
+        drop(source);
+        let target = directory.path().join("reconstructed.db");
+        reconstruct_from_archive(&target, &storage).unwrap();
+        let conn = DbConn::open_file(target.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT m.project_id, m.sender_id, mr.agent_id FROM messages m \
+             JOIN message_recipients mr ON mr.message_id=m.id WHERE m.id=1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("project_id").unwrap(), 73);
+        assert_eq!(rows[0].get_named::<i64>("sender_id").unwrap(), 19);
+        assert_eq!(rows[0].get_named::<i64>("agent_id").unwrap(), 88);
+        drop(conn);
+
+        std::fs::write(
+            storage.join("projects/a-delivery/agents/Recipient/profile.json"),
+            r#"{"id":88,"project_id":74,"name":"Recipient"}"#,
+        )
+        .unwrap();
+        let error = reconstruct_from_archive(&directory.path().join("conflicting.db"), &storage)
+            .expect_err("profile project IDs must agree with the completed checkpoint");
+        assert!(
+            error.to_string().contains("project id conflicts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gh404_salvage_preserves_cross_project_sender_and_recipient_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = directory.path().join("archive");
+        // Bare-name legacy archive is ambiguous between a local and foreign
+        // sender. A readable salvage source supplies exact original identity.
+        write_recovery_identity_fixture(&storage, "a-delivery", None, &[("Shared", None)]);
+        write_recovery_identity_fixture(&storage, "z-peer", None, &[("Shared", None)]);
+        write_recovery_identity_message(&storage, "a-delivery", 1, "Shared", &[], None);
+        let source_path = directory.path().join("source.db");
+        let source = DbConn::open_file(source_path.to_str().unwrap()).unwrap();
+        source.execute_raw(&schema::init_schema_sql_base()).unwrap();
+        source.execute_raw(
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES \
+             (73,'a-delivery','/a-delivery',17),(42,'z-peer','/z-peer',17); \
+             INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES \
+             (88,73,'Shared','codex-cli','test-model',20,30),(19,42,'Shared','codex-cli','test-model',20,30); \
+             INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) VALUES \
+             (1,73,19,'identity message 1','identity body 1',101), \
+             (2,73,19,'salvage-only cross-project message','salvage body',102); \
+             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) VALUES \
+             (1,19,'to',300,400),(2,19,'cc',500,600);",
+        ).unwrap();
+        drop(source);
+        let target = directory.path().join("reconstructed.db");
+        let stats =
+            reconstruct_from_archive_with_private_salvage(&target, &storage, &source_path).unwrap();
+        assert_eq!(stats.salvaged_messages, 1);
+        assert_eq!(stats.salvaged_rows_skipped_unmapped, 0);
+        let conn = DbConn::open_file(target.to_str().unwrap()).unwrap();
+        let rows = conn.query_sync(
+            "SELECT m.id, sp.slug AS sender_project, rp.slug AS recipient_project, mr.read_ts, mr.ack_ts \
+             FROM messages m JOIN agents s ON s.id=m.sender_id JOIN projects sp ON sp.id=s.project_id \
+             JOIN message_recipients mr ON mr.message_id=m.id \
+             JOIN agents r ON r.id=mr.agent_id JOIN projects rp ON rp.id=r.project_id ORDER BY m.id", &[],
+        ).unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, (id, read, ack)) in rows.iter().zip([(1, 300, 400), (2, 500, 600)]) {
+            assert_eq!(row.get_named::<i64>("id").unwrap(), id);
+            assert_eq!(row.get_named::<String>("sender_project").unwrap(), "z-peer");
+            assert_eq!(
+                row.get_named::<String>("recipient_project").unwrap(),
+                "z-peer"
+            );
+            assert_eq!(row.get_named::<i64>("read_ts").unwrap(), read);
+            assert_eq!(row.get_named::<i64>("ack_ts").unwrap(), ack);
+        }
+        assert!(
+            conn.query_sync("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn capped_archive_reader_preserves_regular_text_and_missing_file_errors() {
@@ -9444,6 +10264,11 @@ mod tests {
             recipients: 200,
             project_mailbox_deliveries: 0,
             salvaged_project_mailbox_receipts: 0,
+            archived_receipts: 0,
+            archived_contacts: 0,
+            recovery_checkpoint_present: false,
+            recovery_state_from_salvage: false,
+            delivery_cursor_reset_floor: None,
             duplicate_canonical_message_files: 0,
             duplicate_canonical_message_ids: 0,
             cross_project_canonical_collisions: 0,
@@ -9463,6 +10288,7 @@ mod tests {
             duplicate_canonical_id_set: BTreeSet::new(),
             generated_archive_message_ids: HashSet::new(),
             ambiguous_canonical_parent_ids: HashSet::new(),
+            archived_profile_agent_ids: HashSet::new(),
         };
         let display = stats.to_string();
         assert!(display.contains("2 projects"));
@@ -11440,7 +12266,13 @@ Body for the canonical id golden test.
         let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
         assert_eq!(stats.messages, 0);
         assert_eq!(stats.parse_errors, 2, "both bad files should be counted");
-        assert_eq!(stats.warnings.len(), 2);
+        assert_eq!(stats.warnings.len(), 3);
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning == LEGACY_RECOVERY_STATE_WARNING)
+        );
     }
 
     #[test]

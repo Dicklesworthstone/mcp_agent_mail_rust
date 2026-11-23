@@ -43,6 +43,110 @@ fn cache_scope_for_pool(pool: &DbPool) -> String {
     pool.sqlite_identity_key()
 }
 
+/// Keep a committed mutation and its recovery publication on one side of the
+/// archive reconstruction boundary. Checkout must finish before taking this
+/// lease because cold-pool bootstrap can itself require recovery admission.
+/// Never wait for admission here: callers may already own a counted write lease.
+fn recovery_state_write_activity(
+    pool: &DbPool,
+    operation: &'static str,
+) -> crate::DbResult<Option<crate::write_barrier::WriteActivityGuard>> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(None);
+    }
+    let guard = crate::write_barrier::try_begin_write_activity().ok_or_else(|| {
+        DbError::ResourceBusy(format!(
+            "{operation} is blocked by recovery admission; retry"
+        ))
+    })?;
+    // A promotion can retire this pool between checkout and admission. Once
+    // admitted, the replacement cannot race the mutation or its durable state.
+    if pool.is_closed() {
+        return Err(DbError::ResourceBusy(format!(
+            "{operation} pool was retired by recovery; retry with the current pool"
+        )));
+    }
+    pool.verify_sqlite_authority(operation)?;
+    Ok(Some(guard))
+}
+
+/// A successful durable mutation also preserves the state that message
+/// frontmatter cannot reconstruct. In-memory test/ephemeral pools have no
+/// filesystem recovery contract and must not write into a shared archive.
+fn archive_receipts_after_commit(
+    pool: &DbPool,
+    conn: &crate::DbConn,
+    agent_id: i64,
+    message_ids: &[i64],
+) -> crate::DbResult<()> {
+    if pool.sqlite_path() == ":memory:" || message_ids.is_empty() {
+        return Ok(());
+    }
+    pool.verify_sqlite_authority("receipt recovery publication")?;
+    let root = pool.validated_storage_root("receipt recovery publication")?;
+    crate::recovery_state::persist_receipts(conn, root, agent_id, message_ids)
+}
+
+fn archive_project_receipts_after_commit(
+    pool: &DbPool,
+    conn: &crate::DbConn,
+    project_id: i64,
+    agent_id: i64,
+) -> crate::DbResult<()> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(());
+    }
+    pool.verify_sqlite_authority("bulk receipt recovery publication")?;
+    let root = pool.validated_storage_root("bulk receipt recovery publication")?;
+    crate::recovery_state::persist_project_receipts(conn, root, project_id, agent_id)
+}
+
+fn archive_contact_after_commit(
+    pool: &DbPool,
+    conn: &crate::DbConn,
+    from_agent_id: i64,
+    to_agent_id: i64,
+) -> crate::DbResult<()> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(());
+    }
+    pool.verify_sqlite_authority("contact recovery publication")?;
+    let root = pool.validated_storage_root("contact recovery publication")?;
+    crate::recovery_state::persist_contact(conn, root, from_agent_id, to_agent_id)
+}
+
+fn archive_issued_delivery_cursor(pool: &DbPool, cursor: i64) -> crate::DbResult<()> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(());
+    }
+    let root = pool.validated_storage_root("issued delivery cursor")?;
+    crate::reconstruct_state::record_issued_cursor(root, cursor)
+}
+
+/// Finish recovery publication before replaying a previously committed ACK.
+/// This does not mutate the receipt or its original timestamps.
+pub async fn archive_message_receipts_for_recovery(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    message_ids: &[i64],
+) -> Outcome<(), DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let _recovery_write = match recovery_state_write_activity(pool, "ACK recovery publication") {
+        Ok(guard) => guard,
+        Err(error) => return Outcome::Err(error),
+    };
+    match archive_receipts_after_commit(pool, &conn, agent_id, message_ids) {
+        Ok(()) => Outcome::Ok(()),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
 static MESSAGE_WRITE_SERIALIZER: LazyLock<Arc<asupersync::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(asupersync::sync::Mutex::new(())));
 static MESSAGE_WRITE_ACTIVITY: ObservedLock =
@@ -11796,7 +11900,9 @@ pub struct TopicMessageRow {
 /// and co-located paths apply identical cursor semantics. Cursor conditions
 /// are retained in the [`DbError::InvalidArgument`] message with a stable
 /// prefix so protocol adapters can render machine-readable `cursor_expired`
-/// and `cursor_ahead` responses instead of false empty pages.
+/// and `cursor_ahead` responses instead of false empty pages. File-backed
+/// reads hold a nonblocking recovery lease until their cursor bounds have
+/// been durably archived, so promotion cannot omit a concurrently issued cursor.
 pub async fn fetch_inbox_delivery_events(
     cx: &Cx,
     pool: &DbPool,
@@ -11811,19 +11917,57 @@ pub async fn fetch_inbox_delivery_events(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
+    // Checkout must finish before admission: ordinary cold-pool bootstrap may
+    // itself need the promotion barrier. Once admitted, retain this lease
+    // through both the snapshot and publication of every exposed cursor bound.
+    // Never wait here; the caller can already own other write activity.
+    let _cursor_issuance = if pool.sqlite_path() == ":memory:" {
+        None
+    } else {
+        let Some(guard) = crate::write_barrier::try_begin_write_activity() else {
+            return Outcome::Err(DbError::ResourceBusy(
+                "inbox delivery cursor issuance is blocked by recovery admission; retry"
+                    .to_string(),
+            ));
+        };
+        // Promotion can retire the pool between checkout and admission. An
+        // old connection must not issue a cursor from the replaced ledger.
+        if pool.is_closed() {
+            return Outcome::Err(DbError::ResourceBusy(
+                "inbox delivery cursor pool was retired by recovery; retry with the current pool"
+                    .to_string(),
+            ));
+        }
+        Some(guard)
+    };
     let db_conn: &crate::DbConn = &conn;
     match crate::sync::inbox_delivery_events_from_conn(db_conn, project_id, agent_id, after, limit)
     {
-        Ok(page) => Outcome::Ok(page),
+        Ok(page) => {
+            if let Err(error) = archive_issued_delivery_cursor(pool, page.tail_cursor) {
+                return Outcome::Err(error);
+            }
+            Outcome::Ok(page)
+        }
         Err(crate::sync::InboxDeliveryEventError::Database(error)) => Outcome::Err(error),
         Err(crate::sync::InboxDeliveryEventError::CursorExpired {
             after,
             oldest_available,
-        }) => Outcome::Err(DbError::invalid(
-            "after",
-            format!("cursor_expired after={after} oldest_available_cursor={oldest_available}"),
-        )),
+        }) => {
+            if let Err(error) =
+                archive_issued_delivery_cursor(pool, oldest_available.saturating_sub(1))
+            {
+                return Outcome::Err(error);
+            }
+            Outcome::Err(DbError::invalid(
+                "after",
+                format!("cursor_expired after={after} oldest_available_cursor={oldest_available}"),
+            ))
+        }
         Err(crate::sync::InboxDeliveryEventError::CursorAhead { after, tail }) => {
+            if let Err(error) = archive_issued_delivery_cursor(pool, tail) {
+                return Outcome::Err(error);
+            }
             Outcome::Err(DbError::invalid(
                 "after",
                 format!("cursor_ahead after={after} tail_cursor={tail}"),
@@ -13730,6 +13874,10 @@ pub async fn mark_message_read(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
+    let _recovery_write = match recovery_state_write_activity(pool, "mark_message_read") {
+        Ok(guard) => guard,
+        Err(error) => return Outcome::Err(error),
+    };
 
     let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
@@ -13831,6 +13979,9 @@ pub async fn mark_message_read(
         // already used by the message create/delete paths.
         crate::cache::read_cache()
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+        if let Err(error) = archive_receipts_after_commit(pool, &conn, agent_id, &[message_id]) {
+            return Outcome::Err(error);
+        }
         Outcome::Ok(ts)
     })
     .await
@@ -13860,6 +14011,11 @@ pub async fn mark_messages_read_batch(
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let _recovery_write = match recovery_state_write_activity(pool, "mark_messages_read_batch")
+        {
+            Ok(guard) => guard,
+            Err(error) => return Outcome::Err(error),
         };
 
         let tracked = tracked(&*conn);
@@ -13898,6 +14054,9 @@ pub async fn mark_messages_read_batch(
         // invalidate lets a concurrent reader repopulate stale counts).
         crate::cache::read_cache()
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+        if let Err(error) = archive_receipts_after_commit(pool, &conn, agent_id, message_ids) {
+            return Outcome::Err(error);
+        }
         Outcome::Ok(())
     })
     .await
@@ -14125,6 +14284,10 @@ pub async fn mark_messages_read_bulk(
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
+        let _recovery_write = match recovery_state_write_activity(pool, "mark_messages_read_bulk") {
+            Ok(guard) => guard,
+            Err(error) => return Outcome::Err(error),
+        };
         let tracked = tracked(&*conn);
 
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
@@ -14199,6 +14362,13 @@ pub async fn mark_messages_read_bulk(
         crate::cache::read_cache()
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
+        // Include already-read receipts: a prior call may have committed its
+        // database changes but failed archive publication, leaving this retry
+        // with no unread rows to select.
+        if let Err(error) = archive_project_receipts_after_commit(pool, &conn, project_id, agent_id)
+        {
+            return Outcome::Err(error);
+        }
         Outcome::Ok(BulkMarkReadOutcome {
             marked: u64::try_from(receipts.len()).expect("selected message count fits in u64"),
             more,
@@ -14264,16 +14434,19 @@ SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.t
        NULL AS recipient_id, NULL AS recipient_project_id, \
        NULL AS recipient_name, NULL AS recipient_kind, \
        m.sender_id, a.project_id AS sender_project_id, \
-       NULL AS recipient_read_ts, NULL AS recipient_ack_ts \
+       NULL AS recipient_read_ts, NULL AS recipient_ack_ts, \
+       sp.human_key AS sender_project_key, sp.slug AS sender_project_slug \
 FROM (SELECT id, project_id, sender_id, subject, body_md, thread_id, topic, \
              importance, ack_required, created_ts, recipients_json, attachments, \
              archive_metadata_json FROM messages WHERE id = ?1) m \
 JOIN projects p ON p.id = m.project_id \
 JOIN agents a ON a.id = m.sender_id \
+JOIN projects sp ON sp.id = a.project_id \
 WHERE length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
       length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
       length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
       length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
+      length(CAST(sp.human_key AS BLOB)) + length(CAST(sp.slug AS BLOB)) + \
       COALESCE(length(CAST(m.thread_id AS BLOB)), 0) + \
       COALESCE(length(CAST(m.topic AS BLOB)), 0) + \
       COALESCE(length(CAST(m.archive_metadata_json AS BLOB)), 0) <= ?2 \
@@ -14286,7 +14459,8 @@ SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, N
        CASE WHEN mr.read_ts IS NULL OR typeof(mr.read_ts) = 'integer' \
             THEN mr.read_ts ELSE 'invalid_receipt' END, \
        CASE WHEN mr.ack_ts IS NULL OR typeof(mr.ack_ts) = 'integer' \
-            THEN mr.ack_ts ELSE 'invalid_receipt' END \
+            THEN mr.ack_ts ELSE 'invalid_receipt' END, \
+       NULL, NULL \
 FROM (SELECT message_id, agent_id, kind, read_ts, ack_ts \
       FROM message_recipients WHERE message_id = ?1) mr \
 LEFT JOIN agents a ON a.id = mr.agent_id \
@@ -14295,13 +14469,13 @@ SELECT 2, d.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NU
        NULL, NULL, NULL, NULL, d.project_id, \
        CASE WHEN length(CAST(p.slug AS BLOB)) <= ?3 THEN 'project:' || p.slug ELSE NULL END, \
        CASE WHEN length(CAST(d.kind AS BLOB)) <= 3 THEN d.kind ELSE NULL END, \
-       NULL, NULL, NULL, NULL \
+       NULL, NULL, NULL, NULL, NULL, NULL \
 FROM (SELECT message_id, project_id, kind \
       FROM project_mailbox_deliveries WHERE message_id = ?1) d \
 LEFT JOIN projects p ON p.id = d.project_id \
 ORDER BY row_kind, recipient_id";
 
-const MESSAGE_ARCHIVE_SOURCE_COLUMNS: usize = 24;
+const MESSAGE_ARCHIVE_SOURCE_COLUMNS: usize = 26;
 
 fn message_archive_source_sql() -> String {
     // The pinned compound-select executor requires a literal LIMIT. All
@@ -14818,6 +14992,10 @@ async fn acknowledge_message_impl(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
+    let _recovery_write = match recovery_state_write_activity(pool, "acknowledge_message") {
+        Ok(guard) => guard,
+        Err(error) => return Outcome::Err(error),
+    };
 
     let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
@@ -14834,7 +15012,10 @@ async fn acknowledge_message_impl(
                         &result_json,
                         "acknowledge_message",
                     ) {
-                        Ok(ts) => Outcome::Ok(IdempotentOutcome::Replayed(ts)),
+                        Ok(ts) => match archive_receipts_after_commit(pool, &conn, agent_id, &[message_id]) {
+                            Ok(()) => Outcome::Ok(IdempotentOutcome::Replayed(ts)),
+                            Err(error) => Outcome::Err(error),
+                        },
                         Err(e) => Outcome::Err(e),
                     };
                 }
@@ -15013,6 +15194,9 @@ async fn acknowledge_message_impl(
         // Post-commit invalidation — see mark_message_read.
         crate::cache::read_cache()
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+        if let Err(error) = archive_receipts_after_commit(pool, &conn, agent_id, &[message_id]) {
+            return Outcome::Err(error);
+        }
         Outcome::Ok(IdempotentOutcome::Fresh((read_ts, ack_ts)))
     })
     .await
@@ -15034,10 +15218,9 @@ pub struct BatchAcknowledgeResult {
 /// rows are updated in one transaction, and missing recipient rows are reported
 /// per item instead of failing the whole batch.
 ///
-/// Archive/event policy: this helper only mutates SQLite read/ack state. It
-/// intentionally does not write per-message Git archive artifacts or emit
-/// operator events; higher-level batch surfaces should use the returned per-item
-/// statuses to emit one grouped event rather than recreating a per-message storm.
+/// Recovery state is durably preserved after commit without creating a Git
+/// commit or operator event per message. Higher-level batch surfaces can use
+/// the returned per-item statuses to emit one grouped event.
 pub async fn acknowledge_messages_batch(
     cx: &Cx,
     pool: &DbPool,
@@ -15065,6 +15248,11 @@ pub async fn acknowledge_messages_batch(
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
+        let _recovery_write =
+            match recovery_state_write_activity(pool, "acknowledge_messages_batch") {
+                Ok(guard) => guard,
+                Err(error) => return Outcome::Err(error),
+            };
 
         let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
@@ -15158,6 +15346,11 @@ pub async fn acknowledge_messages_batch(
         // Post-commit invalidation — see mark_message_read.
         crate::cache::read_cache()
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+        if let Err(error) =
+            archive_receipts_after_commit(pool, &conn, agent_id, &unique_message_ids)
+        {
+            return Outcome::Err(error);
+        }
         Outcome::Ok(results)
     })
     .await
@@ -18767,6 +18960,10 @@ pub async fn request_contact(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
+    let _recovery_write = match recovery_state_write_activity(pool, "request_contact") {
+        Ok(guard) => guard,
+        Err(error) => return Outcome::Err(error),
+    };
 
     let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
@@ -18886,6 +19083,9 @@ pub async fn request_contact(
             }
         };
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        if let Err(error) = archive_contact_after_commit(pool, &conn, from_agent_id, to_agent_id) {
+            return Outcome::Err(error);
+        }
         Outcome::Ok(decoded)
     })
     .await
@@ -18977,6 +19177,10 @@ async fn respond_contact_with_mode(
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
+        let _recovery_write = match recovery_state_write_activity(pool, "respond_contact") {
+            Ok(guard) => guard,
+            Err(error) => return Outcome::Err(error),
+        };
 
         let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
@@ -19037,6 +19241,11 @@ async fn respond_contact_with_mode(
             && row.status.eq_ignore_ascii_case("blocked")
         {
             try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            if let Err(error) =
+                archive_contact_after_commit(pool, &conn, from_agent_id, to_agent_id)
+            {
+                return Outcome::Err(error);
+            }
             return Outcome::Ok((0, row));
         }
         row.status = status.to_string();
@@ -19057,6 +19266,9 @@ async fn respond_contact_with_mode(
             map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await)
         );
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        if let Err(error) = archive_contact_after_commit(pool, &conn, from_agent_id, to_agent_id) {
+            return Outcome::Err(error);
+        }
         usize::try_from(updated).map_or_else(
             |_| {
                 Outcome::Err(DbError::invalid(
@@ -22424,6 +22636,106 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
     use tracing::{Event, Id, Metadata, Subscriber, span};
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn gh404_delivery_cursor_issuance_defers_during_promotion() {
+        // Recovery admission is process-wide. Exercise the real barrier in a
+        // private process without delaying unrelated pool users in this suite.
+        const CHILD: &str = "AM_TEST_GH404_CURSOR_PROMOTION_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, name)
+                .output()
+                .expect("run isolated delivery cursor admission test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "delivery cursor admission failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage_root = directory.path().join("archive");
+        let config = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", directory.path().join("mail.db").display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&config).expect("create cursor test pool");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = Cx::for_testing();
+        runtime.block_on(async {
+            // Finish the empty database's ordinary bootstrap before holding
+            // promotion, then add a cursor that startup has never checkpointed.
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects(id,slug,human_key,created_at) \
+                 VALUES(1,'cursor-promotion','/cursor-promotion',1); \
+                 INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+                 VALUES(1,1,'BlueLake','test','test',1,1); \
+                 INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                 VALUES(1,1,1,'cursor protection','body',1); \
+                 INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(1,1,'to')",
+            )
+            .unwrap();
+        });
+        let ceiling_path = storage_root.join("recovery-state/delivery-cursor.json");
+        assert!(!ceiling_path.exists());
+        let owner = crate::write_barrier::try_acquire_promotion_barrier_if_idle()
+            .expect("own recovery promotion");
+        let reader_pool = pool.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(fetch_inbox_delivery_events(
+                &Cx::for_testing(),
+                &reader_pool,
+                1,
+                1,
+                Some(0),
+                10,
+            ));
+            done_tx.send(result.into_result()).unwrap();
+        });
+        let blocked = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let archived_while_promoting = ceiling_path.exists();
+        let active_writers = crate::write_barrier::active_writer_count();
+        drop(owner);
+        reader.join().expect("cursor reader exits");
+
+        let error = blocked
+            .expect("cursor issuance must promptly refuse active promotion")
+            .expect_err("promotion must prevent cursor issuance");
+        assert!(matches!(error, DbError::ResourceBusy(_)));
+        assert!(error.is_retryable());
+        assert!(!archived_while_promoting);
+        assert_eq!(active_writers, 0);
+        let page = runtime
+            .block_on(fetch_inbox_delivery_events(&cx, &pool, 1, 1, Some(0), 10))
+            .into_result()
+            .expect("retry after promotion succeeds");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].message_id, 1);
+        assert!(page.tail_cursor > 0);
+        let ceiling: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ceiling_path).unwrap()).unwrap();
+        assert_eq!(ceiling["issued_through"], page.tail_cursor);
+        assert_eq!(crate::write_barrier::active_writer_count(), 0);
+    }
 
     #[test]
     fn reservation_snapshot_is_complete_readonly_and_preserves_retired_holders() {

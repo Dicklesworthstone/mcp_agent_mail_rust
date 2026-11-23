@@ -31,6 +31,7 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
+- Archive-only recovery preserves read/ack receipts, contact decisions and recorded project/agent IDs through generation-bound recovery checkpoints and incremental archive records (GH#404). Cross-project messages resolve real archived identities before creating placeholders. Issued delivery cursors have a durable ceiling: a rebuilt ledger advances beyond it and explicitly expires old cursors; readable salvage retains its original ledger. Legacy archives without coordination records report their missing state, and malformed recovery metadata refuses promotion.
 - Reservation paths containing a NUL byte are rejected before any mailbox write. This landed after the v0.3.41 tag (`dab8ab6b`).
 
 ---
