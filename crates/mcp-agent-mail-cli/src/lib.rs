@@ -17218,6 +17218,23 @@ impl CanonicalSnapshotSource {
         Ok(())
     }
 
+    fn require_delivery_cursor_state(&self) -> CliResult<()> {
+        match self.kind {
+            CanonicalSnapshotSourceKind::LiveSqlite
+            | CanonicalSnapshotSourceKind::LiveSnapshot
+            | CanonicalSnapshotSourceKind::StagedFamilyCopy => Ok(()),
+            // Even complete live salvage can append archive-only deliveries
+            // to this private ledger. Their sequences have never belonged to
+            // the live mailbox. Receipt preservation does not prove cursor
+            // continuity, and publishing a rebased archive tail would make
+            // the next fallback rebuild expire the cursor we just returned.
+            CanonicalSnapshotSourceKind::ArchiveSnapshot => Err(CliError::Other(
+                "RECOVERY_STATE_UNAVAILABLE: archive fallback cannot establish durable delivery cursors; recover the mailbox before polling inbox-events. Unfiltered message history remains readable."
+                    .to_string(),
+            )),
+        }
+    }
+
     fn create_share_snapshot_context(
         &self,
         snapshot_path: &Path,
@@ -17933,6 +17950,10 @@ impl CanonicalReadInboxDb {
 
     fn require_receipt_state(&self) -> CliResult<()> {
         self.read_db.require_receipt_state()
+    }
+
+    fn require_delivery_cursor_state(&self) -> CliResult<()> {
+        self.read_db.source.require_delivery_cursor_state()
     }
 }
 
@@ -52677,6 +52698,273 @@ http_headers = { Authorization = "Bearer secret" }
                     "Archive cannot establish whether this message was already handled.\n"
                 );
                 assert!(!db_path.exists(), "reads must not promote a fresh mailbox");
+            },
+        );
+    }
+
+    #[test]
+    fn inbox_events_direct_refuses_archive_cursors_without_publishing_a_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Retained delivery",
+            "normal",
+            "2026-03-22T00:00:00Z",
+            "History survives independently of delivery cursor identity.",
+        );
+        let cursor_path = storage_root.join("recovery-state/delivery-cursor.json");
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().unwrap()),
+            ],
+            || {
+                for checkpoint_present in [false, true] {
+                    if checkpoint_present {
+                        // A complete receipt checkpoint and issued ceiling
+                        // still cannot identify the lost delivery ledger.
+                        let evidence = dir.path().join("offline-evidence");
+                        std::fs::create_dir_all(&evidence).unwrap();
+                        let source_path = evidence.join("original.sqlite3");
+                        mcp_agent_mail_db::reconstruct_from_archive(&source_path, &storage_root)
+                            .unwrap();
+                        let source = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                            source_path.to_str().unwrap(),
+                        )
+                        .unwrap();
+                        mcp_agent_mail_db::recovery_state::ensure_checkpoint(
+                            &source,
+                            &storage_root,
+                        )
+                        .unwrap();
+                        mcp_agent_mail_db::reconstruct_state::record_issued_cursor(
+                            &storage_root,
+                            70_000,
+                        )
+                        .unwrap();
+                        drop(source);
+                    }
+                    let cursor_before = std::fs::read(&cursor_path).ok();
+                    let mailbox_before = std::fs::read(&db_path).ok();
+                    // Cover a successful page, position-now, and the expired
+                    // and ahead branches that also publish restart cursors.
+                    for (after, position_now) in [
+                        (None, false),
+                        (None, true),
+                        (Some(0), false),
+                        (Some(i64::MAX), false),
+                    ] {
+                        let error = inbox_events_direct(&InboxEventsDirectConfig {
+                            project_key: "ahead-project".to_string(),
+                            agent_name: "Alice".to_string(),
+                            after,
+                            limit: 10,
+                            position_now,
+                        })
+                        .expect_err("a temporary archive ledger cannot issue durable cursors");
+                        let InboxEventsReadError::Other(error) = error else {
+                            panic!(
+                                "archive fallback exposed synthetic restart coordinates: {error:?}"
+                            );
+                        };
+                        let detail = error.to_string();
+                        assert!(detail.contains("RECOVERY_STATE_UNAVAILABLE"), "{detail}");
+                        assert!(detail.contains("durable delivery cursors"), "{detail}");
+                        assert_eq!(std::fs::read(&cursor_path).ok(), cursor_before);
+                        assert_eq!(std::fs::read(&db_path).ok(), mailbox_before);
+                    }
+                    let history = fetch_mail_inbox_direct_with_database_url(
+                        &db_url,
+                        "ahead-project",
+                        "Alice",
+                        false,
+                        None,
+                        10,
+                        true,
+                    )
+                    .expect("archive history remains readable without issuing a cursor");
+                    assert_eq!(history.len(), 1);
+                    assert_eq!(history[0]["subject"], "Retained delivery");
+                    assert_eq!(std::fs::read(&cursor_path).ok(), cursor_before);
+                    assert_eq!(std::fs::read(&db_path).ok(), mailbox_before);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn inbox_events_direct_refuses_archive_ahead_even_with_complete_live_salvage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Live delivery",
+            "normal",
+            "2026-03-22T00:00:00Z",
+            "This delivery already belongs to the live ledger.",
+        );
+        mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root).unwrap();
+        let source =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        mcp_agent_mail_db::recovery_state::ensure_checkpoint(&source, &storage_root).unwrap();
+        mcp_agent_mail_db::reconstruct_state::checkpoint_cursor(&source, &storage_root).unwrap();
+        drop(source);
+        let cursor_path = storage_root.join("recovery-state/delivery-cursor.json");
+        let cursor_before = std::fs::read(&cursor_path).unwrap();
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0002.md",
+            2,
+            "Alice",
+            "Archive-only delivery",
+            "normal",
+            "2026-03-22T00:00:01Z",
+            "Its temporary replay sequence has not been committed to the live mailbox.",
+        );
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().unwrap()),
+            ],
+            || {
+                let opened = open_db_sync_mail_inbox_with_database_url_and_path(&db_url).unwrap();
+                assert!(opened.read_db.source.uses_archive_snapshot());
+                opened
+                    .require_receipt_state()
+                    .expect("complete live salvage preserves receipt state");
+                drop(opened);
+
+                let error = inbox_events_direct(&InboxEventsDirectConfig {
+                    project_key: "ahead-project".to_string(),
+                    agent_name: "Alice".to_string(),
+                    after: None,
+                    limit: 10,
+                    position_now: false,
+                })
+                .expect_err("receipt salvage does not authorize replayed delivery cursors");
+                let InboxEventsReadError::Other(error) = error else {
+                    panic!("expected unavailable delivery state, got {error:?}");
+                };
+                assert!(error.to_string().contains("RECOVERY_STATE_UNAVAILABLE"));
+                assert_eq!(std::fs::read(&cursor_path).unwrap(), cursor_before);
+                assert_eq!(sqlite_message_count(&db_path), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn inbox_events_direct_preserves_live_cursor_pagination_and_private_copies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        for id in 1..=2 {
+            write_archive_mailbox_message(
+                &message_dir,
+                &format!("msg-{id:04}.md"),
+                id,
+                "Alice",
+                &format!("Delivery {id}"),
+                "normal",
+                "2026-03-22T00:00:00Z",
+                "A committed live delivery.",
+            );
+        }
+        mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root).unwrap();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root.to_str().unwrap()),
+            ],
+            || {
+                let mut config = InboxEventsDirectConfig {
+                    project_key: "ahead-project".to_string(),
+                    agent_name: "Alice".to_string(),
+                    after: None,
+                    limit: 1,
+                    position_now: false,
+                };
+                let first = inbox_events_direct(&config).expect("read first live delivery");
+                assert_eq!(first.events.len(), 1);
+                assert!(first.has_more);
+                config.after = Some(first.next_cursor);
+                let second = inbox_events_direct(&config).expect("resume the same live ledger");
+                assert_eq!(second.events.len(), 1);
+                assert!(!second.has_more);
+                assert_eq!(second.tail_cursor, first.tail_cursor);
+                assert_eq!(second.next_cursor, first.tail_cursor);
+                assert_ne!(
+                    first.events[0]["message_id"],
+                    second.events[0]["message_id"]
+                );
+                config.after = Some(second.next_cursor);
+                let empty = inbox_events_direct(&config).expect("poll the current live tail");
+                assert!(empty.events.is_empty());
+                assert_eq!(empty.next_cursor, first.tail_cursor);
+                config.after = None;
+                config.position_now = true;
+                let now = inbox_events_direct(&config).expect("position at the durable live tail");
+                assert!(now.events.is_empty());
+                assert_eq!(now.next_cursor, first.tail_cursor);
+                let ceiling: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(storage_root.join("recovery-state/delivery-cursor.json"))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(ceiling["issued_through"], first.tail_cursor);
+
+                // Exact private copies retain the source ledger. They must
+                // remain eligible even when the live family needs staging.
+                for snapshot in [
+                    CanonicalSnapshotSource::live_full_sqlite_snapshot(
+                        db_path.clone(),
+                        &db_path,
+                        "inbox-events cursor regression",
+                    )
+                    .unwrap(),
+                    CanonicalSnapshotSource::staged_family_copy(
+                        db_path.clone(),
+                        "inbox-events cursor regression",
+                    )
+                    .unwrap(),
+                ] {
+                    snapshot.require_delivery_cursor_state().unwrap();
+                    let copy = mcp_agent_mail_db::CanonicalDbConn::open_file(
+                        snapshot.actual_path().to_str().unwrap(),
+                    )
+                    .unwrap();
+                    let project = crate::context::resolve_project(&copy, "ahead-project").unwrap();
+                    let agent_id =
+                        resolve_agent_id_for_inbox_check(&copy, project.id, "Alice").unwrap();
+                    let page = mcp_agent_mail_db::sync::inbox_delivery_events_from_conn(
+                        &copy,
+                        project.id,
+                        agent_id,
+                        Some(first.next_cursor),
+                        1,
+                    )
+                    .unwrap();
+                    assert_eq!(page.tail_cursor, first.tail_cursor);
+                    assert_eq!(page.events.len(), 1);
+                    assert_eq!(page.events[0].seq, second.next_cursor);
+                }
             },
         );
     }
@@ -101229,6 +101517,12 @@ fn inbox_events_direct(
 ) -> Result<InboxEventsPage, InboxEventsReadError> {
     let pool_config = mcp_agent_mail_db::DbPoolConfig::from_env();
     let read_db = open_db_sync_mail_inbox_with_database_url_and_path(&pool_config.database_url)
+        .map_err(InboxEventsReadError::Other)?;
+    // Validate the ledger before exposing either events or cursor-error
+    // restart coordinates. Keep the read handle and its existing mailbox
+    // activity lock alive through cursor publication.
+    read_db
+        .require_delivery_cursor_state()
         .map_err(InboxEventsReadError::Other)?;
     let project = crate::context::resolve_project(read_db.conn(), &config.project_key)
         .map_err(InboxEventsReadError::Other)?;
