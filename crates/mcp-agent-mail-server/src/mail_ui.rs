@@ -674,11 +674,11 @@ first body
     }
 
     #[test]
-    fn unified_api_message_value_preserves_client_fields() {
+    fn unified_api_page_preserves_client_fields_and_utf8_lengths() {
         let message = UnifiedMessageAggregate {
             id: 9,
             subject: "API parity".to_string(),
-            body_md: "Body for unified inbox parity".to_string(),
+            body_md: "Réply with \"quotes\"\nand a newline".to_string(),
             created_ts: now_micros(),
             importance: "normal".to_string(),
             thread_id: "br-unified".to_string(),
@@ -688,10 +688,16 @@ first body
             recipients: BTreeSet::from(["BlueLake".to_string()]),
             recipient_read: BTreeMap::from([("BlueLake".to_string(), false)]),
             all_read: false,
-        }
-        .into_view();
-
-        let payload = unified_api_message_value(&message);
+        };
+        let expected_length = message.body_md.len();
+        let created = ts_display(message.created_ts);
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let encoded = encode_unified_api_page(&cx, vec![message], Some(&[])).unwrap();
+        let page: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(page["projects"], serde_json::json!([]));
+        let payload = &page["messages"][0];
+        assert_eq!(payload["body_length"], expected_length);
+        assert_eq!(payload["body_md"], "Réply with \"quotes\"\nand a newline");
         assert_eq!(payload["recipients"], "BlueLake");
         assert_eq!(payload["recipient_names"], serde_json::json!(["BlueLake"]));
         assert_eq!(
@@ -699,11 +705,24 @@ first body
             serde_json::json!({ "BlueLake": false })
         );
         assert_eq!(payload["read"], false);
-        assert_eq!(payload["created_ts"], message.created_ts);
+        assert_eq!(payload["created_ts"], created);
         assert!(
             payload["excerpt"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[test]
+    fn unified_api_page_refuses_cancelled_render_and_omits_unrequested_projects() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let encoded = encode_unified_api_page(&cx, Vec::new(), None).unwrap();
+        let page: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(page, serde_json::json!({"messages": []}));
+        cx.cancel_with(asupersync::types::CancelKind::User, Some("inbox closed"));
+        assert_eq!(
+            encode_unified_api_page(&cx, Vec::new(), None).unwrap_err(),
+            (503, "Request cancelled".to_string())
         );
     }
 
@@ -3506,6 +3525,7 @@ struct UnifiedMessage {
     id: i64,
     subject: String,
     body_md: String,
+    body_length: usize,
     body_html: String,
     created: String,
     created_ts: String,
@@ -3582,6 +3602,7 @@ impl UnifiedMessageAggregate {
             subject: self.subject,
             body_html: markdown::render_markdown_to_safe_html(&self.body_md),
             excerpt: body_excerpt(&self.body_md, 150),
+            body_length: self.body_md.len(),
             body_md: self.body_md,
             created_ts: created.clone(),
             created_full: ts_display_full(self.created_ts),
@@ -3740,32 +3761,6 @@ fn render_unified_inbox(
 
 fn matches_importance_filter(message_importance: &str, filter_importance: Option<&str>) -> bool {
     filter_importance.is_none_or(|filter| message_importance.eq_ignore_ascii_case(filter))
-}
-
-fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
-    let body_length = message.body_md.len();
-    serde_json::json!({
-        "id": message.id,
-        "subject": message.subject,
-        "body_md": message.body_md,
-        "body_html": message.body_html,
-        "body_length": body_length,
-        "excerpt": message.excerpt,
-        "created": message.created,
-        "created_ts": message.created_ts,
-        "created_full": message.created_full,
-        "created_relative": message.created_relative,
-        "importance": message.importance,
-        "thread_id": message.thread_id,
-        "thread_url": message.thread_url,
-        "sender": message.sender,
-        "recipients": message.recipients,
-        "recipient_names": message.recipient_names,
-        "recipient_read": message.recipient_read,
-        "project_slug": message.project_slug,
-        "project_name": message.project_name,
-        "read": message.read,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -5707,24 +5702,63 @@ fn render_api_unified_inbox(
     let messages = unified::collect_messages(cx, pool, limit, normalized_filter.as_deref())
         .map_err(|(status, msg)| (status, format!("unified inbox aggregation failed: {msg}")))?;
 
-    let mut result = serde_json::json!({ "messages": messages.into_iter().map(|message| unified_api_message_value(&message.into_view())).collect::<Vec<_>>() });
-    if include_projects {
-        let proj_list: Vec<serde_json::Value> = projects
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "id": p.id.unwrap_or(0),
-                    "slug": p.slug,
-                    "human_key": p.human_key,
-                    "created_at": ts_display(p.created_at),
-                })
-            })
-            .collect();
-        result["projects"] = serde_json::json!(proj_list);
-    }
+    encode_unified_api_page(
+        cx,
+        messages,
+        include_projects.then_some(projects.as_slice()),
+    )
+    .map(Some)
+}
 
-    let json = serde_json::to_string(&result).map_err(|e| (500, format!("JSON error: {e}")))?;
-    Ok(Some(json))
+/// Render directly into the response buffer. Retain only one message's
+/// rendered Markdown and recipient views at a time, even on the 1,000-row route.
+fn encode_unified_api_page(
+    cx: &Cx,
+    messages: Vec<UnifiedMessageAggregate>,
+    projects: Option<&[ProjectRow]>,
+) -> Result<String, (u16, String)> {
+    use serde::Serializer as _;
+    use serde::ser::SerializeSeq as _;
+
+    let checkpoint = || {
+        cx.checkpoint()
+            .map_err(|_| DbPollError::Cancelled.into_http_error())
+    };
+    let json_error = |error: serde_json::Error| (500, format!("JSON error: {error}"));
+    let mut output = br#"{"messages":"#.to_vec();
+    let mut encoder = serde_json::Serializer::new(&mut output);
+    let mut sequence = encoder
+        .serialize_seq(Some(messages.len()))
+        .map_err(json_error)?;
+    for message in messages {
+        checkpoint()?;
+        sequence
+            .serialize_element(&message.into_view())
+            .map_err(json_error)?;
+    }
+    sequence.end().map_err(json_error)?;
+    if let Some(projects) = projects {
+        output.extend_from_slice(br#","projects":"#);
+        let mut encoder = serde_json::Serializer::new(&mut output);
+        let mut sequence = encoder
+            .serialize_seq(Some(projects.len()))
+            .map_err(json_error)?;
+        for project in projects {
+            checkpoint()?;
+            sequence
+                .serialize_element(&serde_json::json!({
+                    "id": project.id.unwrap_or(0),
+                    "slug": project.slug,
+                    "human_key": project.human_key,
+                    "created_at": ts_display(project.created_at),
+                }))
+                .map_err(json_error)?;
+        }
+        sequence.end().map_err(json_error)?;
+    }
+    checkpoint()?;
+    output.push(b'}');
+    String::from_utf8(output).map_err(|error| (500, format!("JSON encoding error: {error}")))
 }
 
 fn render_api_project_agents(
