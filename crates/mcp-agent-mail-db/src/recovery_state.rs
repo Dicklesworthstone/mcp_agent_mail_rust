@@ -2732,9 +2732,18 @@ mod tests {
                     // The repair has read the old receipt. Attempt a real
                     // commit through an independent connection before it
                     // publishes those rows and a completed revision.
+                    let before = query(
+                        self.peer,
+                        "SELECT ack_ts FROM message_recipients WHERE message_id=41",
+                        &[],
+                    )
+                    .unwrap();
+                    assert_eq!(before[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
                     match self
                         .peer
-                        .execute_raw("UPDATE message_recipients SET ack_ts=999 WHERE message_id=41")
+                        .execute_raw(
+                            "UPDATE message_recipients SET ack_ts=COALESCE(ack_ts,999) WHERE message_id=41",
+                        )
                     {
                         Ok(()) => {
                             self.committed.set(true);
@@ -2760,9 +2769,13 @@ mod tests {
         }
 
         peer.execute_raw("PRAGMA busy_timeout=0").unwrap();
+        // Start without a direct read/ACK so the interrupted operation is
+        // the first read, and the competing operation is the first ACK.
+        conn.execute_raw("UPDATE message_recipients SET read_ts=NULL WHERE message_id=41")
+            .unwrap();
         ensure_checkpoint(conn, root).unwrap();
         conn.execute_raw(
-            "UPDATE message_recipients SET ack_ts=444 WHERE message_id=41; \
+            "UPDATE message_recipients SET read_ts=444 WHERE message_id=41; \
              CREATE TEMP VIEW project_mailbox_receipts AS SELECT * FROM missing_shared_receipts;",
         )
         .unwrap();
@@ -2775,7 +2788,8 @@ mod tests {
         assert!(records(root).1.iter().any(|record| matches!(
             record,
             RecoveryRecord::Receipt(receipt)
-                if receipt.message_id == 41 && !receipt.shared && receipt.ack_ts == Some(444)
+                if receipt.message_id == 41 && !receipt.shared
+                    && receipt.read_ts == Some(444) && receipt.ack_ts.is_none()
         )));
         conn.execute_raw("DROP VIEW temp.project_mailbox_receipts")
             .unwrap();
@@ -2795,8 +2809,10 @@ mod tests {
         if !concurrent.committed.get() {
             // Writer exclusion is one valid solution. Once repair releases
             // admission, the ordinary commit and publication must still work.
-            peer.execute_raw("UPDATE message_recipients SET ack_ts=999 WHERE message_id=41")
-                .unwrap();
+            peer.execute_raw(
+                "UPDATE message_recipients SET ack_ts=COALESCE(ack_ts,999) WHERE message_id=41",
+            )
+            .unwrap();
             persist_receipts(peer, root, 29, &[41]).unwrap();
         }
         let committed = query(

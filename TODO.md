@@ -2,10 +2,16 @@
 
 ## Fresh review of concurrent recovery publication (`br-u9bhg`)
 
-This separate checkout starts at draft PR #408's `2155e7f5`. Its new tests
-are uncompiled baseline probes, not a production repair or runtime proof.
-The published candidate and its three successful static receipts remain
-unchanged in the other checkout.
+This checkout integrates main `615f4b2f`, including incremental recovery
+seals, profile durability repair and Git contention changes. PR #408 was
+merged as `13ef2cea`; its older static receipts do not qualify this tree.
+The concurrent probes are still uncompiled and have executed zero assertions.
+
+The original `c4e665f7` probe was invalid: replacing ACK 444 with ACK 999
+conflicted with the intentional first-ACK/earliest-timestamp contract. Its
+source and refusal logs remain preserved. The corrected scenario publishes
+a first read at 444, then attempts a first ACK at 999 with the production
+`COALESCE` rule and an explicit SQL precondition that ACK is still NULL.
 
 - [x] Reread every published Rust hunk, the storage flush/clone regression,
   durable Git debt, state-lock ordering and incomplete-publication repair.
@@ -20,16 +26,26 @@ unchanged in the other checkout.
 - [x] Isolate a new baseline probe from the published checkout's source freeze.
 - [x] Reuse the real database setup for file-backed canonical and runtime
   connections, with concurrent autocommit enabled on the runtime peer.
-- [x] Exercise a real interrupted receipt write before reconciliation; require
-  archived ACK 444 and an incomplete witness before attempting the new commit.
-- [x] Attempt peer ACK 999 after the repair reads old rows; confirm its actual
-  SQL value and require the completed recovery state to contain ACK 999.
-- [x] Permit writer exclusion only with a subsequent successful real commit
-  and publication after repair releases admission.
-- [x] Pass formatting and whitespace checks for the baseline probes.
-- [x] Complete the final normal-rule scan for this exact baseline test source:
-  one file, zero critical findings, 375 warnings and 94 informational findings;
-  the 36 findings in the new tests are their explicit failure assertions.
+- [x] Correct the invalid timestamp-overwrite model without changing the
+  production first-ACK or earliest-timestamp behavior.
+- [x] Add the interrupted first-read control, requiring an actual read-444,
+  ACK-NULL artifact and incomplete witness before the competing commit.
+- [x] Require ACK NULL immediately before the peer's real COALESCE update;
+  retain actual SQL ACK-999 and recovered ACK-999 assertions.
+- [x] Execute the supporting system-SQLite WAL schedule: seven SQL assertions
+  confirm a first ACK can commit while an older read snapshot remains open,
+  and a later COALESCE update preserves it. This is not Rust runtime evidence.
+- [x] Retain the positive retry control when writer admission excludes the peer.
+- [x] Integrate current main and read the recovery seal/publication changes;
+  preserve all older source and failed receipts.
+- [x] Repair observed workspace formatting failures in five upstream storage
+  paths by applying the reported whitespace changes manually.
+- [x] Pass the current workspace formatting check.
+- [x] Complete normal-rule UBS across the 41-path current scope: 11 fresh
+  scans and 30 byte-identical report reuses, with all 52 reviewed critical,
+  56,497 warning and 20,651 informational source findings retained.
+- [x] Attempt the locked current-tree all-targets check through strict RCH:
+  hz4 refused at disk admission (E330/exit 120), before Cargo, growth zero.
 - [ ] Compile and execute both new baseline probes through ordinary strict
   RCH admission; distinguish a target failure from an invalid control.
 - [ ] If the target fails, implement the smallest production repair supported
@@ -40,21 +56,26 @@ unchanged in the other checkout.
   exact final source and complete its changed-file scanner review.
 - [ ] Execute the original DB, storage, tools and CLI acceptance lanes; keep
   their nonzero counts separate from compile, scanner and admission results.
-- [x] Update the original bead with scoped evidence, flush only intended graph
-  records, confirm zero cycles, and hand off the exact source and limitations.
-  Bead comment 4792 and Agent Mail message 310 retain the actual results.
+- [x] Record the invalid-probe correction and current scope in the original
+  bead, flush only intended graph records, confirm zero cycles, and hand off
+  the exact source and limitations. Comment 4793 supersedes 4792; the prior
+  probe and mail 310 are preserved as historical, unexecuted evidence.
 
-Probe source SHA-256:
+The superseded probe's source SHA-256 was
 `617c462a2874e101ee0934662997a3838657f944ba871f5748d656216d906e80`.
-Evidence remains under `/data/tmp/am-mossytern-20261123/`: the
-`concurrent-ack-v2-baseline-test.patch`, frozen-input hashes, complete
-normal-rule UBS report, and both native admission logs. The published PR's
-three older static passes do not qualify these added tests. A fresh live
-reservation census after the last refusal also lacked the normal static
-budget plus protected floor. No gate, disk reservation, worker drain or
-peer job was changed. Production repair awaits an executed baseline failure.
+Historical `concurrent-ack-v2-*` evidence remains under
+`/data/tmp/am-mossytern-20261123/`. It supplies no runtime or corrected-source
+qualification. Current failures and results use the `current-main-*` prefix.
+No test limit, disk reservation, worker drain or peer job was changed.
+Current probe source SHA-256:
+`f8e46b6dd405627d5f4e443f8d19ef7afe6ac49993ece89942047ac712c896ff`.
+The complete static report is `current-main-v1-ubs-final-report.json`
+(SHA-256 `39c368878852ad8323437e139ca68de097db525f7d22be6b61f481e9087e2da2`).
+The initial aggregate failed to normalize absolute scanner paths; its original
+bytes remain explicitly marked invalid, and the corrected aggregate asserts
+the prior finding counts for all reused files. No finding was suppressed.
 
-## Active recovery qualification (`br-u9bhg`, MossyTern)
+## Published recovery qualification history (`br-u9bhg`, MossyTern)
 
 Current base: `c5672259`. Its durable Git outbox is upstream work, reviewed
 here without claiming authorship or native qualification. The superseded
@@ -101,8 +122,8 @@ inventory candidate and its complete source/Beads history remain intact at
   bead, flush its scoped JSONL and confirm zero dependency cycles.
 - [x] Commit and push the reviewable work as draft PR #408, with native
   assertions explicitly zero and `br-u9bhg` still in progress.
-- [ ] Merge only after original native acceptance and current integration
-  qualification; the draft does not establish release readiness.
+- [ ] Complete original native acceptance and current integration qualification
+  after PR #408's merge; publication does not establish release readiness.
 - [x] Hand off current results in Agent Mail message 303 and release all
   nine source/TODO reservations (2026-11-24 01:46:06 UTC).
 
