@@ -812,3 +812,106 @@ isolated workload, and observation window.
 
 No production correction was indicated by the independent source review.
 The existing supervisor fix remains the implementation under qualification.
+
+## Bounded thread CPU evidence and seeded baseline preparation (2026-11-24)
+
+The earlier completed v0.3.41 run measured 0.776 cores in the silent outage
+window, with CPU already rising before the schema fault. Aggregate process
+counters could not identify the active worker. The adapter now retains
+`thread-cpu.jsonl` alongside each session's existing resource records. It
+records process and thread start identities, thread names, separate user and
+system ticks, and monotonic read bounds. `thread_cpu_window` observations
+retain the original aggregate gate counters plus independently sampled thread
+deltas **before** a CPU assertion can fail.
+
+The existing background sampler collects these diagnostics at most once per
+second. Explicit resource boundaries take fresh samples, so a cached reading
+from before fault setup cannot contaminate the silent-window diagnosis.
+Matching uses TID and start identity, rather than the possibly truncated
+thread name. The report ranks matched CPU deltas and exposes appearances,
+disappearances, identity reuse, counter regression, unreadable or omitted
+threads, sampling skew, and signed aggregate residuals.
+
+| Diagnostic limit | Bound per server lifetime |
+| --- | --- |
+| Thread stat reads per sample | 256; one additional directory entry may establish truncation |
+| Bytes per stat read | 4,096 |
+| Collection time budget | 25 ms, checked between synchronous reads; overruns are recorded |
+| Retained records | 1,024, including capacity reserved for a terminal cap receipt |
+| Retained diagnostic bytes | 16 MiB |
+
+A retention cap or write failure stops further diagnostic reads rather than starting
+a retry loop. Missing diagnostics cannot rescue or suppress the unchanged
+aggregate CPU assertion. The 0.25-core threshold, descriptor/thread/RSS
+growth limits, 35-case contract, and first-response checks remain unchanged.
+The synchronous read budget cannot preempt a stalled syscall. Thread sums
+are never described as exhaustive: short-lived threads, non-atomic reads,
+and tick quantization can leave either positive or negative residuals.
+Thread names alone cannot identify a readiness job or prove single-flight
+execution.
+
+### Seeded mailbox setup correction
+
+A subsequent real v0.3.41 run exposed a separate harness setup problem:
+initial readiness succeeded, but creating the synthetic project could put
+lexical readiness back into initialization. The immediate baseline burst
+then failed and suppressed the later idle/CPU trials. Setup now performs the
+existing full four-second warmup after project creation, waits for post-seed
+readiness, and then performs one strict final burst. Initial and post-seed
+polling share the original 90-second startup deadline. Phase-labelled
+observations separate setup polls from measured requests. The final burst
+is never retried, and a missing prerequisite remains `INCOMPLETE`.
+
+The same three new regressions produced **1 PASS / 2 FAIL on the prior
+harness**, then **3 PASS / 0 FAIL on the correction**. A six-second setup
+transition is admitted; persistent post-seed unreadiness after an 80-second
+initial startup still stops at the original 90-second budget. A bad response
+in the final burst remains `FAIL` on both versions. The delayed-idle control
+still retains all three measured first-request 503s and their immediately
+following successful MCP witnesses.
+
+### Measured validation and its limits
+
+| Execution | Observed result | Scope |
+| --- | --- | --- |
+| Final combined Node controls | 56/56 PASS, zero skipped; 9.16028846 s TAP duration | Exact final harness and test bytes |
+| Python native-controller controls | 27/27 PASS; 3.228 s unittest duration | Controller validation and process ownership, not Agent Mail native regressions |
+| Final real worker contrast | Idle 0.000 CPU s; busy worker 1.240 CPU s; process 1.240 CPU s; residual 0.000; clean shutdown | Known bounded worker, identified independently by Linux TID/start identity |
+| Full healthy surrogate with CPU diagnostics, before the setup correction | 35/35 PASS; 125.530044768 s controller duration | Instrumented predecessor, not a final-source native pass |
+| Final harness with authenticated-digest v0.3.41 | 4 PASS / 3 FAIL / 28 INCOMPLETE; exit 1; 52.706856018 s controller duration | Historical executable; all three strict baseline bursts failed |
+
+In the final historical run, each fixture returned ready during initial and
+post-seed setup, then returned HTTP 503 with `lexical_unverified` during the
+strict mixed-route burst: all 48 responses failed, comprising eight requests
+to each route in each of the three fixtures. Both route names are aliases in
+the [observed v0.3.41 tag source](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/6eca1c4dfeb9b1eedb2ff3ebb06faef23018342c/crates/mcp-agent-mail-server/src/lib.rs#L12956).
+The receipt establishes changing readiness state, not its causal mechanism.
+Those failures remain failures. All three owned
+processes shut down cleanly; the controller recorded unchanged inputs, no
+forced termination, and no remaining descendants. The healthy idle/outage
+CPU windows were **not executed**, so this run supplies no new attribution
+for the earlier 0.776-core failure. The final report SHA-256 is
+`04ae82a8d12275d395d17e0ba3b82cc9a7563bd75b6bf685e946e4a3b2aee2e9`.
+
+The evidence archive, `gh407-thread-cpu-qualification-evidence-20261124.zip`,
+contains the final raw control results, old/new regression receipts, capped
+thread records, historical and surrogate reports, input identities, and
+independent audit. An earlier executor reset destroyed temporary raw files;
+the archive labels the surviving observations from that attempt as excerpts.
+The final controls and later runs were recorded afresh. Git-backed source
+copies and the public release executable are excluded from the archive.
+
+The final harness SHA-256 is
+`af57aec75844c8f4cd7797b74c5c6e7548d45a8dc65b4a03aec6072ae7ddaf5a`.
+The exact-pinned current-source build, three native readiness regressions,
+and complete current-build black-box run remain unverified. The entry point
+remains:
+
+```bash
+python3 scripts/ci/qualify_issue407.py \
+  --expected-source "$(git rev-parse HEAD)" \
+  --evidence /absolute/path/to/new-gh407-native-evidence
+```
+
+These later blocked historical runs do not replace the earlier completed
+v0.3.41 matrix, establish a production CPU cause, or qualify current main.

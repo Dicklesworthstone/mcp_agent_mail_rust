@@ -23,6 +23,11 @@ export const DEFAULTS = Object.freeze({
   maxRssGrowthBytes: 64 * 1024 * 1024, maxIdleCpuCores: 0.25,
 });
 
+export const THREAD_CPU_LIMITS = Object.freeze({
+  threads: 256, samples: 1024, bytes: 16 * 1024 * 1024,
+  statBytes: 4096, sampleSeconds: 0.025, intervalSeconds: 1,
+});
+
 export function qualificationCaseNames(cfg = DEFAULTS) {
   return ['baseline',
     ...Array.from({length: cfg.idleCycles}, (_, i) => ['idle_first_request_' + (i + 1), 'idle_database_' + (i + 1)]).flat(),
@@ -77,6 +82,7 @@ export async function runQualification(io, options = {}) {
       'Failed-probe log cadence measures completed probes, not exact simultaneous internal jobs.',
       'Schema unavailability complements, and does not substitute for, native pool-exhaustion tests.',
       'A stopped-process stale challenge may observe a fresh failure before the first HTTP response.',
+      'Thread CPU diagnostics are bounded, non-atomic samples; residual CPU includes unobserved threads and sampling skew.',
     ],
   };
   const started = io.now();
@@ -135,20 +141,38 @@ export async function runQualification(io, options = {}) {
   }
   async function baseline(s) {
     const deadline = io.now() + cfg.startupTimeout;
-    let response;
-    do {
-      response = await s.get('/health');
-      observation('startup_http', {session: s.label, response});
-      need(!response.startup_fatal, 'Supplied process exited before a healthy baseline: ' + JSON.stringify(response));
-      if (ready(response)) break;
-      await s.idle(0.25);
-    } while (io.now() < deadline);
-    need(ready(response), 'Could not establish a healthy starting binary; see startup responses and server log');
+    async function waitReady(phase) {
+      observation('startup_phase_start', {session: s.label, phase, deadline_monotonic_seconds: deadline});
+      while (io.now() < deadline) {
+        const response = await s.get('/health');
+        observation('startup_http', {session: s.label, phase, response, deadline_monotonic_seconds: deadline});
+        need(!response.startup_fatal, 'Supplied process exited before a healthy baseline: ' + JSON.stringify(response));
+        if (ready(response) && io.now() <= deadline) {
+          observation('startup_phase_end', {session: s.label, phase});
+          return;
+        }
+        const remaining = deadline - io.now();
+        if (remaining > 0) await s.idle(Math.min(0.25, remaining));
+      }
+      need(false, 'Could not establish ' + phase + ' within the original startup deadline; see startup responses and server log');
+    }
+    await waitReady('initial_readiness');
     const control = await s.ensureProject('baseline');
-    observation('database_control', {session: s.label, control});
+    observation('database_control', {session: s.label, phase: 'startup_seed', control});
     need(control.ok, 'Fresh synthetic project could not be created at baseline');
-    await burst(s);
+    // Creating the fixture can invalidate lexical readiness. Settle that
+    // setup mutation before measuring; both readiness waits share one budget.
+    need(deadline - io.now() >= cfg.warmupSeconds, 'Insufficient original startup budget for the full baseline warmup');
+    observation('startup_phase_start', {session: s.label, phase: 'post_seed_warmup', seconds: cfg.warmupSeconds,
+      deadline_monotonic_seconds: deadline});
     await s.idle(cfg.warmupSeconds);
+    observation('startup_phase_end', {session: s.label, phase: 'post_seed_warmup'});
+    await waitReady('post_seed_readiness');
+    // This final burst is strict and is never retried. Later measured idle
+    // first responses and concurrent bursts retain their original semantics.
+    observation('startup_phase_start', {session: s.label, phase: 'final_readiness_burst'});
+    await burst(s);
+    observation('startup_phase_end', {session: s.label, phase: 'final_readiness_burst'});
     await sample(s, 'baseline');
   }
   async function prepareIdle(s, label) {
@@ -257,7 +281,18 @@ export async function runQualification(io, options = {}) {
       return await newControl(s, label, false);
     });
   }
-  function cpuBound(before, after) {
+  function cpuBound(before, after, session) {
+    // Retain attribution before any aggregate assertion throws. Diagnostic
+    // loss cannot rescue, suppress, or replace the existing process-CPU gate.
+    let diagnosis;
+    try { diagnosis = threadCpuDelta(before?.thread_cpu_sample, after?.thread_cpu_sample); }
+    catch (error) { diagnosis = {available: false, reason: 'diagnostic_error', error: String(error).slice(0,512), exhaustive: false}; }
+    observation('thread_cpu_window', {session, from_label: before?.label, to_label: after?.label,
+      aggregate_before: {at_seconds: before?.at_seconds, at_monotonic_seconds: before?.at_monotonic_seconds,
+        cpu_seconds: before?.cpu_seconds, identity: before?.identity, available: before?.available},
+      aggregate_after: {at_seconds: after?.at_seconds, at_monotonic_seconds: after?.at_monotonic_seconds,
+        cpu_seconds: after?.cpu_seconds, identity: after?.identity, available: after?.available},
+      before: before?.thread_cpu || null, after: after?.thread_cpu || null, diagnosis});
     need(before?.available && after?.available, 'CPU telemetry unavailable');
     requireThat(before.identity === after.identity, 'Process identity changed during CPU measurement');
     const seconds = after.at_seconds - before.at_seconds;
@@ -332,7 +367,7 @@ export async function runQualification(io, options = {}) {
       });
       await test('idle_soak_cpu', async () => {
         need(soak, 'Idle soak did not complete; CPU was not qualified');
-        return cpuBound(soak.before, soak.after);
+        return cpuBound(soak.before, soak.after, s.label);
       });
 
       let fault;
@@ -379,7 +414,7 @@ export async function runQualification(io, options = {}) {
         });
         await test('failed_probe_cpu', async () => {
           need(outageWindow, 'No completed failed-probe CPU observation window');
-          return cpuBound(outageWindow.resourceBefore, outageWindow.resourceAfter);
+          return cpuBound(outageWindow.resourceBefore, outageWindow.resourceAfter, s.label);
         });
       } finally {
         const attempted = fault?.attempted;
@@ -494,6 +529,229 @@ function waitWithin(promise, seconds) {
 }
 const MAX_CAPTURE = 16 * 1024 * 1024;
 const nativeNow = () => Number(process.hrtime.bigint()) / 1e9;
+
+/** /proc identity and counters only; never opens a mailbox or requests health. */
+export function parseThreadCpuStat(raw, expectedTid) {
+  if (typeof raw !== 'string' || Buffer.byteLength(raw) > THREAD_CPU_LIMITS.statBytes) throw new Error('stat size limit');
+  const open = raw.indexOf('('), close = raw.lastIndexOf(')');
+  const tid = Number(raw.slice(0, open).trim());
+  const fields = raw.slice(close + 2).trim().split(/\s+/);
+  const user = Number(fields[11]), system = Number(fields[12]), count = Number(fields[17]);
+  if (open < 1 || close < open || tid !== expectedTid || !Number.isSafeInteger(tid) || tid <= 0
+      || !/^\d+$/.test(fields[19] || '') || ![user, system, count].every(v => Number.isSafeInteger(v) && v >= 0)) {
+    throw new Error('invalid stat identity or counters');
+  }
+  return {tid, identity: fields[19], name: raw.slice(open + 1, close),
+    user_ticks: user, system_ticks: system, threads: count};
+}
+
+function boundedProcStat(filename) {
+  const descriptor = fs.openSync(filename, 'r');
+  try {
+    const bytes = Buffer.alloc(THREAD_CPU_LIMITS.statBytes + 1);
+    const length = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
+    if (length > THREAD_CPU_LIMITS.statBytes) throw new Error('stat size limit');
+    return bytes.subarray(0, length).toString('utf8');
+  } finally { fs.closeSync(descriptor); }
+}
+
+/** Reader seams support bounded negative controls; the CLI always uses /proc. */
+export function sampleThreadCpu({pid, identity, ticksPerSecond}, source = {}) {
+  const now = source.now || nativeNow;
+  const readStat = source.readStat || (tid => boundedProcStat('/proc/' + pid + (tid === null ? '/stat' : '/task/' + tid + '/stat')));
+  const threadIds = source.threadIds || function* () {
+    const directory = fs.opendirSync('/proc/' + pid + '/task');
+    try {
+      let entry;
+      while ((entry = directory.readSync())) if (/^\d+$/.test(entry.name)) yield Number(entry.name);
+    } finally { directory.closeSync(); }
+  };
+  const result = {pid, identity, ticks_per_second: ticksPerSecond, available: false,
+    read_started_monotonic_seconds: now(), process_before: null, process_after: null,
+    threads: [], enumerated_threads: 0, unreadable_threads: 0, omitted_threads: null,
+    omitted_threads_lower_bound: 0, enumeration_complete: false, truncated: false,
+    errors: [], error_count: 0, limits: THREAD_CPU_LIMITS};
+  const error = (where, value) => {
+    result.error_count++;
+    if (result.errors.length < 8) result.errors.push({where, error: String(value).slice(0, 512)});
+  };
+  const read = tid => {
+    const start = now();
+    return {...parseThreadCpuStat(readStat(tid), tid === null ? pid : tid),
+      read_started_monotonic_seconds: start, read_finished_monotonic_seconds: now()};
+  };
+  try {
+    result.process_before = read(null);
+    if (result.process_before.identity !== identity) throw new Error('process start identity changed');
+    const deadline = result.read_started_monotonic_seconds + THREAD_CPU_LIMITS.sampleSeconds;
+    let completed = true;
+    for (const tid of threadIds()) {
+      if (result.enumerated_threads >= THREAD_CPU_LIMITS.threads || now() >= deadline) {
+        result.truncated = true; completed = false; result.omitted_threads_lower_bound = 1;
+        result.truncation_reason = result.enumerated_threads >= THREAD_CPU_LIMITS.threads ? 'thread_limit' : 'read_time_budget';
+        break;
+      }
+      result.enumerated_threads++;
+      try { result.threads.push(read(tid)); }
+      catch (failure) { result.unreadable_threads++; error('thread:' + tid, failure); }
+    }
+    result.enumeration_complete = completed;
+    result.omitted_threads = completed ? 0 : null;
+  } catch (failure) { error('census', failure); }
+  try { result.process_after = read(null); }
+  catch (failure) { error('process_after', failure); }
+  result.read_finished_monotonic_seconds = now();
+  result.read_budget_overrun_seconds = Math.max(0, result.read_finished_monotonic_seconds
+    - result.read_started_monotonic_seconds - THREAD_CPU_LIMITS.sampleSeconds);
+  result.available = Number.isFinite(ticksPerSecond) && ticksPerSecond > 0
+    && result.process_before?.identity === identity && result.process_after?.identity === identity;
+  if (!result.available) result.reason = 'process_identity_or_counter_unavailable';
+  // A synchronous /proc syscall can overrun this checked-between-reads budget.
+  // Record its actual width; do not describe the collection as atomic/preemptive.
+  return result;
+}
+
+/** One retained file and one cached sample; no work after a terminal cap/error. */
+export function createThreadCpuSampler(options, source = {}) {
+  const now = source.now || nativeNow;
+  let bytes = 0, sequence = 0, nextAt = -Infinity, last = null, terminal = false;
+  const reserve = 4096;
+  function retain(sample, reason = null) {
+    const record = {sequence: sequence + 1, ...sample};
+    const line = JSON.stringify(record) + '\n';
+    if (!reason && bytes + Buffer.byteLength(line) > THREAD_CPU_LIMITS.bytes - reserve) {
+      return finish('byte_limit');
+    }
+    const reference = {file: options.filename, sequence: record.sequence,
+      offset_bytes: bytes, length_bytes: Buffer.byteLength(line), available: sample.available,
+      read_started_monotonic_seconds: sample.read_started_monotonic_seconds,
+      read_finished_monotonic_seconds: sample.read_finished_monotonic_seconds,
+      persisted: false, cached: false, reason, limits: THREAD_CPU_LIMITS};
+    try {
+      fs.writeFileSync(options.filename, line, {flag: sequence ? 'a' : 'wx', mode: 0o600});
+      reference.persisted = true; bytes += reference.length_bytes; sequence++;
+    } catch (error) {
+      terminal = true; reference.available = false; reference.reason = 'diagnostic_write_failed';
+      reference.error = String(error).slice(0, 512);
+      sample = {...sample, available: false, reason: reference.reason};
+    }
+    last = {reference, sample};
+    return last;
+  }
+  function finish(reason, failure) {
+    terminal = true;
+    const at = now();
+    return retain({pid: options.pid, identity: options.identity, available: false, reason,
+      read_started_monotonic_seconds: at, read_finished_monotonic_seconds: at,
+      error: failure ? String(failure).slice(0, 512) : undefined,
+      retained_samples: sequence, retained_bytes: bytes, limits: THREAD_CPU_LIMITS}, reason);
+  }
+  return {sample({fresh = false} = {}) {
+    if (terminal || (!fresh && now() < nextAt)) return last ? {reference: {...last.reference, cached: true}, sample: last.sample} : null;
+    nextAt = now() + THREAD_CPU_LIMITS.intervalSeconds;
+    // Reserve the last permitted record and a small byte envelope for refusal.
+    if (sequence >= THREAD_CPU_LIMITS.samples - 1) return finish('sample_limit');
+    try { return retain(sampleThreadCpu(options, source)); }
+    catch (error) { return finish('diagnostic_error', error); }
+  }};
+}
+
+/** Rank only stable identities; sampled thread totals are never exhaustive. */
+export function threadCpuDelta(before, after) {
+  const result = {available: false, reason: null, exhaustive: false, threads: [],
+    accounting: {matched_threads: 0, new_threads: [], exited_threads: [], reused_tids: [], invalid_threads: [],
+      omitted_before: before?.omitted_threads ?? null, omitted_after: after?.omitted_threads ?? null,
+      omitted_lower_bound_before: before?.omitted_threads_lower_bound ?? 0,
+      omitted_lower_bound_after: after?.omitted_threads_lower_bound ?? 0,
+      unreadable_before: before?.unreadable_threads ?? null, unreadable_after: after?.unreadable_threads ?? null,
+      enumeration_complete_before: before?.enumeration_complete === true,
+      enumeration_complete_after: after?.enumeration_complete === true,
+      errors_before: before?.error_count ?? null, errors_after: after?.error_count ?? null,
+      population_note: 'New/exited entries are observed appearances/disappearances, not a complete thread-lifecycle census.'},
+    aggregate: null, sampling: null};
+  const refuse = reason => ({...result, reason});
+  const counter = value => Number.isSafeInteger(value) && value >= 0;
+  const stamp = value => Number.isFinite(value?.read_started_monotonic_seconds)
+    && Number.isFinite(value?.read_finished_monotonic_seconds)
+    && value.read_finished_monotonic_seconds >= value.read_started_monotonic_seconds;
+  const midpoint = value => (value.read_started_monotonic_seconds + value.read_finished_monotonic_seconds) / 2;
+  if (!before?.available || !after?.available) return refuse('sample_unavailable');
+  if (!Number.isSafeInteger(before.pid) || before.pid <= 0 || !/^\d+$/.test(before.identity || '')
+      || before.pid !== after.pid || before.identity !== after.identity
+      || [before.process_before, before.process_after, after.process_before, after.process_after]
+        .some(p => p?.tid !== before.pid || p?.identity !== before.identity)) return refuse('process_identity_changed');
+  const hz = before.ticks_per_second;
+  if (!Number.isFinite(hz) || hz <= 0 || hz !== after.ticks_per_second) return refuse('clock_frequency_changed');
+  if (![before, after, before.process_before, before.process_after, after.process_before, after.process_after].every(stamp)
+      || after.read_started_monotonic_seconds <= before.read_finished_monotonic_seconds) return refuse('invalid_sample_interval');
+  if ([before, after].some(sample => [sample.process_before, sample.process_after].some(p =>
+    p.read_started_monotonic_seconds < sample.read_started_monotonic_seconds
+      || p.read_finished_monotonic_seconds > sample.read_finished_monotonic_seconds)
+    || sample.process_before.read_finished_monotonic_seconds > sample.process_after.read_started_monotonic_seconds)) return refuse('invalid_sample_interval');
+  const processPoints = [before.process_before, before.process_after, after.process_before, after.process_after];
+  if (!processPoints.every(p => counter(p.user_ticks) && counter(p.system_ticks))
+      || processPoints.some((p, i) => i && (p.user_ticks < processPoints[i - 1].user_ticks
+        || p.system_ticks < processPoints[i - 1].system_ticks))) return refuse('process_counter_regression');
+  const user = (after.process_before.user_ticks - before.process_before.user_ticks) / hz;
+  const system = (after.process_before.system_ticks - before.process_before.system_ticks) / hz;
+  const interval = midpoint(after.process_before) - midpoint(before.process_before);
+  result.aggregate = {user_cpu_seconds: user, system_cpu_seconds: system, total_cpu_seconds: user + system,
+    interval_seconds: interval, cpu_cores: (user + system) / interval, matched_thread_cpu_seconds: 0, residual_cpu_seconds: null};
+  result.sampling = {before_read_seconds: before.read_finished_monotonic_seconds - before.read_started_monotonic_seconds,
+    after_read_seconds: after.read_finished_monotonic_seconds - after.read_started_monotonic_seconds,
+    interval_lower_seconds: after.read_started_monotonic_seconds - before.read_finished_monotonic_seconds,
+    interval_upper_seconds: after.read_finished_monotonic_seconds - before.read_started_monotonic_seconds,
+    interval_midpoint_seconds: midpoint(after) - midpoint(before), maximum_thread_midpoint_skew_seconds: 0};
+  function index(sample, side) {
+    const rows = new Map();
+    const rejected = new Set();
+    const extra = Math.max(0, (Array.isArray(sample.threads) ? sample.threads.length : 0) - THREAD_CPU_LIMITS.threads);
+    if (extra) {
+      result.accounting['omitted_lower_bound_' + side] += extra;
+      result.accounting['omitted_' + side] = null;
+      result.accounting['enumeration_complete_' + side] = false;
+    }
+    for (const p of (Array.isArray(sample.threads) ? sample.threads : []).slice(0, THREAD_CPU_LIMITS.threads)) {
+      if (!Number.isSafeInteger(p?.tid) || p.tid <= 0 || !/^\d+$/.test(p.identity || '')
+          || !counter(p.user_ticks) || !counter(p.system_ticks) || !stamp(p)
+          || p.read_started_monotonic_seconds < sample.read_started_monotonic_seconds
+          || p.read_finished_monotonic_seconds > sample.read_finished_monotonic_seconds || rows.has(p.tid) || rejected.has(p.tid)) {
+        result.accounting.invalid_threads.push({side, tid: p?.tid ?? null, reason: 'invalid_or_duplicate_thread'});
+        rows.delete(p?.tid); rejected.add(p?.tid);
+      } else rows.set(p.tid, p);
+    }
+    return rows;
+  }
+  const first = index(before, 'before'), last = index(after, 'after');
+  const description = p => ({tid: p.tid, identity: p.identity, name: p.name});
+  for (const [tid, p] of first) {
+    const q = last.get(tid);
+    if (!q) { result.accounting.exited_threads.push(description(p)); continue; }
+    if (p.identity !== q.identity) {
+      result.accounting.reused_tids.push({tid, before_identity: p.identity, after_identity: q.identity});
+      result.accounting.exited_threads.push(description(p)); result.accounting.new_threads.push(description(q));
+      continue;
+    }
+    const seconds = midpoint(q) - midpoint(p);
+    if (q.user_ticks < p.user_ticks || q.system_ticks < p.system_ticks || seconds <= 0) {
+      result.accounting.invalid_threads.push({tid, identity: p.identity, reason: 'counter_regression_or_interval'}); continue;
+    }
+    const u = (q.user_ticks - p.user_ticks) / hz, s = (q.system_ticks - p.system_ticks) / hz;
+    result.threads.push({tid, identity: p.identity, name: q.name, previous_name: p.name,
+      user_cpu_seconds: u, system_cpu_seconds: s, total_cpu_seconds: u + s,
+      interval_seconds: seconds, cpu_cores: (u + s) / seconds});
+    result.sampling.maximum_thread_midpoint_skew_seconds = Math.max(result.sampling.maximum_thread_midpoint_skew_seconds,
+      Math.abs(midpoint(p) - midpoint(before.process_before)), Math.abs(midpoint(q) - midpoint(after.process_before)));
+  }
+  for (const [tid, q] of last) if (!first.has(tid)) result.accounting.new_threads.push(description(q));
+  result.threads.sort((a, b) => b.total_cpu_seconds - a.total_cpu_seconds || a.tid - b.tid);
+  result.accounting.matched_threads = result.threads.length;
+  result.aggregate.matched_thread_cpu_seconds = result.threads.reduce((sum, p) => sum + p.total_cpu_seconds, 0);
+  result.aggregate.residual_cpu_seconds = result.aggregate.total_cpu_seconds - result.aggregate.matched_thread_cpu_seconds;
+  result.available = true;
+  return result;
+}
+
 function errorKind(text) {
   const value = String(text).toLowerCase();
   if (/unauthorized|forbidden|authentication|bearer|rate.?limit|invalid.?param/.test(value)) return 'protocol';
@@ -714,7 +972,9 @@ export async function makeNodeIO(binary, outputDirectory, options = {}) {
       const birth = child.qualificationStart;
       let sequence = 0, stopped = null, suspended = false;
       const resourceFile = path.join(directory, 'resources.jsonl');
-      function snapshot() {
+      const threadCpu = createThreadCpuSampler({pid: child.pid, identity: birth, ticksPerSecond,
+        filename: path.join(directory, 'thread-cpu.jsonl')});
+      function snapshot(includeThreadSample = false) {
         try {
           const current = procStat(child.pid);
           if (!current) return {available: false, identity: 'missing'};
@@ -725,7 +985,14 @@ export async function makeNodeIO(binary, outputDirectory, options = {}) {
             cpu_seconds: current.ticks / ticksPerSecond, identity: current.start === birth ? birth : 'changed',
             children: groupMembers(child.pid).filter(p => p.pid !== child.pid && p.state !== 'Z').length,
             at_monotonic_seconds: nativeNow()};
+          let diagnostic;
+          // Fresh explicit boundaries cannot borrow a cached sample taken
+          // before fault setup or before the request-free observation began.
+          try { diagnostic = threadCpu.sample({fresh: includeThreadSample}); }
+          catch (error) { diagnostic = {reference: {available: false, reason: 'diagnostic_error', error: String(error).slice(0, 512)}}; }
+          result.thread_cpu = diagnostic?.reference || {available: false, reason: 'diagnostic_unavailable'};
           fs.appendFileSync(resourceFile, JSON.stringify(result) + '\n', {mode: 0o600});
+          if (includeThreadSample) result.thread_cpu_sample = diagnostic?.sample;
           return result;
         } catch (error) { return {available: false, error: String(error)}; }
       }
@@ -767,7 +1034,7 @@ export async function makeNodeIO(binary, outputDirectory, options = {}) {
             await delay(Math.min(0.25, until - nativeNow()));
           }
         },
-        resources: async () => snapshot(),
+        resources: async () => snapshot(true),
         logs: async () => ({complete: logComplete && !evidenceError, probe_failures: log.split('serving-pool readiness probe failed').length - 1, evidence_error: evidenceError}),
         async ensureProject(tag) {
           const project = path.join(directory, 'projects', tag + '-' + crypto.randomUUID());

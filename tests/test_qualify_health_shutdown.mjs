@@ -11,7 +11,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { makeNodeIO, DEFAULTS } from '../scripts/qualify_health_idle.mjs';
+import { makeNodeIO, DEFAULTS, THREAD_CPU_LIMITS, threadCpuDelta } from '../scripts/qualify_health_idle.mjs';
 
 const cfg = { ...DEFAULTS, requestTimeout: 2, commandTimeout: 5,
   startupTimeout: 5, resourceInterval: 0.1 };
@@ -22,6 +22,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
+import {Worker} from 'node:worker_threads';
 import {fileURLToPath} from 'node:url';
 const controlPath = new URL('./helper-control.json', import.meta.url);
 const control = fs.existsSync(controlPath) ? JSON.parse(fs.readFileSync(controlPath, 'utf8')) : {};
@@ -57,11 +58,35 @@ if (process.argv[2] === '--fixture-helper-child') {
 } else {
   const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
   const root = process.env.STORAGE_ROOT;
+  let worker = null, workerIdentity = null, workerFinished = false;
+  if (control.cpuWorker) {
+    worker = new Worker(\`
+      const {parentPort} = require('node:worker_threads');
+      const fs = require('node:fs');
+      const fields = fs.readFileSync('/proc/thread-self/stat', 'utf8');
+      const values = fields.slice(fields.lastIndexOf(')') + 2).trim().split(/\\\\s+/);
+      parentPort.postMessage({kind: 'ready', tid: Number(fields.slice(0, fields.indexOf(' '))), start: values[19], stat: fields});
+      parentPort.on('message', message => {
+        if (message !== 'busy') return;
+        // A finite CPU contrast; a failed test cannot leave a spinning worker.
+        const until = performance.now() + 2000;
+        let value = 1;
+        while (performance.now() < until) value = Math.imul(value ^ 12345, 1664525);
+        parentPort.postMessage({kind: 'finished', value});
+      });
+    \`, {eval: true});
+    worker.on('message', message => {
+      if (message.kind === 'ready') workerIdentity = {tid: message.tid, start: message.start, stat: message.stat};
+      if (message.kind === 'finished') workerFinished = true;
+    });
+  }
   const server = http.createServer((request, response) => {
     const closing = request.url === '/exit-cleanly';
+    if (request.url === '/cpu/start' && worker) worker.postMessage('busy');
     response.writeHead(200, {'Content-Type': 'application/json', Connection: 'close'});
     response.end(JSON.stringify({
       status: closing ? 'closing' : 'ready', pid: process.pid,
+      ...(worker ? {worker: workerIdentity, worker_finished: workerFinished} : {}),
       capabilities: {mail_read: true, mail_write: true, lexical_search: false}
     }), () => {
       if (closing) {
@@ -71,10 +96,11 @@ if (process.argv[2] === '--fixture-helper-child') {
       }
     });
   });
-  process.on('SIGTERM', () => {
+  process.on('SIGTERM', async () => {
     fs.appendFileSync(path.join(root, 'sigterm-observed.txt'), 'SIGTERM\\n');
     server.close();
     server.closeAllConnections();
+    if (worker) await worker.terminate();
   });
   server.listen(port, '127.0.0.1');
 }
@@ -307,5 +333,71 @@ test('HARNESS ADAPTER ONLY: prior exit 0 is not counted as a tested SIGTERM shut
       assert.deepEqual(second, first);
     } finally {
       await retainReceipt(io, 'premature_clean_exit', observations);
+    }
+  });
+
+test('HARNESS ADAPTER ONLY: bounded real worker CPU is attributed to its OS identity with raw evidence',
+  {skip: process.platform !== 'linux', timeout: 15_000}, async (t) => {
+    const io = await createIO(t, 'thread_cpu', {cpuWorker: true});
+    const observations = {};
+    try {
+      const session = await io.start('thread_cpu', cfg);
+      observations.server_pid = await waitForListener(session);
+      const deadline = performance.now() + 3000;
+      let response;
+      do {
+        response = await session.get('/health');
+        if (response.body?.worker) break;
+        await pause(20);
+      } while (performance.now() < deadline);
+      observations.worker_witness = response.body?.worker;
+      const witness = observations.worker_witness;
+      assert.ok(Number.isInteger(witness?.tid) && witness.tid > 0, 'Worker must publish its actual /proc TID');
+      assert.match(witness.start, /^\d+$/);
+      assert.ok(witness.stat.startsWith(`${witness.tid} (`));
+      assert.notEqual(witness.tid, observations.server_pid, 'The busy control must be a separate OS thread');
+
+      observations.idle_before = await session.resources();
+      await pause(1100);
+      observations.idle_after = await session.resources();
+      observations.idle_diagnosis = threadCpuDelta(observations.idle_before.thread_cpu_sample,
+        observations.idle_after.thread_cpu_sample);
+      observations.busy_before = await session.resources();
+      observations.busy_command = await session.get('/cpu/start');
+      await pause(1250);
+      observations.busy_after = await session.resources();
+      observations.busy_diagnosis = threadCpuDelta(observations.busy_before.thread_cpu_sample,
+        observations.busy_after.thread_cpu_sample);
+      // Persist the window in finally even when a threshold below fails.
+      const delta = observations.busy_diagnosis;
+      const busy = delta.threads.find(row => row.tid === witness.tid && row.identity === witness.start);
+      const idle = observations.idle_diagnosis.threads.find(row => row.tid === witness.tid && row.identity === witness.start);
+      assert.equal(delta.available, true, JSON.stringify(delta));
+      assert.ok(busy && idle, 'Both windows must match the independently witnessed same-start thread');
+      assert.ok(busy.total_cpu_seconds >= 0.1,
+        `Known busy worker gained too little measured CPU: ${JSON.stringify(busy)}`);
+      assert.ok(busy.total_cpu_seconds > idle.total_cpu_seconds + 0.08,
+        'The sampler must distinguish actual CPU work from a live idle thread');
+      assert.equal(delta.threads[0].tid, witness.tid, 'The known busy worker must rank above idle companions');
+      assert.ok(delta.aggregate.total_cpu_seconds >= 0.1);
+      assert.equal(delta.exhaustive, false);
+      for (const point of [observations.busy_before, observations.busy_after]) {
+        assert.equal(point.thread_cpu.persisted, true);
+        assert.equal(point.thread_cpu.cached, false, 'Explicit CPU windows require fresh sample boundaries');
+        assert.ok(point.thread_cpu_sample.threads.length <= THREAD_CPU_LIMITS.threads);
+        const retained = fs.readFileSync(point.thread_cpu.file).subarray(point.thread_cpu.offset_bytes,
+          point.thread_cpu.offset_bytes + point.thread_cpu.length_bytes).toString();
+        const raw = JSON.parse(retained);
+        assert.equal(raw.sequence, point.thread_cpu.sequence);
+        assert.equal(raw.pid, observations.server_pid);
+        assert.deepEqual(raw.threads, point.thread_cpu_sample.threads,
+          'The reported interval must be reproducible from its retained exact-byte raw record');
+      }
+      observations.shutdown = await session.stop();
+      assertCleanup(observations.shutdown);
+      assert.equal(observations.shutdown.sigterm_sent, true);
+      t.diagnostic(`Measured worker ${witness.tid}/${witness.start}: idle ${idle.total_cpu_seconds.toFixed(3)} CPU s; busy ${busy.total_cpu_seconds.toFixed(3)} CPU s; process ${delta.aggregate.total_cpu_seconds.toFixed(3)} CPU s; residual ${delta.aggregate.residual_cpu_seconds.toFixed(3)} CPU s`);
+    } finally {
+      await retainReceipt(io, 'actual_thread_cpu_contrast', observations);
     }
   });

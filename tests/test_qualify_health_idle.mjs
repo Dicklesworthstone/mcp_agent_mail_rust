@@ -8,7 +8,11 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runQualification, DEFAULTS } from '../scripts/qualify_health_idle.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { runQualification, DEFAULTS, THREAD_CPU_LIMITS, parseThreadCpuStat,
+  sampleThreadCpu, createThreadCpuSampler, threadCpuDelta } from '../scripts/qualify_health_idle.mjs';
 
 export function modelIO(mode = 'healthy', additionalFaults = {}) {
   const has = (name) => mode === name || additionalFaults[name] === true;
@@ -522,3 +526,355 @@ test('HARNESS MODEL ONLY: a failed concurrent read cannot advance while its laun
     assert.equal(caseStatus(report, 'database_fault_restore'), 'PASS');
     assert.equal(caseStatus(report, 'healthy_shutdown'), 'PASS');
   });
+
+function statText(tid, {identity = String(tid * 10), name = 'same worker',
+  user = 100, system = 20, threads = 1} = {}) {
+  const fields = Array(50).fill('0');
+  fields[0] = 'S'; fields[1] = '1'; fields[2] = '1000'; fields[3] = '1000';
+  fields[11] = String(user); fields[12] = String(system);
+  fields[17] = String(threads); fields[19] = identity;
+  return `${tid} (${name}) ${fields.join(' ')}\n`;
+}
+
+function threadPoint(tid, user, system = 0, identity = String(tid * 10)) {
+  return {tid, identity, name: 'same worker', user_ticks: user, system_ticks: system};
+}
+
+function threadSample(at, user, system, threads, overrides = {}) {
+  const stamp = {read_started_monotonic_seconds: at, read_finished_monotonic_seconds: at + 0.01};
+  const process = {tid: 1000, identity: '9000', user_ticks: user, system_ticks: system,
+    read_started_monotonic_seconds: at, read_finished_monotonic_seconds: at + 0.001};
+  return {pid: 1000, identity: '9000', available: true, ticks_per_second: 100, ...stamp,
+    process_before: {...process}, process_after: {...process,
+      read_started_monotonic_seconds: at + 0.009, read_finished_monotonic_seconds: at + 0.01},
+    threads: threads.map(row => ({...row, read_started_monotonic_seconds: at + 0.002,
+      read_finished_monotonic_seconds: at + 0.004})),
+    enumerated_threads: threads.length, unreadable_threads: 0, omitted_threads: 0,
+    omitted_threads_lower_bound: 0, enumeration_complete: true, errors: [], truncated: false,
+    ...overrides};
+}
+
+const closeTo = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-9,
+  `Expected ${actual} to be approximately ${expected}`);
+
+test('HARNESS DIAGNOSTIC ONLY: stat parsing preserves identities and rejects unsafe counters', () => {
+  const parsed = parseThreadCpuStat(statText(41, {name: 'worker ) (busy', identity: '987654321',
+    user: 1234, system: 567, threads: 8}), 41);
+  assert.deepEqual(parsed, {tid: 41, identity: '987654321', name: 'worker ) (busy',
+    user_ticks: 1234, system_ticks: 567, threads: 8});
+  for (const raw of [statText(42), statText(41, {identity: 'not-a-start-time'}),
+    statText(41, {user: -1}), statText(41, {system: Number.MAX_SAFE_INTEGER + 1}),
+    statText(41, {name: 'x'.repeat(THREAD_CPU_LIMITS.statBytes)}), '41 (truncated) S']) {
+    assert.throws(() => parseThreadCpuStat(raw, 41), undefined,
+      'Malformed or mismatched stat data must not produce attributable CPU counters');
+  }
+});
+
+test('HARNESS DIAGNOSTIC ONLY: stable thread identities rank independently of names and retain residual/skew', () => {
+  const before = threadSample(10, 100, 20, [threadPoint(11, 10, 5), threadPoint(12, 20, 10)]);
+  const after = threadSample(12, 160, 40, [threadPoint(12, 30, 20), threadPoint(11, 50, 15)]);
+  const delta = threadCpuDelta(before, after);
+  assert.equal(delta.available, true);
+  assert.equal(delta.exhaustive, false, 'A finite census cannot prove complete lifetime attribution');
+  assert.deepEqual(delta.threads.map(row => [row.tid, row.identity]), [[11, '110'], [12, '120']]);
+  assert.equal(delta.threads[0].name, delta.threads[1].name,
+    'Identical or truncated OS names cannot merge independent thread counters');
+  closeTo(delta.threads[0].user_cpu_seconds, 0.4);
+  closeTo(delta.threads[0].system_cpu_seconds, 0.1);
+  closeTo(delta.threads[0].cpu_cores, 0.25);
+  closeTo(delta.aggregate.total_cpu_seconds, 0.8);
+  closeTo(delta.aggregate.matched_thread_cpu_seconds, 0.7);
+  closeTo(delta.aggregate.residual_cpu_seconds, 0.1);
+  closeTo(delta.sampling.interval_lower_seconds, 1.99);
+  closeTo(delta.sampling.interval_upper_seconds, 2.01);
+  assert.ok(delta.sampling.maximum_thread_midpoint_skew_seconds > 0);
+
+  const skewed = threadSample(12, 100, 20, after.threads);
+  const negative = threadCpuDelta(before, skewed);
+  assert.equal(negative.available, true);
+  closeTo(negative.aggregate.residual_cpu_seconds, -0.7);
+  assert.equal(negative.exhaustive, false,
+    'Sampling skew must remain visible, not be clamped into a complete accounting claim');
+});
+
+test('HARNESS DIAGNOSTIC ONLY: reuse, disappearing threads and regressing counters never acquire false CPU deltas', () => {
+  const before = threadSample(10, 100, 20,
+    [threadPoint(11, 10), threadPoint(12, 10), threadPoint(13, 10), threadPoint(14, 10)]);
+  const after = threadSample(12, 150, 20,
+    [threadPoint(11, 30), threadPoint(12, 1000, 0, '121'), threadPoint(13, 5), threadPoint(15, 1000)],
+    {truncated: true, enumeration_complete: false, omitted_threads: null,
+      omitted_threads_lower_bound: 1, unreadable_threads: 2});
+  const delta = threadCpuDelta(before, after);
+  assert.equal(delta.available, true);
+  assert.deepEqual(delta.threads.map(row => row.tid), [11]);
+  closeTo(delta.aggregate.matched_thread_cpu_seconds, 0.2);
+  assert.ok(delta.accounting.reused_tids.some(row => row.tid === 12));
+  assert.ok(delta.accounting.invalid_threads.some(row => row.tid === 13));
+  assert.ok(delta.accounting.new_threads.some(row => row.tid === 15));
+  assert.ok(delta.accounting.exited_threads.some(row => row.tid === 14));
+  assert.equal(delta.accounting.omitted_after, null, 'An incomplete census has no exact omitted count');
+  assert.equal(delta.accounting.omitted_lower_bound_after, 1);
+  assert.equal(delta.accounting.unreadable_after, 2);
+  const ambiguous = threadCpuDelta(before, threadSample(12, 150, 20,
+    [threadPoint(11, 30), threadPoint(11, 40), threadPoint(11, 50)]));
+  assert.equal(ambiguous.threads.length, 0, 'A third duplicate cannot resurrect a rejected TID');
+  assert.ok(ambiguous.accounting.invalid_threads.some(row => row.tid === 11));
+  for (const broken of [undefined, {...after, available: false}, {...after, pid: 1001},
+    {...after, identity: '9001'}, {...after, ticks_per_second: 200},
+    threadSample(10, 150, 20, []), threadSample(12, 99, 20, [])]) {
+    const result = threadCpuDelta(before, broken);
+    assert.equal(result.available, false, 'Process reuse, invalid intervals and counters must refuse attribution');
+    assert.deepEqual(result.threads, []);
+    assert.equal(result.aggregate, null);
+  }
+});
+
+test('HARNESS DIAGNOSTIC ONLY: census has fixed read budgets and retains unreadable/missing identity evidence', () => {
+  assert.deepEqual(THREAD_CPU_LIMITS, {threads: 256, samples: 1024, bytes: 16 * 1024 * 1024,
+    statBytes: 4096, sampleSeconds: 0.025, intervalSeconds: 1});
+  assert.equal(Object.isFrozen(THREAD_CPU_LIMITS), true);
+  const options = {pid: 1000, identity: '9000', ticksPerSecond: 100};
+  let reads = 0, yielded = 0;
+  const bounded = sampleThreadCpu(options, {now: () => 10,
+    readStat(tid) { reads++; return statText(tid ?? 1000, {identity: tid === null ? '9000' : String(tid)}); },
+    threadIds: function* () { for (let tid = 1; tid < 1_000_000; tid++) { yielded++; yield tid; } }});
+  assert.equal(bounded.threads.length, THREAD_CPU_LIMITS.threads);
+  assert.ok(reads <= THREAD_CPU_LIMITS.threads + 2, 'The reader cannot chase an unbounded task directory');
+  assert.ok(yielded <= THREAD_CPU_LIMITS.threads + 1);
+  assert.equal(bounded.truncated, true);
+  assert.equal(bounded.truncation_reason, 'thread_limit');
+  assert.equal(bounded.omitted_threads, null);
+  assert.equal(bounded.omitted_threads_lower_bound, 1);
+
+  let clock = 20, timedReads = 0;
+  const timed = sampleThreadCpu(options, {now: () => clock,
+    readStat(tid) { timedReads++; clock += 0.01; return statText(tid ?? 1000, {identity: tid === null ? '9000' : String(tid)}); },
+    threadIds: function* () { for (let tid = 1; tid < 1000; tid++) yield tid; }});
+  assert.equal(timed.truncation_reason, 'read_time_budget');
+  assert.ok(timedReads <= 4, 'Check the elapsed budget between reads, including the initial process read');
+  assert.ok(timed.read_budget_overrun_seconds > 0,
+    'A synchronous read crossing the budget must expose its actual overrun');
+
+  const missing = sampleThreadCpu(options, {now: () => 30, threadIds: () => [1, 2],
+    readStat(tid) { if (tid === 1) throw new Error('thread exited during sample');
+      return statText(tid ?? 1000, {identity: tid === null ? '9000' : String(tid)}); }});
+  assert.equal(missing.available, true);
+  assert.equal(missing.unreadable_threads, 1);
+  assert.deepEqual(missing.threads.map(row => row.tid), [2]);
+  assert.equal(missing.enumeration_complete, true);
+  assert.ok(missing.errors.some(error => error.where === 'thread:1'));
+  const vanished = sampleThreadCpu(options, {now: () => 40, threadIds: () => [],
+    readStat() { throw new Error('owned process absent'); }});
+  assert.equal(vanished.available, false);
+  assert.equal(vanished.threads.length, 0);
+  assert.ok(vanished.errors.length > 0);
+  const failures = sampleThreadCpu(options, {now: () => 50,
+    threadIds: () => Array.from({length: 20}, (_, index) => index + 1),
+    readStat(tid) { if (tid !== null) throw new Error('unreadable '.repeat(1000));
+      return statText(1000, {identity: '9000'}); }});
+  assert.equal(failures.error_count, 20, 'All read failures must remain counted');
+  assert.equal(failures.errors.length, 8, 'Repeated diagnostics cannot create unbounded error detail');
+  assert.ok(failures.errors.every(error => error.error.length <= 512));
+});
+
+test('HARNESS DIAGNOSTIC ONLY: retained samples stop at fixed rate/count/byte/error limits', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gh407-thread-caps-'));
+  t.diagnostic(`Retained HARNESS-ONLY cap controls: ${directory}`);
+  const options = {pid: 1000, identity: '9000', ticksPerSecond: 100};
+  let now = 10, reads = 0;
+  const source = {now: () => now, threadIds: () => [11],
+    readStat(tid) { reads++; return statText(tid ?? 1000, {identity: tid === null ? '9000' : String(tid)}); }};
+  const filename = path.join(directory, 'count.jsonl');
+  const sampler = createThreadCpuSampler({...options, filename}, source);
+  const first = sampler.sample();
+  assert.equal(first.reference.persisted, true);
+  const initialReads = reads;
+  for (let i = 0; i < 100; i++) assert.equal(sampler.sample().reference.cached, true);
+  assert.equal(reads, initialReads, 'Repeated resource calls cannot bypass the sampling interval');
+  const fresh = sampler.sample({fresh: true});
+  assert.equal(fresh.reference.cached, false);
+  assert.equal(fresh.reference.sequence, 2, 'An explicit CPU boundary must retain a new sample');
+  assert.ok(reads > initialReads);
+  let last;
+  for (let i = 1; i < THREAD_CPU_LIMITS.samples + 4; i++) { now += 2; last = sampler.sample(); }
+  assert.equal(last.reference.reason, 'sample_limit');
+  assert.equal(last.sample.available, false);
+  const lines = fs.readFileSync(filename, 'utf8').trimEnd().split('\n').map(JSON.parse);
+  assert.equal(lines.length, THREAD_CPU_LIMITS.samples, 'The terminal receipt consumes a reserved sample slot');
+  assert.equal(lines.at(-1).reason, 'sample_limit');
+  const finalReads = reads;
+  now += 100;
+  assert.equal(sampler.sample({fresh: true}).reference.cached, true);
+  assert.equal(reads, finalReads, 'A terminal cap must stop all further /proc reads');
+
+  const bytesFile = path.join(directory, 'bytes.jsonl');
+  const bytesSampler = createThreadCpuSampler({...options, filename: bytesFile}, {...source,
+    threadIds: () => Array.from({length: THREAD_CPU_LIMITS.threads}, (_, i) => i + 1)});
+  for (let i = 0; i < THREAD_CPU_LIMITS.samples + 2; i++) {
+    now += 2; last = bytesSampler.sample();
+    if (last.reference.reason) break;
+  }
+  assert.equal(last.reference.reason, 'byte_limit');
+  assert.ok(fs.statSync(bytesFile).size <= THREAD_CPU_LIMITS.bytes,
+    'The refusal receipt itself must fit within the fixed file budget');
+  const bytesReads = reads;
+  now += 100; bytesSampler.sample();
+  assert.equal(reads, bytesReads);
+
+  const failed = createThreadCpuSampler({...options, filename: path.join(directory, 'absent-parent', 'samples.jsonl')}, source);
+  const refusal = failed.sample();
+  assert.equal(refusal.reference.persisted, false);
+  assert.equal(refusal.reference.reason, 'diagnostic_write_failed');
+  assert.equal(refusal.sample.available, false);
+  const failedReads = reads;
+  now += 100; failed.sample();
+  assert.equal(reads, failedReads, 'Write failure cannot start a recurring diagnostic retry loop');
+});
+
+test('HARNESS MODEL ONLY: absent, invalid or low thread diagnostics cannot rescue aggregate CPU failures', async () => {
+  assert.equal(DEFAULTS.maxIdleCpuCores, 0.25, 'Diagnostic work cannot raise the existing aggregate CPU threshold');
+  for (const mode of ['absent', 'process_reused', 'zero_thread_cpu']) {
+    const io = modelIO('idle_cpu_runaway');
+    const originalStart = io.start.bind(io);
+    io.start = async (...arguments_) => {
+      const session = await originalStart(...arguments_);
+      const originalResources = session.resources.bind(session);
+      session.resources = async () => {
+        const point = await originalResources();
+        if (mode !== 'absent') {
+          point.thread_cpu_sample = threadSample(io.now(), 0, 0, [threadPoint(11, 0)]);
+          if (mode === 'process_reused') point.thread_cpu_sample.identity = String(io.now());
+        }
+        return point;
+      };
+      return session;
+    };
+    const report = await runQualification(io);
+    assert.equal(report.status, 'FAIL', `${mode}: ${failureSummary(report)}`);
+    assert.equal(caseStatus(report, 'idle_soak_cpu'), 'FAIL');
+    assert.equal(caseStatus(report, 'failed_probe_cpu'), 'FAIL');
+    const windows = report.observations.filter(row => row.kind === 'thread_cpu_window');
+    assert.equal(windows.length, 2, 'CPU evidence must be recorded before the aggregate threshold assertion');
+    if (mode === 'zero_thread_cpu') {
+      assert.ok(windows.every(row => row.diagnosis.available && row.diagnosis.aggregate.total_cpu_seconds === 0));
+    } else assert.ok(windows.every(row => row.diagnosis.available === false));
+  }
+});
+
+function postSeedModel({mode = 'healthy', initialDelay = 0, settleSeconds = 6,
+  failFinalBurst = false} = {}) {
+  const io = modelIO(mode);
+  io.seedTransitions = [];
+  const originalStart = io.start.bind(io);
+  io.start = async (...arguments_) => {
+    const session = await originalStart(...arguments_);
+    const trace = {session: session.label, started: io.now(), seeded: null,
+      final_burst_failure: null, requests: []};
+    io.seedTransitions.push(trace);
+    const originalControl = session.ensureProject.bind(session);
+    session.ensureProject = async (tag) => {
+      const result = await originalControl(tag);
+      if (tag === 'baseline' && result.ok) trace.seeded = io.now();
+      return result;
+    };
+    const originalGet = session.get.bind(session);
+    session.get = async (route) => {
+      const result = await originalGet(route);
+      if (!['/health', '/health/readiness'].includes(route)) return result;
+      let reason = null;
+      if (io.now() - trace.started < initialDelay) reason = 'database_initializing';
+      else if (trace.seeded !== null && io.now() - trace.seeded < settleSeconds) reason = 'lexical_initializing';
+      else if (failFinalBurst && trace.seeded !== null && route === '/health/readiness'
+          && trace.final_burst_failure === null) {
+        reason = 'test_final_burst_failure';
+        trace.final_burst_failure = io.now();
+      }
+      const response = reason ? {...result, status: 503, body: {...result.body,
+        status: 'unavailable', reason, lexical_state: 'initializing',
+        capabilities: {mail_read: reason === 'lexical_initializing',
+          mail_write: reason === 'lexical_initializing', lexical_search: false}}} : result;
+      trace.requests.push({at: io.now(), route, status: response.status,
+        reason: response.body?.reason ?? null, after_seed: trace.seeded !== null});
+      return response;
+    };
+    return session;
+  };
+  return io;
+}
+
+function retainSeedControl(t, label, report, io) {
+  if (!process.env.GH407_TEST_EVIDENCE_ROOT) return;
+  const directory = fs.mkdtempSync(path.join(path.resolve(process.env.GH407_TEST_EVIDENCE_ROOT), 'baseline-'));
+  const filename = path.join(directory, label + '.json');
+  fs.writeFileSync(filename, JSON.stringify({evidence_class: 'harness_model',
+    native_agent_mail_executions: 0, label, report, seed_transitions: io.seedTransitions,
+    events: io.events}, null, 2) + '\n', {flag: 'wx', mode: 0o600});
+  t.diagnostic(`Retained HARNESS-ONLY baseline control: ${filename}`);
+}
+
+test('HARNESS MODEL ONLY: post-seed transient readiness settles before measuring and cannot retry an idle failure', async (t) => {
+  for (const mode of ['healthy', 'delayed_idle_refresh']) {
+    const io = postSeedModel({mode});
+    const report = await runQualification(io);
+    retainSeedControl(t, 'transient_' + mode, report, io);
+    for (const name of ['baseline', 'stale_success_baseline', 'outage_shutdown_baseline']) {
+      assert.equal(caseStatus(report, name), 'PASS', `${mode}: ${failureSummary(report)}`);
+    }
+    assert.equal(report.status, mode === 'healthy' ? 'PASS' : 'FAIL', failureSummary(report));
+    for (const trace of io.seedTransitions) {
+      const pending = trace.requests.filter(row => row.after_seed && row.reason === 'lexical_initializing');
+      assert.ok(pending.length > 0, 'The control must actually observe the post-seed transient');
+      assert.ok(pending.every(row => row.at >= trace.seeded + DEFAULTS.warmupSeconds),
+        'The complete predeclared warmup precedes readiness preparation');
+      const readyAfterSeed = trace.requests.find(row => row.after_seed && row.status === 200);
+      assert.ok(readyAfterSeed.at >= trace.seeded + 6, 'An initializing response cannot establish readiness');
+    }
+    for (let cycle = 1; cycle <= DEFAULTS.idleCycles; cycle++) {
+      assert.equal(caseStatus(report, `idle_first_request_${cycle}`), mode === 'healthy' ? 'PASS' : 'FAIL');
+      assert.equal(caseStatus(report, `idle_database_${cycle}`), 'PASS');
+      if (mode === 'delayed_idle_refresh') assertMcpAfterStaleFirstResponse(report, 'healthy', `idle_${cycle - 1}`);
+    }
+    assertSilentIdleWindows(io);
+  }
+});
+
+test('HARNESS MODEL ONLY: persistent post-seed unreadiness cannot reset the original startup deadline', async (t) => {
+  assert.equal(DEFAULTS.startupTimeout, 90);
+  const io = postSeedModel({initialDelay: 80, settleSeconds: Infinity});
+  const report = await runQualification(io);
+  retainSeedControl(t, 'persistent_post_seed', report, io);
+  assert.equal(report.status, 'INCOMPLETE', failureSummary(report));
+  for (const name of ['baseline', 'stale_success_baseline', 'outage_shutdown_baseline']) {
+    assert.equal(caseStatus(report, name), 'INCOMPLETE', failureSummary(report));
+    assert.equal(report.cases.find(row => row.name === name).duration_seconds, 90,
+      'Initial startup, fixture creation, warmup and post-seed readiness share one 90-second budget');
+  }
+  for (const trace of io.seedTransitions) {
+    assert.equal(trace.seeded - trace.started, 80);
+    const pending = trace.requests.filter(row => row.after_seed);
+    assert.ok(pending.length > 0);
+    assert.ok(pending.every(row => row.status === 503 && row.reason === 'lexical_initializing'));
+    assert.ok(pending.every(row => row.at < trace.started + 90), 'No new request starts after the original deadline');
+  }
+  assert.equal(caseStatus(report, 'idle_first_request_1'), 'INCOMPLETE');
+  assert.ok(!report.observations.some(row => row.kind === 'idle_start'),
+    'A missing post-seed baseline cannot be mislabeled as a measured idle trial');
+});
+
+test('HARNESS MODEL ONLY: a genuine final baseline burst failure remains strict and is never retried', async (t) => {
+  const io = postSeedModel({settleSeconds: 0, failFinalBurst: true});
+  const report = await runQualification(io);
+  retainSeedControl(t, 'final_baseline_burst_failure', report, io);
+  assert.equal(report.status, 'FAIL', failureSummary(report));
+  for (const name of ['baseline', 'stale_success_baseline', 'outage_shutdown_baseline']) {
+    assert.equal(caseStatus(report, name), 'FAIL', failureSummary(report));
+  }
+  for (const trace of io.seedTransitions) {
+    const reads = report.observations.filter(row => row.kind === 'http' && row.session === trace.session);
+    assert.equal(reads.length, DEFAULTS.concurrency, 'One complete final burst is retained, without a retry burst');
+    assert.equal(reads.filter(row => row.response.status === 503).length, 1);
+    assert.equal(reads.filter(row => row.response.status === 200).length, DEFAULTS.concurrency - 1);
+    assert.equal(trace.requests.filter(row => row.reason === 'test_final_burst_failure').length, 1);
+  }
+  assert.equal(caseStatus(report, 'idle_first_request_1'), 'INCOMPLETE');
+});
