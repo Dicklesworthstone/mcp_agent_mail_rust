@@ -734,7 +734,7 @@ impl PassRepository {
         // includes keep the existing fresh-open path. Only the ordinary local
         // archive layout has a small, complete discovery witness here.
         let git_dir = root.join(".git");
-        let capture = || -> Option<(fs::File, fs::File, u32, Vec<u8>, Option<Vec<u8>>)> {
+        let capture = || {
             if repository.is_bare()
                 || repository.path() != git_dir
                 || repository.commondir() != git_dir

@@ -35,6 +35,12 @@
 - [ ] Qualify the final source with both workspace compiler graphs, strict
   Clippy, formatting and updated scanner bindings. E9's passes below qualify
   that earlier source only; these new test changes are still uncompiled.
+  The first strict workspace Clippy request on `51bbbb5b` exited 101 at
+  `reservation_reconcile.rs:737`: the explicit closure return tuple triggered
+  denied `type_complexity`. All 3,952 receipt entries match the frozen source;
+  receipt root `55cfb8476b3e25c13369d5dacbaa90f22ca29200fd5b3b85d7cfd9e3e1a63083`.
+  Preserve this failure. Remove only the redundant annotation, letting Rust
+  infer the same return type, and rerun the unchanged strict gate.
 - [ ] Publish exact source and executed evidence; keep original Bead
   acceptance open until every required native lane has passed.
 
