@@ -6,6 +6,7 @@
 //! DB row, or replaces another generation's reservation history.
 
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -662,6 +663,345 @@ enum ReleaseTargets {
     WithOwnedAliases,
 }
 
+/// Discovery and decoded project identity belong to one bounded batch, never
+/// to the scan cursor. Neither cached value authorizes an artifact write: the
+/// source, paths, HEAD, project bytes and target bytes are observed again under
+/// the ordinary publication locks for every reservation.
+#[derive(Default)]
+struct PassVerification {
+    reuse: bool,
+    #[cfg(unix)]
+    repository: Option<PassRepository>,
+    project: Option<VerifiedProject>,
+    #[cfg(test)]
+    discoveries: usize,
+    #[cfg(test)]
+    project_decodes: usize,
+}
+
+struct VerifiedProject {
+    path: PathBuf,
+    slug: String,
+    human_key: Value,
+    working: Option<Vec<u8>>,
+    committed: Option<Vec<u8>>,
+}
+
+/// Pin directory identities rather than trusting names, mtimes or sizes. The
+/// open handles also prevent inode reuse from making a replaced repository
+/// look like the repository discovered earlier in this batch.
+#[cfg(unix)]
+struct PassRepository {
+    repository: Repository,
+    root: fs::File,
+    git_dir: fs::File,
+    owner_uid: u32,
+    config: Vec<u8>,
+    packed_refs: Option<Vec<u8>>,
+}
+
+#[cfg(unix)]
+impl PassRepository {
+    fn pin_directory(path: &Path) -> std::io::Result<fs::File> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(path)
+    }
+
+    fn same_directory(file: &fs::File, path: &Path, owner_uid: u32) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let Ok(current) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        let Ok(pinned) = file.metadata() else {
+            return false;
+        };
+        current.is_dir()
+            && current.dev() == pinned.dev()
+            && current.ino() == pinned.ino()
+            && current.uid() == owner_uid
+            && pinned.uid() == owner_uid
+    }
+
+    fn capture(repository: Repository, root: &Path) -> Result<Self, Repository> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // Worktrees, gitfiles, unusual extensions and external configuration
+        // includes keep the existing fresh-open path. Only the ordinary local
+        // archive layout has a small, complete discovery witness here.
+        let git_dir = root.join(".git");
+        let capture = || -> Option<(fs::File, fs::File, u32, Vec<u8>, Option<Vec<u8>>)> {
+            if repository.is_bare()
+                || repository.path() != git_dir
+                || repository.commondir() != git_dir
+                || repository.workdir() != Some(root)
+                || git_dir.join("objects").to_str().is_none()
+                || fs::symlink_metadata(git_dir.join("commondir")).is_ok()
+            {
+                return None;
+            }
+            let pinned_root = Self::pin_directory(root).ok()?;
+            let pinned_git_dir = Self::pin_directory(&git_dir).ok()?;
+            let owner_uid = nix::unistd::geteuid().as_raw();
+            // Only intrinsic current-user ownership can be reused. Archives
+            // admitted through sudo/admin rules or safe.directory keep normal
+            // discovery, including its live ownership/configuration check.
+            if pinned_root.metadata().ok()?.uid() != owner_uid
+                || pinned_git_dir.metadata().ok()?.uid() != owner_uid
+            {
+                return None;
+            }
+            let config = read_bounded_regular_bytes(&git_dir.join("config")).ok()??;
+            let text = std::str::from_utf8(&config).ok()?.to_ascii_lowercase();
+            if text.contains("include") || text.contains("[extensions") {
+                return None;
+            }
+            Some((
+                pinned_root,
+                pinned_git_dir,
+                owner_uid,
+                config,
+                read_bounded_regular_bytes(&git_dir.join("packed-refs")).ok()?,
+            ))
+        };
+        match capture() {
+            Some((root, git_dir, owner_uid, config, packed_refs)) => Ok(Self {
+                repository,
+                root,
+                git_dir,
+                owner_uid,
+                config,
+                packed_refs,
+            }),
+            None => Err(repository),
+        }
+    }
+
+    fn matches(&self, root: &Path) -> bool {
+        let git_dir = root.join(".git");
+        nix::unistd::geteuid().as_raw() == self.owner_uid
+            && Self::same_directory(&self.root, root, self.owner_uid)
+            && Self::same_directory(&self.git_dir, &git_dir, self.owner_uid)
+            && self.repository.path() == git_dir
+            && fs::symlink_metadata(git_dir.join("commondir")).is_err_and(|error| {
+                error.kind() == std::io::ErrorKind::NotFound
+            })
+            // These are direct children of the just-checked .git directory;
+            // retain the no-follow file check without walking root ancestors
+            // twice more for every reservation.
+            && read_bounded_regular_bytes(&git_dir.join("config"))
+                .is_ok_and(|current| current.as_ref() == Some(&self.config))
+            // libgit2 caches packed references by a filesystem stamp. Exact
+            // bytes also catch in-place edits that preserve size and mtime.
+            && read_bounded_regular_bytes(&git_dir.join("packed-refs"))
+                .is_ok_and(|current| current == self.packed_refs)
+    }
+
+    fn fresh_objects(&self) -> crate::Result<(Repository, Option<Oid>)> {
+        // A Repository retains decoded objects. Reusing those objects could
+        // conceal a removed/corrupt blob while HEAD is unchanged. Use the
+        // discovered reference location but an empty object cache per row.
+        let head = match self.repository.head() {
+            Ok(head) => Some(
+                head.target()
+                    .ok_or_else(|| invalid("unresolved archive HEAD"))?,
+            ),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let objects = self.repository.commondir().join("objects");
+        // A missing alternate is silently ignored by libgit2. The primary
+        // archive object directory must still exist, including for an unborn
+        // HEAD, before any publication can be considered.
+        if !fs::metadata(&objects)?.is_dir() {
+            return Err(invalid("archive object directory is not a directory"));
+        }
+        let Some(objects) = objects.to_str() else {
+            return Err(invalid("archive object directory is not UTF-8"));
+        };
+        let odb = git2::Odb::new_ext(self.repository.object_format())?;
+        odb.add_disk_alternate(objects)?;
+        Ok((Repository::from_odb(odb)?, head))
+    }
+}
+
+impl PassVerification {
+    fn for_batch() -> Self {
+        Self {
+            reuse: true,
+            ..Self::default()
+        }
+    }
+
+    fn repository(&mut self, root: &Path) -> crate::Result<(Repository, Option<Oid>)> {
+        #[cfg(unix)]
+        {
+            if self.reuse
+                && self
+                    .repository
+                    .as_ref()
+                    .is_some_and(|cached| cached.matches(root))
+            {
+                return self
+                    .repository
+                    .as_ref()
+                    .expect("matched repository")
+                    .fresh_objects();
+            }
+            self.repository = None;
+        }
+        self.project = None;
+        #[cfg(test)]
+        {
+            self.discoveries += 1;
+        }
+        let repository = Repository::open(root)?;
+        #[cfg(unix)]
+        let repository = if self.reuse {
+            match PassRepository::capture(repository, root) {
+                Ok(cached) => {
+                    let result = cached.fresh_objects();
+                    self.repository = Some(cached);
+                    return result;
+                }
+                Err(repository) => repository,
+            }
+        } else {
+            repository
+        };
+        let head = match repository.head() {
+            Ok(head) => Some(
+                head.target()
+                    .ok_or_else(|| invalid("unresolved archive HEAD"))?,
+            ),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok((repository, head))
+    }
+
+    fn verify_project(
+        &mut self,
+        repo: &Repository,
+        tree: Option<&git2::Tree<'_>>,
+        path: &Path,
+        relative: &str,
+        source: &ReleaseSource,
+    ) -> crate::Result<()> {
+        let working = read_verification_bytes(path)?;
+        let committed = committed_verification_bytes(repo, tree, relative)?;
+        if self.project.as_ref().is_some_and(|cached| {
+            cached.path == path
+                && cached.slug == source.project_slug
+                && cached.human_key == source.artifact["project"]
+                && cached.working == working
+                && cached.committed == committed
+        }) {
+            return Ok(());
+        }
+        self.project = None;
+        #[cfg(test)]
+        {
+            self.project_decodes += 1;
+        }
+        for bytes in [working.as_ref(), committed.as_ref()].into_iter().flatten() {
+            let metadata: Value = serde_json::from_slice(bytes)?;
+            if !metadata.is_object()
+                || metadata["slug"] != source.project_slug
+                || metadata["human_key"] != source.artifact["project"]
+            {
+                return Err(invalid(
+                    "archived project identity conflicts with reservation source; preserved",
+                ));
+            }
+        }
+        if self.reuse {
+            self.project = Some(VerifiedProject {
+                path: path.to_path_buf(),
+                slug: source.project_slug.clone(),
+                human_key: source.artifact["project"].clone(),
+                working,
+                committed,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn read_verification_bytes(path: &Path) -> crate::Result<Option<Vec<u8>>> {
+    if crate::path_existing_prefix_has_symlink(path)? {
+        return Err(invalid("reservation verification path contains a symlink"));
+    }
+    read_bounded_regular_bytes(path)
+}
+
+fn read_bounded_regular_bytes(path: &Path) -> crate::Result<Option<Vec<u8>>> {
+    let file = match mcp_agent_mail_core::disk::open_regular_file_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES as u64 {
+        return Err(invalid(
+            "reservation verification file exceeds the byte bound",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_ARTIFACT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_ARTIFACT_BYTES {
+        return Err(invalid(
+            "reservation verification file exceeds the byte bound",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn committed_verification_bytes(
+    repo: &Repository,
+    tree: Option<&git2::Tree<'_>>,
+    path: &str,
+) -> crate::Result<Option<Vec<u8>>> {
+    let Some(tree) = tree else { return Ok(None) };
+    let entry = match tree.get_path(Path::new(path)) {
+        Ok(entry) => entry,
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if entry.kind() != Some(ObjectType::Blob) || !matches!(entry.filemode(), 0o100644 | 0o100755) {
+        return Err(invalid("committed project metadata is not a regular file"));
+    }
+    let (size, kind) = repo.odb()?.read_header(entry.id())?;
+    if kind != ObjectType::Blob || size > MAX_ARTIFACT_BYTES {
+        return Err(invalid("committed project metadata exceeds the byte bound"));
+    }
+    let bytes = repo.find_blob(entry.id())?.content().to_vec();
+    if bytes.len() > MAX_ARTIFACT_BYTES {
+        return Err(invalid("committed project metadata exceeds the byte bound"));
+    }
+    Ok(Some(bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn publish_release(
     cx: &Cx,
     pool: &DbPool,
@@ -670,6 +1010,7 @@ fn publish_release(
     targets: ReleaseTargets,
     attempted: &mut bool,
     archive_state: &mut ReservationArchiveState,
+    verification: &mut PassVerification,
 ) -> Result<bool, ReleaseFailure> {
     // Pool checkout may wait for capacity or connection validation. Never
     // retain the global archive fence while waiting: a current borrower may
@@ -702,25 +1043,13 @@ fn publish_release(
         }
         let root = crate::archive_project_root_checked(&archive)?;
         let repo_root = crate::archive_repo_root_checked(&archive)?;
-        let repo = Repository::open(repo_root)?;
-        let tree = head_tree(&repo)?;
+        let (repo, head) = verification.repository(repo_root)?;
+        let tree = head
+            .map(|head| repo.find_object(head, None)?.peel_to_tree())
+            .transpose()?;
         let project_path = root.join("project.json");
         let project_rel = crate::rel_path_cached(&archive.canonical_repo_root, &project_path)?;
-        for metadata in [
-            read_artifact(&project_path)?,
-            committed_artifact(&repo, tree.as_ref(), &project_rel)?,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if metadata.value["slug"] != original.project_slug
-                || metadata.value["human_key"] != original.artifact["project"]
-            {
-                return Err(invalid(
-                    "archived project identity conflicts with reservation source; preserved",
-                ));
-            }
-        }
+        verification.verify_project(&repo, tree.as_ref(), &project_path, &project_rel, original)?;
         let dir = root.join("file_reservations");
         let stable = dir.join(reservation_artifact_filename(
             original.generation.as_deref(),
@@ -948,6 +1277,7 @@ pub fn reconcile_released_reservation(
         ReleaseTargets::StableOnly,
         &mut false,
         &mut archive_state,
+        &mut PassVerification::default(),
     );
     drop(write_activity);
     log_release_decision(&source, &archive_state, &result);
@@ -1145,6 +1475,7 @@ mod tests {
                     ReleaseTargets::WithOwnedAliases,
                     &mut false,
                     &mut ReservationArchiveState::default(),
+                    &mut PassVerification::default(),
                 )
             });
             let pending = pending_rx.recv_timeout(std::time::Duration::from_secs(5));
@@ -1795,6 +2126,7 @@ mod tests {
                     ReleaseTargets::WithOwnedAliases,
                     &mut false,
                     &mut ReservationArchiveState::default(),
+                    &mut PassVerification::default(),
                 )
                 .unwrap_err()
                 .to_string()

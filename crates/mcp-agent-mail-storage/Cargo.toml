@@ -29,7 +29,7 @@ sha1.workspace = true
 sha2.workspace = true
 hex = "0.4"
 fs2.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["user"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 base64 = "0.23"
 thiserror.workspace = true

@@ -155,7 +155,6 @@ fn admit_source(
     Ok(activity)
 }
 
-#[derive(Clone, Copy)]
 struct PassControl<'a> {
     identity: &'a str,
     // The checkpointed maintenance path binds its logical generation too.
@@ -163,6 +162,7 @@ struct PassControl<'a> {
     // None preserves the ordinary in-memory API's per-release source proof.
     generation: Option<Option<&'a str>>,
     stop: &'a AtomicBool,
+    verification: &'a mut PassVerification,
 }
 
 // History already walks a bounded primary-key page. Priority must bound the
@@ -257,7 +257,7 @@ fn attempt(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
-    control: PassControl<'_>,
+    control: &mut PassControl<'_>,
     id: i64,
     queue: &mut RetryQueue,
     report: &mut ReservationReconcileReport,
@@ -296,6 +296,7 @@ fn attempt(
                 ReleaseTargets::WithOwnedAliases,
                 &mut attempted,
                 &mut archive_state,
+                control.verification,
             );
             (Some(source), result)
         }
@@ -306,7 +307,13 @@ fn attempt(
     // Neither diagnostics nor another item may prolong this exclusion.
     drop(activity);
     #[cfg(test)]
-    tests::observe_boundary(tests::Boundary::Attempt(id));
+    {
+        tests::observe_boundary(tests::Boundary::Verification {
+            discoveries: control.verification.discoveries,
+            project_decodes: control.verification.project_decodes,
+        });
+        tests::observe_boundary(tests::Boundary::Attempt(id));
+    }
     if let Some(source) = source {
         log_release_decision(&source, &archive_state, &result);
     } else {
@@ -445,10 +452,12 @@ fn run_batch(
 ) -> Result<ReservationReconcileReport, String> {
     let mut report = ReservationReconcileReport::default();
     let source_identity = cursor.source_identity.clone();
-    let control = PassControl {
+    let mut verification = PassVerification::for_batch();
+    let mut control = PassControl {
         identity: &source_identity,
         generation: expected_generation,
         stop,
+        verification: &mut verification,
     };
     let due = cursor.retries.due(Instant::now());
     let mut selected_count = i64::try_from(due.len()).expect("bounded retry selection");
@@ -470,7 +479,7 @@ fn run_batch(
             cx,
             pool,
             config,
-            control,
+            &mut control,
             id,
             &mut cursor.retries,
             &mut report,
@@ -545,7 +554,7 @@ fn run_batch(
                 cx,
                 pool,
                 config,
-                control,
+                &mut control,
                 id,
                 &mut cursor.retries,
                 &mut report,
@@ -587,6 +596,10 @@ mod tests {
     pub(super) enum Boundary {
         Selection(bool),
         Attempt(i64),
+        Verification {
+            discoveries: usize,
+            project_decodes: usize,
+        },
     }
 
     type BoundaryObserver = Box<dyn FnMut(Boundary)>;
@@ -622,6 +635,481 @@ mod tests {
                 slot.borrow_mut().take();
             });
         }
+    }
+
+    fn seed_healthy_releases(cx: &Cx, pool: &DbPool, config: &Config, count: i64) -> Vec<PathBuf> {
+        assert!((2..=IDS_PER_BATCH).contains(&count));
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        for id in 402..401 + count {
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id},71,81,'file-{id}.rs',1,'terminal',1000000,9000000,5000000)"
+            )).unwrap();
+        }
+        drop(conn);
+        let archive = crate::ensure_archive(config, "project").unwrap();
+        let project = archive.root.join("project.json");
+        fs::write(&project, br#"{"slug":"project","human_key":"/project"}"#).unwrap();
+        let mut relative = vec!["projects/project/project.json".to_string()];
+        let mut paths = Vec::new();
+        for id in 401..401 + count {
+            let source = read_source(cx, pool, id).unwrap().unwrap();
+            let path = archive
+                .root
+                .join("file_reservations")
+                .join(reservation_artifact_filename(
+                    source.generation.as_deref(),
+                    id,
+                ));
+            crate::ensure_parent_dir(&path).unwrap();
+            fs::write(&path, serde_json::to_vec_pretty(&source.artifact).unwrap()).unwrap();
+            relative.push(crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap());
+            paths.push(path);
+        }
+        crate::commit_paths_with_retry(
+            &archive.repo_root,
+            config,
+            "test: healthy reservation history",
+            &relative.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        paths
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_batch_discovers_repository_and_decodes_project_once() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        super::super::tests::fixture(|cx, pool, config| {
+            let paths = seed_healthy_releases(cx, pool, config, IDS_PER_BATCH);
+            let before = paths
+                .iter()
+                .map(fs::read)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let head = Repository::open(&config.storage_root)
+                .unwrap()
+                .head()
+                .unwrap()
+                .target();
+            let observations = Rc::new(RefCell::new(Vec::new()));
+            let observed = Rc::clone(&observations);
+            let observer = ObserveBoundary::new(move |boundary| {
+                if let Boundary::Verification {
+                    discoveries,
+                    project_decodes,
+                } = boundary
+                {
+                    observed.borrow_mut().push((discoveries, project_decodes));
+                }
+            });
+            // Independent passes cannot inherit discovery or identity proof,
+            // even when they revisit the same healthy history immediately.
+            for _ in 0..2 {
+                let report = run(
+                    cx,
+                    pool,
+                    config,
+                    &mut ReservationReconcileCursor::default(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert_eq!(report.scanned, usize::try_from(IDS_PER_BATCH).unwrap());
+                assert_eq!(report.unchanged, report.scanned);
+                assert_eq!(
+                    (report.attempted, report.repaired, report.deferred),
+                    (0, 0, 0)
+                );
+            }
+            drop(observer);
+            assert_eq!(
+                observations.borrow().len(),
+                usize::try_from(2 * IDS_PER_BATCH).unwrap()
+            );
+            assert!(observations.borrow().iter().all(|entry| *entry == (1, 1)));
+            assert_eq!(
+                paths
+                    .iter()
+                    .map(fs::read)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                Repository::open(&config.storage_root)
+                    .unwrap()
+                    .head()
+                    .unwrap()
+                    .target(),
+                head
+            );
+        });
+    }
+
+    fn project_change_between_rows_is_freshly_verified(committed_only: bool) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        super::super::tests::fixture(|cx, pool, config| {
+            let paths = seed_healthy_releases(cx, pool, config, 2);
+            let second_before = fs::read(&paths[1]).unwrap();
+            let project = config.storage_root.join("projects/project/project.json");
+            let original = fs::read(&project).unwrap();
+            let changed = br#"{"slug":"project","human_key":"/foreign"}"#;
+            let observed = Rc::new(Cell::new(false));
+            let visited = Rc::clone(&observed);
+            let mutation_config = config.clone();
+            let mutation_project = project.clone();
+            let original_for_mutation = original.clone();
+            let observer = ObserveBoundary::new(move |boundary| {
+                if boundary != Boundary::Attempt(401) || visited.replace(true) {
+                    return;
+                }
+                let modified = fs::metadata(&mutation_project).unwrap().modified().unwrap();
+                fs::write(&mutation_project, changed).unwrap();
+                if committed_only {
+                    crate::commit_paths_with_retry(
+                        &mutation_config.storage_root,
+                        &mutation_config,
+                        "test: changed committed project identity",
+                        &["projects/project/project.json"],
+                    )
+                    .unwrap();
+                    fs::write(&mutation_project, &original_for_mutation).unwrap();
+                } else {
+                    // Identical length and mtime cannot stand in for the
+                    // fresh working-byte comparison under project ownership.
+                    fs::File::options()
+                        .write(true)
+                        .open(&mutation_project)
+                        .unwrap()
+                        .set_times(fs::FileTimes::new().set_modified(modified))
+                        .unwrap();
+                }
+            });
+            let report = run(
+                cx,
+                pool,
+                config,
+                &mut ReservationReconcileCursor::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            drop(observer);
+            assert!(observed.get());
+            assert_eq!(
+                (report.scanned, report.unchanged, report.deferred),
+                (2, 1, 1)
+            );
+            assert_eq!((report.attempted, report.repaired), (0, 0));
+            assert_eq!(fs::read(&paths[1]).unwrap(), second_before);
+            assert_eq!(
+                fs::read(project).unwrap(),
+                if committed_only {
+                    original
+                } else {
+                    changed.to_vec()
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn pass_rechecks_changed_working_project_bytes_between_rows() {
+        project_change_between_rows_is_freshly_verified(false);
+    }
+
+    #[test]
+    fn pass_rechecks_new_head_project_identity_between_rows() {
+        project_change_between_rows_is_freshly_verified(true);
+    }
+
+    #[test]
+    fn pass_rechecks_changed_repository_configuration_between_rows() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        super::super::tests::fixture(|cx, pool, config| {
+            let paths = seed_healthy_releases(cx, pool, config, 2);
+            let second_before = fs::read(&paths[1]).unwrap();
+            let config_path = config.storage_root.join(".git/config");
+            let original = fs::read(&config_path).unwrap();
+            let mut changed = original.clone();
+            changed.extend_from_slice(b"\n[unfinished-section\n");
+            let observed = Rc::new(Cell::new(false));
+            let visited = Rc::clone(&observed);
+            let mutation_path = config_path.clone();
+            let observer = ObserveBoundary::new(move |boundary| {
+                if boundary == Boundary::Attempt(401) && !visited.replace(true) {
+                    fs::write(&mutation_path, &changed).unwrap();
+                }
+            });
+            let result = run(
+                cx,
+                pool,
+                config,
+                &mut ReservationReconcileCursor::default(),
+                &AtomicBool::new(false),
+            );
+            drop(observer);
+            assert!(observed.get());
+            // Establish that actual Git discovery rejects the changed config,
+            // rather than asserting only a cache counter.
+            let discovery_failed = Repository::open(&config.storage_root).is_err();
+            fs::write(config_path, original).unwrap();
+            assert!(discovery_failed);
+            let report = result.unwrap();
+            assert_eq!(
+                (report.scanned, report.unchanged, report.deferred),
+                (2, 1, 1)
+            );
+            assert_eq!((report.attempted, report.repaired), (0, 0));
+            assert_eq!(fs::read(&paths[1]).unwrap(), second_before);
+        });
+    }
+
+    #[test]
+    fn pass_rechecks_packed_reference_bytes_with_preserved_mtime() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        super::super::tests::fixture(|cx, pool, config| {
+            let paths = seed_healthy_releases(cx, pool, config, 2);
+            let second_before = fs::read(&paths[1]).unwrap();
+            let repository = Repository::open(&config.storage_root).unwrap();
+            let head = repository.head().unwrap();
+            let healthy = head.target().unwrap();
+            let branch = head.name().unwrap().to_string();
+            drop(head);
+            let project = config.storage_root.join("projects/project/project.json");
+            let original = fs::read(&project).unwrap();
+            fs::write(&project, br#"{"slug":"project","human_key":"/foreign"}"#).unwrap();
+            crate::commit_paths_with_retry(
+                &config.storage_root,
+                config,
+                "test: packed reference changes project identity",
+                &["projects/project/project.json"],
+            )
+            .unwrap();
+            let conflicting = repository.head().unwrap().target().unwrap();
+            assert_ne!(healthy, conflicting);
+            fs::write(&project, original).unwrap();
+            let packed = repository.path().join("packed-refs");
+            let healthy_refs = format!("# pack-refs with: peeled\n{healthy} {branch}\n");
+            let conflicting_refs = format!("# pack-refs with: peeled\n{conflicting} {branch}\n");
+            assert_eq!(healthy_refs.len(), conflicting_refs.len());
+            fs::write(&packed, healthy_refs).unwrap();
+            // Preserve the loose reference as evidence while making the real
+            // repository resolve HEAD through its packed reference file.
+            fs::rename(
+                repository.path().join(&branch),
+                repository.path().join("held-loose-head"),
+            )
+            .unwrap();
+            assert_eq!(
+                Repository::open(&config.storage_root)
+                    .unwrap()
+                    .head()
+                    .unwrap()
+                    .target(),
+                Some(healthy)
+            );
+            let modified = fs::metadata(&packed).unwrap().modified().unwrap();
+            let observed = Rc::new(Cell::new(false));
+            let visited = Rc::clone(&observed);
+            let observer = ObserveBoundary::new(move |boundary| {
+                if boundary == Boundary::Attempt(401) && !visited.replace(true) {
+                    fs::write(&packed, &conflicting_refs).unwrap();
+                    fs::File::options()
+                        .write(true)
+                        .open(&packed)
+                        .unwrap()
+                        .set_times(fs::FileTimes::new().set_modified(modified))
+                        .unwrap();
+                }
+            });
+            let report = run(
+                cx,
+                pool,
+                config,
+                &mut ReservationReconcileCursor::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            drop(observer);
+            assert!(observed.get());
+            assert_eq!(
+                Repository::open(&config.storage_root)
+                    .unwrap()
+                    .head()
+                    .unwrap()
+                    .target(),
+                Some(conflicting)
+            );
+            assert_eq!(
+                (report.scanned, report.unchanged, report.deferred),
+                (2, 1, 1)
+            );
+            assert_eq!((report.attempted, report.repaired), (0, 0));
+            assert_eq!(fs::read(&paths[1]).unwrap(), second_before);
+        });
+    }
+
+    #[test]
+    fn pass_refuses_missing_objects_before_unborn_head_publication() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        super::super::tests::fixture(|cx, pool, config| {
+            let paths = seed_healthy_releases(cx, pool, config, 2);
+            let second_before = fs::read(&paths[1]).unwrap();
+            let repository = Repository::open(&config.storage_root).unwrap();
+            let branch = repository.head().unwrap().name().unwrap().to_string();
+            let objects = repository.path().join("objects");
+            let held = repository.path().join("held-objects-directory");
+            let observed = Rc::new(Cell::new(false));
+            let visited = Rc::clone(&observed);
+            let mutation_root = config.storage_root.clone();
+            let mutation_objects = objects.clone();
+            let mutation_held = held.clone();
+            let observer = ObserveBoundary::new(move |boundary| {
+                if boundary == Boundary::Attempt(401) && !visited.replace(true) {
+                    Repository::open(&mutation_root)
+                        .unwrap()
+                        .set_head("refs/heads/missing-objects-test")
+                        .unwrap();
+                    fs::rename(&mutation_objects, &mutation_held).unwrap();
+                }
+            });
+            let result = run(
+                cx,
+                pool,
+                config,
+                &mut ReservationReconcileCursor::default(),
+                &AtomicBool::new(false),
+            );
+            drop(observer);
+            assert!(observed.get());
+            let untouched = !objects.exists();
+            fs::rename(held, objects).unwrap();
+            Repository::open(&config.storage_root)
+                .unwrap()
+                .set_head(&branch)
+                .unwrap();
+            let report = result.unwrap();
+            assert_eq!(
+                (report.scanned, report.unchanged, report.deferred),
+                (2, 1, 1)
+            );
+            assert_eq!((report.attempted, report.repaired), (0, 0));
+            assert!(untouched, "refused publication recreated object storage");
+            assert_eq!(fs::read(&paths[1]).unwrap(), second_before);
+        });
+    }
+
+    #[test]
+    fn pass_does_not_hide_a_removed_project_blob_in_the_object_cache() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        super::super::tests::fixture(|cx, pool, config| {
+            let paths = seed_healthy_releases(cx, pool, config, 2);
+            let second_before = fs::read(&paths[1]).unwrap();
+            let repository = Repository::open(&config.storage_root).unwrap();
+            let tree = head_tree(&repository).unwrap().unwrap();
+            let oid = tree
+                .get_path(Path::new("projects/project/project.json"))
+                .unwrap()
+                .id()
+                .to_string();
+            let object = repository
+                .path()
+                .join("objects")
+                .join(&oid[..2])
+                .join(&oid[2..]);
+            let held = repository.path().join("held-project-object");
+            assert!(
+                object.is_file(),
+                "fixture must exercise a real loose Git object"
+            );
+            let observed = Rc::new(Cell::new(false));
+            let visited = Rc::clone(&observed);
+            let moved_object = object.clone();
+            let moved_held = held.clone();
+            let observer = ObserveBoundary::new(move |boundary| {
+                if boundary == Boundary::Attempt(401) && !visited.replace(true) {
+                    fs::rename(&moved_object, &moved_held).unwrap();
+                }
+            });
+            let result = run(
+                cx,
+                pool,
+                config,
+                &mut ReservationReconcileCursor::default(),
+                &AtomicBool::new(false),
+            );
+            drop(observer);
+            assert!(observed.get());
+            fs::rename(held, object).unwrap();
+            let report = result.unwrap();
+            assert_eq!(
+                (report.scanned, report.unchanged, report.deferred),
+                (2, 1, 1)
+            );
+            assert_eq!((report.attempted, report.repaired), (0, 0));
+            assert_eq!(fs::read(&paths[1]).unwrap(), second_before);
+        });
+    }
+
+    #[test]
+    fn pass_rediscovers_a_replaced_git_directory_between_rows() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        super::super::tests::fixture(|cx, pool, config| {
+            let paths = seed_healthy_releases(cx, pool, config, 2);
+            let second_before = fs::read(&paths[1]).unwrap();
+            let observed = Rc::new(Cell::new(false));
+            let visited = Rc::clone(&observed);
+            let root = config.storage_root.clone();
+            let observer = ObserveBoundary::new(move |boundary| {
+                if boundary == Boundary::Attempt(401) && !visited.replace(true) {
+                    fs::rename(root.join(".git"), root.join("held-git-directory")).unwrap();
+                    Repository::init(&root).unwrap();
+                }
+            });
+            let report = run(
+                cx,
+                pool,
+                config,
+                &mut ReservationReconcileCursor::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            drop(observer);
+            assert!(observed.get());
+            assert_eq!(
+                (report.scanned, report.unchanged, report.deferred),
+                (2, 1, 0)
+            );
+            assert_eq!((report.attempted, report.repaired), (1, 1));
+            assert_eq!(fs::read(&paths[1]).unwrap(), second_before);
+            let repository = Repository::open(&config.storage_root).unwrap();
+            let tree = head_tree(&repository).unwrap().unwrap();
+            let entry = tree
+                .get_path(Path::new(
+                    "projects/project/file_reservations/id-402-gaabb.json",
+                ))
+                .unwrap();
+            assert_eq!(
+                repository.find_blob(entry.id()).unwrap().content(),
+                second_before
+            );
+            // The former repository cannot supply a false "already committed"
+            // result for the replacement repository's initially unborn HEAD.
+            assert!(config.storage_root.join("held-git-directory").is_dir());
+        });
     }
 
     fn exercise_promotion_between_items(boundary: Boundary) {
@@ -984,6 +1472,7 @@ mod tests {
                     ReleaseTargets::WithOwnedAliases,
                     &mut attempted,
                     &mut ReservationArchiveState::default(),
+                    &mut PassVerification::default(),
                 );
                 assert!(
                     !attempted,
@@ -1002,10 +1491,11 @@ mod tests {
                         cx,
                         pool,
                         config,
-                        PassControl {
+                        &mut PassControl {
                             identity: &pool.sqlite_identity_key(),
                             generation: None,
                             stop: &AtomicBool::new(false),
+                            verification: &mut PassVerification::default(),
                         },
                         401,
                         &mut cursor.retries,
@@ -1119,10 +1609,11 @@ mod tests {
                     cx,
                     pool,
                     config,
-                    PassControl {
+                    &mut PassControl {
                         identity: &pool.sqlite_identity_key(),
                         generation: None,
                         stop: &AtomicBool::new(false),
+                        verification: &mut PassVerification::default(),
                     },
                     401,
                     &mut queue,
@@ -1501,6 +1992,7 @@ mod tests {
                     ReleaseTargets::WithOwnedAliases,
                     &mut false,
                     &mut ReservationArchiveState::default(),
+                    &mut PassVerification::default(),
                 )
                 .unwrap()
             );
