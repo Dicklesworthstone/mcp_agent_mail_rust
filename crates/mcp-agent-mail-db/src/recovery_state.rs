@@ -136,6 +136,12 @@ pub struct RecoveryReadWitness {
 }
 
 impl RecoveryReadWitness {
+    /// Logical database generation whose completed recovery state this witness covers.
+    #[must_use]
+    pub fn generation(&self) -> &str {
+        &self.manifest.generation
+    }
+
     pub(crate) fn matches_manifest(&self, manifest: &Manifest) -> bool {
         &self.manifest == manifest
     }

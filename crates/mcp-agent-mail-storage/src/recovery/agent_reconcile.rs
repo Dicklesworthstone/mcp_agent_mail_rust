@@ -6,6 +6,7 @@
 //! maintenance pass repairs those profiles without changing mailbox rows or
 //! relying on another registration, message, or client read.
 
+mod durability;
 mod observation;
 mod retry;
 
@@ -189,6 +190,7 @@ struct AgentSelection {
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
+    config: &Config,
     cursor: &mut AgentReconcileCursor,
 ) -> Result<Vec<Candidate>, String> {
     let identity = pool.sqlite_identity_key();
@@ -198,6 +200,7 @@ fn select_ids(
             ..Default::default()
         };
     }
+    durability::seed_retries(config, cursor);
     let conn = outcome(block_on(pool.acquire(cx)))?;
     // Discovery gates both the roster and retries. Quarantine a failed reader
     // without catching publication or replacing the retry queue's lifetime lock.
@@ -802,7 +805,7 @@ pub fn reconcile_agent_batch(
         let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
             .ok_or("agent reconciliation deferred: recovery promotion or admission contention")?;
         validate_source(pool, config)?;
-        select_ids(cx, pool, cursor)?
+        select_ids(cx, pool, config, cursor)?
     };
     let selected_identity = cursor.source_identity.clone();
     let scan_started_after = cursor.after;
@@ -845,8 +848,24 @@ pub fn reconcile_agent_batch(
                 "agent reconciliation source changed after selection; rescan required".into(),
             );
         }
-        let result = read_source(cx, pool, id)
-            .and_then(|source| reconcile_agent(cx, pool, config, &source, stop));
+        let result = read_source(cx, pool, id).and_then(|source| {
+            let tickets = crate::recovery::message_reconcile::database::durability::profiles::tickets_for(
+                config,
+                &source.project_slug,
+                &source.profile,
+            );
+            let repaired = reconcile_agent(cx, pool, config, &source, stop)?;
+            durability::confirm_repaired(
+                cx,
+                pool,
+                config,
+                &selected_identity,
+                id,
+                &tickets,
+                stop,
+            );
+            Ok(repaired)
+        });
         // Do not keep database-promotion exclusion alive across diagnostics.
         // An interrupted publication leaves its files for the same cursor to
         // verify on retry, not a captured profile queued for later overwrite.
@@ -1118,7 +1137,7 @@ mod tests {
         true
     }
 
-    fn with_mailbox(test: impl FnOnce(&Cx, &DbPool, &Config, &Path)) {
+    pub(super) fn with_mailbox(test: impl FnOnce(&Cx, &DbPool, &Config, &Path)) {
         if isolate_admission_test() {
             return;
         }
@@ -1161,13 +1180,13 @@ mod tests {
         .unwrap()
     }
 
-    fn profile_path(config: &Config) -> std::path::PathBuf {
+    pub(super) fn profile_path(config: &Config) -> std::path::PathBuf {
         config
             .storage_root
             .join("projects/project/agents/BlueLake/profile.json")
     }
 
-    fn assert_profile_committed(config: &Config) -> Value {
+    pub(super) fn assert_profile_committed(config: &Config) -> Value {
         let path = profile_path(config);
         let bytes = fs::read(&path).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("never-archive-this-secret"));
@@ -1396,7 +1415,7 @@ mod tests {
                     cursor.retries.defer(101, ready_since);
                     let saved = format!("{cursor:?}");
                     DISCOVERY_READ_FAULT.with(|slot| slot.set(Some((failing_query, panic))));
-                    let error = select_ids(cx, pool, &mut cursor)
+                    let error = select_ids(cx, pool, config, &mut cursor)
                         .expect_err("the selected discovery read must fail");
                     assert!(DISCOVERY_READ_FAULT.with(|slot| slot.get().is_none()));
                     assert_eq!(format!("{cursor:?}"), saved);
@@ -1471,7 +1490,7 @@ mod tests {
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
             conn.execute_raw("PRAGMA query_only = ON").unwrap();
             drop(conn);
-            let error = select_ids(cx, pool, &mut cursor)
+            let error = select_ids(cx, pool, config, &mut cursor)
                 .expect_err("a query-only source cannot authorize repair");
             assert!(error.contains("query-only"), "{error}");
             assert_eq!(format!("{cursor:?}"), saved);
@@ -1513,7 +1532,7 @@ mod tests {
             cursor.retries.defer(101, Instant::now());
             let saved = format!("{cursor:?}");
             DISCOVERY_READ_FAULT.with(|slot| slot.set(Some((3, false))));
-            assert!(select_ids(cx, pool, &mut cursor).is_err());
+            assert!(select_ids(cx, pool, config, &mut cursor).is_err());
             assert!(DISCOVERY_READ_FAULT.with(|slot| slot.get().is_none()));
             assert_eq!(format!("{cursor:?}"), saved);
             assert_eq!(fs::read(profile_path(config)).unwrap(), previous);
