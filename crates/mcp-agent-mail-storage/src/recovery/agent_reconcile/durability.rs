@@ -84,8 +84,8 @@ fn read_current(cx: &Cx, pool: &DbPool, id: i64) -> Result<(AgentSource, String)
     };
     // Limit unwind recovery to the engine reads and decoding. A panicked
     // reader is retired; neither publication nor worker ownership is caught.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read))
-        .unwrap_or_else(|_| {
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_or_else(|_| {
             Err(Failure::source_unavailable(
                 "profile durability source read panicked",
             ))
@@ -209,7 +209,10 @@ mod tests {
         crate::wbq_start();
         let before = crate::wbq_stats().unrecoverable_errors;
         assert_eq!(crate::wbq_enqueue(op.clone()), WbqEnqueueResult::Enqueued);
-        assert_eq!(crate::wbq_flush_status(), WbqFlushOutcome::PersistenceFailed);
+        assert_eq!(
+            crate::wbq_flush_status(),
+            WbqFlushOutcome::PersistenceFailed
+        );
         assert_eq!(crate::wbq_stats().unrecoverable_errors, before + 1);
         assert!(crate::durability_degraded());
     }
@@ -288,14 +291,9 @@ mod tests {
                 ceiling: Some(999),
                 ..Default::default()
             };
-            let report = reconcile_agent_batch(
-                cx,
-                pool,
-                config,
-                &mut cursor,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+            let report =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
             assert_eq!(
                 (report.scanned, report.repaired, report.deferred),
                 (1, 1, 0)
@@ -346,10 +344,7 @@ mod tests {
         with_mailbox(|cx, pool, config, _| {
             let failed = failed_profile(cx, pool, config);
             retain_obstruction(config, "retained-conflicting-profile-obstruction");
-            let WriteOp::AgentProfile {
-                mut agent_json, ..
-            } = failed
-            else {
+            let WriteOp::AgentProfile { mut agent_json, .. } = failed else {
                 unreachable!()
             };
             agent_json["deregistered_at"] = json!(mcp_agent_mail_db::micros_to_iso(3000000));
@@ -415,7 +410,10 @@ mod tests {
             assert_eq!(drive(cx, pool, config).repaired, 1);
             assert_profile_committed(config);
             assert!(crate::durability_degraded());
-            assert_eq!(crate::wbq_shutdown_status(), WbqFlushOutcome::PersistenceFailed);
+            assert_eq!(
+                crate::wbq_shutdown_status(),
+                WbqFlushOutcome::PersistenceFailed
+            );
         });
     }
 
@@ -435,7 +433,10 @@ mod tests {
                 mcp_agent_mail_db::micros_to_iso(4000000)
             );
             assert!(crate::durability_degraded());
-            assert_eq!(crate::wbq_shutdown_status(), WbqFlushOutcome::PersistenceFailed);
+            assert_eq!(
+                crate::wbq_shutdown_status(),
+                WbqFlushOutcome::PersistenceFailed
+            );
         });
     }
 
@@ -458,7 +459,10 @@ mod tests {
             assert_eq!(drive(cx, pool, config).repaired, 1);
             assert!(assert_profile_committed(config)["deregistered_at"].is_null());
             assert!(crate::durability_degraded());
-            assert_eq!(crate::wbq_shutdown_status(), WbqFlushOutcome::PersistenceFailed);
+            assert_eq!(
+                crate::wbq_shutdown_status(),
+                WbqFlushOutcome::PersistenceFailed
+            );
         });
     }
 
@@ -485,7 +489,10 @@ mod tests {
                     .contains("private-unsupported-profile-credential")
             );
             assert!(crate::durability_degraded());
-            assert_eq!(crate::wbq_shutdown_status(), WbqFlushOutcome::PersistenceFailed);
+            assert_eq!(
+                crate::wbq_shutdown_status(),
+                WbqFlushOutcome::PersistenceFailed
+            );
         });
     }
 

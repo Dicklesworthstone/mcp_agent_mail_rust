@@ -2,7 +2,8 @@
 
 ## Shared stdio client initialization (`br-1w2z0`, scoped contribution)
 
-This shell-client change is based on main `615f4b2f`. Its real transport
+This shell-client change started on main `615f4b2f` and integrates `6eb6264d`.
+Its real transport
 control uses a privately extracted, signature-verified v0.3.41 server.
 It does not qualify current Rust source or close the original direct-suite
 task. EmeraldEagle's ownership and shared-root path-safety work are preserved.
@@ -35,7 +36,8 @@ current compiler qualification remains blocked by ordinary RCH admission.
   acceptance/status/owner, and hand off the exact client source and limits.
 - [x] Prepare the reviewed client fix, regression controls and scoped Bead
   evidence for publication on `mossytern/stdio-initialize-validation-20261124`.
-  Git and the Agent Mail handoff record the final commit and review link.
+- [x] Publish the client fix as `ca78ce6f` and draft PR #409. Preserve both
+  stdio and recovery TODO sections when integrating main's concurrent update.
 - [ ] Complete the inherited direct-client inventory and current-source suite
   qualification under the original task; do not count this contribution as
   completion of peer path-safety work or Rust recovery qualification.
@@ -46,7 +48,82 @@ logs retain all ten cases. `verified-binaries.json` binds release identity;
 `real-client-verification.json` binds the client/self-test hashes, actual mail
 ID, correlated replies, restarted receipt and committed archive copies.
 
-## Active recovery qualification (`br-u9bhg`, MossyTern)
+## Fresh review of concurrent recovery publication (`br-u9bhg`)
+
+This checkout integrates main `615f4b2f`, including incremental recovery
+seals, profile durability repair and Git contention changes. PR #408 was
+merged as `13ef2cea`; its older static receipts do not qualify this tree.
+The concurrent probes are still uncompiled and have executed zero assertions.
+
+The original `c4e665f7` probe was invalid: replacing ACK 444 with ACK 999
+conflicted with the intentional first-ACK/earliest-timestamp contract. Its
+source and refusal logs remain preserved. The corrected scenario publishes
+a first read at 444, then attempts a first ACK at 999 with the production
+`COALESCE` rule and an explicit SQL precondition that ACK is still NULL.
+
+- [x] Reread every published Rust hunk, the storage flush/clone regression,
+  durable Git debt, state-lock ordering and incomplete-publication repair.
+- [x] Refresh Beads/BV, git and peer activity; keep the original qualification
+  task in progress rather than taking a second unfinished soak task.
+- [x] Verify live disk reservations before the normal native request.
+- [x] Preserve the first DB request's terminal queue-timeout refusal: strict
+  RCH on `vmi1149989`, exit 103, no Cargo execution or native assertions.
+- [x] Preserve the new probes' unavailable-worker refusal (exit 103) and
+  subsequent selected-worker disk-admission refusal (exit 120, RCH-E330).
+  Both happened before Cargo; native assertions remain zero.
+- [x] Isolate a new baseline probe from the published checkout's source freeze.
+- [x] Reuse the real database setup for file-backed canonical and runtime
+  connections, with concurrent autocommit enabled on the runtime peer.
+- [x] Correct the invalid timestamp-overwrite model without changing the
+  production first-ACK or earliest-timestamp behavior.
+- [x] Add the interrupted first-read control, requiring an actual read-444,
+  ACK-NULL artifact and incomplete witness before the competing commit.
+- [x] Require ACK NULL immediately before the peer's real COALESCE update;
+  retain actual SQL ACK-999 and recovered ACK-999 assertions.
+- [x] Execute the supporting system-SQLite WAL schedule: seven SQL assertions
+  confirm a first ACK can commit while an older read snapshot remains open,
+  and a later COALESCE update preserves it. This is not Rust runtime evidence.
+- [x] Retain the positive retry control when writer admission excludes the peer.
+- [x] Integrate current main and read the recovery seal/publication changes;
+  preserve all older source and failed receipts.
+- [x] Repair observed workspace formatting failures in five upstream storage
+  paths by applying the reported whitespace changes manually.
+- [x] Pass the current workspace formatting check.
+- [x] Complete normal-rule UBS across the 41-path current scope: 11 fresh
+  scans and 30 byte-identical report reuses, with all 52 reviewed critical,
+  56,497 warning and 20,651 informational source findings retained.
+- [x] Attempt the locked current-tree all-targets check through strict RCH:
+  hz4 refused at disk admission (E330/exit 120), before Cargo, growth zero.
+- [ ] Compile and execute both new baseline probes through ordinary strict
+  RCH admission; distinguish a target failure from an invalid control.
+- [ ] If the target fails, implement the smallest production repair supported
+  by that failure, preserving cancellation and caller-owned transactions.
+- [ ] Execute both probes again, retain the original failure, and require
+  successful peer commit/publication after the repaired operation.
+- [ ] Pass all three required locked workspace compiler/Clippy graphs on the
+  exact final source and complete its changed-file scanner review.
+- [ ] Execute the original DB, storage, tools and CLI acceptance lanes; keep
+  their nonzero counts separate from compile, scanner and admission results.
+- [x] Record the invalid-probe correction and current scope in the original
+  bead, flush only intended graph records, confirm zero cycles, and hand off
+  the exact source and limitations. Comment 4793 supersedes 4792; the prior
+  probe and mail 310 are preserved as historical, unexecuted evidence.
+
+The superseded probe's source SHA-256 was
+`617c462a2874e101ee0934662997a3838657f944ba871f5748d656216d906e80`.
+Historical `concurrent-ack-v2-*` evidence remains under
+`/data/tmp/am-mossytern-20261123/`. It supplies no runtime or corrected-source
+qualification. Current failures and results use the `current-main-*` prefix.
+No test limit, disk reservation, worker drain or peer job was changed.
+Current probe source SHA-256:
+`f8e46b6dd405627d5f4e443f8d19ef7afe6ac49993ece89942047ac712c896ff`.
+The complete static report is `current-main-v1-ubs-final-report.json`
+(SHA-256 `39c368878852ad8323437e139ca68de097db525f7d22be6b61f481e9087e2da2`).
+The initial aggregate failed to normalize absolute scanner paths; its original
+bytes remain explicitly marked invalid, and the corrected aggregate asserts
+the prior finding counts for all reused files. No finding was suppressed.
+
+## Published recovery qualification history (`br-u9bhg`, MossyTern)
 
 Current base: `c5672259`. Its durable Git outbox is upstream work, reviewed
 here without claiming authorship or native qualification. The superseded
@@ -93,8 +170,8 @@ inventory candidate and its complete source/Beads history remain intact at
   bead, flush its scoped JSONL and confirm zero dependency cycles.
 - [x] Commit and push the reviewable work as draft PR #408, with native
   assertions explicitly zero and `br-u9bhg` still in progress.
-- [ ] Merge only after original native acceptance and current integration
-  qualification; the draft does not establish release readiness.
+- [ ] Complete original native acceptance and current integration qualification
+  after PR #408's merge; publication does not establish release readiness.
 - [x] Hand off current results in Agent Mail message 303 and release all
   nine source/TODO reservations (2026-11-24 01:46:06 UTC).
 

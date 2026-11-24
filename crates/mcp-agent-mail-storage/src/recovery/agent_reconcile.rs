@@ -849,21 +849,14 @@ pub fn reconcile_agent_batch(
             );
         }
         let result = read_source(cx, pool, id).and_then(|source| {
-            let tickets = crate::recovery::message_reconcile::database::durability::profiles::tickets_for(
-                config,
-                &source.project_slug,
-                &source.profile,
-            );
+            let tickets =
+                crate::recovery::message_reconcile::database::durability::profiles::tickets_for(
+                    config,
+                    &source.project_slug,
+                    &source.profile,
+                );
             let repaired = reconcile_agent(cx, pool, config, &source, stop)?;
-            durability::confirm_repaired(
-                cx,
-                pool,
-                config,
-                &selected_identity,
-                id,
-                &tickets,
-                stop,
-            );
+            durability::confirm_repaired(cx, pool, config, &selected_identity, id, &tickets, stop);
             Ok(repaired)
         });
         // Do not keep database-promotion exclusion alive across diagnostics.

@@ -3,11 +3,13 @@
 //! Nothing is eligible for replay until the entire pinned EOF has been checked:
 //! a terminal marker can follow its intent, or precede a duplicate of it. Each
 //! poll consumes bounded bytes/records and revalidates the retained file handle.
-//! Oversized snapshots/state and unsupported schemas are errors, never empty
-//! queues. This stricter maintenance reader does not rewrite or compact evidence.
+//! Candidate windows are checked against the same complete snapshot before
+//! unresolved payloads are admitted. Memory is bounded by unresolved work and
+//! one window, not the journal's completed history. Unsupported records or live
+//! queue overload remain errors. This reader never rewrites journal evidence.
 
-use std::collections::{HashMap, HashSet};
-use std::io::{self, BufRead, Read};
+use std::collections::HashMap;
+use std::io::{self, BufRead, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mcp_agent_mail_core::Config;
@@ -20,7 +22,6 @@ use serde_json::Value;
 const BYTES_PER_POLL: usize = 256 * 1024;
 const RECORDS_PER_POLL: usize = 256;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
-const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IDENTITIES: usize = 65_536;
 
@@ -73,7 +74,8 @@ impl Intent {
 #[derive(Clone, Copy)]
 struct Limits {
     record_bytes: usize,
-    snapshot_bytes: u64,
+    candidate_bytes: usize,
+    candidate_identities: usize,
     pending_bytes: usize,
     identities: usize,
 }
@@ -82,7 +84,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             record_bytes: MAX_RECORD_BYTES,
-            snapshot_bytes: MAX_SNAPSHOT_BYTES,
+            candidate_bytes: MAX_PENDING_BYTES,
+            candidate_identities: MAX_IDENTITIES,
             pending_bytes: MAX_PENDING_BYTES,
             identities: MAX_IDENTITIES,
         }
@@ -165,16 +168,28 @@ impl Scanner {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Candidates,
+    Terminals,
+    Admit,
+}
+
 struct Snapshot {
     kind: Kind,
     directory: JournalDirectory,
-    reader: io::BufReader<io::Take<std::fs::File>>,
+    reader: io::BufReader<std::fs::File>,
     initial_bytes: u64,
+    position: u64,
+    line_start: u64,
     line: Vec<u8>,
+    phase: Phase,
+    resume_at: u64,
+    candidates: HashMap<Key, (u64, Intent, usize)>,
+    candidate_bytes: usize,
+    admission: Option<std::collections::hash_map::IntoIter<Key, (u64, Intent, usize)>>,
     pending: HashMap<Key, (u64, Intent, usize)>,
-    terminal: HashSet<Key>,
     pending_bytes: usize,
-    next_order: u64,
     skipped: u64,
     limits: Limits,
 }
@@ -196,28 +211,28 @@ impl Snapshot {
             Err(error) => return Err(error),
         };
         let initial_bytes = file.metadata()?.len();
-        if initial_bytes > limits.snapshot_bytes {
-            return Err(invalid(
-                "closeout journal snapshot exceeds the background scan byte limit; journal preserved; operator review required",
-            ));
-        }
         Ok(Some(Self {
             kind,
             directory,
-            reader: io::BufReader::with_capacity(8192, file.take(initial_bytes)),
+            reader: io::BufReader::with_capacity(8192, file),
             initial_bytes,
+            position: 0,
+            line_start: 0,
             line: Vec::new(),
+            phase: Phase::Candidates,
+            resume_at: 0,
+            candidates: HashMap::new(),
+            candidate_bytes: 0,
+            admission: None,
             pending: HashMap::new(),
-            terminal: HashSet::new(),
             pending_bytes: 0,
-            next_order: 0,
             skipped: 0,
             limits,
         }))
     }
 
     fn validate(&self) -> io::Result<()> {
-        let file = self.reader.get_ref().get_ref();
+        let file = self.reader.get_ref();
         self.directory.validate_file(self.kind.file_name(), file)?;
         if file.metadata()?.len() < self.initial_bytes {
             return Err(invalid(
@@ -225,6 +240,23 @@ impl Snapshot {
             ));
         }
         Ok(())
+    }
+
+    fn seek_to(&mut self, position: u64) -> io::Result<()> {
+        self.validate()?;
+        // BufReader::seek discards prefetched bytes. Keep the original handle
+        // and EOF: no phase may reopen a different source or chase appends.
+        self.reader.seek(SeekFrom::Start(position))?;
+        self.position = position;
+        self.line_start = position;
+        self.line.clear();
+        Ok(())
+    }
+
+    fn validate_candidates(&mut self, resume_at: u64) -> io::Result<()> {
+        self.resume_at = resume_at;
+        self.phase = Phase::Terminals;
+        self.seek_to(0)
     }
 
     fn advance(
@@ -235,20 +267,48 @@ impl Snapshot {
     ) -> io::Result<bool> {
         while bytes > 0 && records > 0 {
             check_shutdown(shutdown)?;
-            let available = self.reader.fill_buf()?;
-            if available.is_empty() {
-                if self.reader.get_ref().limit() != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "closeout journal truncated before its pinned EOF",
-                    ));
+            if self.phase == Phase::Admit {
+                let next = self.admission.as_mut().and_then(Iterator::next);
+                if let Some((key, entry)) = next {
+                    self.admit_pending(key, entry)?;
+                    records -= 1;
+                } else {
+                    self.admission = None;
+                    self.phase = Phase::Candidates;
+                    self.seek_to(self.resume_at)?;
+                    if self.position == self.initial_bytes {
+                        return Ok(true);
+                    }
                 }
+                continue;
+            }
+            if self.position == self.initial_bytes {
                 if !self.line.is_empty() {
                     self.accept_line()?;
+                    records -= 1;
+                    continue;
                 }
-                return Ok(true);
+                match self.phase {
+                    Phase::Candidates if self.candidates.is_empty() => return Ok(true),
+                    Phase::Candidates => self.validate_candidates(self.position)?,
+                    Phase::Terminals => {
+                        self.admission = Some(std::mem::take(&mut self.candidates).into_iter());
+                        self.phase = Phase::Admit;
+                    }
+                    Phase::Admit => unreachable!("handled before reading"),
+                }
+                continue;
             }
-            let available = &available[..available.len().min(bytes)];
+            let remaining = usize::try_from(self.initial_bytes - self.position)
+                .unwrap_or(usize::MAX);
+            let available = self.reader.fill_buf()?;
+            if available.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "closeout journal truncated before its pinned EOF",
+                ));
+            }
+            let available = &available[..available.len().min(bytes).min(remaining)];
             let newline = available.iter().position(|byte| *byte == b'\n');
             let consumed = newline.map_or(available.len(), |index| index + 1);
             if consumed > self.limits.record_bytes.saturating_sub(self.line.len()) {
@@ -258,6 +318,7 @@ impl Snapshot {
             }
             self.line.extend_from_slice(&available[..consumed]);
             self.reader.consume(consumed);
+            self.position += u64::try_from(consumed).expect("bounded read fits its snapshot");
             bytes -= consumed;
             if newline.is_some() {
                 self.accept_line()?;
@@ -267,60 +328,77 @@ impl Snapshot {
         Ok(false)
     }
 
-    // A new terminal key passes `admit_key` before it is inserted: the limit
-    // counts the identities already held, so inserting first would refuse one
-    // identity early.
-    #[allow(clippy::set_contains_or_insert)]
     fn accept_line(&mut self) -> io::Result<()> {
         let bytes = self.line.len();
+        let start = self.line_start;
         let decoded = if self.line.iter().all(u8::is_ascii_whitespace) {
             None
         } else if let Ok(value) = serde_json::from_slice::<Value>(&self.line) {
+            // Every phase validates schemas and hashes, including records
+            // unrelated to the selected candidates. No prefix is replayable.
             Some(decode(self.kind, value)?)
         } else {
-            self.skipped = self.skipped.saturating_add(1);
+            if self.phase == Phase::Candidates {
+                self.skipped = self.skipped.saturating_add(1);
+            }
             None
         };
         self.line.clear();
-        match decoded {
-            Some(Record::Intent(intent)) => {
+        self.line_start = self.position;
+        match (self.phase, decoded) {
+            (Phase::Candidates, Some(Record::Intent(intent))) => {
                 let key = intent.key();
-                if self.terminal.contains(&key) || self.pending.contains_key(&key) {
+                if self.pending.contains_key(&key) || self.candidates.contains_key(&key) {
                     return Ok(());
                 }
-                self.admit_key()?;
-                if bytes > self.limits.pending_bytes.saturating_sub(self.pending_bytes) {
+                if bytes > self.limits.candidate_bytes || self.limits.candidate_identities == 0 {
                     return Err(invalid(
-                        "closeout journal pending payload limit exceeded; partial queue refused",
+                        "closeout journal candidate cannot fit its window; partial queue refused",
                     ));
                 }
-                let order = self.next_order;
-                self.next_order = order
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("closeout journal sequence overflow"))?;
-                self.pending_bytes += bytes;
-                self.pending.insert(key, (order, intent, bytes));
-            }
-            Some(Record::Terminal(key)) => {
-                if let Some((_, _, bytes)) = self.pending.remove(&key) {
-                    self.pending_bytes -= bytes;
+                if self.candidates.len() >= self.limits.candidate_identities
+                    || bytes > self.limits.candidate_bytes.saturating_sub(self.candidate_bytes)
+                {
+                    // This complete record belongs to the next window. Resume
+                    // at its start, never after an intent that was not retained.
+                    return self.validate_candidates(start);
                 }
-                if !self.terminal.contains(&key) {
-                    self.admit_key()?;
-                    self.terminal.insert(key);
+                self.candidate_bytes += bytes;
+                self.candidates.insert(key, (start, intent, bytes));
+                if self.candidates.len() == self.limits.candidate_identities
+                    || self.candidate_bytes == self.limits.candidate_bytes
+                {
+                    self.validate_candidates(self.position)?;
                 }
             }
-            Some(Record::Ignored) | None => {}
+            (Phase::Terminals, Some(Record::Terminal(key))) => {
+                if let Some((_, _, bytes)) = self.candidates.remove(&key) {
+                    self.candidate_bytes -= bytes;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
 
-    fn admit_key(&self) -> io::Result<()> {
-        if self.pending.len().saturating_add(self.terminal.len()) >= self.limits.identities {
+    fn admit_pending(&mut self, key: Key, entry: (u64, Intent, usize)) -> io::Result<()> {
+        // Survivors have now been checked against every terminal marker in
+        // this same pinned snapshot, including markers before their intents.
+        // Limit unresolved work, never the journal's completed lifetime history.
+        if self.pending.len() >= self.limits.identities {
             return Err(invalid(
-                "closeout journal identity limit exceeded; partial queue refused",
+                "closeout journal pending identity limit exceeded; partial queue refused",
             ));
         }
+        let bytes = entry.2;
+        if bytes > self.limits.pending_bytes.saturating_sub(self.pending_bytes) {
+            return Err(invalid(
+                "closeout journal pending payload limit exceeded; partial queue refused",
+            ));
+        }
+        self.candidate_bytes -= bytes;
+        self.pending_bytes += bytes;
+        self.pending.insert(key, entry);
         Ok(())
     }
 }
@@ -651,6 +729,7 @@ mod tests {
                 let path = journal::log_path(&config, kind.file_name());
                 let before = std::fs::read(&path).unwrap();
                 let mut scanner = Scanner::new(kind);
+                scanner.limits.candidate_identities = 1;
                 let error = finish(&mut scanner, &config).unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
                 assert!(scanner.snapshot.is_none());
@@ -778,15 +857,15 @@ mod tests {
 
     #[test]
     fn all_admission_limits_fail_explicitly_without_returning_a_prefix() {
-        for bound in ["snapshot", "record", "pending", "identities"] {
+        for bound in ["record", "pending", "identities"] {
             let (_dir, config) = fixture();
             append(&config, Kind::Ack, &intent(Kind::Ack, 1));
             append(&config, Kind::Ack, &intent(Kind::Ack, 2));
             let path = journal::log_path(&config, Kind::Ack.file_name());
             let before = std::fs::read(&path).unwrap();
             let mut scanner = Scanner::new(Kind::Ack);
+            scanner.limits.candidate_identities = 1;
             match bound {
-                "snapshot" => scanner.limits.snapshot_bytes = 1,
                 "record" => scanner.limits.record_bytes = 1,
                 "pending" => scanner.limits.pending_bytes = 1,
                 "identities" => scanner.limits.identities = 1,
@@ -795,6 +874,296 @@ mod tests {
             assert!(finish(&mut scanner, &config).is_err(), "{bound}");
             assert!(scanner.snapshot.is_none());
             assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn completed_history_exceeding_scaled_snapshot_and_identity_budgets_is_replayable() {
+        for kind in [Kind::Ack, Kind::Release] {
+            let (_dir, config) = fixture();
+            let live = intent(kind, 1000);
+            append(&config, kind, &live);
+            for sequence in 1..=12 {
+                let done = intent(kind, sequence);
+                if sequence % 2 == 0 {
+                    append(
+                        &config,
+                        kind,
+                        &marker(kind, &done, journal::REPLAY_STATUS_REPLAYED),
+                    );
+                }
+                append(&config, kind, &done);
+                if sequence % 2 != 0 {
+                    append(
+                        &config,
+                        kind,
+                        &marker(kind, &done, journal::REPLAY_STATUS_ABANDONED),
+                    );
+                }
+            }
+            append(&config, kind, &live);
+            let mut scanner = Scanner::new(kind);
+            scanner.limits.identities = 1;
+            scanner.limits.pending_bytes = serde_json::to_vec(&live).unwrap().len() + 1;
+            scanner.limits.candidate_identities = 2;
+            scanner.limits.candidate_bytes = scanner.limits.pending_bytes * 2;
+            let path = journal::log_path(&config, kind.file_name());
+            let before = std::fs::read(&path).unwrap();
+            // The former snapshot cap was four times the pending-byte cap.
+            // Scale both budgets down so this exercises a larger lifetime
+            // history without allocating a 64 MiB fixture.
+            assert!(before.len() > scanner.limits.pending_bytes * 4);
+            let pending = finish(&mut scanner, &config).unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].key().0, live["intent_id"].as_str().unwrap());
+            assert_same_as_existing_reader(kind, &config, pending);
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn terminal_before_duplicates_is_checked_across_windows_in_first_append_order() {
+        for kind in [Kind::Ack, Kind::Release] {
+            let (_dir, config) = fixture();
+            let completed = intent(kind, 1);
+            let first = intent(kind, 99);
+            let second = intent(kind, 2);
+            append(
+                &config,
+                kind,
+                &marker(kind, &completed, journal::REPLAY_STATUS_REPLAYED),
+            );
+            for record in [&first, &completed, &second, &completed, &first] {
+                append(&config, kind, record);
+            }
+            let mut scanner = Scanner::new(kind);
+            scanner.limits.candidate_identities = 1;
+            scanner.limits.identities = 2;
+            let pending = finish(&mut scanner, &config).unwrap();
+            let ids: Vec<_> = pending.iter().map(|intent| intent.key().0).collect();
+            assert_eq!(
+                ids,
+                [
+                    first["intent_id"].as_str().unwrap(),
+                    second["intent_id"].as_str().unwrap(),
+                ]
+            );
+            assert_same_as_existing_reader(kind, &config, pending);
+        }
+    }
+
+    #[test]
+    fn candidate_byte_overflow_revisits_whole_records_including_unterminated_tail() {
+        for kind in [Kind::Ack, Kind::Release] {
+            for newline in [true, false] {
+                let (_dir, config) = fixture();
+                let first = intent(kind, 1);
+                let second = intent(kind, 1000);
+                let first_payload = serde_json::to_vec(&first).unwrap();
+                let second_payload = serde_json::to_vec(&second).unwrap();
+                append(&config, kind, &first);
+                if newline {
+                    append(&config, kind, &second);
+                } else {
+                    // A complete valid JSON record may survive a crash without
+                    // its newline. It still participates in both scan passes.
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(journal::log_path(&config, kind.file_name()))
+                        .unwrap()
+                        .write_all(&second_payload)
+                        .unwrap();
+                }
+                let mut scanner = Scanner::new(kind);
+                scanner.limits.candidate_bytes =
+                    first_payload.len().max(second_payload.len()) + 1;
+                scanner.limits.candidate_identities = 64;
+                let first_bytes = first_payload.len() + 1;
+                assert!(
+                    first_bytes < scanner.limits.candidate_bytes,
+                    "the first record must leave a nonzero, insufficient remainder"
+                );
+                let stop = AtomicBool::new(false);
+                assert!(
+                    scanner
+                        .poll_bounded(&config, &stop, usize::MAX, 1)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(scanner.snapshot.as_ref().unwrap().phase, Phase::Candidates);
+                assert!(
+                    scanner
+                        .poll_bounded(&config, &stop, usize::MAX, 1)
+                        .unwrap()
+                        .is_none()
+                );
+                let snapshot = scanner.snapshot.as_ref().unwrap();
+                assert_eq!(snapshot.phase, Phase::Terminals);
+                assert_eq!(snapshot.position, 0);
+                assert_eq!(snapshot.resume_at, u64::try_from(first_bytes).unwrap());
+                assert_eq!(snapshot.candidates.len(), 1);
+                let pending = finish(&mut scanner, &config).unwrap();
+                assert_eq!(
+                    pending.iter().map(|intent| intent.key().0).collect::<Vec<_>>(),
+                    [
+                        first["intent_id"].as_str().unwrap(),
+                        second["intent_id"].as_str().unwrap(),
+                    ]
+                );
+                assert_same_as_existing_reader(kind, &config, pending);
+            }
+        }
+    }
+
+    #[test]
+    fn phase_changes_preserve_each_polls_byte_and_record_budgets() {
+        let (_dir, config) = fixture();
+        let first = intent(Kind::Ack, 1);
+        append(&config, Kind::Ack, &first);
+        append(&config, Kind::Ack, &intent(Kind::Ack, 2));
+        let first_bytes = serde_json::to_vec(&first).unwrap().len() + 1;
+        let stop = AtomicBool::new(false);
+        for (bytes, records) in [(first_bytes, 10), (usize::MAX, 1)] {
+            let mut scanner = Scanner::new(Kind::Ack);
+            scanner.limits.candidate_identities = 1;
+            assert!(
+                scanner
+                    .poll_bounded(&config, &stop, bytes, records)
+                    .unwrap()
+                    .is_none()
+            );
+            let snapshot = scanner.snapshot.as_ref().unwrap();
+            assert_eq!(snapshot.phase, Phase::Terminals);
+            assert_eq!(snapshot.position, 0, "the new pass gets no renewed budget");
+            assert_eq!(snapshot.candidates.len(), 1);
+            assert!(
+                scanner
+                    .poll_bounded(&config, &stop, 1, 10)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(scanner.snapshot.as_ref().unwrap().position, 1);
+            assert_eq!(finish(&mut scanner, &config).unwrap().len(), 2);
+        }
+
+        let mut scanner = Scanner::new(Kind::Ack);
+        let file_bytes = std::fs::metadata(journal::log_path(&config, Kind::Ack.file_name()))
+            .unwrap()
+            .len();
+        // Stop exactly at the validation EOF. Both survivors still need
+        // admission, and that in-memory work consumes the same record budget.
+        for _ in 0..2 {
+            assert!(
+                scanner
+                    .poll_bounded(
+                        &config,
+                        &stop,
+                        usize::try_from(file_bytes).unwrap(),
+                        10,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            scanner
+                .poll_bounded(&config, &stop, usize::MAX, 1)
+                .unwrap()
+                .is_none()
+        );
+        let snapshot = scanner.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.phase, Phase::Admit);
+        assert_eq!(
+            snapshot.pending.len(),
+            1,
+            "admission cannot merge a whole window at once"
+        );
+        assert_eq!(finish(&mut scanner, &config).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn every_validation_pass_uses_the_original_eof_despite_new_completions() {
+        for kind in [Kind::Ack, Kind::Release] {
+            let (_dir, config) = fixture();
+            let first = intent(kind, 1);
+            let second = intent(kind, 2);
+            let later = intent(kind, 3);
+            append(&config, kind, &first);
+            append(&config, kind, &second);
+            let mut scanner = Scanner::new(kind);
+            scanner.limits.candidate_identities = 1;
+            assert!(
+                scanner
+                    .poll_bounded(&config, &AtomicBool::new(false), usize::MAX, 1)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(scanner.snapshot.as_ref().unwrap().phase, Phase::Terminals);
+            append(
+                &config,
+                kind,
+                &marker(kind, &first, journal::REPLAY_STATUS_REPLAYED),
+            );
+            append(&config, kind, &first);
+            append(&config, kind, &later);
+            let pinned = finish(&mut scanner, &config).unwrap();
+            assert_eq!(
+                pinned.iter().map(|intent| intent.key().0).collect::<Vec<_>>(),
+                [
+                    first["intent_id"].as_str().unwrap(),
+                    second["intent_id"].as_str().unwrap(),
+                ]
+            );
+            let current = finish(&mut scanner, &config).unwrap();
+            assert_eq!(current.len(), 2);
+            assert_same_as_existing_reader(kind, &config, current);
+        }
+    }
+
+    #[test]
+    fn cancellation_and_source_changes_discard_already_validated_windows() {
+        for failure in ["cancel", "replace", "truncate"] {
+            let (_dir, config) = fixture();
+            append(&config, Kind::Ack, &intent(Kind::Ack, 1));
+            let mut scanner = Scanner::new(Kind::Ack);
+            scanner.limits.candidate_identities = 1;
+            let stop = AtomicBool::new(false);
+            for _ in 0..3 {
+                assert!(
+                    scanner
+                        .poll_bounded(&config, &stop, usize::MAX, 1)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let snapshot = scanner.snapshot.as_ref().unwrap();
+            assert_eq!(snapshot.phase, Phase::Admit);
+            assert_eq!(snapshot.pending.len(), 1);
+            let path = journal::log_path(&config, Kind::Ack.file_name());
+            let retained = config.storage_root.join("retained-journal.jsonl");
+            match failure {
+                "cancel" => stop.store(true, Ordering::Release),
+                "replace" => {
+                    std::fs::rename(&path, &retained).unwrap();
+                    append(&config, Kind::Ack, &intent(Kind::Ack, 2));
+                }
+                "truncate" => {
+                    std::fs::copy(&path, &retained).unwrap();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_len(0)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(scanner.poll(&config, &stop).is_err(), "{failure}");
+            assert!(scanner.snapshot.is_none());
+            stop.store(false, Ordering::Release);
+            let pending = finish(&mut scanner, &config).unwrap();
+            assert_eq!(pending.len(), usize::from(failure != "truncate"));
+            assert_same_as_existing_reader(Kind::Ack, &config, pending);
         }
     }
 
@@ -868,7 +1237,7 @@ mod tests {
                     .is_none()
             );
             let snapshot = scanner.snapshot.as_ref().unwrap();
-            assert_eq!(snapshot.reader.get_ref().limit(), snapshot.initial_bytes);
+            assert_eq!(snapshot.position, 0);
             assert_eq!(snapshot.line, [] as [u8; 0]);
         }
         assert_eq!(finish(&mut scanner, &config).unwrap().len(), 1);

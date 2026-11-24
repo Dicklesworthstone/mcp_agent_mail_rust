@@ -49,7 +49,9 @@ fn projection(profile: &Value) -> Option<Projection> {
     // Credentials, response-only metadata and unknown extensions do not
     // acquire automatic failure-forgiveness authority.
     if fields.len() != PROFILE_FIELDS.len()
-        || fields.keys().any(|key| !PROFILE_FIELDS.contains(&key.as_str()))
+        || fields
+            .keys()
+            .any(|key| !PROFILE_FIELDS.contains(&key.as_str()))
     {
         return None;
     }
@@ -248,7 +250,9 @@ pub(crate) fn seed_retries(config: &Config, mut admit: impl FnMut(i64) -> bool) 
         if entry.witness.scope != scope
             || binding.generation != generation
             || entry.ready_at > now
-            || admitted.iter().any(|prior: &Ticket| prior.witness.id == entry.witness.id)
+            || admitted
+                .iter()
+                .any(|prior: &Ticket| prior.witness.id == entry.witness.id)
             || !admit(entry.witness.id)
         {
             continue;

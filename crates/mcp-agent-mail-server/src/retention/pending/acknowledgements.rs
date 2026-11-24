@@ -415,6 +415,103 @@ mod tests {
     }
 
     #[test]
+    fn ack_replay_refuses_post_intent_messages_and_replacement_agents() {
+        if isolated() {
+            return;
+        }
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            for key in [None, Some("cutoff-key")] {
+                for newer_agent in [false, true] {
+                    let fixture = Fixture::new(key);
+                    let cutoff = fixture.intents[0].created_ts;
+                    let before = fixture.bytes();
+                    let conn = fastmcp_core::block_on(fixture.pool.acquire(&fixture.cx))
+                        .into_result()
+                        .unwrap();
+                    let agent_id = conn
+                        .query_sync(
+                            "SELECT sender_id FROM messages WHERE id = ?",
+                            &[fixture.message.into()],
+                        )
+                        .unwrap()[0]
+                        .get_named::<i64>("sender_id")
+                        .unwrap();
+                    let (sql, id) = if newer_agent {
+                        ("UPDATE agents SET inception_ts = ? WHERE id = ?", agent_id)
+                    } else {
+                        (
+                            "UPDATE messages SET created_ts = ? WHERE id = ?",
+                            fixture.message,
+                        )
+                    };
+                    conn.execute_sync(sql, &[(cutoff + 1).into(), id.into()])
+                        .unwrap();
+                    drop(conn);
+
+                    for _ in 0..2 {
+                        // Restarting the worker does not make a later occupant
+                        // of this ID eligible for the original closeout.
+                        let report = fixture.replay(&mut RoundCursor::default(), false).unwrap();
+                        assert_eq!(
+                            (
+                                report.attempted,
+                                report.applied,
+                                report.completed,
+                                report.deferred
+                            ),
+                            (1, 0, 0, 1),
+                            "key={key:?}, newer_agent={newer_agent}"
+                        );
+                        assert_eq!(fixture.receipts(fixture.message), (None, None));
+                        assert_eq!(fixture.bytes(), before, "no false terminal journal receipt");
+                        let conn = fastmcp_core::block_on(fixture.pool.acquire(&fixture.cx))
+                            .into_result()
+                            .unwrap();
+                        assert_eq!(
+                            conn.query_sync("SELECT COUNT(*) AS n FROM idempotency_keys", &[])
+                                .unwrap()[0]
+                                .get_named::<i64>("n")
+                                .unwrap(),
+                            0,
+                            "a refused replay cannot consume its key"
+                        );
+                    }
+
+                    // A restored original identity/delivery at the exact
+                    // cutoff remains eligible; refusal did not consume it.
+                    let conn = fastmcp_core::block_on(fixture.pool.acquire(&fixture.cx))
+                        .into_result()
+                        .unwrap();
+                    conn.execute_sync(sql, &[cutoff.into(), id.into()]).unwrap();
+                    drop(conn);
+                    let report = fixture.replay(&mut RoundCursor::default(), false).unwrap();
+                    assert_eq!(
+                        (report.applied, report.completed, report.deferred),
+                        (1, 1, 0)
+                    );
+                    let receipts = fixture.receipts(fixture.message);
+                    assert!(receipts.0.is_some() && receipts.1.is_some());
+                    assert!(
+                        journal::read_queued_ack_intents(&fixture.config)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    // Even an already-loaded snapshot can be retried without
+                    // changing the first committed read and ACK timestamps.
+                    assert_eq!(
+                        fixture
+                            .replay(&mut RoundCursor::default(), false)
+                            .unwrap()
+                            .completed,
+                        1
+                    );
+                    assert_eq!(fixture.receipts(fixture.message), receipts);
+                }
+            }
+        });
+    }
+
+    #[test]
     fn ack_replay_refuses_owned_and_failed_drain_admission_without_mutation() {
         if isolated() {
             return;
@@ -623,8 +720,20 @@ mod tests {
         if isolated() {
             return;
         }
+        assert_ack_receipt_lock_failure_preserves_committed_ack(Some("original-key"));
+    }
+
+    #[test]
+    fn ack_receipt_lock_failure_preserves_the_unkeyed_ack_for_idempotent_recovery() {
+        if isolated() {
+            return;
+        }
+        assert_ack_receipt_lock_failure_preserves_committed_ack(None);
+    }
+
+    fn assert_ack_receipt_lock_failure_preserves_committed_ack(key: Option<&str>) {
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
-            let fixture = Fixture::new(Some("original-key"));
+            let fixture = Fixture::new(key);
             let before = fixture.bytes();
             let lock_path = journal::log_path(&fixture.config, journal::ACK_INTENT_LOG_FILE)
                 .with_file_name(journal::ACK_INTENT_LOCK_FILE);

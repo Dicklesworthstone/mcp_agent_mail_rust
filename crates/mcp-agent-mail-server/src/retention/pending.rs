@@ -668,33 +668,34 @@ async fn apply_ack(
         .id
         .filter(|id| *id > 0)
         .ok_or_else(|| "durable replay agent has no positive identity".to_string())?;
-    if let Some(idempotency) = &intent.idempotency {
-        // Do not call the tool handler: it would rediscover ambient config,
-        // recursively drain the queue, and append another intent on failure.
-        let claim = IdempotencyClaim {
+    let claim = intent
+        .idempotency
+        .as_ref()
+        .map(|idempotency| IdempotencyClaim {
             project_id,
             tool: "acknowledge_message",
             key: &idempotency.key,
             fingerprint: &idempotency.fingerprint,
-        };
-        let outcome = db_value(
-            queries::acknowledge_message_idempotent(
-                ctx.cx(),
-                pool,
-                agent_id,
-                intent.message_id,
-                claim,
-            )
-            .await,
-        )?;
-        Ok(match outcome {
-            IdempotentOutcome::Fresh(_) | IdempotentOutcome::Replayed(_) => Completion::Replayed,
-            IdempotentOutcome::Conflict(_) => Completion::KeyConflict,
-        })
-    } else {
-        db_value(queries::acknowledge_message(ctx.cx(), pool, agent_id, intent.message_id).await)?;
-        Ok(Completion::Replayed)
-    }
+        });
+    // Use the same transaction-bound authority as foreground replay. A durable
+    // intent cannot acknowledge a later message or replacement agent at reused
+    // IDs. A matching committed key still replays its original timestamps.
+    // Calling the tool handler would recursively drain and requeue on failure.
+    let outcome = db_value(
+        queries::acknowledge_message_with_replay_cutoff(
+            ctx.cx(),
+            pool,
+            agent_id,
+            intent.message_id,
+            intent.created_ts,
+            claim,
+        )
+        .await,
+    )?;
+    Ok(match outcome {
+        IdempotentOutcome::Fresh(_) | IdempotentOutcome::Replayed(_) => Completion::Replayed,
+        IdempotentOutcome::Conflict(_) => Completion::KeyConflict,
+    })
 }
 
 fn db_value<T>(outcome: Outcome<T, DbError>) -> Result<T, String> {
