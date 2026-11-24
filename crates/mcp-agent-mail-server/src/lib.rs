@@ -6050,8 +6050,14 @@ async fn run_http_server_supervisor(
             continue;
         }
 
+        // Keep the serving-pool observation fresh even when no client polls
+        // /health. The cache admits at most one bounded probe per refresh
+        // interval; the supervisor never waits for it. Stopping after the
+        // initial notification made every first poll after six idle seconds
+        // fail with database_probe_stale on an otherwise healthy mailbox.
+        let readiness = instance.state.mail_readiness().result();
         if !ready_notified {
-            match instance.state.mail_readiness().result() {
+            match readiness {
                 Ok(()) => {
                     sd_notify_ready();
                     tracing::info!(
@@ -34498,6 +34504,116 @@ first body
                 assert!(
                     lock_mutex(&state.mail_readiness).sample.is_none(),
                     "ordinary mail reads must not require a lexical/readiness probe"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn health_readiness_supervisor_refreshes_without_client_polls() {
+        const TEST: &str = "tests::health_readiness_supervisor_refreshes_without_client_polls";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        with_serialized_health_route(|| {
+            with_ready_health_state(prepared_http_test_config(), |state, _archive| {
+                let pool = lock_mutex(&state.mail_readiness)
+                    .pool
+                    .clone()
+                    .expect("real serving pool");
+                let runtime = build_http_runtime().expect("owned HTTP runtime");
+                let (control_tx, control_rx) = mpsc::channel(1);
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let result_rx = spawn_http_supervisor_task(
+                    runtime.handle(),
+                    state.config.clone(),
+                    None,
+                    Some(HttpServerControl::new(control_rx)),
+                    None,
+                    Some(Box::new(move |bound| {
+                        let _ = ready_tx.send(bound.clone());
+                    })),
+                )
+                .expect("start real HTTP supervisor");
+
+                // Always stop the real listener and its runtime, including if a
+                // control fails, before restoring the fixture environment.
+                let checks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let bound = ready_rx
+                        .recv_timeout(Duration::from_secs(15))
+                        .expect("supervisor must reach initial mailbox readiness");
+                    let client = build_probe_http_client();
+                    let fetch = |path: &str| {
+                        runtime.block_on(async {
+                            let cx = Cx::current().expect("HTTP client context");
+                            let url = format!(
+                                "http://{}:{}{path}",
+                                connect_authority_host(&bound.http_host),
+                                bound.http_port,
+                            );
+                            let response = timeout(
+                                wall_now(),
+                                Duration::from_secs(5),
+                                client.send_get(&cx, &url),
+                            )
+                            .await
+                            .expect("health response deadline")
+                            .expect("real HTTP health response");
+                            let body: serde_json::Value =
+                                serde_json::from_slice(&response.body).expect("health JSON");
+                            (response.status, body)
+                        })
+                    };
+
+                    // Do not issue a readiness request during the whole sample
+                    // lifetime. This catches the original first-poll-after-idle
+                    // failure through the listener, after on_ready has run.
+                    std::thread::sleep(
+                        MAIL_READINESS_MAX_SAMPLE_AGE + MAIL_READINESS_REFRESH_INTERVAL,
+                    );
+                    let (status, body) = fetch("/health");
+                    assert_eq!(status, 200, "idle readiness: {body}");
+                    assert_eq!(body["status"], "ready");
+                    assert_eq!(body["capabilities"]["mail_read"], true);
+
+                    // A real unavailable serving pool must still replace that
+                    // success with a failure. The supervisor refresh is not a
+                    // stale-success exemption, and transport liveness survives.
+                    let cx = runtime_request_cx(Budget::INFINITE);
+                    let held = block_on(pool.acquire(&cx))
+                        .into_result()
+                        .expect("hold the sole serving connection");
+                    let refresh_window = MAIL_READINESS_REFRESH_INTERVAL
+                        + MAIL_READINESS_PROBE_BUDGET
+                        + Duration::from_secs(1);
+                    std::thread::sleep(refresh_window);
+                    let (status, body) = fetch("/health/readiness");
+                    assert_eq!(status, 503, "unavailable pool: {body}");
+                    assert_eq!(body["reason"], "database_probe_failed");
+                    assert_eq!(body["capabilities"]["mail_read"], false);
+                    let (status, body) = fetch("/healthz");
+                    assert_eq!(status, 200);
+                    assert_eq!(body["status"], "alive");
+                    drop(held);
+
+                    // Recovery must also happen without a readiness request
+                    // to trigger it. The next external poll sees the result.
+                    std::thread::sleep(refresh_window);
+                    let (status, body) = fetch("/health/readiness");
+                    assert_eq!(status, 200, "recovered pool: {body}");
+                    assert_eq!(body["status"], "ready");
+                }));
+                send_server_shutdown_control(&control_tx);
+                let stopped =
+                    recv_http_supervisor_result_within(&result_rx, Duration::from_secs(10));
+                let runtime_stopped = runtime.shutdown_timeout(Duration::from_secs(5));
+                if let Err(panic) = checks {
+                    std::panic::resume_unwind(panic);
+                }
+                stopped.expect("join supervised listener");
+                assert!(
+                    runtime_stopped,
+                    "readiness workers must stop with their runtime"
                 );
             });
         });
