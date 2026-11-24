@@ -914,15 +914,28 @@ fn ensure_no_recovery_references(primary: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn immutable_generation_id(path: &Path) -> Option<String> {
     let connection = crate::pool::open_immutable_canonical_sqlite(path).ok()?;
-    let rows = connection.query_sync(
-        "SELECT singleton, substr(generation_id, 1, 257) AS generation_id FROM db_identity LIMIT 2",
-        &[],
-    ).ok()?;
+    // SQLite's text substr stops at NUL. Read the entire token or none of
+    // it, including for UTF-16 databases (at most two storage bytes per
+    // accepted UTF-8 byte). Keep malformed rows in the singleton count.
+    let rows = connection
+        .query_sync(
+            "SELECT singleton, CASE WHEN typeof(generation_id) = 'text'
+                 AND octet_length(generation_id) BETWEEN 1 AND 512
+                 AND instr(generation_id, char(0)) = 0
+                 THEN generation_id ELSE '' END AS generation_id FROM db_identity LIMIT 2",
+            &[],
+        )
+        .ok()?;
     if rows.len() != 1 || rows[0].get_named::<i64>("singleton").ok()? != 0 {
         return None;
     }
     let generation = rows[0].get_named::<String>("generation_id").ok()?;
-    (!generation.is_empty() && generation.len() <= 256).then_some(generation)
+    // The driver decodes invalid UTF-8 with a replacement character. A
+    // lossy string cannot establish lineage for a destructive operation.
+    (!generation.is_empty()
+        && generation.len() <= 256
+        && !generation.contains(char::REPLACEMENT_CHARACTER))
+    .then_some(generation)
 }
 
 #[cfg(any(unix, windows))]

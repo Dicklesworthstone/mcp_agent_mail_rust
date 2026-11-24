@@ -2045,6 +2045,8 @@ mod tests {
         for scenario in [
             "matching_lineage",
             "foreign_lineage",
+            "nul_suffix",
+            "lossy_text",
             "unseeded_duplicate",
             "unseeded_changed",
         ] {
@@ -2052,11 +2054,13 @@ mod tests {
             let root = dir.path().canonicalize().unwrap();
             let primary = root.join("storage.sqlite3");
             make_restorable_mailbox_db(&primary);
-            if matches!(scenario, "matching_lineage" | "foreign_lineage") {
+            if !scenario.starts_with("unseeded_") {
                 let conn = crate::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
-                conn.execute_raw(
-                    "INSERT INTO db_identity VALUES (0, 'original-mailbox-generation')",
-                )
+                conn.execute_raw(if scenario == "lossy_text" {
+                    "INSERT INTO db_identity VALUES (0, char(65533))"
+                } else {
+                    "INSERT INTO db_identity VALUES (0, 'original-mailbox-generation')"
+                })
                 .unwrap();
                 conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
                     .unwrap();
@@ -2069,12 +2073,19 @@ mod tests {
                 .unwrap();
             let old = history.join("storage.sqlite3.bak.20261001_000000");
             std::fs::copy(&primary, &old).unwrap();
-            if scenario == "foreign_lineage" {
+            let change_generation = match scenario {
+                "foreign_lineage" => {
+                    Some("UPDATE db_identity SET generation_id = 'another-mailbox-generation'")
+                }
+                "nul_suffix" => Some(
+                    "UPDATE db_identity SET generation_id = generation_id || char(0) || 'other'",
+                ),
+                "lossy_text" => Some("UPDATE db_identity SET generation_id = CAST(x'ff' AS TEXT)"),
+                _ => None,
+            };
+            if let Some(sql) = change_generation {
                 let conn = crate::CanonicalDbConn::open_file(old.to_str().unwrap()).unwrap();
-                conn.execute_raw(
-                    "UPDATE db_identity SET generation_id = 'another-mailbox-generation'",
-                )
-                .unwrap();
+                conn.execute_raw(sql).unwrap();
                 conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
                     .unwrap();
             }
@@ -2113,7 +2124,7 @@ mod tests {
                 } else {
                     guard.delete_superseded_generation(&primary, path, &inventoried)
                 };
-                if matches!(scenario, "foreign_lineage" | "unseeded_changed") {
+                if change_generation.is_some() || scenario == "unseeded_changed" {
                     assert!(result.unwrap_err().to_string().contains("lineage"));
                     assert_eq!(std::fs::read(path).unwrap(), before);
                 } else {
