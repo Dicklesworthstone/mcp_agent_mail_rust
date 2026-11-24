@@ -19176,6 +19176,9 @@ mod tests {
         )
         .unwrap();
         let manifest = recovery_state::ensure_checkpoint(&conn, &config.storage_root).unwrap();
+        let early = recovery_state::take_pending_archive_paths();
+        assert_eq!(early.len(), 1);
+        assert_eq!(early[0].0, config.storage_root);
         conn.execute_raw(
             "UPDATE message_recipients SET read_ts=111,ack_ts=222 WHERE message_id=41; \
              UPDATE agent_links SET status='blocked',updated_ts=30 WHERE id=93;",
@@ -19186,6 +19189,16 @@ mod tests {
         mcp_agent_mail_db::reconstruct_state::record_issued_cursor(&config.storage_root, 321)
             .unwrap();
         drop(conn);
+
+        // Model a drained old batch plus lost hints from a later publisher.
+        // The real storage flush must discover the actual records and cursor,
+        // rather than committing their completed header without those files.
+        let late = recovery_state::take_pending_archive_paths();
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].0, config.storage_root);
+        for (root, paths) in early {
+            recovery_state::note_pending_archive_paths(&root, paths);
+        }
 
         let generation = format!("recovery-state/g{}", manifest.generation);
         let generation_path = config.storage_root.join(&generation);
@@ -19265,6 +19278,11 @@ mod tests {
         let cloned =
             Repository::clone(config.storage_root.to_str().unwrap(), &recovered_root).unwrap();
         drop(cloned);
+        assert!(
+            recovery_state::read_revision_witness(&recovered_root)
+                .unwrap()
+                .is_some()
+        );
         let mut records = Vec::new();
         let recovered_manifest = recovery_state::visit_records(&recovered_root, |record| {
             records.push(record);
@@ -19388,7 +19406,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(repo.head().unwrap().target().unwrap(), baseline_commit);
-        assert!(recovery_state::take_pending_archive_paths().is_empty());
+        assert_eq!(recovery_state::take_pending_archive_paths().len(), 0);
         let witness = recovery_state::read_revision_witness(&config.storage_root)
             .unwrap()
             .unwrap();
@@ -19463,7 +19481,7 @@ mod tests {
         let journal = config
             .storage_root
             .join("recovery-state/.git-pending.jsonl");
-        assert!(fs::read(&journal).unwrap().is_empty());
+        assert_eq!(fs::read(&journal).unwrap().as_slice(), b"");
         for runtime in [
             "recovery-state/.git-pending.jsonl",
             "recovery-state/..git-pending.jsonl.123.1.pending",
