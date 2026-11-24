@@ -143,6 +143,48 @@ class HarnessAdmission(RetainedFixtures):
         report["cases"][0]["status"] = "FAIL"
         self.assertEqual(self.admit(report), "FAIL")
 
+    def test_observed_failure_survives_explicit_unexecuted_recovery_records(self):
+        report = copy.deepcopy(self.report)
+        report["status"], report["exit_code"] = "FAIL", 1
+        for case in report["cases"]:
+            if case["name"] == "genuine_database_unavailability":
+                case.update(status="FAIL", error="Observed stale readiness during the database fault")
+            elif case["name"] in {"stale_success_challenge", "stale_fault_restore", "stale_challenge_recovery"}:
+                case.update(status="INCOMPLETE", error="Not executed: independent healthy prerequisite unavailable")
+        self.assertEqual(self.admit(report), "FAIL")
+        # Missing execution cannot erase an observed failure or promote the run
+        # to a pass, even though all required records are now present.
+        for status, code in (("PASS", 0), ("INCOMPLETE", 2)):
+            with self.subTest(status=status):
+                with self.assertRaisesRegex(qualification.Refusal, "summary disagrees"):
+                    self.admit({**report, "status": status, "exit_code": code})
+
+    def test_unexecuted_recovery_without_observed_failure_stays_incomplete(self):
+        report = copy.deepcopy(self.report)
+        report["status"], report["exit_code"] = "INCOMPLETE", 2
+        for case in report["cases"]:
+            if case["name"] == "stale_challenge_recovery":
+                case.update(status="INCOMPLETE", error="Not executed: schema restoration unavailable")
+        self.assertEqual(self.admit(report), "INCOMPLETE")
+        with self.assertRaisesRegex(qualification.Refusal, "summary disagrees"):
+            self.admit({**report, "status": "PASS", "exit_code": 0})
+
+    def test_failure_report_still_requires_unique_explicit_prerequisite_records(self):
+        report = copy.deepcopy(self.report)
+        report["status"], report["exit_code"] = "FAIL", 1
+        for case in report["cases"]:
+            if case["name"] == "genuine_database_unavailability":
+                case["status"] = "FAIL"
+            elif case["name"] == "stale_challenge_recovery":
+                case.update(status="INCOMPLETE", error="Not executed: independent healthy prerequisite unavailable")
+        prerequisite = next(case for case in report["cases"] if case["name"] == "stale_challenge_recovery")
+        missing = [case for case in report["cases"] if case["name"] != prerequisite["name"]]
+        duplicated = [*report["cases"], prerequisite]
+        for cases in (missing, duplicated):
+            with self.subTest(count=len(cases)):
+                with self.assertRaisesRegex(qualification.Refusal, "missing or duplicated"):
+                    self.admit({**report, "cases": cases})
+
     def test_empty_missing_duplicate_or_failing_cases_cannot_hide_under_pass(self):
         for cases in ([], self.report["cases"][:-1], self.report["cases"] * 2,
                       [{**case, "status": "FAIL"} for case in self.report["cases"]]):

@@ -32,11 +32,18 @@ TESTS = (
 )
 HARNESS_CASES = frozenset((
     "baseline", "idle_first_request_1", "idle_first_request_2", "idle_first_request_3",
-    "concurrent_first_requests_after_idle", "idle_soak",
+    "idle_database_1", "idle_database_2", "idle_database_3",
+    "concurrent_first_requests_after_idle", "idle_soak", "idle_soak_cpu",
     "genuine_database_unavailability", "database_fault_restore",
-    "recovery_without_readiness_polling", "stale_success_challenge",
+    "database_outage_liveness", "concurrent_requests_during_database_outage",
+    "failed_probe_cadence", "failed_probe_cpu",
+    "recovery_without_readiness_polling", "recovery_database_operation",
+    "stale_success_baseline", "stale_success_challenge",
+    "stale_outage_database_operation", "stale_outage_liveness",
     "stale_fault_restore", "stale_challenge_recovery", "bounded_observed_resources",
+    "stale_recovery_database_operation", "stale_shutdown",
     "healthy_shutdown", "outage_shutdown_baseline", "shutdown_with_database_unavailable",
+    "outage_shutdown_readiness", "outage_shutdown_liveness",
     "outage_process_cleanup", "outage_shutdown_schema_restore", "binary_identity_stable",
 ))
 SUMMARY = re.compile(

@@ -23,6 +23,21 @@ export const DEFAULTS = Object.freeze({
   maxRssGrowthBytes: 64 * 1024 * 1024, maxIdleCpuCores: 0.25,
 });
 
+export function qualificationCaseNames(cfg = DEFAULTS) {
+  return ['baseline',
+    ...Array.from({length: cfg.idleCycles}, (_, i) => ['idle_first_request_' + (i + 1), 'idle_database_' + (i + 1)]).flat(),
+    'concurrent_first_requests_after_idle', 'idle_soak', 'idle_soak_cpu',
+    'genuine_database_unavailability', 'database_outage_liveness',
+    'concurrent_requests_during_database_outage', 'failed_probe_cadence', 'failed_probe_cpu',
+    'database_fault_restore', 'recovery_without_readiness_polling', 'recovery_database_operation',
+    'bounded_observed_resources', 'healthy_shutdown', 'stale_success_baseline',
+    'stale_success_challenge', 'stale_outage_database_operation', 'stale_outage_liveness',
+    'stale_fault_restore', 'stale_challenge_recovery', 'stale_recovery_database_operation',
+    'stale_shutdown', 'outage_shutdown_baseline', 'outage_shutdown_readiness',
+    'outage_shutdown_liveness', 'shutdown_with_database_unavailable',
+    'outage_process_cleanup', 'outage_shutdown_schema_restore'];
+}
+
 class QualificationError extends Error {
   constructor(message, status = 'FAIL') { super(message); this.status = status; }
 }
@@ -79,21 +94,35 @@ export async function runQualification(io, options = {}) {
     }
   }
   async function read(s, route) {
-    const response = await s.get(route);
+    let response;
+    try { response = await s.get(route); }
+    catch (error) {
+      observation('http_error', {session: s.label, route, error: String(error)});
+      throw error;
+    }
     observation('http', {session: s.label, route, response});
     requireThat(response.duration_ms <= cfg.requestTimeout * 1000,
       'HTTP response exceeded the predeclared request deadline');
     return response;
   }
+  async function readAll(s, routes) {
+    // A deadline failure cannot release a sibling request into a later idle,
+    // restoration or shutdown phase. Every initiated bounded read must settle.
+    const outcomes = await Promise.allSettled(routes.map(route => read(s, route)));
+    const failed = outcomes.find(value => value.status === 'rejected');
+    if (failed) throw failed.reason;
+    return outcomes.map(value => value.value);
+  }
   async function live(s) {
-    for (const route of ['/healthz', '/health/liveness']) {
-      const r = await read(s, route);
+    const responses = await readAll(s, ['/healthz', '/health/liveness']);
+    for (const r of responses) {
       requireThat(r.status === 200 && r.body?.status === 'alive', 'Transport liveness failed: ' + JSON.stringify(r));
     }
+    return {responses};
   }
   async function burst(s, unavailable = false, allowStale = false) {
-    const results = await Promise.all(Array.from({length: cfg.concurrency}, (_, i) =>
-      read(s, i % 2 ? '/health/readiness' : '/health')));
+    const results = await readAll(s, Array.from({length: cfg.concurrency}, (_, i) =>
+      i % 2 ? '/health/readiness' : '/health'));
     // Inspect every response; a later success never overwrites the first failure.
     for (const result of results) unavailable ? checkUnavailable(result, allowStale) : checkReady(result);
     return results;
@@ -122,6 +151,26 @@ export async function runQualification(io, options = {}) {
     await s.idle(cfg.warmupSeconds);
     await sample(s, 'baseline');
   }
+  async function prepareIdle(s, label) {
+    // This prepares a NEW trial only. A previous trial's retained first
+    // response and verdict are immutable, including when these polls recover.
+    const begin = io.now(), deadline = begin + cfg.failureWait;
+    observation('precondition_start', {session: s.label, label, timeout_seconds: cfg.failureWait});
+    let requests = 0;
+    do {
+      const response = await s.get('/health');
+      requests++;
+      observation('precondition_http', {session: s.label, label, response});
+      need(!response.startup_fatal, 'Owned process exited before the next idle trial');
+      if (ready(response)) {
+        const result = {requests, elapsed_seconds: io.now() - begin};
+        observation('precondition_end', {session: s.label, label, ...result});
+        return result;
+      }
+      await s.idle(0.25);
+    } while (io.now() < deadline);
+    need(false, 'Could not establish a healthy precondition; this idle trial was not executed');
+  }
   async function sample(s, label) {
     const point = {label, at_seconds: io.now(), ...(await s.resources())};
     s._resourcePoints.push(point);
@@ -140,7 +189,8 @@ export async function runQualification(io, options = {}) {
     observation('database_control', {session: s.label, tag, control: value});
     if (expectFailure) need(value.ok === false && value.error_kind === 'database',
       'Fault did not produce an independently attributed MCP database/schema failure');
-    else requireThat(value.ok === true, 'Database operation failed after recovery: ' + JSON.stringify(value));
+    else requireThat(value.ok === true, 'Fresh database operation failed: ' + JSON.stringify(value));
+    return value;
   }
   async function sql(s, kind, statement) {
     const result = await s.sql(kind, statement);
@@ -165,6 +215,7 @@ export async function runQualification(io, options = {}) {
     need(!old.ok && old.error_kind === 'database' && saved.ok
       && canonical(saved.rows) === canonical(fault.before),
     'Independent same-engine controls did not prove the intended table outage');
+    fault.confirmed = true;
     if (mcpControl) await newControl(s, 'outage', true);
   }
   async function restore(s, fault) {
@@ -183,12 +234,38 @@ export async function runQualification(io, options = {}) {
     fault.attempted = false;
     return {project_rows_preserved: true, schema_object_identities_preserved: true, rows: after.rows.length};
   }
-  async function recover(s, label) {
-    await idle(s, cfg.failureWait, label);
-    const r = await read(s, '/health/readiness');
-    checkReady(r);
-    await newControl(s, 'recovery', false);
-    return {first_response: r};
+  async function restoreCase(s, fault, name) {
+    return await test(name, async () => {
+      const result = await restore(s, fault); // Cleanup is required even after partial injection.
+      need(fault?.confirmed === true, 'No independently confirmed schema outage was installed; restoration was not qualified');
+      return result;
+    });
+  }
+  async function recover(s, label, readinessCase, databaseCase) {
+    let idleCompleted = false;
+    await test(readinessCase, async () => {
+      await idle(s, cfg.failureWait, label);
+      idleCompleted = true;
+      const r = await read(s, '/health/readiness');
+      checkReady(r);
+      return {first_response: r};
+    });
+    await test(databaseCase, async () => {
+      need(idleCompleted, 'Recovery idle interval did not complete; database recovery was not qualified');
+      // Preserve the first health verdict before the fresh database witness.
+      // No readiness retry occurs between these independently judged checks.
+      return await newControl(s, label, false);
+    });
+  }
+  function cpuBound(before, after) {
+    need(before?.available && after?.available, 'CPU telemetry unavailable');
+    requireThat(before.identity === after.identity, 'Process identity changed during CPU measurement');
+    const seconds = after.at_seconds - before.at_seconds;
+    need(seconds > 0, 'No CPU observation interval measured');
+    const cores = (after.cpu_seconds - before.cpu_seconds) / seconds;
+    requireThat(Number.isFinite(cores) && cores >= 0 && cores <= cfg.maxIdleCpuCores,
+      'Idle CPU exceeded bound or counter identity changed');
+    return {seconds, cpu_cores: cores};
   }
   async function shutdown(s) {
     const stopped = await s.stop();
@@ -218,92 +295,97 @@ export async function runQualification(io, options = {}) {
     const startedOk = await test('baseline', async () => { s = await start('healthy'); await baseline(s); });
     if (startedOk) {
       for (let cycle = 0; cycle < cfg.idleCycles; cycle++) {
+        let idleCompleted = false;
         await test('idle_first_request_' + (cycle + 1), async () => {
-          // Establish the reporter's last known success immediately before idle.
-          checkReady(await read(s, '/health'));
+          const preparation = await prepareIdle(s, 'idle_' + cycle);
           await idle(s, cfg.idleSeconds, 'idle_' + cycle);
+          idleCompleted = true;
           const r = await read(s, '/health');
           checkReady(r);
-          await sample(s, 'idle_' + cycle);
-          return {first_response: r};
+          return {first_response: r, preparation};
         });
+        await test('idle_database_' + (cycle + 1), async () => {
+          need(idleCompleted, 'Idle interval did not complete; the post-idle database witness was not qualified');
+          // The first health outcome is already retained, even on timeout.
+          // This fresh MCP operation precedes any readiness preparation/retry.
+          return await newControl(s, 'idle_' + cycle, false);
+        });
+        await sample(s, 'idle_' + cycle);
       }
       await test('concurrent_first_requests_after_idle', async () => {
-        checkReady(await read(s, '/health'));
+        await prepareIdle(s, 'concurrent_idle');
         await idle(s, cfg.idleSeconds, 'concurrent_idle');
         const results = await burst(s);
         await s.idle(cfg.refreshSeconds);
         await sample(s, 'after_concurrency');
         return {responses: results.length};
       });
+      let soak;
       await test('idle_soak', async () => {
         const before = await sample(s, 'soak_start');
         await idle(s, cfg.soakSeconds, 'soak');
         const after = await sample(s, 'soak_end');
-        checkReady(await read(s, '/health'));
-        need(before.available && after.available, 'Idle CPU telemetry unavailable');
-        const elapsed = after.at_seconds - before.at_seconds;
-        need(elapsed > 0, 'No idle soak interval measured');
-        const cores = (after.cpu_seconds - before.cpu_seconds) / elapsed;
-        requireThat(Number.isFinite(cores) && cores >= 0 && cores <= cfg.maxIdleCpuCores, 'Idle CPU exceeded bound or counter identity changed');
-        return {seconds: elapsed, cpu_cores: cores};
+        soak = {before, after};
+        const first = await read(s, '/health');
+        checkReady(first);
+        return {first_response: first};
+      });
+      await test('idle_soak_cpu', async () => {
+        need(soak, 'Idle soak did not complete; CPU was not qualified');
+        return cpuBound(soak.before, soak.after);
       });
 
       let fault;
+      let outageWindow;
+      let outageConfirmed = false;
       try {
         await test('genuine_database_unavailability', async () => {
           fault = await prepareFault(s);
           await inject(s, fault);
+          outageConfirmed = true;
           const logsBefore = await s.logs();
           const resourceBefore = await sample(s, 'outage_start');
           const begin = io.now();
           await idle(s, cfg.failureWait, 'database_outage');
-          const first = await read(s, '/health');
-          checkUnavailable(first);
-          await live(s);
-          await burst(s, true);
+          // Finish the autonomous-probe observation BEFORE any health or
+          // liveness request can schedule work and contaminate its evidence.
           const resourceAfter = await sample(s, 'outage');
           const logsAfter = await s.logs();
           const duration = io.now() - begin;
+          outageWindow = {logsBefore, logsAfter, resourceBefore, resourceAfter, duration};
+          observation('autonomous_probe_window', {session: s.label, ...outageWindow});
+          const first = await read(s, '/health');
+          checkUnavailable(first);
+          return {first_response: first};
+        });
+        await test('database_outage_liveness', async () => {
+          need(outageConfirmed, 'No independently confirmed serving-database outage');
+          return await live(s);
+        });
+        await test('concurrent_requests_during_database_outage', async () => {
+          need(outageWindow, 'Database outage interval did not complete');
+          const responses = await burst(s, true);
+          return {responses: responses.length};
+        });
+        await test('failed_probe_cadence', async () => {
+          need(outageWindow, 'No completed autonomous failed-probe observation window');
+          const {logsBefore, logsAfter, duration} = outageWindow;
           need(logsBefore.complete && logsAfter.complete, 'Probe logs unavailable or truncated');
           const failures = logsAfter.probe_failures - logsBefore.probe_failures;
           need(failures >= 2, 'Insufficient failed-probe completions to qualify continued background refresh');
           const maximum = Math.floor(duration / cfg.refreshSeconds) + 2;
           requireThat(failures <= maximum, 'Readiness failure work exceeded the declared refresh cadence');
-          need(resourceBefore.available && resourceAfter.available, 'Failed-probe CPU telemetry unavailable');
-          const cores = (resourceAfter.cpu_seconds - resourceBefore.cpu_seconds) / duration;
-          requireThat(Number.isFinite(cores) && cores >= 0 && cores <= cfg.maxIdleCpuCores, 'Failed-probe CPU exceeded bound');
-          return {first_response: first, failure_completions: failures, maximum, observation_seconds: duration, cpu_cores: cores};
+          return {failure_completions: failures, maximum, observation_seconds: duration, request_free: true};
+        });
+        await test('failed_probe_cpu', async () => {
+          need(outageWindow, 'No completed failed-probe CPU observation window');
+          return cpuBound(outageWindow.resourceBefore, outageWindow.resourceAfter);
         });
       } finally {
         const attempted = fault?.attempted;
-        const restored = await test('database_fault_restore', () => restore(s, fault));
-        if (restored && attempted) await test('recovery_without_readiness_polling', () => recover(s, 'recovery_idle'));
-      }
-
-      let staleFault;
-      let suspended = false;
-      try {
-        await test('stale_success_challenge', async () => {
-          checkReady(await read(s, '/health'));
-          staleFault = await prepareFault(s);
-          suspended = true; // Resume even if suspension fails after SIGSTOP.
-          await s.suspend();
-          try {
-            await inject(s, staleFault, false);
-            await idle(s, cfg.failureWait, 'suspended_stale_sample');
-          } finally { await s.resume(); suspended = false; }
-          const first = await read(s, '/health/readiness');
-          checkUnavailable(first, true);
-          await newControl(s, 'stale_outage', true);
-          await live(s);
-          return {first_response: first, stale_branch_observed: first.body.reason === 'database_probe_stale'};
-        });
-      } finally {
-        if (suspended) await s.resume();
-        const attempted = staleFault?.attempted;
-        const restored = await test('stale_fault_restore', () => restore(s, staleFault));
-        if (restored && attempted) await test('stale_challenge_recovery', () => recover(s, 'stale_recovery_idle'));
+        const restored = await restoreCase(s, fault, 'database_fault_restore');
+        if (restored && attempted) await recover(s, 'recovery_idle',
+          'recovery_without_readiness_polling', 'recovery_database_operation');
       }
       await sample(s, 'final');
       await test('bounded_observed_resources', () => resourceBounds(s));
@@ -314,23 +396,87 @@ export async function runQualification(io, options = {}) {
     if (s) await test('healthy_shutdown', () => shutdown(s));
   }
 
+  // Stale-success safety must not depend on a previous recovery succeeding.
+  // This lifetime has its own mailbox, baseline, reversible fault and cleanup.
+  let stale;
+  let staleFault;
+  let suspended = false;
+  try {
+    const ok = await test('stale_success_baseline', async () => {
+      stale = await start('stale_success');
+      await baseline(stale);
+    });
+    if (ok) {
+      try {
+        await test('stale_success_challenge', async () => {
+          checkReady(await read(stale, '/health'));
+          staleFault = await prepareFault(stale);
+          suspended = true; // Resume even if suspension fails after SIGSTOP.
+          try {
+            await stale.suspend();
+            await inject(stale, staleFault, false);
+            await idle(stale, cfg.failureWait, 'suspended_stale_sample');
+          } finally { await stale.resume(); suspended = false; }
+          const first = await read(stale, '/health/readiness');
+          checkUnavailable(first, true);
+          return {first_response: first, stale_branch_observed: first.body.reason === 'database_probe_stale'};
+        });
+        await test('stale_outage_database_operation', async () => {
+          need(staleFault?.confirmed && !suspended, 'No confirmed, resumed stale-sample database outage');
+          return await newControl(stale, 'stale_outage', true);
+        });
+        await test('stale_outage_liveness', async () => {
+          need(staleFault?.confirmed && !suspended, 'No confirmed, resumed stale-sample database outage');
+          return await live(stale);
+        });
+      } finally {
+        if (suspended) { await stale.resume(); suspended = false; }
+        const attempted = staleFault?.attempted;
+        const restored = await restoreCase(stale, staleFault, 'stale_fault_restore');
+        if (restored && attempted) await recover(stale, 'stale_recovery_idle',
+          'stale_challenge_recovery', 'stale_recovery_database_operation');
+      }
+    }
+  } catch (error) {
+    report.cases.push({name: 'unexpected_stale_challenge_error', status: error.status || 'FAIL', error: String(error)});
+  } finally {
+    if (stale) await test('stale_shutdown', () => shutdown(stale));
+  }
+
   let outage;
   let finalFault;
+  let finalOutageConfirmed = false;
   try {
     const ok = await test('outage_shutdown_baseline', async () => { outage = await start('outage_shutdown'); await baseline(outage); });
-    if (ok) await test('shutdown_with_database_unavailable', async () => {
-      finalFault = await prepareFault(outage);
-      await inject(outage, finalFault);
-      await idle(outage, cfg.failureWait, 'outage_shutdown_idle');
-      checkUnavailable(await read(outage, '/health/readiness'));
-      await live(outage);
-      return await shutdown(outage);
-    });
+    if (ok) {
+      await test('outage_shutdown_readiness', async () => {
+        finalFault = await prepareFault(outage);
+        await inject(outage, finalFault);
+        finalOutageConfirmed = true;
+        await idle(outage, cfg.failureWait, 'outage_shutdown_idle');
+        const first = await read(outage, '/health/readiness');
+        checkUnavailable(first);
+        return {first_response: first};
+      });
+      await test('outage_shutdown_liveness', async () => {
+        need(finalOutageConfirmed, 'No independently confirmed database outage before shutdown');
+        return await live(outage);
+      });
+      await test('shutdown_with_database_unavailable', async () => {
+        need(finalOutageConfirmed, 'No independently confirmed database outage before shutdown');
+        return await shutdown(outage);
+      });
+    }
   } finally {
     if (outage) {
       await test('outage_process_cleanup', () => shutdown(outage));
-      await test('outage_shutdown_schema_restore', () => restore(outage, finalFault));
+      await restoreCase(outage, finalFault, 'outage_shutdown_schema_restore');
     }
+  }
+  const recorded = new Set(report.cases.map(value => value.name));
+  for (const name of qualificationCaseNames(cfg)) {
+    if (!recorded.has(name)) report.cases.push({name, status: 'INCOMPLETE', executed: false,
+      error: 'Required check was not executed because an earlier prerequisite did not complete; see preceding case records'});
   }
   report.duration_seconds = io.now() - started;
   report.status = report.cases.some(c => c.status === 'FAIL') ? 'FAIL'

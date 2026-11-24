@@ -272,6 +272,132 @@ Public release binaries and GitHub-backed source snapshots are omitted; their
 identities are recorded separately. Current-main native compilation and the
 three native regression bodies remain unverified.
 
+## Independent outcomes after a readiness failure
+
+The completed historical run exposed an orchestration gap: the first stale
+readiness assertion prevented separate liveness, probe-cadence, CPU, and fresh
+recovery database witnesses from running. Its failed recovery also prevented the
+stale-success challenge from reaching suspension. The model's immediate
+request-triggered refresh concealed the asynchronous prerequisite cascade seen
+in the native process.
+
+The runner now retains independent outcomes for these obligations. Each idle
+trial records its first health result, then attempts one fresh-key MCP database
+operation before any readiness retry, including after a failed health response.
+A later trial may use separately labelled preparation polls within an eight-second
+retry window, retaining each request's five-second deadline, to establish its
+own successful precondition before another full idle
+interval. These polls cannot replace or change the preceding trial's result.
+
+The failed-probe count and CPU window closes before any post-idle health,
+liveness, or concurrent readiness requests. This ensures request-triggered
+refresh cannot supply evidence for autonomous probing. Liveness, concurrent
+outage responses, cadence, and CPU each retain their own verdict. Recovery's
+first readiness response and fresh MCP witness are likewise independent.
+
+The suspended stale-success challenge uses a third fresh mailbox and server
+lifetime. A failed earlier recovery therefore cannot disable that safety arm.
+Partial fault injection still obligates restoration and SIGCONT, while a
+restoration pass requires a confirmed schema outage. Every initiated bounded
+HTTP request in a parallel group settles before the next phase starts, even
+when another request has already failed its deadline.
+
+The native driver and runner now require 35 default case records. Unexecuted
+obligations receive explicit INCOMPLETE records, and demonstrated failures retain
+precedence. This also repairs the prior cross-component mismatch: the historical
+18-case FAIL omitted `stale_challenge_recovery`, so the strict native driver
+would refuse its shape before preserving that failure. Missing and duplicate
+case records, weakened defaults, and false PASS summaries remain rejected.
+
+### Measured validation of the independent outcomes
+
+The revised harness SHA-256 is
+`f0dff77e3b5908d3598376f4451bc1564408e7486cfaafcdba8294c34b57216b`.
+The model now includes delayed request-triggered refresh and combined failures,
+and verifies the ordering of first health responses, fresh MCP witnesses,
+restoration, and shutdown. A deferred HTTP-sibling adversary demonstrates that
+the previous harness could restore the schema and start the next fixture while
+an already launched request remained pending; the revised harness waits for it
+and retains the original deadline failure.
+
+| Validation | Measured result | Scope |
+| --- | --- | --- |
+| Phase-isolation model controls against the prior `c27452ad` harness | 29 passed, 12 failed out of 41 | Demonstrates the previous missing observations and two-fixture expectations. |
+| Final Node suite | 46/46 passed, zero skipped; 6.665 seconds | 42 model controls and four actual-process controls; no native Rust regression. |
+| Native-driver controller suite | 27/27 passed; 5.785 seconds | Report/source/process controls; no native Rust regression. |
+| Healthy process/HTTP/SQLite surrogate | 35/35 passed; exit 0; 131.432 seconds externally | Real adapter validation against the labelled surrogate. |
+| Authenticated native v0.3.41 | 24 PASS, 10 FAIL, one INCOMPLETE; exit 1; 163.756 seconds externally | Completed historical negative control; current-main native remains unverified. |
+| Actual historical report through the native controller boundary | All six admission/adversarial checks passed | The unchanged report retains FAIL; missing/duplicate records and false summaries are refused. |
+
+Both adapter runs retained unchanged source and binary identities, unchanged
+2 GiB disk/1 GiB available-memory guards, and the existing 900-second outer
+limit. Neither required forced cleanup or left owned processes. They ran
+concurrently in separate owned process trees and synthetic mailboxes; their
+latencies are observations under that shared host load, not benchmark claims.
+
+The revised native run completed all three reporter idle trials:
+
+| Trial | Client-silent idle | First health response | Immediately subsequent fresh MCP operation |
+| --- | --- | --- | --- |
+| 1 | 8.006599 seconds | 503/stale, 3.433 ms | Succeeded, 12.634 ms |
+| 2 | 8.000951 seconds | 503/stale, 3.820 ms | Succeeded, 29.656 ms |
+| 3 | 8.000602 seconds | 503/stale, 11.876 ms | Succeeded, 17.313 ms |
+
+No readiness request intervened before any of those fresh database witnesses.
+All 16 concurrent post-idle responses were stale 503s (9.390–38.870 ms).
+Both no-poll recovery responses were stale, while both immediately subsequent
+fresh MCP operations succeeded. The isolated suspended stale-success challenge
+actually executed and returned 503 with `database_probe_stale` and all
+capabilities false; its fresh MCP witness confirmed the installed schema outage.
+All three actual inverse renames preserved rows/schema identities, and all three
+server lifetimes exited cleanly, including shutdown with the fault still active.
+Outage liveness now executed and passed independently of stale readiness.
+
+The healthy surrogate recorded four autonomous failed probes during its
+8.464-second request-free observation window, within the predeclared maximum of
+six. The historical binary recorded zero such completions in its 8.163-second
+window, so `failed_probe_cadence` remains INCOMPLETE. Subsequent readiness
+requests produced fresh failed-probe responses; those request-driven results
+are not credited as autonomous refresh.
+
+The independent native CPU check exposed an additional retained failure:
+process CPU increased from 5.40 to 11.64 seconds during the outage observation.
+The harness interval gives **0.776 CPU cores**, exceeding the unchanged 0.25
+limit. Recalculation from the adapter's own snapshot timestamps gives 0.765
+cores and the same failure. Process identity remained unchanged. CPU had
+already risen during the last part of the preceding healthy soak, before schema
+injection, and no log identifies the hot worker. This is a historical aggregate
+process-CPU failure; the evidence does not attribute it to the schema fault or
+continued readiness probes and does not justify a current-supervisor correction.
+Settled resource growth separately passed: threads 47 to 48, descriptors 54 to
+57, and RSS 135,294,976 to 144,965,632 bytes over nine checkpoints. Those finite
+observations do not establish lifetime bounds.
+
+Raw report SHA-256 identities:
+
+- Healthy surrogate:
+  `2df77c2276c1f76cdc2368c417c4a6cd564c2e7c6b0f26ff0adcf9d6db498691`.
+- Historical native:
+  `009415f4148da5ac598e4a1966529dd505bd26d21ad3fdff6919b11d8090787c`.
+
+An independent audit found zero received HTTP requests in all ten surrogate
+idle windows, using 114 server-side request records across three fixtures.
+Native client silence and first-response/MCP ordering are supported by the
+retained controller observations. The native stale arm's stopped-state check is
+bound to the executed adapter source and corroborated by eight flat CPU samples;
+there is no separately retained signal trace. All 30 native SQL receipts support
+the three confirmed faults and verified restorations. All six native liveness
+requests returned 200/alive.
+
+The retained evidence archive contains 361 evidence files plus its manifest and
+README, including both complete adapter runs, original failing controls,
+corrected suites, independent audits, and signed historical release manifests.
+Its SHA-256 is
+`7a5485d897e6b65c3896ceef4114057cf55c6e0b371b9493b7f725efceaeda71`.
+Public binaries and GitHub-backed source snapshots are excluded; their exact
+identities are retained. Current-main compilation and all three native Rust
+regression bodies remain unverified by this work.
+
 ## What the source review establishes
 
 The supervisor now invokes `mail_readiness()` outside the one-time startup
@@ -345,7 +471,10 @@ commit. A supplied old release is never relabelled as a current-main build.
    taking the settled resource baseline.
 2. Reproduce the reporter's exact sequence three times by default: a successful
    `/health`, eight seconds without any external HTTP/MCP request, then one
-   `/health`. Preserve the first response even if a later request succeeds.
+   `/health`. Preserve the first response, then independently attempt a fresh
+   MCP database operation before any readiness retry. Separately recorded,
+   bounded preparation polls may establish the next trial's healthy precondition;
+   they never replace a preceding first response or its verdict.
 3. Wait another eight seconds with no requests, then concurrently issue 16
    readiness requests across `/health` and `/health/readiness`. Inspect every
    response, not only the first success.
@@ -354,14 +483,17 @@ commit. A supplied old release is never relabelled as a current-main build.
 5. Establish a real, reversible named-table outage through the supplied binary's
    own FrankenSQLite CLI. Prove the table is missing through another CLI query
    and a fresh MCP database operation, then leave health idle for eight seconds.
+   Close the autonomous failed-probe count and CPU window before any request.
    Require the first response to be 503 with `database_probe_failed`, all mail
    capabilities false, and both liveness routes still 200/alive. Repeat the
-   concurrent readiness burst while the fault is active.
+   concurrent readiness burst while the fault is active. Evaluate these checks
+   independently, even if the first readiness assertion fails.
 6. Restore the table and original project rows/schema object identities. Wait
    eight seconds without readiness polling. Require the first response to be
    ready and a fresh MCP project operation to succeed.
-7. Challenge stale success separately: confirm readiness, snapshot the synthetic
-   schema, SIGSTOP the owned process, confirm it is stopped, install the same
+7. Challenge stale success in a fresh third mailbox and server lifetime: confirm
+   readiness, snapshot the synthetic schema, SIGSTOP the owned process,
+   confirm it is stopped, install the same
    independently witnessed schema fault, wait eight seconds, and SIGCONT.
    The first readiness response must fail closed with stale or failed-probe
    reason. Record which branch actually won the scheduling race. Restore and
@@ -402,8 +534,9 @@ tooling](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/6eb6264d5
 and [database
 queries](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/6eb6264d5d6becc2a7609d795c7209c88aac9d55/crates/mcp-agent-mail-db/src/queries.rs).
 
-This fault is source-grounded but still needs execution against native Agent
-Mail. A refusal, unsupported ALTER operation, ineffective mutation, or failure
+Historical native execution validated this fault on v0.3.41; current-main
+execution remains required. A refusal, unsupported ALTER operation, ineffective
+mutation, or failure
 to establish the MCP control yields INCOMPLETE, not a qualification pass. No
 alternate engine or owner-guard bypass is substituted.
 
@@ -420,6 +553,7 @@ flock cannot simply reproduce the native fixture's sole-pool exhaustion.
 | HTTP response | 5 seconds per request, including timeout failures |
 | CLI helper | 20 seconds, then TERM/KILL and at most 4 seconds for terminal drain |
 | Initial healthy baseline | 90 seconds; process exit aborts it early |
+| Preparation for a subsequent idle trial | 8-second retry window with the existing 5-second request deadline; separate from measured idle |
 | Clean server shutdown | 10-second TERM grace; SIGKILL escalation is recorded as failure |
 | Settled descriptors | Baseline plus at most 32 |
 | Settled threads | Baseline plus at most 16 |
@@ -456,7 +590,7 @@ node scripts/qualify_health_idle.mjs \
 
 The output directory need not exist. Each run creates a unique child; it does
 not overwrite a prior run or clean up retained synthetic data. The final stdout
-names `report.json`. The two session directories contain launch settings,
+names `report.json`. The three session directories contain launch settings,
 binary versions, server logs, one-second resource samples, and every SQL helper
 receipt. User-configurable idle and soak lengths cannot be shortened below
 their qualification minima through the CLI.
