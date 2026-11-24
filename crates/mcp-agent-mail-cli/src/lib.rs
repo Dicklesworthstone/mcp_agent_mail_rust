@@ -10281,24 +10281,16 @@ fn handle_mark_all_read(
             &config.http_path,
             local_server_bearer_token(&config),
         );
-        let server_urls = rpc_config.server_urls.clone();
-
         let rt = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .map_err(|e| CliError::Other(format!("runtime error: {e}")))?;
-        let via_daemon = rt.block_on(async {
-            mark_all_read_via_jsonrpc(&rpc_config, &server_urls, older_than_days, limit).await
-        });
-
-        match via_daemon {
-            Ok(payload) => payload,
-            // The daemon went away between the reachability probe and the
-            // call; honor the co-located `--direct` intent.
-            Err(_) if direct => {
-                mark_all_read_direct(&project_key, &agent_name, older_than_days, limit)?
-            }
-            Err(error) => return Err(error),
-        }
+        // A lost response can follow a committed batch. Replaying against the
+        // local database would then mark the next batch, exceeding --limit.
+        rt.block_on(mark_all_read_via_jsonrpc(
+            &rpc_config,
+            older_than_days,
+            limit,
+        ))?
     } else {
         mark_all_read_direct(&project_key, &agent_name, older_than_days, limit)?
     };
@@ -10335,66 +10327,101 @@ fn build_mark_all_read_jsonrpc_request(
     })
 }
 
-/// Invoke the daemon's `mark_all_read` tool, trying each candidate server URL.
+/// Discover the MCP route with a read-only ping, then issue one bulk mutation.
+/// A retry is unsafe even with identical arguments: each call selects the
+/// next unread batch, and the first call may already have committed.
 async fn mark_all_read_via_jsonrpc(
     config: &CheckInboxRpcConfig,
-    server_urls: &[String],
     older_than_days: Option<i64>,
     limit: usize,
 ) -> CliResult<serde_json::Value> {
-    let mut urls = Vec::with_capacity(config.server_urls.len() + server_urls.len() + 1);
-    urls.push(config.server_url.clone());
-    for url in server_urls.iter().chain(config.server_urls.iter()) {
-        if !urls.iter().any(|existing| existing == url) {
-            urls.push(url.clone());
-        }
-    }
-
+    let client = asupersync::http::h1::HttpClient::builder()
+        .no_redirects()
+        .no_retries()
+        .build();
+    let probe = serde_json::json!({
+        "jsonrpc": "2.0", "id": "mark-all-read-probe", "method": "ping"
+    });
     let request = build_mark_all_read_jsonrpc_request(config, older_than_days, limit);
-    let mut last_error: Option<CliError> = None;
-    for server_url in urls {
-        let payload = match post_jsonrpc_request(
-            &server_url,
+    let candidates = std::iter::once(&config.server_url).chain(
+        config
+            .server_urls
+            .iter()
+            .filter(|url| *url != &config.server_url),
+    );
+    for server_url in candidates {
+        let response = match post_jsonrpc_request_with_client(
+            server_url,
             config.bearer_token.as_deref(),
-            &request,
+            &probe,
             config.timeout_seconds,
+            &client,
+            JsonRpcHttpResponsePolicy::RequireHttpSuccess,
         )
         .await
         {
-            Ok(payload) => payload,
-            Err(error) => {
-                last_error = Some(error);
+            Ok(response) => response,
+            Err(CliError::Other(message))
+                if message.starts_with("unexpected HTTP status 404 ")
+                    || message.starts_with("unexpected HTTP status 405 ") =>
+            {
                 continue;
             }
+            Err(error) => return Err(error),
         };
-        if let Some(error) = parse_jsonrpc_error(&payload) {
-            // A tool-level refusal (bad limit, unknown project/agent) is
-            // authoritative — surface it instead of retrying other URLs.
+        if response["jsonrpc"] != "2.0"
+            || response["id"] != probe["id"]
+            || response.get("error").is_some()
+            || !response["result"].is_object()
+        {
+            return Err(CliError::Other(
+                "invalid MCP ping response before mark-all-read".into(),
+            ));
+        }
+        let payload = post_jsonrpc_request_with_client(
+            server_url,
+            config.bearer_token.as_deref(),
+            &request,
+            config.timeout_seconds,
+            &client,
+            JsonRpcHttpResponsePolicy::RequireHttpSuccess,
+        )
+        .await
+        .map_err(|error| {
+            CliError::Other(format!(
+                "mark-all-read outcome unconfirmed; inspect the inbox before retrying: {error}"
+            ))
+        })?;
+        if payload["jsonrpc"] != "2.0" || payload["id"] != request["id"] {
+            return Err(CliError::Other(
+                "mark-all-read outcome unconfirmed: mismatched JSON-RPC response".into(),
+            ));
+        }
+        if let Some(error) =
+            parse_jsonrpc_error(&payload).or_else(|| parse_tool_result_error(&payload))
+        {
             return Err(CliError::Other(error));
         }
-        let Some(result) = payload.get("result").cloned() else {
-            last_error = Some(CliError::Other(
-                "missing JSON-RPC result payload".to_string(),
-            ));
-            continue;
-        };
-        match coerce_tool_result_json(result) {
-            Some(value) if value.get("marked_count").is_some() => return Ok(value),
-            Some(other) => {
-                last_error = Some(CliError::Other(format!(
-                    "unexpected mark_all_read response shape: {other}"
-                )));
-            }
-            None => {
-                last_error = Some(CliError::Other(
-                    "unexpected mark_all_read response shape".to_string(),
-                ));
-            }
-        }
+        return payload
+            .get("result")
+            .cloned()
+            .and_then(coerce_tool_result_json)
+            .filter(|value| {
+                value["marked_count"]
+                    .as_u64()
+                    .and_then(|count| usize::try_from(count).ok())
+                    .is_some_and(|count| count <= limit.min(MARK_ALL_READ_CLI_MAX_LIMIT))
+                    && value["more"].is_boolean()
+            })
+            .ok_or_else(|| {
+                CliError::Other(
+                    "mark-all-read outcome unconfirmed: invalid bulk-read result".into(),
+                )
+            });
     }
-    Err(last_error.unwrap_or_else(|| {
-        CliError::Other("no server URLs configured for mark-all-read HTTP mode".to_string())
-    }))
+    Err(CliError::Other(
+        "no MCP endpoint found for mark-all-read HTTP mode".into(),
+    ))
 }
 
 /// Direct-SQLite fallback for mark-all-read (no daemon listening).
@@ -51984,6 +52011,78 @@ http_headers = { Authorization = "Bearer secret" }
                 .is_none(),
             "absent filter must be omitted so the tool default (no age filter) applies"
         );
+    }
+
+    #[test]
+    fn mark_all_read_negotiates_routes_before_sending_exactly_one_batch() {
+        use crate::reservation_read::tests::{TestReply, with_test_server};
+        use serde_json::json;
+
+        for (reply, expected_error) in [
+            (
+                TestReply::Tool(json!({"marked_count": 2, "more": true})),
+                None,
+            ),
+            (TestReply::Raw(500, json!({})), Some("outcome unconfirmed")),
+            (
+                TestReply::Tool(json!({"marked_count": "2"})),
+                Some("invalid bulk-read result"),
+            ),
+            (
+                TestReply::Raw(
+                    200,
+                    json!({
+                        "jsonrpc": "2.0", "result": {"isError": true, "content": [{"text":"actor refused"}]}
+                    }),
+                ),
+                Some("actor refused"),
+            ),
+        ] {
+            // Another candidate listens but must never receive a connection,
+            // even if the selected daemon's mutation response was lost.
+            let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            unused.set_nonblocking(true).unwrap();
+            let (result, requests) = with_test_server(
+                |_| {
+                    vec![
+                        TestReply::Raw(404, json!({})),
+                        TestReply::Raw(200, json!({"jsonrpc":"2.0", "result":{}})),
+                        reply,
+                    ]
+                },
+                |config| {
+                    let mut rpc = resolve_check_inbox_rpc_config_reader(
+                        |_| None,
+                        "/tmp/p",
+                        "BlueLake",
+                        &config.http_host,
+                        config.http_port,
+                        "/api/",
+                        config.http_bearer_token.clone(),
+                    );
+                    rpc.server_urls
+                        .push(format!("http://{}/mcp/", unused.local_addr().unwrap()));
+                    rpc.timeout_seconds = 1;
+                    asupersync::runtime::RuntimeBuilder::current_thread()
+                        .build()
+                        .unwrap()
+                        .block_on(mark_all_read_via_jsonrpc(&rpc, Some(30), 2))
+                },
+            );
+            assert_eq!(requests[0]["method"], "ping");
+            assert_eq!(requests[1]["method"], "ping");
+            assert_eq!(requests[2]["params"]["name"], "mark_all_read");
+            assert_eq!(requests[2]["params"]["arguments"]["limit"], 2);
+            assert_eq!(
+                unused.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            if let Some(expected) = expected_error {
+                assert!(result.unwrap_err().to_string().contains(expected));
+            } else {
+                assert_eq!(result.unwrap()["marked_count"], 2);
+            }
+        }
     }
 
     /// GH#273 agreement test (the GH#269 lesson applied to the new verb): the
