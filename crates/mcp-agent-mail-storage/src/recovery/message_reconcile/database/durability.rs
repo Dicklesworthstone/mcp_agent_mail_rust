@@ -573,9 +573,11 @@ pub(super) fn ticket_for(config: &Config, prepared: &PreparedMessage) -> Option<
         return None;
     }
     let id = prepared.message.get("id")?.as_i64()?;
-    if !ledger().entries.iter().any(|entry| {
-        entry.witness.kind == WitnessKind::Message && entry.witness.id == id
-    }) {
+    if !ledger()
+        .entries
+        .iter()
+        .any(|entry| entry.witness.kind == WitnessKind::Message && entry.witness.id == id)
+    {
         return None;
     }
     let scope = Scope::capture(config)?;

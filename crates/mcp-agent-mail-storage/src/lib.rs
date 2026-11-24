@@ -9665,8 +9665,8 @@ pub fn commit_paths_with_retry(
 
                 #[cfg(test)]
                 {
-                    let hook = COMMIT_BEFORE_RETRY_BACKOFF_TEST_HOOK
-                        .with(|slot| slot.borrow_mut().take());
+                    let hook =
+                        COMMIT_BEFORE_RETRY_BACKOFF_TEST_HOOK.with(|slot| slot.borrow_mut().take());
                     if let Some(hook) = hook {
                         hook();
                     }
@@ -12465,36 +12465,68 @@ std::thread_local! {
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static MESSAGE_PUBLICATION_AFTER_DEFER_TEST_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static MESSAGE_PUBLICATION_BEFORE_PROJECT_WAIT_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static MESSAGE_PUBLICATION_BEFORE_WRITE_TEST_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static MESSAGE_PUBLICATION_BEFORE_PERSIST_TEST_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
-enum PreparedPublicationTry<P, T> {
+enum PreparedPublicationTry<T> {
     Published(T),
-    Deferred {
-        prepared: P,
-        lock_generation: Option<u64>,
-        messages_root_stamp: Option<MessageFileStamp>,
-    },
+    Deferred,
 }
 
-/// Keep an immutable message's complete identity scan out of the global fence
-/// when possible, and reuse the prepared proof across fence contention when no
-/// message-affecting project lock or `messages/` directory change intervened.
+/// Try both project-lock layers once, preserving normal ownership and
+/// canonical-ID generation tracking. Ordinary preparation can retry outside the
+/// fence; an enclosing mutation window must defer instead of retaining its
+/// caller's fence behind a busy project.
+fn with_message_project_lock_once<T>(
+    archive: &ProjectArchive,
+    publish: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let process_lock = archive_process_lock(archive)?;
+    let project_root = archive_project_root_checked(archive)?;
+    let _process = match process_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return Err(StorageError::LockContention {
+                message: "message publication project lock busy; publication deferred".to_string(),
+            });
+        }
+    };
+    let mut lock = FileLock::new(project_root.join(".archive.lock"))
+        .with_timeout(Duration::ZERO)
+        .with_max_retries(0);
+    let lock_start = Instant::now();
+    lock.acquire_existing_parent()?;
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .archive_lock_wait_us
+        .record(lock_start.elapsed().as_micros() as u64);
+    let generation = ActiveProjectLockGenerationGuard::new(&project_root, lock.acquired_generation);
+    let result = publish();
+    drop(generation);
+    lock.release()?;
+    result
+}
+
+/// Keep an immutable message's complete identity scan outside the global fence.
 ///
-/// `prepare` is read-only and may run twice when another message writer or
-/// repair lock acquires `.archive.lock` while waiting for the global fence.
-/// Nested callers already own the fence and use the established fence-first path.
+/// Publication needs both project ownership and the global fence. Try the fence
+/// without waiting while preparation retains project ownership; on contention,
+/// release that ownership before waiting. Reacquiring a project requires a new
+/// identity proof: foreign writers do not advance the process-local lock
+/// generation and can add files below existing month directories without
+/// changing the top-level messages/ stamp.
 fn with_prepared_message_publication<P, T>(
     archive: &ProjectArchive,
     mut prepare: impl FnMut() -> Result<P>,
     mut publish: impl FnMut(P) -> Result<T>,
 ) -> Result<T> {
     let repo_root = archive_repo_root_checked(archive)?;
-    let project_root = archive_project_root_checked(archive)?;
-    let messages_root = project_root.join("messages");
     let mut publish = |prepared| {
         #[cfg(test)]
         if let Some(hook) =
@@ -12504,9 +12536,20 @@ fn with_prepared_message_publication<P, T>(
         }
         publish(prepared)
     };
-    let mut deferred_prepared: Option<(P, Option<u64>, Option<MessageFileStamp>)> = None;
-    if ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get) == 0 {
-        let outcome = with_project_lock_inner(archive, false, true, || {
+    if ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get) != 0 {
+        let _mutation = ArchiveMutationGuard::begin_at(repo_root);
+        return with_message_project_lock_once(archive, || publish(prepare()?));
+    }
+
+    let mut revalidate = false;
+    loop {
+        let mut attempt = |waited_for_project: bool| {
+            if revalidate || waited_for_project {
+                // A retained cache entry can still save reparsing unchanged
+                // files, but a generation shortcut cannot prove the absence of
+                // foreign canonical IDs after project ownership was released.
+                invalidate_canonical_id_cache_for_archive(archive);
+            }
             let prepared = prepare()?;
             #[cfg(test)]
             if let Some(hook) =
@@ -12517,25 +12560,30 @@ fn with_prepared_message_publication<P, T>(
             let _mutation = match ArchiveMutationGuard::try_begin_repair(repo_root, || false) {
                 Ok(mutation) => mutation,
                 Err(StorageError::LockContention { .. }) => {
-                    return Ok(PreparedPublicationTry::Deferred {
-                        prepared,
-                        lock_generation: active_project_lock_generation(&project_root),
-                        messages_root_stamp: current_path_stamp(&messages_root),
-                    });
+                    return Ok(PreparedPublicationTry::Deferred);
                 }
                 Err(error) => return Err(error),
             };
             publish(prepared).map(PreparedPublicationTry::Published)
-        })?;
+        };
+        // Keep admission failure separate from an admitted preparation or
+        // publication error. Only the former may enter the blocking wait.
+        let outcome = match with_message_project_lock_once(archive, || Ok(attempt(false))) {
+            Ok(result) => result?,
+            Err(StorageError::LockContention { .. } | StorageError::LockTimeout(_)) => {
+                #[cfg(test)]
+                if let Some(hook) = MESSAGE_PUBLICATION_BEFORE_PROJECT_WAIT_TEST_HOOK
+                    .with(|slot| slot.borrow_mut().take())
+                {
+                    hook();
+                }
+                with_project_lock_inner(archive, false, true, || attempt(true))?
+            }
+            Err(error) => return Err(error),
+        };
         match outcome {
             PreparedPublicationTry::Published(result) => return Ok(result),
-            PreparedPublicationTry::Deferred {
-                prepared,
-                lock_generation,
-                messages_root_stamp,
-            } => {
-                deferred_prepared = Some((prepared, lock_generation, messages_root_stamp));
-            }
+            PreparedPublicationTry::Deferred => revalidate = true,
         }
         #[cfg(test)]
         if let Some(hook) =
@@ -12543,25 +12591,13 @@ fn with_prepared_message_publication<P, T>(
         {
             hook();
         }
-    }
 
-    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
-    with_project_lock(archive, || {
-        let fallback_gen = active_project_lock_generation(&project_root);
-        let prepared = match deferred_prepared.take() {
-            Some((prepared, Some(try_gen), try_root_stamp))
-                if fallback_gen == Some(try_gen.saturating_add(1))
-                    && current_path_stamp(&messages_root) == try_root_stamp =>
-            {
-                if let Some(generation) = fallback_gen {
-                    advance_canonical_id_cache_lock_generation(&messages_root, generation);
-                }
-                prepared
-            }
-            _ => prepare()?,
-        };
-        publish(prepared)
-    })
+        // Wait for the global owner with no project ownership. This is an
+        // admission probe, not a mutation: release it before reacquiring the
+        // project or rebuilding its identity proof. The next attempt still
+        // takes the real mutation guard before publishing any archive bytes.
+        drop(FenceLease::acquire());
+    }
 }
 
 fn reject_duplicate_message_ids_in_batch(entries: &[MessageBundleBatchEntry<'_>]) -> Result<()> {
@@ -21816,7 +21852,7 @@ mod tests {
     }
 
     #[test]
-    fn message_publication_fallback_reuses_prepared_proof_when_project_lock_uncontended() {
+    fn message_publication_deferral_rechecks_proof_when_project_lock_is_quiet() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let archive = ensure_archive(&config, "fallback-proof-reuse").unwrap();
@@ -21849,8 +21885,9 @@ mod tests {
         });
 
         deferred_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        // While deferred on the global fence, a non-message project lock
-        // (such as a reservation lock) does not invalidate the message proof.
+        // A non-message owner leaves the local message generation alone.
+        // That still cannot exclude a foreign writer during the released
+        // ownership window, so preparation must be checked again.
         {
             let mut non_msg_lock = FileLock::new(archive.root.join(".archive.lock"))
                 .with_timeout(Duration::ZERO)
@@ -21864,9 +21901,456 @@ mod tests {
         writer.join().unwrap().unwrap();
         assert_eq!(
             prepare_calls.load(Ordering::Acquire),
-            1,
-            "fallback must reuse the try-path proof when no message-affecting lock intervened"
+            2,
+            "reacquiring the project must rebuild proof even when its local generation is quiet"
         );
+    }
+
+    fn message_project_retry_keeps_other_publication_live(foreign_flock: bool) {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "waiting-message").unwrap();
+        let other = ensure_archive(&config, "unrelated-message").unwrap();
+        let process = archive_process_lock(&archive).unwrap();
+        let message = serde_json::json!({
+            "id": 41,
+            "subject": "Deferred message",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "project": "waiting-message",
+        });
+        let recipients = vec!["Recipient".to_string()];
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, &message, "Sender", &recipients).unwrap();
+        let (deferred_tx, deferred_rx) = std::sync::mpsc::channel();
+        let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let fence = ArchiveMutationGuard::begin_at(&archive.repo_root);
+        let writer_archive = archive.clone();
+        let writer_config = config.clone();
+        let writer = std::thread::spawn(move || {
+            MESSAGE_PUBLICATION_AFTER_DEFER_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    deferred_tx.send(()).unwrap();
+                    retry_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }));
+            });
+            MESSAGE_PUBLICATION_BEFORE_PROJECT_WAIT_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // A real process-mutex/flock refusal reached this boundary.
+                    // Both the old preparation and the fence probe are gone.
+                    assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+                    assert_eq!(archive_mutations_active(), 0);
+                    waiting_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }));
+            });
+            write_message_bundle(
+                &writer_archive,
+                &writer_config,
+                &message,
+                "deferred body",
+                "Sender",
+                &recipients,
+                &[],
+                None,
+            )
+        });
+        deferred_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Take project ownership only after the first preparation has released
+        // it. That forces contention specifically on the fallback/retry path.
+        let held_process = (!foreign_flock).then(|| process.lock().unwrap());
+        let held_file = foreign_flock.then(|| {
+            let mut lock = FileLock::new(archive.root.join(".archive.lock"));
+            lock.acquire().unwrap();
+            lock
+        });
+        drop(fence);
+        retry_tx.send(()).unwrap();
+        let waiting = waiting_rx.recv_timeout(Duration::from_secs(10));
+        if waiting.is_ok() {
+            let other_root = other.repo_root.clone();
+            let other_config = config.clone();
+            let other_archive = other.clone();
+            std::thread::spawn(move || {
+                let _admitted = ArchiveMutationGuard::try_begin_repair(&other_root, || false)
+                    .expect("a deferred message must not hold the global fence");
+                write_message_bundle(
+                    &other_archive,
+                    &other_config,
+                    &serde_json::json!({
+                        "id": 99,
+                        "subject": "Independent progress",
+                        "created_ts": "2026-01-15T10:00:00Z",
+                        "project": "unrelated-message",
+                    }),
+                    "independent body",
+                    "OtherSender",
+                    &["OtherRecipient".to_string()],
+                    &[],
+                    None,
+                )
+                .unwrap();
+            })
+            .join()
+            .unwrap();
+            flush_async_commits();
+            assert_eq!(
+                list_message_files(&other.root.join("messages"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            if foreign_flock {
+                let mut probe = FileLock::new(archive.root.join(".archive.lock"))
+                    .with_timeout(Duration::ZERO)
+                    .with_max_retries(0);
+                assert!(matches!(probe.acquire(), Err(StorageError::LockTimeout(_))));
+            } else {
+                assert!(matches!(
+                    process.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock),
+                ));
+            }
+            assert!(!paths.canonical.exists());
+            assert!(!paths.outbox.exists());
+            assert!(paths.inbox.iter().all(|path| !path.exists()));
+        }
+        drop(held_file);
+        drop(held_process);
+        let _ = resume_tx.send(());
+        let result = writer.join().unwrap();
+        waiting.expect("the controlled fallback must encounter the held project lock");
+        result.unwrap();
+        flush_async_commits();
+        for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+            let (published, body) = read_message_file(path).unwrap();
+            assert_eq!(published["id"], 41);
+            assert_eq!(body.trim(), "deferred body");
+        }
+        assert_eq!(archive_mutations_active(), 0);
+        assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+        assert!(archive_publication_fence_holder().is_none());
+    }
+
+    #[test]
+    fn message_preparation_retry_releases_fence_before_waiting_for_project_mutex() {
+        if !isolated_coalescer_regression(
+            "tests::message_preparation_retry_releases_fence_before_waiting_for_project_mutex",
+        ) {
+            return;
+        }
+        message_project_retry_keeps_other_publication_live(false);
+    }
+
+    #[test]
+    fn message_preparation_retry_releases_fence_before_waiting_for_foreign_flock() {
+        if !isolated_coalescer_regression(
+            "tests::message_preparation_retry_releases_fence_before_waiting_for_foreign_flock",
+        ) {
+            return;
+        }
+        message_project_retry_keeps_other_publication_live(true);
+    }
+
+    #[test]
+    fn deferred_message_identity_rechecks_a_foreign_historical_month() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::process::{Command, Stdio};
+
+        const NAME: &str = "tests::deferred_message_identity_rechecks_a_foreign_historical_month";
+        const FOREIGN_ROOT: &str = "AM_TEST_DEFERRED_MESSAGE_FOREIGN_ROOT";
+        const OWNED: &str = "foreign-message-project-owned";
+        let foreign_message = serde_json::json!({
+            "id": 41,
+            "subject": "Foreign canonical identity",
+            "created_ts": "2025-11-12T10:00:00Z",
+            "project": "foreign-identity",
+        });
+        if let Some(root) = std::env::var_os(FOREIGN_ROOT) {
+            let config = test_config(Path::new(&root));
+            let archive = ensure_archive(&config, "foreign-identity").unwrap();
+            MESSAGE_PUBLICATION_AFTER_PREPARE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(|| {
+                    // Tell the parent only after owning both actual project
+                    // locks, then retain them until its contender has refused.
+                    eprintln!("{OWNED}");
+                    std::io::stdin().read_exact(&mut [0]).unwrap();
+                }));
+            });
+            write_message_bundle(
+                &archive,
+                &config,
+                &foreign_message,
+                "foreign immutable body",
+                "Sender",
+                &["Recipient".to_string()],
+                &[],
+                None,
+            )
+            .unwrap();
+            flush_async_commits();
+            return;
+        }
+        if !isolated_coalescer_regression(NAME) {
+            return;
+        }
+
+        for first_project_wait in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let archive = ensure_archive(&config, "foreign-identity").unwrap();
+            let messages_root = archive.root.join("messages");
+            fs::create_dir_all(messages_root.join("2025/11")).unwrap();
+            fs::create_dir_all(messages_root.join("2026/01")).unwrap();
+            // Keep every recent cached path in the target/current month. The
+            // foreign month must be outside BOTH the target and recent windows,
+            // or those cheap stamp probes would hide a missing invalidation.
+            for id in 7..12 {
+                fs::write(
+                    messages_root.join(format!("2026/01/seed__{id}.md")),
+                    render_message_bundle_content(&serde_json::json!({"id": id}), "seed body")
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            let incoming = serde_json::json!({
+                "id": 41,
+                "subject": "Conflicting new canonical identity",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "foreign-identity",
+            });
+            let recipients = vec!["Recipient".to_string()];
+            let (incoming_paths, _, _) =
+                message_paths_for_bundle(&archive, &incoming, "Sender", &recipients).unwrap();
+            let (foreign_paths, _, _) =
+                message_paths_for_bundle(&archive, &foreign_message, "Sender", &recipients)
+                    .unwrap();
+            // Warm the real fast index before the foreign process acquires its
+            // lock. Its writes cannot advance this process's lock generation.
+            {
+                let entry = MessageBundleBatchEntry {
+                    message: &incoming,
+                    body_md: "unpublished",
+                    sender: "Sender",
+                    recipients: &recipients,
+                    extra_paths: &[],
+                };
+                with_project_lock_inner(&archive, false, true, || {
+                    let ids =
+                        collect_existing_batch_message_ids(&archive, std::slice::from_ref(&entry))?;
+                    assert!(!ids.contains_key(&41));
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let root_stamp = current_path_stamp(&messages_root).unwrap();
+            let target_stamp = current_path_stamp(&messages_root.join("2026/01")).unwrap();
+            let spawn_foreign = || {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture"])
+                    .env(FOREIGN_ROOT, tmp.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let start = child.stdin.take().unwrap();
+                let stderr = child.stderr.take().unwrap();
+                let (owned_tx, owned_rx) = std::sync::mpsc::channel();
+                let drain = std::thread::spawn(move || {
+                    let mut diagnostic = String::new();
+                    for line in std::io::BufReader::new(stderr).lines() {
+                        let line = line.unwrap();
+                        if line == OWNED {
+                            let _ = owned_tx.send(());
+                        }
+                        diagnostic.push_str(&line);
+                        diagnostic.push('\n');
+                    }
+                    diagnostic
+                });
+                (child, start, owned_rx, drain)
+            };
+            let mut foreign = first_project_wait.then(spawn_foreign);
+            if let Some((_, _, owned, _)) = &foreign {
+                owned.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            let fence =
+                (!first_project_wait).then(|| ArchiveMutationGuard::begin_at(&archive.repo_root));
+            let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let writer_archive = archive.clone();
+            let writer_config = config.clone();
+            let writer = std::thread::spawn(move || {
+                let pause: Box<dyn FnOnce()> = Box::new(move || {
+                    waiting_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                });
+                if first_project_wait {
+                    MESSAGE_PUBLICATION_BEFORE_PROJECT_WAIT_TEST_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(pause);
+                    });
+                } else {
+                    MESSAGE_PUBLICATION_AFTER_DEFER_TEST_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(pause);
+                    });
+                }
+                write_message_bundle(
+                    &writer_archive,
+                    &writer_config,
+                    &incoming,
+                    "must never become a second canonical identity",
+                    "Sender",
+                    &recipients,
+                    &[],
+                    None,
+                )
+            });
+            waiting_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            if foreign.is_none() {
+                let owner = spawn_foreign();
+                owner.2.recv_timeout(Duration::from_secs(10)).unwrap();
+                foreign = Some(owner);
+            }
+            let (child, mut start, _, drain) = foreign.unwrap();
+            start.write_all(&[1]).unwrap();
+            drop(start);
+            let output = child.wait_with_output().unwrap();
+            let diagnostic = drain.join().unwrap();
+            let after_root = current_path_stamp(&messages_root).unwrap();
+            let after_target = current_path_stamp(&messages_root.join("2026/01")).unwrap();
+            drop(fence);
+            let _ = resume_tx.send(());
+            let result = writer.join().unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("test result: ok. 1 passed"),
+                "the independent writer must complete:\n{}\n{diagnostic}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            assert_eq!(after_root, root_stamp);
+            assert_eq!(after_target, target_stamp);
+            let error =
+                result.expect_err("foreign canonical ID must invalidate every waited-on proof");
+            assert!(
+                error
+                    .to_string()
+                    .contains("canonical message id 41 already exists"),
+                "first_project_wait={first_project_wait}: {error}",
+            );
+            for path in [
+                &foreign_paths.canonical,
+                &foreign_paths.outbox,
+                &foreign_paths.inbox[0],
+            ] {
+                let (message, body) = read_message_file(path).unwrap();
+                assert_eq!(message["id"], 41);
+                assert_eq!(body.trim(), "foreign immutable body");
+            }
+            assert!(!incoming_paths.canonical.exists());
+            assert!(!incoming_paths.outbox.exists());
+            assert!(incoming_paths.inbox.iter().all(|path| !path.exists()));
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            let foreign_rel = foreign_paths
+                .canonical
+                .strip_prefix(&archive.repo_root)
+                .unwrap();
+            assert!(tree.get_path(foreign_rel).is_ok());
+            assert_eq!(archive_mutations_active(), 0);
+            assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+        }
+    }
+
+    #[test]
+    fn nested_message_publication_refuses_busy_project_without_partial_copies() {
+        if !isolated_coalescer_regression(
+            "tests::nested_message_publication_refuses_busy_project_without_partial_copies",
+        ) {
+            return;
+        }
+
+        for foreign_flock in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let archive = ensure_archive(&config, "nested-message").unwrap();
+            let message = serde_json::json!({
+                "id": 43,
+                "subject": "Nested publication",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "nested-message",
+            });
+            let recipients = vec!["Recipient".to_string()];
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message, "Sender", &recipients).unwrap();
+            let process = archive_process_lock(&archive).unwrap();
+            let held_process = (!foreign_flock).then(|| process.lock().unwrap());
+            let held_file = foreign_flock.then(|| {
+                let mut lock = FileLock::new(archive.root.join(".archive.lock"));
+                lock.acquire().unwrap();
+                lock
+            });
+            let worker_archive = archive.clone();
+            let worker_config = config.clone();
+            let worker_message = message.clone();
+            let worker_recipients = recipients.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let mutation = ArchiveMutationGuard::begin_at(&worker_archive.repo_root);
+                let result = write_message_bundle(
+                    &worker_archive,
+                    &worker_config,
+                    &worker_message,
+                    "nested body",
+                    "Sender",
+                    &worker_recipients,
+                    &[],
+                    None,
+                );
+                assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 1);
+                drop(mutation);
+                done_tx.send(result).unwrap();
+            });
+            let completed_while_owned = done_rx.recv_timeout(Duration::from_secs(10));
+            let untouched = !paths.canonical.exists()
+                && !paths.outbox.exists()
+                && paths.inbox.iter().all(|path| !path.exists());
+            drop(held_file);
+            drop(held_process);
+            writer.join().unwrap();
+            assert!(
+                matches!(
+                    completed_while_owned,
+                    Ok(Err(
+                        StorageError::LockContention { .. } | StorageError::LockTimeout(_)
+                    ))
+                ),
+                "nested message publication must defer while the owner remains held",
+            );
+            assert!(untouched);
+            assert_eq!(archive_mutations_active(), 0);
+            write_message_bundle(
+                &archive,
+                &config,
+                &message,
+                "nested body",
+                "Sender",
+                &recipients,
+                &[],
+                None,
+            )
+            .unwrap();
+            flush_async_commits();
+            for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+                let (published, body) = read_message_file(path).unwrap();
+                assert_eq!(published["id"], 43);
+                assert_eq!(body.trim(), "nested body");
+            }
+            assert_eq!(archive_mutations_active(), 0);
+            assert!(archive_publication_fence_holder().is_none());
+        }
     }
 
     #[test]
@@ -36937,7 +37421,11 @@ mod tests {
         let other_path = "projects/other/progress.txt";
         fs::write(archive.repo_root.join(requested), b"first attempt").unwrap();
         fs::write(other_archive.repo_root.join(other_path), b"other root").unwrap();
-        fs::write(archive.repo_root.join("staged-only.txt"), b"staged evidence").unwrap();
+        fs::write(
+            archive.repo_root.join("staged-only.txt"),
+            b"staged evidence",
+        )
+        .unwrap();
         let mut shared_index = repo.index().unwrap();
         shared_index.add_path(Path::new("staged-only.txt")).unwrap();
         shared_index.write().unwrap();
@@ -37058,7 +37546,10 @@ mod tests {
             &Repository::open(&other_archive.repo_root).unwrap(),
             Path::new(other_path),
         ));
-        assert_eq!(sm.lockfree_commit_fallbacks_total.load(), fallbacks_before + 1);
+        assert_eq!(
+            sm.lockfree_commit_fallbacks_total.load(),
+            fallbacks_before + 1
+        );
         assert_eq!(
             sm.git_index_lock_retries_total.load(),
             retries_before + u64::from(!hold_advisory),
@@ -37122,7 +37613,9 @@ mod tests {
             .unwrap();
             let manifest = recovery_state::ensure_checkpoint(&conn, &config.storage_root).unwrap();
             drop(conn);
-            let pending_path = config.storage_root.join("recovery-state/.git-pending.jsonl");
+            let pending_path = config
+                .storage_root
+                .join("recovery-state/.git-pending.jsonl");
             let debt_before = fs::read(&pending_path).unwrap();
             assert_ne!(debt_before.as_slice(), b"");
             let mut held_ref = repo.transaction().unwrap();
@@ -37156,7 +37649,10 @@ mod tests {
 
             completed_while_owned
                 .expect("the outer recovery window must defer while locks are held");
-            assert_eq!(debt_after, debt_before, "failed publication cannot acknowledge debt");
+            assert_eq!(
+                debt_after, debt_before,
+                "failed publication cannot acknowledge debt"
+            );
             assert_eq!(head_after, initial.id());
             assert_eq!(archive_mutations_active(), 0);
             assert!(archive_publication_fence_holder().is_none());
@@ -37198,7 +37694,11 @@ mod tests {
             let branch = "refs/heads/index.lock-initialization";
             repo.set_head(branch).unwrap();
             fs::write(tmp.path().join(".gitattributes"), b"*.json text eol=lf\n").unwrap();
-            fs::write(tmp.path().join(".gitignore"), b"# retained operator rule\n*.bak\n").unwrap();
+            fs::write(
+                tmp.path().join(".gitignore"),
+                b"# retained operator rule\n*.bak\n",
+            )
+            .unwrap();
             if unborn {
                 // An interrupted first initialization left valid working
                 // metadata but no committed HEAD and no process-local cache.
@@ -37222,7 +37722,9 @@ mod tests {
             let retry_config = config.clone();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let initializer = std::thread::spawn(move || {
-                done_tx.send(ensure_repo(&retry_root, &retry_config)).unwrap();
+                done_tx
+                    .send(ensure_repo(&retry_root, &retry_config))
+                    .unwrap();
             });
             let refused_while_owned = done_rx.recv_timeout(Duration::from_secs(10));
             held_advisory.release().unwrap();
@@ -39007,7 +39509,10 @@ Test body.
         assert_eq!(published.parent_id(0).unwrap(), original_tip);
         let tree = published.tree().unwrap();
         let entry = tree.get_path(Path::new(".gitignore")).unwrap();
-        assert_eq!(restored.find_blob(entry.id()).unwrap().content(), ignore_bytes);
+        assert_eq!(
+            restored.find_blob(entry.id()).unwrap().content(),
+            ignore_bytes
+        );
         assert!(restored.find_commit(original_tip).is_ok());
     }
 }
