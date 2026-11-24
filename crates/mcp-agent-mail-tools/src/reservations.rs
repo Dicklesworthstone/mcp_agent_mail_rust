@@ -1507,7 +1507,7 @@ async fn replay_single_release_intent(
     // Shared recovery admits only full-hash-verified release records and
     // validates the bounded journal snapshot before replay mutates the database.
     ensure_request_live(ctx).map_err(release_intent_replay_error)?;
-    let project = resolve_project(ctx, pool, &intent.project_key)
+    let project = resolve_existing_project(ctx, pool, &intent.project_key)
         .await
         .map_err(release_intent_replay_error)?;
     ensure_request_live(ctx).map_err(release_intent_replay_error)?;
@@ -1527,7 +1527,7 @@ async fn replay_single_release_intent(
     ensure_request_live(ctx).map_err(release_intent_replay_error)?;
     let agent_id = agent.id.unwrap_or(0);
     let ids_to_release = if normalized_paths.is_some() || intent.file_reservation_ids.is_some() {
-        let existing_rows = match mcp_agent_mail_db::queries::list_unreleased_file_reservations(
+        let mut existing_rows = match mcp_agent_mail_db::queries::list_unreleased_file_reservations(
             ctx.cx(),
             pool,
             project_id,
@@ -1545,19 +1545,33 @@ async fn replay_single_release_intent(
                 return Err((format!("panicked: {}", panic.message()), true));
             }
         };
-        let mut ids = Vec::new();
-        for reservation in existing_rows {
-            if renewal_filter_matches(
-                &reservation,
+        if normalized_paths.is_none()
+            && let Some(ids) = intent.file_reservation_ids.as_deref()
+        {
+            // A previous partial replay may have released the selecting row
+            // before recording completion. Its original path still identifies
+            // older siblings, but a pre-intent release or newer selector
+            // must never acquire authority over another held path.
+            let selected = mcp_agent_mail_db::queries::get_release_replay_selectors(
+                ctx.cx(),
+                pool,
+                project_id,
                 agent_id,
-                normalized_paths.as_deref(),
-                intent.file_reservation_ids.as_deref(),
-            ) && let Some(id) = reservation.id
-            {
-                ids.push(id);
-            }
+                ids,
+                intent.created_ts,
+            )
+            .await;
+            existing_rows
+                .extend(db_outcome_to_mcp_result(selected).map_err(release_intent_replay_error)?);
         }
-        Some(ids)
+        Some(select_release_reservation_ids(
+            &existing_rows,
+            project_id,
+            agent_id,
+            normalized_paths.as_deref(),
+            intent.file_reservation_ids.as_deref(),
+            Some(intent.created_ts),
+        ))
     } else {
         None
     };
@@ -1734,6 +1748,60 @@ fn renewal_filter_matches(
         }
     }
     true
+}
+
+/// A release uses supplied paths as its scope; IDs select exact held paths
+/// only when paths are absent. Selecting one legacy duplicate releases its
+/// same-path siblings, never another holder or project. Replay also bounds
+/// both the selecting row and every target by the original intent timestamp.
+///
+/// Replay may include an ID's terminal row after a partial apply, so it remains
+/// a selector only if its release happened at or after the intent was queued.
+fn select_release_reservation_ids(
+    rows: &[mcp_agent_mail_db::FileReservationRow],
+    project_id: i64,
+    agent_id: i64,
+    paths: Option<&[String]>,
+    reservation_ids: Option<&[i64]>,
+    created_at_or_before: Option<i64>,
+) -> Vec<i64> {
+    let in_scope = |row: &mcp_agent_mail_db::FileReservationRow| {
+        row.project_id == project_id
+            && row.agent_id == agent_id
+            && created_at_or_before.is_none_or(|cutoff| row.created_ts <= cutoff)
+    };
+    let selected_paths = if paths.is_none() {
+        reservation_ids.map(|ids| {
+            let ids: HashSet<_> = ids.iter().copied().collect();
+            rows.iter()
+                .filter(|row| in_scope(row))
+                .filter(|row| row.id.is_some_and(|id| ids.contains(&id)))
+                .filter(|row| {
+                    row.released_ts.is_none_or(|ts| ts <= 0)
+                        || created_at_or_before.is_some_and(|cutoff| {
+                            row.released_ts.is_some_and(|released| released >= cutoff)
+                        })
+                })
+                .map(|row| row.path_pattern.as_str())
+                .collect::<HashSet<_>>()
+        })
+    } else {
+        None
+    };
+    let mut ids = rows
+        .iter()
+        .filter(|row| in_scope(row))
+        .filter(|row| renewal_filter_matches(row, agent_id, paths, None))
+        .filter(|row| {
+            selected_paths
+                .as_ref()
+                .is_none_or(|selected| selected.contains(row.path_pattern.as_str()))
+        })
+        .filter_map(|row| row.id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 fn collect_previous_expiries(
@@ -3107,50 +3175,14 @@ pub async fn release_file_reservations(
             }
             other => db_outcome_to_mcp_result(other)?,
         };
-        let selected_rows = existing_rows
-            .iter()
-            .filter(|res| {
-                renewal_filter_matches(
-                    res,
-                    agent_id,
-                    normalized_paths.as_deref(),
-                    // Paths describe the release scope. When present they must
-                    // not be narrowed by a stale/incomplete ID list, or a
-                    // release-by-path call can report success while siblings
-                    // still block peers.
-                    normalized_paths
-                        .is_none()
-                        .then_some(file_reservation_ids.as_deref())
-                        .flatten(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        // A historical retry could leave several active rows for the same
-        // `(agent, path_pattern)`. An ID is a selector for a held path, not
-        // permission to leave its active siblings behind.
-        let mut ids = if file_reservation_ids.is_some() {
-            let selected_paths = selected_rows
-                .iter()
-                .map(|res| res.path_pattern.as_str())
-                .collect::<HashSet<_>>();
-            existing_rows
-                .iter()
-                .filter(|res| {
-                    renewal_filter_matches(res, agent_id, None, None)
-                        && selected_paths.contains(res.path_pattern.as_str())
-                })
-                .filter_map(|res| res.id)
-                .collect::<Vec<_>>()
-        } else {
-            selected_rows
-                .iter()
-                .filter_map(|res| res.id)
-                .collect::<Vec<_>>()
-        };
-        ids.sort_unstable();
-        ids.dedup();
-        Some(ids)
+        Some(select_release_reservation_ids(
+            &existing_rows,
+            project_id,
+            agent_id,
+            normalized_paths.as_deref(),
+            file_reservation_ids.as_deref(),
+            None,
+        ))
     } else {
         None
     };
@@ -7579,6 +7611,11 @@ mod tests {
                 let (paths, ids) = match filter {
                     "all" => (None, None),
                     "paths" => (Some(vec!["src/**".to_string()]), None),
+                    "paths_and_stale_ids" => (
+                        Some(vec!["src/**".to_string()]),
+                        Some(vec![original_ids[2]]),
+                    ),
+                    "paths_and_empty_ids" => (Some(vec!["src/**".to_string()]), Some(vec![])),
                     "ids" => (None, Some(original_ids[..2].to_vec())),
                     other => panic!("unexpected filter {other}"),
                 };
@@ -7729,6 +7766,16 @@ mod tests {
                 assert_eq!(remaining.len(), expected_ids.len());
             });
         });
+    }
+
+    #[test]
+    fn replay_release_intent_preserves_path_scope_with_stale_ids() {
+        assert_release_replay_preserves_later_same_agent_leases("paths_and_stale_ids");
+    }
+
+    #[test]
+    fn replay_release_intent_preserves_path_scope_with_empty_ids() {
+        assert_release_replay_preserves_later_same_agent_leases("paths_and_empty_ids");
     }
 
     #[test]
@@ -9602,6 +9649,235 @@ mod tests {
                         .is_empty(),
                     "successfully replayed intents should not be replayed again"
                 );
+            });
+        });
+    }
+
+    #[test]
+    fn replay_release_intent_does_not_recreate_a_missing_project() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/removed-release-project-{}", unique_suffix());
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                let before = conn
+                    .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                    .unwrap()[0]
+                    .get_named::<i64>("n")
+                    .unwrap();
+                drop(conn);
+                append_release_intent(
+                    &config,
+                    &project_key,
+                    "BlueLake",
+                    Some(vec!["src/**".into()]),
+                    None,
+                    "injected_db_unavailable",
+                    "database unavailable",
+                )
+                .expect("queue release for absent project");
+                let ctx = McpContext::new(cx.clone(), 1);
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                let after = conn
+                    .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                    .unwrap()[0]
+                    .get_named::<i64>("n")
+                    .unwrap();
+                assert_eq!(after, before, "a closeout cannot recreate a project");
+                assert!(read_queued_release_intents(&config).unwrap().is_empty());
+            });
+        });
+    }
+
+    #[test]
+    fn replay_release_intent_rejects_ambiguous_terminal_selectors() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project = ensure_project(
+                    &cx,
+                    &pool,
+                    &format!("/tmp/release-selector-authority-{}", unique_suffix()),
+                )
+                .await;
+                let project_id = project.id.unwrap();
+                let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let agent_id = agent.id.unwrap();
+                let future = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+                let post_cutoff = future.to_string();
+                let cases = [
+                    ("NULL", Some(0), false),
+                    ("1", Some(future), false),
+                    (post_cutoff.as_str(), Some(1), false),
+                    ("'garbage'", None, false),
+                    ("'none'", None, true),
+                    ("NULL", Some(future), true),
+                ];
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                let mut selectors = Vec::new();
+                let mut siblings = Vec::new();
+                for (index, (base, ledger, eligible)) in cases.into_iter().enumerate() {
+                    conn.execute_raw(&format!(
+                        "INSERT INTO file_reservations \
+                         (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES \
+                         ({project_id}, {agent_id}, 'src/authority-{index}.rs', 1, 'selector', 1, {future}, {base}), \
+                         ({project_id}, {agent_id}, 'src/authority-{index}.rs', 1, 'sibling', 1, {future}, NULL)"
+                    ))
+                    .unwrap();
+                    let rows = conn.query_sync(
+                        "SELECT id, reason FROM file_reservations WHERE project_id = ? AND path_pattern = ?",
+                        &[
+                            SqlValue::BigInt(project_id),
+                            SqlValue::Text(format!("src/authority-{index}.rs")),
+                        ],
+                    )
+                    .unwrap();
+                    assert_eq!(rows.len(), 2);
+                    for row in rows {
+                        let id = row.get_named::<i64>("id").unwrap();
+                        if row.get_named::<String>("reason").unwrap() == "selector" {
+                            selectors.push(id);
+                            if let Some(released) = ledger {
+                                conn.execute_sync(
+                                    "INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES (?, ?)",
+                                    &[SqlValue::BigInt(id), SqlValue::BigInt(released)],
+                                )
+                                .unwrap();
+                            }
+                        } else {
+                            siblings.push((id, eligible));
+                        }
+                    }
+                }
+                drop(conn);
+                append_release_intent(
+                    &config,
+                    &project.human_key,
+                    &agent.name,
+                    None,
+                    Some(selectors),
+                    "injected_db_unavailable",
+                    "database unavailable",
+                )
+                .unwrap();
+                let ctx = McpContext::new(cx.clone(), 1);
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                let ids = siblings.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+                let rows = queries::get_reservations_by_ids(&cx, &pool, &ids)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(rows.len(), cases.len());
+                for row in rows {
+                    let eligible = siblings
+                        .iter()
+                        .find(|(id, _)| Some(*id) == row.id)
+                        .unwrap()
+                        .1;
+                    assert_eq!(
+                        row.released_ts.is_some_and(|ts| ts > 0),
+                        eligible,
+                        "{row:?}"
+                    );
+                }
+                assert!(read_queued_release_intents(&config).unwrap().is_empty());
+            });
+        });
+    }
+
+    #[test]
+    fn replay_release_intent_finishes_old_siblings_after_partial_apply() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project = ensure_project(
+                    &cx,
+                    &pool,
+                    &format!("/tmp/release-siblings-{}", unique_suffix()),
+                )
+                .await;
+                let project_id = project.id.unwrap();
+                let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let agent_id = agent.id.unwrap();
+                let selected = create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    "src/held.rs",
+                    3600,
+                    true,
+                )
+                .await;
+                let selected_id = selected.id.unwrap();
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                conn.execute_sync(
+                    "INSERT INTO file_reservations \
+                     (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                     SELECT project_id, agent_id, path_pattern, \"exclusive\", 'legacy sibling', created_ts, expires_ts \
+                     FROM file_reservations WHERE id = ?",
+                    &[SqlValue::BigInt(selected_id)],
+                )
+                .unwrap();
+                drop(conn);
+                append_release_intent(
+                    &config,
+                    &project.human_key,
+                    &agent.name,
+                    None,
+                    Some(vec![selected_id]),
+                    "injected_db_unavailable",
+                    "database unavailable",
+                )
+                .unwrap();
+                let intent = read_queued_release_intents(&config).unwrap().remove(0);
+                queries::release_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    None,
+                    Some(&[selected_id]),
+                )
+                .await
+                .into_result()
+                .unwrap();
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                conn.execute_sync(
+                    "INSERT INTO file_reservations \
+                     (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                     VALUES (?, ?, 'src/held.rs', 1, 'future sibling', ?, ?)",
+                    &[
+                        SqlValue::BigInt(project_id),
+                        SqlValue::BigInt(agent_id),
+                        SqlValue::BigInt(intent.created_ts + 1),
+                        SqlValue::BigInt(selected.expires_ts),
+                    ],
+                )
+                .unwrap();
+                drop(conn);
+                let ctx = McpContext::new(cx.clone(), 1);
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(active.len(), 1, "the old sibling must be released");
+                assert_eq!(active[0].reason, "future sibling");
+                assert!(active[0].created_ts > intent.created_ts);
+                assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                let remaining = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].id, active[0].id);
             });
         });
     }

@@ -17467,7 +17467,14 @@ pub fn release_reservations_with_replay_cutoffs<'a>(
                 paths,
             );
 
-            let select_sql = format!("{FILE_RESERVATION_SELECT_COLUMNS_SQL}{filter_sql}");
+            // The predicate already admits only logically active rows. Legacy
+            // TEXT sentinels must not fail typed decoding before their release
+            // markers supply the authoritative positive terminal timestamp.
+            let select_sql = format!(
+                "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, \
+                 created_ts, expires_ts, NULL AS released_ts, revision \
+                 FROM file_reservations{filter_sql}"
+            );
             let rows_out =
                 map_sql_outcome(traw_query(cx, &tracked_conn, &select_sql, &filter_params).await);
             let reservations: Vec<FileReservationRow> = match rows_out {
@@ -20413,6 +20420,197 @@ pub async fn prune_released_file_reservations(
     }
 
     Outcome::Ok(deleted)
+}
+
+async fn query_release_replay_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    sql: &str,
+    params: &[Value],
+) -> Outcome<Vec<SqlRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    };
+    let tracked = tracked(&*conn);
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
+    let rows = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(traw_query(cx, &tracked, sql, params).await)
+    );
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+    Outcome::Ok(rows)
+}
+
+/// Freeze the release replay ID window from fresh committed state.
+pub async fn get_release_replay_ceiling(cx: &Cx, pool: &DbPool) -> Outcome<i64, DbError> {
+    match query_release_replay_snapshot(
+        cx,
+        pool,
+        "SELECT COALESCE(MAX(id), 0) AS ceiling FROM file_reservations",
+        &[],
+    )
+    .await
+    {
+        Outcome::Ok(rows) => match rows.first() {
+            Some(row) => match row.get_named::<i64>("ceiling") {
+                Ok(ceiling) => Outcome::Ok(ceiling.max(0)),
+                Err(error) => Outcome::Err(map_sql_error(&error)),
+            },
+            None => Outcome::Err(DbError::Internal("release page ceiling is missing".into())),
+        },
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => Outcome::Panicked(panic),
+    }
+}
+
+/// Read one bounded, fresh keyset page of release candidates.
+///
+/// Terminal rows remain in the numeric window so restarts and sparse filters
+/// make progress. The replay caller separately verifies logical activity before
+/// mutation. Exact paths, when supplied, come from validated ID selectors.
+#[allow(clippy::too_many_arguments)]
+pub async fn get_release_replay_candidate_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    cutoff: i64,
+    after: i64,
+    ceiling: i64,
+    paths: Option<&[String]>,
+    limit: i64,
+) -> Outcome<Vec<i64>, DbError> {
+    if project_id <= 0
+        || agent_id <= 0
+        || cutoff <= 0
+        || after < 0
+        || ceiling < 0
+        || !usize::try_from(limit).is_ok_and(|limit| (1..=MAX_IN_CLAUSE_ITEMS).contains(&limit))
+        || paths.is_some_and(|paths| paths.len() > MAX_IN_CLAUSE_ITEMS)
+    {
+        return Outcome::Err(DbError::invalid(
+            "release_page_scope",
+            "invalid release page bounds",
+        ));
+    }
+    if paths.is_some_and(<[String]>::is_empty) {
+        return Outcome::Ok(Vec::new());
+    }
+    let mut sql = String::from(
+        "SELECT id FROM file_reservations WHERE project_id = ? AND agent_id = ? \
+         AND created_ts <= ? AND id > ? AND id <= ?",
+    );
+    let mut params = vec![
+        Value::BigInt(project_id),
+        Value::BigInt(agent_id),
+        Value::BigInt(cutoff),
+        Value::BigInt(after),
+        Value::BigInt(ceiling),
+    ];
+    if let Some(paths) = paths {
+        sql.push_str(" AND path_pattern IN (");
+        sql.push_str(&placeholders(paths.len()));
+        sql.push(')');
+        params.extend(paths.iter().cloned().map(Value::Text));
+    }
+    sql.push_str(" ORDER BY id LIMIT ?");
+    params.push(Value::BigInt(limit));
+    match query_release_replay_snapshot(cx, pool, &sql, &params).await {
+        Outcome::Ok(rows) => {
+            let mut ids = Vec::with_capacity(rows.len());
+            for row in rows {
+                match row.get_named::<i64>("id") {
+                    Ok(id) => ids.push(id),
+                    Err(error) => return Outcome::Err(map_sql_error(&error)),
+                }
+            }
+            Outcome::Ok(ids)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => Outcome::Panicked(panic),
+    }
+}
+
+/// Resolve ID selectors for a deferred release without reviving old authority.
+///
+/// An active row can select its held path. A row released at or after the intent
+/// can still select older siblings after a partial replay. Check the base row
+/// and release ledger separately: a merged timestamp can hide an earlier
+/// terminal record, and any ledger entry excludes a row from active authority.
+/// Unknown or nonpositive ledger timestamps never authorize sibling releases.
+pub async fn get_release_replay_selectors(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    ids: &[i64],
+    cutoff: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    if project_id <= 0 || agent_id <= 0 || cutoff <= 0 {
+        return Outcome::Err(DbError::invalid(
+            "release_selector_scope",
+            "release selectors require positive identities and cutoff",
+        ));
+    }
+    if ids.is_empty() {
+        return Outcome::Ok(Vec::new());
+    }
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    };
+    let tracked = tracked(&*conn);
+    // Recycled handles may retain an older pooled observation. Selector
+    // authority must reflect a fresh read of both terminal stores.
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
+    let active_base = active_reservation_candidate_predicate_for("fr");
+    let mut out = Vec::new();
+    for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT fr.id AS id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                    fr.created_ts, fr.expires_ts, \
+                    CASE WHEN rr.reservation_id IS NOT NULL THEN CAST(rr.released_ts AS INTEGER) \
+                         WHEN {active_base} THEN NULL ELSE CAST(fr.released_ts AS INTEGER) END AS released_ts, fr.revision \
+             FROM file_reservations fr \
+             LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+             WHERE fr.id IN ({placeholders}) AND fr.project_id = ? AND fr.agent_id = ? AND fr.created_ts <= ? \
+               AND ({active_base} OR (typeof(fr.released_ts) IN ('integer', 'real') AND fr.released_ts >= ?)) \
+               AND (rr.reservation_id IS NULL OR (typeof(rr.released_ts) IN ('integer', 'real') AND rr.released_ts >= ?))"
+        );
+        let mut params = chunk.iter().copied().map(Value::BigInt).collect::<Vec<_>>();
+        params.extend([
+            Value::BigInt(project_id),
+            Value::BigInt(agent_id),
+            Value::BigInt(cutoff),
+            Value::BigInt(cutoff),
+            Value::BigInt(cutoff),
+        ]);
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await)
+        );
+        for row in &rows {
+            match decode_file_reservation_row(row) {
+                Ok(row) => out.push(row),
+                Err(error) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
+            }
+        }
+    }
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+    Outcome::Ok(out)
 }
 
 /// Fetch specific file reservations by their IDs.

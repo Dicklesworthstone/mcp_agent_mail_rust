@@ -3,9 +3,12 @@
 //! The failure path retains bounded identifiers and content digests, not Config,
 //! bearer tokens or replayable message payloads. Repair reads the live source and
 //! uses the existing no-clobber, BCC-safe, Git-verifying reconciler. Unknown,
-//! oversized and non-message failures require the existing operator clear.
+//! oversized and unsupported failures require the existing operator clear.
+//! Profile failures share this bounded ledger, but their separate proof lane
+//! verifies the current authoritative incarnation rather than replaying stale data.
 
 mod extra_paths;
+pub(crate) mod profiles;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -74,7 +77,14 @@ impl Scope {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum WitnessKind {
+    Message,
+    AgentProfile(profiles::Binding),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Witness {
+    kind: WitnessKind,
     scope: Scope,
     project: String,
     id: i64,
@@ -176,6 +186,14 @@ fn fingerprint(
 
 impl Witness {
     fn from_op(op: &WriteOp) -> Option<Self> {
+        if let WriteOp::AgentProfile {
+            config,
+            project_slug,
+            agent_json,
+        } = op
+        {
+            return profiles::witness(config, project_slug, agent_json);
+        }
         let WriteOp::MessageBundle {
             config,
             project_slug,
@@ -203,6 +221,7 @@ impl Witness {
             return None;
         }
         Some(Self {
+            kind: WitnessKind::Message,
             scope: Scope::capture(config)?,
             project: project_slug.clone(),
             id,
@@ -211,7 +230,8 @@ impl Witness {
     }
 
     fn matches(&self, prepared: &PreparedMessage) -> bool {
-        prepared.project_slug == self.project
+        self.kind == WitnessKind::Message
+            && prepared.project_slug == self.project
             && prepared.message.get("id").and_then(Value::as_i64) == Some(self.id)
             && fingerprint(
                 &prepared.message,
@@ -441,7 +461,11 @@ fn complete(ticket: &Ticket) {
         metric.set(0);
         drop(ledger);
         tracing::info!(target: "maintenance", event = "wbq_durability_recovered",
-            message_id = ticket.witness.id,
+            entity_id = ticket.witness.id,
+            failure_kind = match &ticket.witness.kind {
+                WitnessKind::Message => "message",
+                WitnessKind::AgentProfile(_) => "agent_profile",
+            },
             failure_timestamp_us = failed_at,
             "all tracked WBQ failures verified in the archive; write refusal cleared");
     }
@@ -489,7 +513,8 @@ fn ready_tickets(
         // cooling IDs must not prevent later failed messages from being admitted.
         // Multiple failed versions of one ID retain distinct proof obligations,
         // but only need one source read on this pass.
-        if &entry.witness.scope != scope
+        if entry.witness.kind != WitnessKind::Message
+            || &entry.witness.scope != scope
             || entry.ready_at > now
             || cursor.retries.iter().any(|retry| retry.id == id)
             || cursor
@@ -548,7 +573,11 @@ pub(super) fn ticket_for(config: &Config, prepared: &PreparedMessage) -> Option<
         return None;
     }
     let id = prepared.message.get("id")?.as_i64()?;
-    if !ledger().entries.iter().any(|entry| entry.witness.id == id) {
+    if !ledger()
+        .entries
+        .iter()
+        .any(|entry| entry.witness.kind == WitnessKind::Message && entry.witness.id == id)
+    {
         return None;
     }
     let scope = Scope::capture(config)?;
@@ -562,7 +591,8 @@ pub(super) fn ticket_for(config: &Config, prepared: &PreparedMessage) -> Option<
         .entries
         .iter()
         .find(|entry| {
-            entry.witness.scope == scope
+            entry.witness.kind == WitnessKind::Message
+                && entry.witness.scope == scope
                 && entry.witness.id == id
                 && entry.witness.project == prepared.project_slug
                 && entry.witness.digest == digest
@@ -1002,6 +1032,7 @@ mod tests {
 
     fn witness(id: i64) -> Witness {
         Witness {
+            kind: WitnessKind::Message,
             scope: Scope {
                 database: PathBuf::from("/fixture/mail.sqlite3"),
                 archive: PathBuf::from("/fixture/archive"),
