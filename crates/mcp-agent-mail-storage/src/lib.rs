@@ -9496,9 +9496,82 @@ fn build_tree_with_updates(
     Ok(oid)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    // Pause only after real contention and after the attempt's guards unwind.
+    // These hooks schedule competing publishers; they never replace Git or
+    // advisory-lock outcomes.
+    static COMMIT_BEFORE_ADVISORY_WAIT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static COMMIT_BEFORE_RETRY_BACKOFF_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Enter one fallback attempt in fence -> advisory-lock order.
+///
+/// A foreign advisory owner must not pin the process-wide publication fence.
+/// Probe it without waiting inside the fence, then wait outside and release
+/// that probe before trying the ordered pair again. The second acquisition is
+/// authoritative: neither the probe nor a previous attempt preserves a tree or
+/// HEAD snapshot. A caller that already owns a larger mutation window must
+/// retry that whole operation instead of sleeping while it retains the fence.
+fn with_commit_fallback_lock<T>(
+    repo_root: &Path,
+    lock_path: &Path,
+    deadline: Instant,
+    commit: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let caller_owns_fence = ARCHIVE_MUTATION_DEPTH.with(|depth| depth.get() > 0);
+    let lock_start = Instant::now();
+    loop {
+        let mutation = ArchiveMutationGuard::begin_at(repo_root);
+        let mut lock = FileLock::new(lock_path.to_path_buf())
+            .with_timeout(Duration::ZERO)
+            .with_max_retries(0);
+        let error = match lock.acquire() {
+            Ok(()) => {
+                mcp_agent_mail_core::global_metrics()
+                    .storage
+                    .commit_lock_wait_us
+                    .record(lock_start.elapsed().as_micros() as u64);
+                let result = commit();
+                lock.release()?;
+                return result;
+            }
+            Err(error @ StorageError::LockTimeout(_)) => error,
+            Err(error) => return Err(error),
+        };
+        drop(lock);
+        drop(mutation);
+        if caller_owns_fence {
+            return Err(error);
+        }
+
+        #[cfg(test)]
+        {
+            let hook = COMMIT_BEFORE_ADVISORY_WAIT_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(error);
+        }
+        let mut probe = FileLock::new(lock_path.to_path_buf())
+            .with_timeout(remaining)
+            .with_max_retries(0);
+        probe.acquire()?;
+        // Never carry an advisory lease into the next fence acquisition.
+        probe.release()?;
+    }
+}
+
 /// Commit with git index.lock contention retry logic.
 ///
-/// Wraps `commit_paths` with retry and exponential backoff for index.lock errors.
+/// Each real attempt owns the publication fence. Advisory-lock waits and
+/// exponential backoff release it so unrelated archives can make progress.
 pub fn commit_paths_with_retry(
     repo_root: &Path,
     config: &Config,
@@ -9507,15 +9580,13 @@ pub fn commit_paths_with_retry(
 ) -> Result<()> {
     const MAX_INDEX_LOCK_RETRIES: usize = 5;
 
-    // Retain the fence through fallback/retries. Otherwise the fallback commit
-    // lock could be held while commit_paths waits for this fence, reversing the
-    // order used by bundle writers and message reconciliation.
-    let _mutation = ArchiveMutationGuard::begin_at(repo_root);
+    let caller_owns_fence = ARCHIVE_MUTATION_DEPTH.with(|depth| depth.get() > 0);
     let sm = &mcp_agent_mail_core::global_metrics().storage;
     sm.commit_attempts_total.inc();
     sm.commit_batch_size_last.set(rel_paths.len() as u64);
 
-    // Try lock-free commit first (avoids index.lock entirely)
+    // Try lock-free commit first (avoids index.lock entirely). This helper
+    // fences its own object creation, HEAD healing and reference transaction.
     {
         let repo = Repository::open(repo_root)?;
         // Blob filter attribute lookup otherwise loads and parses the entire
@@ -9540,52 +9611,75 @@ pub fn commit_paths_with_retry(
         }
     }
 
-    // Fall back to index-based commit with project-scoped lock
+    // Every fallback attempt reacquires the ordered pair. Share the original
+    // advisory-lock budget across retries instead of restarting it each time.
     let lock_path = commit_lock_path(repo_root, rel_paths);
     ensure_parent_dir(&lock_path)?;
-
-    let mut lock = FileLock::new(lock_path);
-    let lock_start = std::time::Instant::now();
-    lock.acquire()?;
-    sm.commit_lock_wait_us
-        .record(lock_start.elapsed().as_micros() as u64);
+    let lock_deadline = Instant::now() + FileLock::new(lock_path.clone()).timeout;
 
     let mut last_err_msg: Option<String> = None;
     let mut did_last_resort_clean = false;
     let mut index_lock_retries: u64 = 0;
 
     for attempt in 0..MAX_INDEX_LOCK_RETRIES + 2 {
-        let repo = Repository::open(repo_root)?;
-        let commit_start = std::time::Instant::now();
-        match run_with_lock_owner(repo_root, || {
-            commit_paths(&repo, config, message, rel_paths)
-        }) {
-            Ok(()) => {
+        let result = with_commit_fallback_lock(repo_root, &lock_path, lock_deadline, || {
+            let repo = Repository::open(repo_root)?;
+            let commit_start = std::time::Instant::now();
+            let result = run_with_lock_owner(repo_root, || {
+                commit_paths(&repo, config, message, rel_paths)
+            });
+            if result.is_ok() {
                 sm.git_commit_latency_us
                     .record(commit_start.elapsed().as_micros() as u64);
+            }
+            result
+        });
+        match result {
+            Ok(()) => {
                 if index_lock_retries > 0 {
                     sm.git_index_lock_retries_total.add(index_lock_retries);
                 }
-                lock.release()?;
                 return Ok(());
             }
             Err(StorageError::Git(ref git_err)) if is_git_index_lock_error(git_err) => {
                 last_err_msg = Some(git_err.message().to_string());
                 index_lock_retries += 1;
 
+                // Recovery publication and repository initialization own an
+                // outer window. Preserve its snapshot and let its owner retry;
+                // this function cannot release that owner's fence for backoff.
+                if caller_owns_fence {
+                    break;
+                }
                 if attempt >= MAX_INDEX_LOCK_RETRIES {
-                    if !did_last_resort_clean && try_clean_stale_git_lock(repo_root, 60.0) {
+                    let cleaned = {
+                        let _mutation = ArchiveMutationGuard::begin_at(repo_root);
+                        !did_last_resort_clean && try_clean_stale_git_lock(repo_root, 60.0)
+                    };
+                    if cleaned {
                         did_last_resort_clean = true;
                         continue;
                     }
                     break;
                 }
 
-                // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms
+                #[cfg(test)]
+                {
+                    let hook = COMMIT_BEFORE_RETRY_BACKOFF_TEST_HOOK
+                        .with(|slot| slot.borrow_mut().take());
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+
+                // Both attempt guards have unwound before this backoff:
+                // 100ms, 200ms, 400ms, 800ms, 1600ms.
                 let delay_ms = 100 * (1u64 << attempt.min(4));
                 std::thread::sleep(Duration::from_millis(delay_ms));
 
-                // Try cleaning stale locks (5 minute threshold)
+                // Stale-lock cleanup mutates Git control files, so give it a
+                // separate short window after the unfenced wait.
+                let _mutation = ArchiveMutationGuard::begin_at(repo_root);
                 let _ = try_clean_stale_git_lock(repo_root, 300.0);
             }
             Err(other) => {
@@ -9593,27 +9687,27 @@ pub fn commit_paths_with_retry(
                 if index_lock_retries > 0 {
                     sm.git_index_lock_retries_total.add(index_lock_retries);
                 }
-                lock.release()?;
                 return Err(other);
             }
         }
     }
 
-    // All retries exhausted — record failure metrics.
     sm.commit_failures_total.inc();
     sm.git_index_lock_failures_total.inc();
     sm.git_index_lock_retries_total.add(index_lock_retries);
-    lock.release()?;
 
-    let git_lock_path = repo_root.join(".git").join("index.lock");
+    let retries = if caller_owns_fence {
+        0
+    } else {
+        MAX_INDEX_LOCK_RETRIES
+    };
     Err(StorageError::GitIndexLock {
         message: format!(
-            "Git index.lock contention after {} retries. {}",
-            MAX_INDEX_LOCK_RETRIES,
+            "Git index.lock contention after {retries} retries. {}",
             last_err_msg.unwrap_or_default()
         ),
-        lock_path: git_lock_path,
-        attempts: MAX_INDEX_LOCK_RETRIES,
+        lock_path: repo_root.join(".git").join("index.lock"),
+        attempts: retries,
     })
 }
 
@@ -10354,12 +10448,39 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
         // caching the path; otherwise subsequent writes silently trust it.
         let existing = Repository::open(root)?;
         configure_archive_git_defaults(&existing);
-        if ensure_archive_gitignore(root)? {
+        let ignore_changed = ensure_archive_gitignore(root)?;
+        // A previous attempt can have written these files and then deferred
+        // its nested Git commit. Disk equality does not prove publication:
+        // compare with HEAD before caching, including after a process restart.
+        let head_tree = resolve_head_commit_oid(&existing)?
+            .map(|oid| existing.find_commit(oid).and_then(|commit| commit.tree()))
+            .transpose()?;
+        let ignore_oid = existing.blob_path(&root.join(".gitignore"))?;
+        let committed_ignore = head_tree
+            .as_ref()
+            .and_then(|tree| tree.get_name(".gitignore"))
+            .map(|entry| entry.id());
+        if ignore_changed || committed_ignore != Some(ignore_oid) {
+            let mut paths = vec![".gitignore"];
+            if head_tree.is_none() {
+                match fs::symlink_metadata(root.join(".gitattributes")) {
+                    Ok(metadata) if metadata.file_type().is_file() => {
+                        paths.push(".gitattributes");
+                    }
+                    Ok(_) => {
+                        return Err(StorageError::InvalidPath(
+                            "archive .gitattributes must be a regular file".to_string(),
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
             commit_paths_with_retry(
                 root,
                 config,
-                "chore: ignore archive runtime artifacts",
-                &[".gitignore"],
+                "chore: preserve archive initialization metadata",
+                &paths,
             )?;
         }
         repo_cache_insert(root);
@@ -36795,6 +36916,344 @@ mod tests {
         );
     }
 
+    fn commit_retry_releases_fence_and_reloads_work(hold_advisory: bool) {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp.path().join("blocked"));
+        let archive = ensure_archive(&config, "blocked").unwrap();
+        let sibling = ensure_archive(&config, "sibling").unwrap();
+        let other_config = test_config(&tmp.path().join("other"));
+        let other_archive = ensure_archive(&other_config, "other").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let initial = repo.head().unwrap().peel_to_commit().unwrap();
+        // Exercise the existing index-lock retry classifier with a real locked
+        // reference. No hook supplies a synthetic Git error.
+        let branch = "refs/heads/index.lock-contention";
+        repo.reference(branch, initial.id(), false, "retry fixture")
+            .unwrap();
+        repo.set_head(branch).unwrap();
+
+        let requested = "projects/blocked/request.txt";
+        let sibling_path = "projects/sibling/progress.txt";
+        let other_path = "projects/other/progress.txt";
+        fs::write(archive.repo_root.join(requested), b"first attempt").unwrap();
+        fs::write(other_archive.repo_root.join(other_path), b"other root").unwrap();
+        fs::write(archive.repo_root.join("staged-only.txt"), b"staged evidence").unwrap();
+        let mut shared_index = repo.index().unwrap();
+        shared_index.add_path(Path::new("staged-only.txt")).unwrap();
+        shared_index.write().unwrap();
+        let index_before = fs::read(repo.path().join("index")).unwrap();
+        let epoch_before = archive_mutation_epoch();
+        let token_before = read_archive_epoch_token(repo.path()).unwrap();
+        let sm = &mcp_agent_mail_core::global_metrics().storage;
+        let fallbacks_before = sm.lockfree_commit_fallbacks_total.load();
+        let retries_before = sm.git_index_lock_retries_total.load();
+
+        let lock_path = commit_lock_path(&archive.repo_root, &[requested]);
+        let held_advisory = hold_advisory.then(|| {
+            let mut lock = FileLock::new(lock_path.clone());
+            lock.acquire().unwrap();
+            lock
+        });
+        let mut held_ref = repo.transaction().unwrap();
+        held_ref.lock_ref(branch).unwrap();
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let writer_root = archive.repo_root.clone();
+        let writer_config = config.clone();
+        let hook_lock_path = lock_path.clone();
+        let other_root = other_archive.repo_root.clone();
+        let writer = std::thread::spawn(move || {
+            let hook: Box<dyn FnOnce()> = Box::new(move || {
+                assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+                assert_eq!(archive_mutations_active(), 0);
+                let mut probe = FileLock::new(hook_lock_path)
+                    .with_timeout(Duration::ZERO)
+                    .with_max_retries(0);
+                let acquired = probe.acquire();
+                if hold_advisory {
+                    assert!(matches!(acquired, Err(StorageError::LockTimeout(_))));
+                } else {
+                    acquired.expect("a failed Git attempt must release its advisory lease");
+                    probe.release().unwrap();
+                }
+                // A different thread must enter the actual fence and publish a
+                // different root while the original Git owner remains held.
+                std::thread::spawn(move || {
+                    let _admission = ArchiveMutationGuard::try_begin_repair(&other_root, || false)
+                        .expect("a commit wait must release the publication fence");
+                    commit_paths_with_retry(
+                        &other_root,
+                        &other_config,
+                        "Unrelated root progresses during commit wait",
+                        &[other_path],
+                    )
+                    .unwrap();
+                })
+                .join()
+                .unwrap();
+                paused_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            if hold_advisory {
+                COMMIT_BEFORE_ADVISORY_WAIT_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(hook);
+                });
+            } else {
+                COMMIT_BEFORE_RETRY_BACKOFF_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(hook);
+                });
+            }
+            let result = commit_paths_with_retry(
+                &writer_root,
+                &writer_config,
+                "Retry the requested archive path",
+                &[requested],
+            );
+            assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+            result
+        });
+
+        // The timeout is only a deadlock failbound. The held reference forces
+        // fallback, and the one-shot hook identifies the actual wait boundary.
+        let paused = paused_rx.recv_timeout(Duration::from_secs(10));
+        drop(held_ref);
+        let mut intervening_commit = None;
+        if paused.is_ok() {
+            // Keep the first project's advisory owner held while a second
+            // project publishes and replaces the requested working bytes.
+            let mutation = ArchiveMutationGuard::try_begin_repair(&archive.repo_root, || false)
+                .expect("the paused retry must own no publication fence");
+            fs::write(archive.repo_root.join(requested), b"fresh retry bytes").unwrap();
+            fs::write(sibling.root.join("progress.txt"), b"sibling progress").unwrap();
+            commit_paths_with_retry(
+                &archive.repo_root,
+                &config,
+                "Sibling project progresses before retry",
+                &[sibling_path],
+            )
+            .unwrap();
+            intervening_commit = repo.head().unwrap().target();
+            drop(mutation);
+        }
+        drop(held_advisory);
+        let _ = resume_tx.send(());
+        let result = writer.join().unwrap();
+        paused.expect("the real contention boundary must be observed");
+        result.unwrap();
+
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(commit.parent_id(0).unwrap(), intervening_commit.unwrap());
+        let tree = commit.tree().unwrap();
+        for (path, expected) in [
+            (requested, b"fresh retry bytes".as_slice()),
+            (sibling_path, b"sibling progress".as_slice()),
+        ] {
+            let entry = tree.get_path(Path::new(path)).unwrap();
+            assert_eq!(repo.find_blob(entry.id()).unwrap().content(), expected);
+        }
+        assert!(tree.get_path(Path::new("staged-only.txt")).is_err());
+        assert_eq!(fs::read(repo.path().join("index")).unwrap(), index_before);
+        assert!(head_tree_contains(
+            &Repository::open(&other_archive.repo_root).unwrap(),
+            Path::new(other_path),
+        ));
+        assert_eq!(sm.lockfree_commit_fallbacks_total.load(), fallbacks_before + 1);
+        assert_eq!(
+            sm.git_index_lock_retries_total.load(),
+            retries_before + u64::from(!hold_advisory),
+        );
+        assert!(!lock_path.exists());
+        assert!(!repo.path().join("index.lock.owner").exists());
+        assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+        assert_eq!(archive_mutations_active(), 0);
+        assert!(archive_publication_fence_holder().is_none());
+        assert!(archive_mutation_epoch() > epoch_before);
+        assert_ne!(read_archive_epoch_token(repo.path()).unwrap(), token_before);
+        assert!(ARCHIVE_PUBLICATION_FENCE.try_lock().is_ok());
+    }
+
+    #[test]
+    fn commit_advisory_wait_releases_fence_and_reloads_head() {
+        if !isolated_coalescer_regression(
+            "tests::commit_advisory_wait_releases_fence_and_reloads_head",
+        ) {
+            return;
+        }
+        commit_retry_releases_fence_and_reloads_work(true);
+    }
+
+    #[test]
+    fn commit_retry_backoff_releases_fence_and_private_index() {
+        if !isolated_coalescer_regression(
+            "tests::commit_retry_backoff_releases_fence_and_private_index",
+        ) {
+            return;
+        }
+        commit_retry_releases_fence_and_reloads_work(false);
+    }
+
+    #[test]
+    fn nested_recovery_commit_contention_preserves_debt_for_next_publication() {
+        if !isolated_coalescer_regression(
+            "tests::nested_recovery_commit_contention_preserves_debt_for_next_publication",
+        ) {
+            return;
+        }
+
+        use mcp_agent_mail_db::recovery_state;
+        for hold_advisory in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let archive = ensure_archive(&config, "recoverable").unwrap();
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let initial = repo.head().unwrap().peel_to_commit().unwrap();
+            let branch = "refs/heads/index.lock-recovery";
+            repo.reference(branch, initial.id(), false, "recovery retry fixture")
+                .unwrap();
+            repo.set_head(branch).unwrap();
+            let conn = mcp_agent_mail_db::CanonicalDbConn::open_memory().unwrap();
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects(id,slug,human_key,created_at) \
+                 VALUES (7,'recoverable','/work/recoverable',1);",
+            )
+            .unwrap();
+            let manifest = recovery_state::ensure_checkpoint(&conn, &config.storage_root).unwrap();
+            drop(conn);
+            let pending_path = config.storage_root.join("recovery-state/.git-pending.jsonl");
+            let debt_before = fs::read(&pending_path).unwrap();
+            assert_ne!(debt_before.as_slice(), b"");
+            let mut held_ref = repo.transaction().unwrap();
+            held_ref.lock_ref(branch).unwrap();
+            let held_advisory = hold_advisory.then(|| {
+                let mut lock = FileLock::new(archive.repo_root.join(".commit.lock"));
+                lock.acquire().unwrap();
+                lock
+            });
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let publisher = std::thread::spawn(move || {
+                COMMIT_BEFORE_ADVISORY_WAIT_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(|| {
+                        panic!("a nested publication must defer instead of waiting");
+                    }));
+                });
+                COMMIT_BEFORE_RETRY_BACKOFF_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(|| {
+                        panic!("a nested publication must defer instead of backoff");
+                    }));
+                });
+                publish_pending_recovery_state();
+                done_tx.send(()).unwrap();
+            });
+            let completed_while_owned = done_rx.recv_timeout(Duration::from_secs(10));
+            let debt_after = fs::read(&pending_path).unwrap();
+            let head_after = repo.head().unwrap().target().unwrap();
+            drop(held_advisory);
+            drop(held_ref);
+            publisher.join().unwrap();
+
+            completed_while_owned
+                .expect("the outer recovery window must defer while locks are held");
+            assert_eq!(debt_after, debt_before, "failed publication cannot acknowledge debt");
+            assert_eq!(head_after, initial.id());
+            assert_eq!(archive_mutations_active(), 0);
+            assert!(archive_publication_fence_holder().is_none());
+            // Retry the actual outer publisher, not its inner commit helper:
+            // the retained hint rebuilds one current, locked recovery snapshot.
+            publish_pending_recovery_state();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            for path in [
+                "recovery-state/active.json".to_string(),
+                "recovery-state/read-revision.json".to_string(),
+                format!("recovery-state/g{}/baseline.jsonl", manifest.generation),
+            ] {
+                let entry = tree.get_path(Path::new(&path)).unwrap();
+                assert_eq!(
+                    repo.find_blob(entry.id()).unwrap().content(),
+                    fs::read(config.storage_root.join(path)).unwrap(),
+                );
+            }
+            assert_eq!(fs::read(pending_path).unwrap().as_slice(), b"");
+            assert_eq!(recovery_state::take_pending_archive_paths().len(), 0);
+            assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+            assert_eq!(archive_mutations_active(), 0);
+            assert!(ARCHIVE_PUBLICATION_FENCE.try_lock().is_ok());
+        }
+    }
+
+    #[test]
+    fn deferred_repository_initialization_retries_metadata_before_caching() {
+        if !isolated_coalescer_regression(
+            "tests::deferred_repository_initialization_retries_metadata_before_caching",
+        ) {
+            return;
+        }
+
+        for unborn in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let repo = Repository::init(tmp.path()).unwrap();
+            let branch = "refs/heads/index.lock-initialization";
+            repo.set_head(branch).unwrap();
+            fs::write(tmp.path().join(".gitattributes"), b"*.json text eol=lf\n").unwrap();
+            fs::write(tmp.path().join(".gitignore"), b"# retained operator rule\n*.bak\n").unwrap();
+            if unborn {
+                // An interrupted first initialization left valid working
+                // metadata but no committed HEAD and no process-local cache.
+                ensure_archive_gitignore(tmp.path()).unwrap();
+            } else {
+                commit_paths_lockfree(
+                    &repo,
+                    &config,
+                    "Existing archive before runtime ignore update",
+                    &[".gitattributes", ".gitignore"],
+                )
+                .unwrap();
+            }
+            assert!(!repo_cache_contains(tmp.path()));
+            let mut held_ref = repo.transaction().unwrap();
+            held_ref.lock_ref(branch).unwrap();
+            let mut held_advisory = FileLock::new(tmp.path().join(".commit.lock"));
+            held_advisory.acquire().unwrap();
+
+            let retry_root = tmp.path().to_path_buf();
+            let retry_config = config.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let initializer = std::thread::spawn(move || {
+                done_tx.send(ensure_repo(&retry_root, &retry_config)).unwrap();
+            });
+            let refused_while_owned = done_rx.recv_timeout(Duration::from_secs(10));
+            held_advisory.release().unwrap();
+            drop(held_ref);
+            initializer.join().unwrap();
+            assert!(
+                matches!(refused_while_owned, Ok(Err(StorageError::LockTimeout(_)))),
+                "a busy nested initialization must remain retryable: {refused_while_owned:?}",
+            );
+            assert!(!repo_cache_contains(tmp.path()));
+            let ignore = fs::read(tmp.path().join(".gitignore")).unwrap();
+            assert!(!ensure_archive_gitignore(tmp.path()).unwrap());
+
+            // The next ordinary initialization must retry the commit even
+            // though ensure_archive_gitignore no longer changes working bytes.
+            assert!(!ensure_repo(tmp.path(), &config).unwrap());
+            assert!(repo_cache_contains(tmp.path()));
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            for (path, expected) in [
+                (".gitignore", ignore),
+                (".gitattributes", b"*.json text eol=lf\n".to_vec()),
+            ] {
+                let entry = tree.get_path(Path::new(path)).unwrap();
+                assert_eq!(repo.find_blob(entry.id()).unwrap().content(), expected);
+            }
+            assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+            assert_eq!(archive_mutations_active(), 0);
+            assert!(archive_publication_fence_holder().is_none());
+        }
+    }
+
     #[test]
     fn run_with_lock_owner_cleans_up_on_error() {
         let tmp = TempDir::new().unwrap();
@@ -38543,7 +39002,12 @@ Test body.
         fs::rename(&saved_head, &head_path).unwrap();
         assert!(!ensure_repo(root, &config).expect("open restored archive"));
         let restored = Repository::open(root).unwrap();
-        assert_eq!(restored.head().unwrap().target(), Some(original_tip));
+        let published = restored.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(published.parent_count(), 1);
+        assert_eq!(published.parent_id(0).unwrap(), original_tip);
+        let tree = published.tree().unwrap();
+        let entry = tree.get_path(Path::new(".gitignore")).unwrap();
+        assert_eq!(restored.find_blob(entry.id()).unwrap().content(), ignore_bytes);
         assert!(restored.find_commit(original_tip).is_ok());
     }
 }
