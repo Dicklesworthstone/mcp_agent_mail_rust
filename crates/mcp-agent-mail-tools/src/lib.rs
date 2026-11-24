@@ -2290,6 +2290,15 @@ pub mod tool_util {
             self.snapshot.is_none().then(|| self.pool.sqlite_path())
         }
 
+        /// The acquired mailbox source, stable across private snapshot rebuilds.
+        /// This is read identity only; it does not authorize live mutations.
+        pub(crate) fn source_sqlite_path(&self) -> &Path {
+            self.snapshot.as_ref().map_or_else(
+                || Path::new(self.pool.sqlite_path()),
+                |snapshot| snapshot.source_sqlite_path(),
+            )
+        }
+
         /// Missing archive receipts mean unknown state, not unread/unacknowledged.
         /// Historical content remains readable, but receipt-filtered consumers
         /// must not replay old notifications from a lossy reconstructed view.

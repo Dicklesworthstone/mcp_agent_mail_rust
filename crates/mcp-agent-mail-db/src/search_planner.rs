@@ -490,6 +490,8 @@ impl MessageSearchCursorScope {
 
     const LIVE: &'static str = "ml2";
     const SNAPSHOT: &'static str = "ms2";
+    const PRODUCT_LIVE: &'static str = "pl2";
+    const PRODUCT_SNAPSHOT: &'static str = "ps2";
 
     #[must_use]
     pub fn live(
@@ -504,17 +506,97 @@ impl MessageSearchCursorScope {
     #[must_use]
     pub fn snapshot(
         project_id: i64,
+        project_slug: &str,
         database_path: &Path,
+        storage_root: &Path,
+        source_kind: &str,
         query: &SearchQuery,
         recipient_kind: Option<&str>,
     ) -> Self {
-        Self::new(
+        let mut scope = Self::new(
             Self::SNAPSHOT,
             project_id,
             database_path,
             query,
             recipient_kind,
+        );
+        // Legacy archive reconstruction can assign this numeric ID to a
+        // different project on the next read. The resolved slug must agree.
+        let identity = serde_json::json!({
+            "project_slug": project_slug,
+            "source_kind": source_kind,
+        });
+        let mut hash = Sha256::new();
+        hash.update(scope.tag.as_bytes());
+        hash.update(Sha256::digest(storage_root.as_os_str().as_encoded_bytes()));
+        hash.update(identity.to_string().as_bytes());
+        scope.tag = hex::encode(hash.finalize());
+        scope
+    }
+
+    #[must_use]
+    pub fn product_live(
+        product_uid: &str,
+        project_slug: Option<&str>,
+        database_path: &Path,
+        storage_root: &Path,
+        query: &SearchQuery,
+    ) -> Self {
+        Self::new_product(
+            Self::PRODUCT_LIVE,
+            product_uid,
+            project_slug,
+            database_path,
+            storage_root,
+            query,
         )
+    }
+
+    #[must_use]
+    pub fn product_snapshot(
+        product_uid: &str,
+        project_slug: Option<&str>,
+        database_path: &Path,
+        storage_root: &Path,
+        query: &SearchQuery,
+    ) -> Self {
+        Self::new_product(
+            Self::PRODUCT_SNAPSHOT,
+            product_uid,
+            project_slug,
+            database_path,
+            storage_root,
+            query,
+        )
+    }
+
+    fn new_product(
+        route: &'static str,
+        product_uid: &str,
+        project_slug: Option<&str>,
+        database_path: &Path,
+        storage_root: &Path,
+        query: &SearchQuery,
+    ) -> Self {
+        let mut scope = Self::new(
+            route,
+            query.product_id.unwrap_or_default(),
+            database_path,
+            query,
+            None,
+        );
+        // Reconstructed snapshots can reassign numeric entity IDs. Bind the
+        // resolved identities too, while allowing caller name/path aliases.
+        let identities = serde_json::json!({
+            "product_uid": product_uid,
+            "project_slug": project_slug,
+        });
+        let mut hash = Sha256::new();
+        hash.update(scope.tag.as_bytes());
+        hash.update(Sha256::digest(storage_root.as_os_str().as_encoded_bytes()));
+        hash.update(identities.to_string().as_bytes());
+        scope.tag = hex::encode(hash.finalize());
+        scope
     }
 
     fn new(
@@ -566,7 +648,14 @@ impl MessageSearchCursorScope {
 
     #[must_use]
     pub fn accepts_syntax(token: &str) -> bool {
-        Self::parts(token).is_some()
+        Self::parts(token).is_some_and(|(route, _, _)| matches!(route, Self::LIVE | Self::SNAPSHOT))
+    }
+
+    #[must_use]
+    pub fn accepts_product_syntax(token: &str) -> bool {
+        Self::parts(token).is_some_and(|(route, _, _)| {
+            matches!(route, Self::PRODUCT_LIVE | Self::PRODUCT_SNAPSHOT)
+        })
     }
 
     #[must_use]
@@ -586,8 +675,10 @@ impl MessageSearchCursorScope {
         }
         let (route, rest) = token.split_once(':')?;
         let (tag, position) = rest.split_once(':')?;
-        if matches!(route, Self::LIVE | Self::SNAPSHOT)
-            && tag.len() == 64
+        if matches!(
+            route,
+            Self::LIVE | Self::SNAPSHOT | Self::PRODUCT_LIVE | Self::PRODUCT_SNAPSHOT
+        ) && tag.len() == 64
             && tag.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             SearchCursor::decode(position).map(|_| (route, tag, position))
@@ -1785,12 +1876,46 @@ mod tests {
                 .position(&token)
                 .is_none()
         );
-        let snapshot = MessageSearchCursorScope::snapshot(7, db, &query, None);
+        let archive = Path::new("archive");
+        let snapshot = MessageSearchCursorScope::snapshot(
+            7,
+            "z-project",
+            db,
+            archive,
+            "archive_snapshot",
+            &query,
+            None,
+        );
         assert!(snapshot.position(&token).is_none());
         assert!(!MessageSearchCursorScope::is_snapshot_token(&token));
         let snapshot_token = snapshot.bind(&position);
         assert!(MessageSearchCursorScope::is_snapshot_token(&snapshot_token));
         assert_eq!(snapshot.position(&snapshot_token), Some(position.as_str()));
+        assert!(
+            MessageSearchCursorScope::snapshot(
+                7,
+                "a-project",
+                db,
+                archive,
+                "archive_snapshot",
+                &query,
+                None,
+            )
+            .position(&snapshot_token)
+            .is_none(),
+            "a rebuilt archive must not rebind the cursor to a different project with the same ID"
+        );
+        for (root, kind) in [
+            (Path::new("other-archive"), "archive_snapshot"),
+            (archive, "live_snapshot"),
+        ] {
+            assert!(
+                MessageSearchCursorScope::snapshot(7, "z-project", db, root, kind, &query, None)
+                    .position(&snapshot_token)
+                    .is_none(),
+                "the acquired archive and source kind must remain bound"
+            );
+        }
         assert!(scope.position(&snapshot_token).is_none());
         assert!(
             scope
@@ -1908,7 +2033,17 @@ mod tests {
             allowed_project_ids: vec![7, 8],
         };
         let position = SearchCursor { score: 1.5, id: 42 }.encode();
-        let token = MessageSearchCursorScope::snapshot(7, db, &query, None).bind(&position);
+        let archive = Path::new("archive");
+        let token = MessageSearchCursorScope::snapshot(
+            7,
+            "project",
+            db,
+            archive,
+            "archive_snapshot",
+            &query,
+            None,
+        )
+        .bind(&position);
         query.text = query.text.trim().to_string();
         query.importance = vec![Importance::Normal, Importance::Urgent, Importance::Normal];
         query.scope = ScopePolicy::ProjectSet {
@@ -1918,15 +2053,135 @@ mod tests {
         query.cursor = Some(position.clone());
         query.explain = true;
         assert_eq!(
-            MessageSearchCursorScope::snapshot(7, db, &query, None).position(&token),
+            MessageSearchCursorScope::snapshot(
+                7,
+                "project",
+                db,
+                archive,
+                "archive_snapshot",
+                &query,
+                None,
+            )
+            .position(&token),
             Some(position.as_str())
         );
         query.text = "needle \"two words\"".into();
         assert!(
-            MessageSearchCursorScope::snapshot(7, db, &query, None)
-                .position(&token)
-                .is_none(),
+            MessageSearchCursorScope::snapshot(
+                7,
+                "project",
+                db,
+                archive,
+                "archive_snapshot",
+                &query,
+                None,
+            )
+            .position(&token)
+            .is_none(),
             "whitespace within quoted text must not be normalized"
+        );
+    }
+
+    #[test]
+    fn product_page_cursor_binds_resolved_entities_archive_and_route() {
+        let db = Path::new("storage.sqlite3");
+        let archive = Path::new("archive");
+        let mut query = SearchQuery::product_messages("needle", 7);
+        query.project_id = Some(11);
+        let scope = MessageSearchCursorScope::product_live(
+            "product-uid",
+            Some("alpha"),
+            db,
+            archive,
+            &query,
+        );
+        let position = SearchCursor { score: 1.5, id: 42 }.encode();
+        let token = scope.bind(&position);
+        assert!(MessageSearchCursorScope::accepts_product_syntax(&token));
+        assert!(!MessageSearchCursorScope::accepts_syntax(&token));
+        assert_eq!(scope.position(&token), Some(position.as_str()));
+        assert!(!MessageSearchCursorScope::accepts_product_syntax(&position));
+        for foreign in [
+            MessageSearchCursorScope::product_live(
+                "different-product",
+                Some("alpha"),
+                db,
+                archive,
+                &query,
+            ),
+            MessageSearchCursorScope::product_live(
+                "product-uid",
+                Some("beta"),
+                db,
+                archive,
+                &query,
+            ),
+            MessageSearchCursorScope::product_live(
+                "product-uid",
+                Some("alpha"),
+                Path::new("other.sqlite3"),
+                archive,
+                &query,
+            ),
+            MessageSearchCursorScope::product_live(
+                "product-uid",
+                Some("alpha"),
+                db,
+                Path::new("other-archive"),
+                &query,
+            ),
+            MessageSearchCursorScope::product_snapshot(
+                "product-uid",
+                Some("alpha"),
+                db,
+                archive,
+                &query,
+            ),
+            MessageSearchCursorScope::live(11, db, &query, None),
+            MessageSearchCursorScope::snapshot(
+                11,
+                "alpha",
+                db,
+                archive,
+                "archive_snapshot",
+                &query,
+                None,
+            ),
+        ] {
+            assert!(foreign.position(&token).is_none());
+        }
+        let snapshot = MessageSearchCursorScope::product_snapshot(
+            "product-uid",
+            Some("alpha"),
+            db,
+            archive,
+            &query,
+        );
+        let snapshot_token = snapshot.bind(&position);
+        assert!(MessageSearchCursorScope::accepts_product_syntax(
+            &snapshot_token
+        ));
+        assert!(!MessageSearchCursorScope::accepts_syntax(&snapshot_token));
+        assert!(!MessageSearchCursorScope::is_snapshot_token(
+            &snapshot_token
+        ));
+        assert!(scope.position(&snapshot_token).is_none());
+        assert!(!MessageSearchCursorScope::accepts_product_syntax(
+            &MessageSearchCursorScope::live(11, db, &query, None).bind(&position)
+        ));
+        query.limit = Some(100);
+        query.cursor = Some(position.clone());
+        query.explain = true;
+        assert_eq!(
+            MessageSearchCursorScope::product_live(
+                "product-uid",
+                Some("alpha"),
+                db,
+                archive,
+                &query,
+            )
+            .position(&token),
+            Some(position.as_str())
         );
     }
 

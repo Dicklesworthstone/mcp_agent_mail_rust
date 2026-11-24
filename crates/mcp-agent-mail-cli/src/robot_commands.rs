@@ -16907,14 +16907,24 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 None,
             )?;
             let recipient_kind = parse_search_recipient_kind(kind.as_deref())?;
+            let snapshot_kind = match read_db._source.kind {
+                crate::CanonicalSnapshotSourceKind::LiveSqlite => "live_sqlite",
+                crate::CanonicalSnapshotSourceKind::LiveSnapshot => "live_snapshot",
+                crate::CanonicalSnapshotSourceKind::StagedFamilyCopy => "staged_family_copy",
+                crate::CanonicalSnapshotSourceKind::ArchiveSnapshot => "archive_snapshot",
+            };
             let cursor_scope = MessageSearchCursorScope::snapshot(
                 project_id,
+                &project_slug,
                 read_db._source.reported_path(),
+                read_db.pool().storage_root(),
+                snapshot_kind,
                 &cursor_query,
                 recipient_kind.as_deref(),
             );
-            // A snapshot cannot continue a page from another request, server,
-            // or mailbox. Its source path survives private snapshot recreation.
+            // Bind the original mailbox and authority across snapshot recreation.
+            // A resolved slug prevents a reused legacy numeric ID from accepting
+            // another project's continuation. ID changes require a fresh search.
             let cursor = cursor
                 .as_deref()
                 .map(|token| {
@@ -31468,6 +31478,7 @@ mod tests {
         use mcp_agent_mail_db::search_planner::{MessageSearchCursorScope, SearchCursor};
 
         let source = Path::new("/mailbox/storage.sqlite3");
+        let archive = Path::new("/mailbox/archive");
         let query = robot_search_query(
             7,
             "needle",
@@ -31477,7 +31488,15 @@ mod tests {
         )
         .unwrap();
         let position = SearchCursor { score: 1.5, id: 42 }.encode();
-        let scope = MessageSearchCursorScope::snapshot(7, source, &query, Some("cc"));
+        let scope = MessageSearchCursorScope::snapshot(
+            7,
+            "mail-project",
+            source,
+            archive,
+            "archive_snapshot",
+            &query,
+            Some("cc"),
+        );
         let token = scope.bind(&position);
         let equivalent = robot_search_query(
             7,
@@ -31488,7 +31507,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            MessageSearchCursorScope::snapshot(7, source, &equivalent, Some("cc")).position(&token),
+            MessageSearchCursorScope::snapshot(
+                7,
+                "mail-project",
+                source,
+                archive,
+                "archive_snapshot",
+                &equivalent,
+                Some("cc"),
+            )
+            .position(&token),
             Some(position.as_str()),
             "recreating a snapshot must retain its original source and request"
         );
@@ -31500,21 +31528,58 @@ mod tests {
         ] {
             let changed = robot_search_query(7, text, Some(importance), Some(since), None).unwrap();
             assert!(
-                MessageSearchCursorScope::snapshot(7, source, &changed, Some(kind))
-                    .position(&token)
-                    .is_none()
+                MessageSearchCursorScope::snapshot(
+                    7,
+                    "mail-project",
+                    source,
+                    archive,
+                    "archive_snapshot",
+                    &changed,
+                    Some(kind),
+                )
+                .position(&token)
+                .is_none()
             );
         }
         assert!(
             MessageSearchCursorScope::snapshot(
                 7,
+                "mail-project",
                 Path::new("/other-mailbox/storage.sqlite3"),
+                archive,
+                "archive_snapshot",
                 &query,
                 Some("cc"),
             )
             .position(&token)
             .is_none()
         );
+        for (project_slug, storage_root, source_kind) in [
+            ("another-project", archive, "archive_snapshot"),
+            (
+                "mail-project",
+                Path::new("/another-archive"),
+                "archive_snapshot",
+            ),
+            ("mail-project", archive, "live_snapshot"),
+            ("mail-project", archive, "staged_family_copy"),
+            ("mail-project", archive, "live_sqlite"),
+        ] {
+            assert!(
+                MessageSearchCursorScope::snapshot(
+                    7,
+                    project_slug,
+                    source,
+                    storage_root,
+                    source_kind,
+                    &query,
+                    Some("cc"),
+                )
+                .position(&token)
+                .is_none(),
+                "a reused numeric ID must not hide a changed project or read authority"
+            );
+        }
     }
 
     #[test]

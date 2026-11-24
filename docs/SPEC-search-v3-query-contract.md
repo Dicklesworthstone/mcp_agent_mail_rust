@@ -428,7 +428,8 @@ search_messages(
     query: str,
     limit?: int,                # default 20, max 1000
     offset?: int,               # default 0; offset + effective limit <= 5000
-    ranking?: str,              # "relevance" | "recency"
+    cursor?: str,               # opaque next_cursor from the same search; no nonzero offset
+    ranking?: str,              # "relevance" | "recency" | "oldest"
     sender?: str,               # aliases: from_agent, sender_name
     importance?: str,           # comma-separated: low,normal,high,urgent
     thread_id?: str,
@@ -456,6 +457,8 @@ search_messages_product(
     product_key: str,
     query: str,
     limit?: int,
+    cursor?: str,               # opaque next_cursor from the same product search
+    ranking?: str,              # "relevance" | "recency" | "oldest"
     project?: str,              # aliases: project_key_filter, project_slug, proj
     sender?: str,               # aliases: from_agent, sender_name
     importance?: str,
@@ -465,9 +468,26 @@ search_messages_product(
 ) -> {
     result: [{id, subject, importance, ack_required, created_ts, thread_id, from, project_id}],
     assistance?: QueryAssistance,
+    next_cursor?: str,
     diagnostics?: SearchDiagnostics
 }
 ```
+
+For both tools, treat `next_cursor` as opaque and pass it back with the same
+query, filters, ranking, and project or product. Continuations also bind the
+mailbox source and read route: a live result cannot continue against an archive
+snapshot, or vice versa. Recreating a private snapshot preserves its original
+mailbox identity; its temporary filename is not a cursor identity.
+If reconstruction reassigns entity IDs, start a new search without a cursor.
+
+Page size and presentation controls may change between pages. Equivalent
+normalized filters, such as reordered importance values or timestamps with
+equivalent UTC offsets, retain the same scope. Query text preserves case and
+quoted whitespace; only surrounding whitespace is ignored.
+
+Malformed, legacy raw, or mismatched cursors return `INVALID_ARGUMENT`. Start a
+new search without `cursor` after changing its scope or upgrading from an older
+cursor format. Public project and product cursors are not interchangeable.
 
 ### 6.3 Notes
 

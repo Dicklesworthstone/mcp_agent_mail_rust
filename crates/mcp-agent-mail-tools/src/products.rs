@@ -13,6 +13,7 @@ use mcp_agent_mail_core::{
     append_tail_latency_evidence_if_configured,
 };
 use mcp_agent_mail_db::queries::ThreadMessageRow;
+use mcp_agent_mail_db::search_planner::MessageSearchCursorScope;
 use mcp_agent_mail_db::{DbError, DbPool, ProductRow, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -209,6 +210,15 @@ fn parse_product_search_limit(limit: Option<i32>) -> usize {
         _ => 20,
     };
     max_results_raw.unsigned_abs() as usize
+}
+
+fn invalid_product_search_cursor() -> McpError {
+    legacy_tool_error(
+        "INVALID_ARGUMENT",
+        "invalid product search cursor. Use next_cursor from the same product, query, filters, and read route, or start again without cursor.",
+        true,
+        serde_json::json!({"field": "cursor"}),
+    )
 }
 
 fn missing_linked_project_placeholder(project_id: i64) -> String {
@@ -598,6 +608,11 @@ pub async fn search_messages_product(
     phase.mark("product_scope_resolution");
 
     let trimmed = query.trim();
+    if let Some(token) = cursor.as_deref()
+        && (trimmed.is_empty() || !MessageSearchCursorScope::accepts_product_syntax(token))
+    {
+        return Err(invalid_product_search_cursor());
+    }
     if trimmed.is_empty() {
         let product_projects = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
@@ -689,8 +704,8 @@ pub async fn search_messages_product(
     let partial_failures = product_partial_failures_for_projects(&product_projects);
     phase.mark("product_project_scope_resolution");
 
-    // Build planner query with product scope and facets
-    let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
+    // Resolve the complete request before accepting its continuation.
+    let mut search_query = mcp_agent_mail_db::search_planner::SearchQuery {
         text: trimmed.to_string(),
         doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
         project_id: scoped_project_id,
@@ -703,11 +718,38 @@ pub async fn search_messages_product(
         time_range,
         ranking: ranking_mode,
         limit: Some(max_results),
-        cursor,
+        cursor: None,
         // Collect explain internally to derive deterministic degraded diagnostics.
         explain: true,
         ..Default::default()
     };
+    let project_slug = scoped_project.as_ref().map(|project| project.slug.as_str());
+    let cursor_scope = if pool.live_sqlite_path().is_some() {
+        MessageSearchCursorScope::product_live(
+            &product.product_uid,
+            project_slug,
+            pool.source_sqlite_path(),
+            pool.storage_root(),
+            &search_query,
+        )
+    } else {
+        MessageSearchCursorScope::product_snapshot(
+            &product.product_uid,
+            project_slug,
+            pool.source_sqlite_path(),
+            pool.storage_root(),
+            &search_query,
+        )
+    };
+    search_query.cursor = cursor
+        .as_deref()
+        .map(|token| {
+            cursor_scope
+                .position(token)
+                .map(str::to_owned)
+                .ok_or_else(invalid_product_search_cursor)
+        })
+        .transpose()?;
     phase.mark("planner_query_build");
 
     // Product search always routes through the unified Search V3 service.
@@ -762,7 +804,10 @@ pub async fn search_messages_product(
     let response = ProductSearchResponse {
         result,
         assistance: planner_response.assistance,
-        next_cursor: planner_response.next_cursor,
+        next_cursor: planner_response
+            .next_cursor
+            .as_deref()
+            .map(|position| cursor_scope.bind(position)),
         diagnostics,
         partial_failures,
     };
@@ -1045,6 +1090,212 @@ mod tests {
     /// exercise archive snapshot fallback when the live mailbox is behind.
     fn seed_pool() -> mcp_agent_mail_db::DbPool {
         get_db_pool().expect("db pool").clone()
+    }
+
+    async fn call_product_search_tool(
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, serde_json::Value> {
+        let router = fastmcp_server::ServerBuilder::new("product-search-cursor-test", "0")
+            .tool(crate::SearchMessagesProduct)
+            .build()
+            .into_router();
+        let response = router
+            .handle_tools_call(
+                ctx,
+                fastmcp::CallToolParams {
+                    name: "search_messages_product".to_string(),
+                    arguments: Some(arguments),
+                    meta: None,
+                },
+                fastmcp_core::SessionState::new(),
+                None,
+                None,
+            )
+            .await
+            .expect("registered product search tool call");
+        assert_eq!(
+            response.content.len(),
+            1,
+            "one serialized product search result"
+        );
+        let fastmcp::legacy_2024::LegacyContent::Text { text, .. } = &response.content[0] else {
+            panic!("product search must return JSON text content");
+        };
+        let payload = serde_json::from_str(text).expect("product search JSON");
+        if response.is_error {
+            Err(payload)
+        } else {
+            Ok(payload)
+        }
+    }
+
+    #[test]
+    fn product_search_cursor_binds_request_and_preserves_aliases_and_page_controls() {
+        use mcp_agent_mail_db::search_planner::SearchCursor;
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        crate::test_support::with_isolated_mailbox(
+            &TEST_LOCK,
+            "product search continuation",
+            &[
+                ("WORKTREES_ENABLED", "1"),
+                ("MESSAGING_SESSION_IDENTITY", "0"),
+                ("AM_SEARCH_ENGINE", "lexical"),
+                ("AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES_PRODUCT", "lexical"),
+            ],
+            |_| {
+                Config::reset_cached();
+                RuntimeBuilder::current_thread().build().expect("runtime").block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    let pool = seed_pool();
+                    let conn = pool.acquire(&cx).await.into_result().expect("corpus connection");
+                    conn.execute_raw(
+                        "BEGIN IMMEDIATE;
+                         INSERT INTO projects (id,slug,human_key,created_at) VALUES
+                            (1,'cursor-alpha','/cursor-alpha',1),
+                            (2,'cursor-beta','/cursor-beta',1),
+                            (3,'cursor-outside','/cursor-outside',1);
+                         INSERT INTO agents (id,project_id,name,program,model,inception_ts,last_active_ts) VALUES
+                            (1,1,'BlueLake','test','test',1,1),
+                            (2,1,'RedFox','test','test',1,1),
+                            (3,2,'BlueLake','test','test',1,1),
+                            (4,2,'RedFox','test','test',1,1),
+                            (5,3,'BlueLake','test','test',1,1),
+                            (6,3,'RedFox','test','test',1,1);
+                         INSERT INTO products (id,product_uid,name,created_at) VALUES
+                            (1,'11111111111111111111111111111111','cursor-product-a',1),
+                            (2,'22222222222222222222222222222222','cursor-product-b',1);
+                         INSERT INTO product_project_links (product_id,project_id,created_at) VALUES
+                            (1,1,1),(1,2,1),(2,3,1);",
+                    ).expect("linked product corpus");
+                    for id in 1_i64..=8 {
+                        let project_id = if id % 2 == 0 { 2 } else { 1 };
+                        let sender_id = if project_id == 1 { 1 } else { 3 };
+                        let importance = if id % 2 == 0 { "normal" } else { "high" };
+                        conn.execute_sync(
+                            "INSERT INTO messages (id,project_id,sender_id,subject,body_md,thread_id,importance,created_ts)
+                             VALUES (?,?,?,'needle','needle body','thread-needle',?,?)",
+                            &[
+                                Value::BigInt(id), Value::BigInt(project_id), Value::BigInt(sender_id),
+                                Value::Text(importance.to_string()), Value::BigInt(id * 1_000_000),
+                            ],
+                        ).expect("product message");
+                        conn.execute_sync(
+                            "INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (?,?,'to')",
+                            &[Value::BigInt(id), Value::BigInt(sender_id + 1)],
+                        ).expect("product delivery");
+                    }
+                    conn.execute_raw(
+                        "INSERT INTO messages (id,project_id,sender_id,subject,body_md,created_ts)
+                            VALUES (100,3,5,'needle','foreign product body',100000000);
+                         INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (100,6,'to');
+                         COMMIT;",
+                    ).expect("foreign product message");
+                    drop(conn);
+
+                    let ctx = McpContext::new(cx, 1);
+                    let arguments = serde_json::json!({
+                        "product_key": "cursor-product-a",
+                        "query": "needle",
+                        "limit": 2,
+                        "ranking": "recency",
+                        "sender": "BlueLake",
+                        "importance": "normal,high",
+                        "date_start": "1970-01-01T00:00:00Z",
+                        "date_end": "1970-01-02T00:00:00Z",
+                    });
+                    let first = call_product_search_tool(&ctx, arguments.clone())
+                        .await.expect("first linked-product page");
+                    assert_eq!(first["result"][0]["id"], 8);
+                    assert_eq!(first["result"][1]["id"], 7);
+                    assert_eq!(first["result"][0]["project_id"], 2);
+                    assert_eq!(first["result"][1]["project_id"], 1);
+                    let cursor = first["next_cursor"].as_str().expect("continuation");
+                    assert!(cursor.starts_with("pl2:"));
+
+                    for (field, value) in [
+                        ("product_key", "cursor-product-b"),
+                        ("query", "body"),
+                        ("query", "needle thread:other"),
+                        ("query", "   "),
+                        ("project", "cursor-alpha"),
+                        ("sender", "RedFox"),
+                        ("importance", "normal"),
+                        ("thread_id", "other"),
+                        ("ranking", "oldest"),
+                        ("date_start", "1970-01-01T00:00:01Z"),
+                        ("date_end", "1970-01-03T00:00:00Z"),
+                    ] {
+                        let mut changed = arguments.clone();
+                        changed["cursor"] = cursor.into();
+                        changed[field] = value.into();
+                        let error = call_product_search_tool(&ctx, changed)
+                            .await.expect_err("different request must restart pagination");
+                        assert_eq!(error["error"]["type"], "INVALID_ARGUMENT", "{field}");
+                        assert_eq!(error["error"]["data"]["field"], "cursor", "{field}");
+                    }
+                    let suffix = cursor.split_once(':').unwrap().1;
+                    for token in [
+                        "garbage".to_string(),
+                        SearchCursor { score: -8_000_000.0, id: 8 }.encode(),
+                        format!("pl1:{suffix}"),
+                        format!("ml2:{suffix}"),
+                        format!("ms2:{suffix}"),
+                        format!("ps2:{suffix}"),
+                    ] {
+                        let mut changed = arguments.clone();
+                        changed["cursor"] = token.into();
+                        let error = call_product_search_tool(&ctx, changed)
+                            .await.expect_err("invalid or foreign cursor must not restart silently");
+                        assert_eq!(error["error"]["data"]["field"], "cursor");
+                    }
+
+                    let mut continued = arguments.clone();
+                    continued["cursor"] = cursor.into();
+                    continued["product_key"] = "11111111111111111111111111111111".into();
+                    continued["query"] = "  needle  ".into();
+                    continued["limit"] = 3.into();
+                    continued["include_body_md"] = true.into();
+                    continued["sender"] = serde_json::Value::Null;
+                    continued["from_agent"] = "BlueLake".into();
+                    continued["importance"] = "HIGH,normal,high".into();
+                    continued["date_start"] = serde_json::Value::Null;
+                    continued["after"] = "1970-01-01T01:00:00+01:00".into();
+                    continued["date_end"] = "1970-01-02T01:00:00+01:00".into();
+                    let second = call_product_search_tool(&ctx, continued.clone())
+                        .await.expect("normalized continuation");
+                    let ids: Vec<_> = second["result"].as_array().unwrap().iter()
+                        .map(|hit| hit["id"].as_i64().unwrap()).collect();
+                    assert_eq!(ids, [6, 5, 4]);
+                    assert_eq!(second["result"][0]["body_md"], "needle body");
+                    continued["cursor"] = second["next_cursor"].clone();
+                    continued["limit"] = 10.into();
+                    let last = call_product_search_tool(&ctx, continued)
+                        .await.expect("last linked-product page");
+                    let ids: Vec<_> = last["result"].as_array().unwrap().iter()
+                        .map(|hit| hit["id"].as_i64().unwrap()).collect();
+                    assert_eq!(ids, [3, 2, 1]);
+                    assert!(last["next_cursor"].is_null());
+
+                    let mut scoped = arguments;
+                    scoped["project"] = "cursor-alpha".into();
+                    scoped["limit"] = 1.into();
+                    let first = call_product_search_tool(&ctx, scoped.clone())
+                        .await.expect("project-filtered first page");
+                    assert_eq!(first["result"][0]["id"], 7);
+                    scoped["cursor"] = first["next_cursor"].clone();
+                    scoped["project"] = serde_json::Value::Null;
+                    scoped["project_key_filter"] = "/cursor-alpha".into();
+                    scoped["limit"] = 2.into();
+                    let next = call_product_search_tool(&ctx, scoped)
+                        .await.expect("same resolved project through its path alias");
+                    assert_eq!(next["result"][0]["id"], 5);
+                    assert_eq!(next["result"][1]["id"], 3);
+                });
+            },
+        );
     }
 
     #[test]
@@ -3225,6 +3476,64 @@ archive body
                             .as_str()
                             .is_some_and(|body| body.contains("archive body")),
                         "expected archive body in fetched message: {value}"
+                    );
+
+                    // Pagination must bind the acquired original mailbox, not
+                    // the temporary filename of this reconstructed read pool.
+                    let add_archive_message = |id: i64, created_ts: &str| {
+                        let _publication =
+                            crate::archive_read::WriteGuard::begin(&storage_root, Some(&db_path));
+                        let metadata = serde_json::json!({
+                            "id": id, "from": "Alice", "to": ["Bob"],
+                            "subject": "Archive inbox", "importance": "high",
+                            "created_ts": created_ts,
+                        });
+                        std::fs::write(
+                            messages_dir.join(format!(
+                                "{}__archive__{id}.md",
+                                created_ts.replace(':', "-")
+                            )),
+                            format!("---json\n{metadata}\n---\n\narchive body\n"),
+                        )
+                        .expect("publish another archived message");
+                    };
+                    add_archive_message(10, "2026-04-01T12:00:01Z");
+                    let first_pool = get_read_db_pool(&cx).await.expect("first archive pool");
+                    assert!(first_pool.live_sqlite_path().is_none());
+                    assert_eq!(
+                        first_pool.source_sqlite_path(),
+                        db_path.canonicalize().unwrap(),
+                    );
+                    let mut arguments = serde_json::json!({
+                        "product_key": "prod-stale", "query": "archive",
+                        "ranking": "recency", "limit": 1,
+                    });
+                    let first = call_product_search_tool(&ctx, arguments.clone())
+                        .await
+                        .expect("first archive search page");
+                    assert_eq!(first["result"][0]["id"], 10);
+                    assert!(first["next_cursor"].as_str().unwrap().starts_with("ps2:"));
+
+                    add_archive_message(11, "2026-04-01T12:00:02Z");
+                    let second_pool = get_read_db_pool(&cx).await.expect("rebuilt archive pool");
+                    assert!(second_pool.live_sqlite_path().is_none());
+                    assert_ne!(first_pool.sqlite_path(), second_pool.sqlite_path());
+                    assert_eq!(
+                        first_pool.source_sqlite_path(),
+                        second_pool.source_sqlite_path()
+                    );
+                    arguments["cursor"] = first["next_cursor"].clone();
+                    arguments["include_body_md"] = true.into();
+                    let next = call_product_search_tool(&ctx, arguments)
+                        .await
+                        .expect("continue across private snapshot reconstruction");
+                    assert_eq!(next["result"].as_array().unwrap().len(), 1);
+                    assert_eq!(next["result"][0]["id"], 9);
+                    assert!(
+                        next["result"][0]["body_md"]
+                            .as_str()
+                            .unwrap()
+                            .contains("archive body")
                     );
                 });
             },

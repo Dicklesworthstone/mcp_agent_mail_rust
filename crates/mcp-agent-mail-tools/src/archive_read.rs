@@ -63,6 +63,7 @@ struct CheapGeneration {
 
 pub struct SharedSnapshot {
     pool: mcp_agent_mail_db::DbPool,
+    source_sqlite_path: PathBuf,
     receipt_state_preserved: bool,
     recovery_checkpoint_present: bool,
     _directory: mcp_agent_mail_db::pool::CanonicalSnapshotTempDir,
@@ -71,6 +72,10 @@ pub struct SharedSnapshot {
 impl SharedSnapshot {
     pub(crate) fn pool(&self) -> mcp_agent_mail_db::DbPool {
         self.pool.clone()
+    }
+
+    pub(crate) fn source_sqlite_path(&self) -> &Path {
+        &self.source_sqlite_path
     }
 
     pub(crate) const fn has_preserved_receipt_state(&self) -> bool {
@@ -947,6 +952,7 @@ fn build_snapshot(
     .map_err(AcquireError::failed)?;
     Ok(Arc::new(SharedSnapshot {
         pool,
+        source_sqlite_path: slot.scope.sqlite_path.clone(),
         receipt_state_preserved: stats.has_receipt_state(),
         recovery_checkpoint_present: stats.recovery_checkpoint_present,
         _directory: directory,
