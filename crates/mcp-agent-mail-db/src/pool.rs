@@ -12727,22 +12727,6 @@ struct SqliteCleanupSidecarWitness {
     prefix_len: usize,
 }
 
-struct SqliteFamilyCleanupPlan {
-    wal: Option<SqliteCleanupSidecarWitness>,
-    shm: Option<SqliteCleanupSidecarWitness>,
-    wal_cert: Option<SqliteCleanupSidecarWitness>,
-    wal_cert_head: Option<SqliteCleanupSidecarWitness>,
-}
-
-impl SqliteFamilyCleanupPlan {
-    const fn is_empty(&self) -> bool {
-        self.wal.is_none()
-            && self.shm.is_none()
-            && self.wal_cert.is_none()
-            && self.wal_cert_head.is_none()
-    }
-}
-
 #[allow(clippy::result_large_err)]
 fn open_sqlite_cleanup_sidecar(
     path: &Path,
@@ -12896,7 +12880,9 @@ fn witnessed_wal_is_truncation_artifact(wal: &SqliteCleanupSidecarWitness) -> bo
 /// symlinked/directory SHM from becoming a partial cleanup: the whole family is
 /// accepted or refused before the durable admission boundary is entered.
 #[allow(clippy::result_large_err)]
-fn classify_sqlite_family_cleanup(sqlite_path: &Path) -> Result<SqliteFamilyCleanupPlan, SqlError> {
+fn damaged_wal_for_cleanup(
+    sqlite_path: &Path,
+) -> Result<Option<SqliteCleanupSidecarWitness>, SqlError> {
     if let Ok(metadata) = std::fs::symlink_metadata(sqlite_path)
         && !metadata.file_type().is_file()
     {
@@ -12906,89 +12892,40 @@ fn classify_sqlite_family_cleanup(sqlite_path: &Path) -> Result<SqliteFamilyClea
         )));
     }
 
-    let mut sidecars: HashMap<&'static str, SqliteCleanupSidecarOpen> = HashMap::new();
+    let mut wal = None;
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let path = sqlite_sidecar_path(sqlite_path, suffix);
-        if suffix == "-shm" {
-            // Linux FrankenSQLite uses classic process-associated fcntl locks
-            // on this inode. Opening and then closing an otherwise healthy SHM
-            // from this process can release locks held by live connections.
-            // Validate the pathname without acquiring a descriptor; if the WAL
-            // is later proved damaged we open/witness SHM under cleanup admission.
-            match std::fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.file_type().is_file() => {}
-                Ok(_) => {
-                    return Err(SqlError::Custom(format!(
-                        "refusing SQLite-family cleanup because {} sidecar {} is not a regular file",
-                        sqlite_recovery_sidecar_label(suffix),
-                        path.display()
-                    )));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(SqlError::Custom(format!(
-                        "failed to classify {} sidecar {} before SQLite-family cleanup: {error}",
-                        sqlite_recovery_sidecar_label(suffix),
-                        path.display()
-                    )));
-                }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => {
+                return Err(SqlError::Custom(format!(
+                    "refusing SQLite-family cleanup because {} sidecar {} is not a regular file",
+                    sqlite_recovery_sidecar_label(suffix),
+                    path.display()
+                )));
             }
-            continue;
-        }
-        if let Some(opened) =
-            open_sqlite_cleanup_sidecar(&path, sqlite_recovery_sidecar_label(suffix))?
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "failed to classify {} sidecar {} before SQLite-family cleanup: {error}",
+                    sqlite_recovery_sidecar_label(suffix),
+                    path.display()
+                )));
+            }
+        };
+        // Preflight can run while the engine owns SHM locks. Even on a
+        // damaged WAL, inspect companions by metadata alone until admission.
+        if suffix == "-wal"
+            && (1..=SQLITE_WAL_HEADER_BYTES).contains(&metadata.len())
+            && let Some(opened) =
+                open_sqlite_cleanup_sidecar(&path, sqlite_recovery_sidecar_label(suffix))?
+            && (1..=SQLITE_WAL_HEADER_BYTES).contains(&opened.len)
         {
-            sidecars.insert(suffix, opened);
+            let witness = seal_sqlite_cleanup_sidecar(opened)?;
+            wal = witnessed_wal_is_truncation_artifact(&witness).then_some(witness);
         }
     }
-
-    let wal = match sidecars.remove("-wal") {
-        Some(opened) if opened.len > 0 && opened.len <= SQLITE_WAL_HEADER_BYTES => {
-            let witnessed = seal_sqlite_cleanup_sidecar(opened)?;
-            witnessed_wal_is_truncation_artifact(&witnessed).then_some(witnessed)
-        }
-        _ => None,
-    };
-    // FrankenSQLite does not use canonical SQLite's shared-memory index: a
-    // healthy live family may have no `-shm` pathname at all, or an empty
-    // compatibility placeholder. Rotate SHM only as a companion of a WAL
-    // that this classifier has independently proved damaged. Treating an
-    // empty SHM as standalone cleanup authority can rename a descriptor held
-    // by the live engine and leave a healthy framed WAL sidecarless.
-    let shm = if wal.is_some() {
-        let path = sqlite_sidecar_path(sqlite_path, "-shm");
-        open_sqlite_cleanup_sidecar(&path, sqlite_recovery_sidecar_label("-shm"))?
-            .map(seal_sqlite_cleanup_sidecar)
-            .transpose()?
-    } else {
-        None
-    };
-    // FrankenSQLite's WAL certificates describe the exact WAL/main generation.
-    // Keeping either certificate attached after its damaged WAL is detached can
-    // replay the old db_size against the next generation, so they rotate as one
-    // witnessed family even when their own bytes look well-formed.
-    let wal_cert = if wal.is_some() {
-        sidecars
-            .remove("-wal-cert")
-            .map(seal_sqlite_cleanup_sidecar)
-            .transpose()?
-    } else {
-        None
-    };
-    let wal_cert_head = if wal.is_some() {
-        sidecars
-            .remove("-wal-cert-head")
-            .map(seal_sqlite_cleanup_sidecar)
-            .transpose()?
-    } else {
-        None
-    };
-    Ok(SqliteFamilyCleanupPlan {
-        wal,
-        shm,
-        wal_cert,
-        wal_cert_head,
-    })
+    Ok(wal)
 }
 
 /// Quarantine a damaged WAL/SHM family only after durable recovery admission.
@@ -13014,7 +12951,7 @@ fn cleanup_truncated_wal_sidecar_with_timeout(
     writer_drain_timeout: Duration,
 ) -> Result<SqliteFamilyCleanupOutcome, SqlError> {
     validate_sqlite_target_path(sqlite_path, "SQLite-family cleanup target")?;
-    if classify_sqlite_family_cleanup(sqlite_path)?.is_empty() {
+    if damaged_wal_for_cleanup(sqlite_path)?.is_none() {
         return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
     }
 
@@ -13263,21 +13200,56 @@ where
     F: FnMut(&Path),
 {
     let parent_anchor = AnchoredRecoveryParent::capture(db_path, "SQLite-family cleanup")?;
-    let plan = classify_sqlite_family_cleanup(db_path)?;
-    if plan.is_empty() {
+    let Some(wal) = damaged_wal_for_cleanup(db_path)? else {
         return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
-    }
-
-    let wal = plan.wal.is_some();
-    let shm = plan.shm.is_some();
-    let wal_cert = plan.wal_cert.is_some();
-    let wal_cert_head = plan.wal_cert_head.is_some();
+    };
+    refuse_sqlite_family_cleanup_while_owned(db_path)?;
+    // The process writer drain does not close idle Franken connections.
+    // Keep exclusive namespace admission through companion descriptor close
+    // and all moves, so another attachment cannot lose its SHM locks here.
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    let _namespace = match inspect_namespace_sidecar_shape(db_path, "SQLite-family cleanup")? {
+        NamespaceSidecarShape::Absent => None,
+        NamespaceSidecarShape::Incomplete => {
+            return Err(SqlError::Custom(format!(
+                "SQLite-family cleanup refused for {}: incomplete FrankenSQLite namespace",
+                db_path.display()
+            )));
+        }
+        NamespaceSidecarShape::Complete => {
+            use fsqlite::fsqlite_vfs::namespace::{NamespaceOpenIntent, PendingNamespaceOpen};
+            let stable = std::fs::canonicalize(db_path).map_err(|error| {
+                SqlError::Custom(format!(
+                    "SQLite-family cleanup cannot resolve {}: {error}",
+                    db_path.display()
+                ))
+            })?;
+            Some(
+                PendingNamespaceOpen::begin(&stable, NamespaceOpenIntent::ReservedExclusive)
+                    .map_err(|error| {
+                        SqlError::Custom(format!(
+                            "SQLite-family cleanup cannot reserve {} exclusively: {error}",
+                            stable.display()
+                        ))
+                    })?,
+            )
+        }
+    };
+    let companion = |suffix| {
+        let path = sqlite_sidecar_path(db_path, suffix);
+        open_sqlite_cleanup_sidecar(&path, sqlite_recovery_sidecar_label(suffix))?
+            .map(seal_sqlite_cleanup_sidecar)
+            .transpose()
+    };
+    let shm = companion("-shm")?;
+    let wal_cert = companion("-wal-cert")?;
+    let wal_cert_head = companion("-wal-cert-head")?;
     let mut quarantine_nonce = None;
     let mut moved = Vec::new();
     // Move derived coordination state first and the WAL last. If the process
     // crashes between moves, the WAL evidence remains attached; moving the WAL
     // first would leave SHM/certification state that names a detached generation.
-    if let Some(witness) = plan.wal_cert_head.as_ref() {
+    if let Some(witness) = wal_cert_head.as_ref() {
         if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
             return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
         }
@@ -13292,7 +13264,7 @@ where
             &mut moved,
         )?;
     }
-    if let Some(witness) = plan.wal_cert.as_ref() {
+    if let Some(witness) = wal_cert.as_ref() {
         if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
             return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
         }
@@ -13307,27 +13279,7 @@ where
             &mut moved,
         )?;
     }
-    if let Some(witness) = plan.shm.as_ref() {
-        if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
-            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
-        }
-        before_move(&witness.path);
-        if let Err(error) = parent_anchor.verify_parent_only("SQLite-family cleanup") {
-            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
-        }
-        let reason = if wal {
-            "companion WAL is classified for quarantine"
-        } else {
-            "empty SHM sidecar"
-        };
-        quarantine_sqlite_cleanup_sidecar_or_rollback(
-            witness,
-            &mut quarantine_nonce,
-            reason,
-            &mut moved,
-        )?;
-    }
-    if let Some(witness) = plan.wal.as_ref() {
+    if let Some(witness) = shm.as_ref() {
         if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
             return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
         }
@@ -13338,18 +13290,31 @@ where
         quarantine_sqlite_cleanup_sidecar_or_rollback(
             witness,
             &mut quarantine_nonce,
-            "header-only/truncated WAL sidecar",
+            "companion WAL is classified for quarantine",
             &mut moved,
         )?;
     }
+    if let Err(error) = refuse_sqlite_family_cleanup_while_owned(db_path) {
+        return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+    }
+    before_move(&wal.path);
+    if let Err(error) = parent_anchor.verify_parent_only("SQLite-family cleanup") {
+        return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+    }
+    quarantine_sqlite_cleanup_sidecar_or_rollback(
+        &wal,
+        &mut quarantine_nonce,
+        "header-only/truncated WAL sidecar",
+        &mut moved,
+    )?;
     if let Err(error) = sync_recovery_parent(db_path) {
         return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
     }
     Ok(SqliteFamilyCleanupOutcome::Quarantined {
-        wal,
-        shm,
-        wal_cert,
-        wal_cert_head,
+        wal: true,
+        shm: shm.is_some(),
+        wal_cert: wal_cert.is_some(),
+        wal_cert_head: wal_cert_head.is_some(),
     })
 }
 
@@ -15455,7 +15420,7 @@ fn sqlite_file_is_healthy_without_family_cleanup_staged(path: &Path) -> Result<b
     {
         return Ok(false);
     }
-    if !classify_sqlite_family_cleanup(path)?.is_empty() {
+    if damaged_wal_for_cleanup(path)?.is_some() {
         return Ok(false);
     }
     sqlite_file_is_healthy_staged(path, false)
@@ -21865,7 +21830,7 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     crate::forensics::verify_recovery_receipt_state(recovery_receipt_root, primary_path)?;
     let exists = primary_path.exists();
     if exists {
-        if !classify_sqlite_family_cleanup(primary_path)?.is_empty() {
+        if damaged_wal_for_cleanup(primary_path)?.is_some() {
             return with_recovery_admission(primary_path, "automatic sqlite recovery", || {
                 ensure_sqlite_file_healthy_inner(primary_path)
             });
@@ -21998,7 +21963,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
 
     let had_primary = primary_path.exists();
     if had_primary {
-        if !classify_sqlite_family_cleanup(primary_path)?.is_empty() {
+        if damaged_wal_for_cleanup(primary_path)?.is_some() {
             return with_recovery_admission(
                 primary_path,
                 "automatic sqlite archive recovery",
@@ -44707,12 +44672,15 @@ mod tests {
         std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(0o000))
             .expect("make SHM descriptor-open hostile");
 
-        let result = classify_sqlite_family_cleanup(&db_path);
+        let result = damaged_wal_for_cleanup(&db_path);
 
         std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(original_mode))
             .expect("restore SHM permissions");
-        let plan = result.expect("healthy WAL classification must inspect SHM metadata only");
-        assert!(plan.is_empty());
+        assert!(
+            result
+                .expect("healthy WAL classification must inspect SHM metadata only")
+                .is_none()
+        );
         assert!(shm_path.exists());
     }
 
@@ -44754,7 +44722,7 @@ mod tests {
     /// for its whole lifetime, letting a foreign stock-SQLite first opener
     /// take DMS EXCLUSIVE and truncate/reinitialize the WAL index beneath the
     /// live mapping. Before the metadata-only `-shm` check in
-    /// `classify_sqlite_family_cleanup`, the classifier raw-opened every
+    /// `damaged_wal_for_cleanup`, the classifier raw-opened every
     /// existing sidecar, including `-shm`, and this test failed. Unlike
     /// `healthy_wal_classification_does_not_open_shm`, it observes the lock
     /// itself from a separate process, and also covers the periodic cycle.
@@ -44859,6 +44827,48 @@ mod tests {
             8
         );
         crate::close_db_conn(writer, "clean up live-SHM lock regression writer");
+
+        // Model an attached but idle engine and a torn WAL in a separate
+        // family. No live mapping is truncated to construct the fixture.
+        let damaged = dir.path().join("torn.sqlite3");
+        std::fs::write(&damaged, b"primary").unwrap();
+        seed_quiescent_franken_namespace(&damaged);
+        let binding = acquire_guarded_read_only_namespace_binding(&damaged, "cleanup fixture")
+            .expect("hold existing namespace as an idle reader");
+        let torn_wal = sqlite_sidecar_path(&damaged, "-wal");
+        std::fs::write(&torn_wal, b"torn").unwrap();
+        let damaged_shm = sqlite_sidecar_path(&damaged, "-shm");
+        let shm_file = std::fs::File::create_new(&damaged_shm).unwrap();
+        let lock = nix::libc::flock {
+            l_type: nix::libc::c_short::try_from(nix::libc::F_RDLCK).unwrap(),
+            l_whence: nix::libc::c_short::try_from(nix::libc::SEEK_SET).unwrap(),
+            l_start: SHM_DMS_BYTE,
+            l_len: 1,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(&shm_file, nix::fcntl::FcntlArg::F_SETLK(&lock))
+            .expect("hold classic SHM read lock");
+        assert!(child_observes_parent_dms_claim(&damaged_shm));
+        assert!(damaged_wal_for_cleanup(&damaged).unwrap().is_some());
+        assert!(
+            child_observes_parent_dms_claim(&damaged_shm),
+            "classifying a damaged WAL must preserve the held SHM lock"
+        );
+        let error = apply_classified_sqlite_family_cleanup(&damaged)
+            .expect_err("idle attachment must prevent cleanup before any companion open");
+        assert!(error.to_string().contains("exclusively"), "{error}");
+        assert!(child_observes_parent_dms_claim(&damaged_shm));
+        assert_eq!(std::fs::read(&torn_wal).unwrap(), b"torn");
+        drop(shm_file);
+        drop(binding);
+        assert!(matches!(
+            apply_classified_sqlite_family_cleanup(&damaged).unwrap(),
+            SqliteFamilyCleanupOutcome::Quarantined {
+                wal: true,
+                shm: true,
+                ..
+            }
+        ));
     }
 
     #[test]
