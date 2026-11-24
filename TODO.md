@@ -1,5 +1,53 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## Shared stdio client initialization (`br-1w2z0`, scoped contribution)
+
+This shell-client change started on main `615f4b2f` and integrates `6eb6264d`.
+Its real transport
+control uses a privately extracted, signature-verified v0.3.41 server.
+It does not qualify current Rust source or close the original direct-suite
+task. EmeraldEagle's ownership and shared-root path-safety work are preserved.
+The separate recovery candidate is published at `a025434e`; its native and
+current compiler qualification remains blocked by ordinary RCH admission.
+
+- [x] Read the original task and shared client's lifecycle/EOF behavior.
+- [x] Verify the release checksum manifest with the pinned Minisign key,
+  verify the Linux archive hash, and retain both private binary hashes.
+- [x] Execute a real initialize/tools-list baseline without building Rust or
+  replacing installed executables; retain isolated storage and all artifacts.
+- [x] Demonstrate seven malformed initialize results accepted by the old
+  client, including NULL and missing or mistyped required metadata.
+- [x] Reject malformed required metadata before notifications/initialized or
+  queued tools, preserving valid extensions and JSON-RPC initialization errors.
+- [x] Add ten peer controls with exact success/failure exits, diagnostics and
+  observed request order. Negative peer fixtures are not live-server proof.
+- [x] Pass all 13 helper self-tests, including those ten initialization cases.
+- [x] Exercise ordered and pipelined sessions against the signed real server:
+  20 correlated replies, coordination tools, resource reads and an expected
+  post-initialize unknown-tool error.
+- [x] Use the returned mail ID after automatic contact mail; verify the intended
+  message body and unchanged ACK through separate server process restarts.
+- [x] Confirm the delivery receipt and committed canonical/inbox/outbox Git
+  blobs. Read the committed tree directly; lock-free publication leaves the
+  shared Git index empty.
+- [x] Preserve original client deadlines and raw protocol-negative clients;
+  pass Bash syntax and whitespace checks for the two changed source files.
+- [x] Record scoped evidence on the existing Bead, retain its original
+  acceptance/status/owner, and hand off the exact client source and limits.
+- [x] Prepare the reviewed client fix, regression controls and scoped Bead
+  evidence for publication on `mossytern/stdio-initialize-validation-20261124`.
+- [x] Publish the client fix as `ca78ce6f` and draft PR #409. Preserve both
+  stdio and recovery TODO sections when integrating main's concurrent update.
+- [ ] Complete the inherited direct-client inventory and current-source suite
+  qualification under the original task; do not count this contribution as
+  completion of peer path-safety work or Rust recovery qualification.
+
+Evidence and retained replay state:
+`/data/tmp/am-mossytern-stdio-release-g0zrolbg/`. The baseline and final helper
+logs retain all ten cases. `verified-binaries.json` binds release identity;
+`real-client-verification.json` binds the client/self-test hashes, actual mail
+ID, correlated replies, restarted receipt and committed archive copies.
+
 ## Fresh review of concurrent recovery publication (`br-u9bhg`)
 
 This checkout integrates main `615f4b2f`, including incremental recovery
