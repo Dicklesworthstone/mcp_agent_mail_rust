@@ -7,8 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use asupersync::{Cx, Outcome};
-use mcp_agent_mail_db::{DbError, DbPool};
+use asupersync::Cx;
+use mcp_agent_mail_db::DbPool;
 
 use super::super::{IntentKey, RoundCursor};
 
@@ -50,6 +50,9 @@ struct Authority {
 #[derive(Default)]
 pub(super) struct Position {
     authority: Option<Authority>,
+    /// Last fully examined group of ID selectors. Each group releases its
+    /// exact-path siblings with a separate bounded row cursor in `after`.
+    requested_after: i64,
     after: i64,
     ceiling: Option<i64>,
     /// Confirmed rows released during this cursor's lifetime, not a durable
@@ -75,7 +78,12 @@ impl Position {
     /// Call only after a successful database outcome, even for a page with no
     /// matching paths. Failed/ambiguous mutations must retry the same page.
     pub(super) fn applied(&mut self, page: &Page, released: usize) {
-        self.after = page.after;
+        if let Some(after) = page.finished_requested {
+            self.requested_after = after;
+            self.after = 0;
+        } else {
+            self.after = page.after;
+        }
         self.released = self.released.saturating_add(released);
     }
 }
@@ -83,22 +91,17 @@ impl Position {
 pub(super) struct Page {
     pub(super) ids: Vec<i64>,
     after: i64,
+    finished_requested: Option<i64>,
     pub(super) complete: bool,
-}
-
-fn source_error(error: impl std::fmt::Display) -> String {
-    let error = DbError::Sqlite(error.to_string());
-    mcp_agent_mail_db::corruption_circuit_breaker().observe_error(&error);
-    error.to_string()
 }
 
 /// Select a finite page before loading reservation payloads. Released rows are
 /// deliberately included: the typed query owns release-ledger interpretation,
 /// and advancing by selected IDs also makes sparse path filters progress.
 /// The frozen upper ID prevents new arrivals from extending an existing scan.
-/// Explicit-ID intents page over their requested IDs instead of the owner's
-/// entire reservation history. Those IDs are candidates, not authorization:
-/// the caller must still enforce project, owner, path and creation cutoff.
+/// Explicit-ID intents materialize bounded pages of exact-path siblings
+/// selected by a bounded group of requested IDs. Both selectors and targets
+/// must belong to the original owner and cutoff.
 pub(super) async fn select(
     cx: &Cx,
     pool: &DbPool,
@@ -115,64 +118,117 @@ pub(super) async fn select(
     if cutoff <= 0 || authority.project_id <= 0 || authority.agent_id <= 0 {
         return Err("release page requires positive identities and cutoff".to_string());
     }
-    let conn = match pool.acquire(cx).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Err(source_error(error)),
-        Outcome::Cancelled(_) => return Err("release page selection cancelled".to_string()),
-        Outcome::Panicked(_) => return Err("release page selection panicked".to_string()),
-    };
     if position.ceiling.is_none() {
-        let rows = conn
-            .query_sync(
-                "SELECT COALESCE(MAX(id), 0) AS ceiling FROM file_reservations",
-                &[],
-            )
-            .map_err(source_error)?;
-        let ceiling = rows
-            .first()
-            .ok_or_else(|| "release page ceiling is missing".to_string())?
-            .get_named::<i64>("ceiling")
-            .map_err(source_error)?;
-        position.ceiling = Some(ceiling.max(0));
+        position.ceiling = Some(super::super::db_value(
+            mcp_agent_mail_db::queries::get_release_replay_ceiling(cx, pool).await,
+        )?);
     }
     let ceiling = position.ceiling.unwrap_or(0);
     if let Some(requested) = requested_ids {
-        // Payload lookup and mutation already use page-bounded primary keys.
-        // Do not walk unrelated historical leases just to find those keys.
-        drop(conn);
-        return requested_page(cx, requested, position.after, ceiling);
+        return sibling_page(cx, pool, cutoff, position, requested).await;
     }
-    let rows = conn
-        .query_sync(
-            "SELECT id FROM file_reservations WHERE project_id = ? AND agent_id = ? \
-         AND created_ts <= ? AND id > ? AND id <= ? ORDER BY id LIMIT ?",
-            &[
-                authority.project_id.into(),
-                authority.agent_id.into(),
-                cutoff.into(),
-                position.after.into(),
-                ceiling.into(),
-                i64::try_from(PAGE_SIZE).expect("bounded page size").into(),
-            ],
+    let ids = super::super::db_value(
+        mcp_agent_mail_db::queries::get_release_replay_candidate_ids(
+            cx,
+            pool,
+            authority.project_id,
+            authority.agent_id,
+            cutoff,
+            position.after,
+            ceiling,
+            None,
+            i64::try_from(PAGE_SIZE).expect("bounded page size"),
         )
-        .map_err(source_error)?;
-    let mut ids = Vec::with_capacity(rows.len().min(PAGE_SIZE));
-    let mut after = position.after;
-    if rows.len() > PAGE_SIZE {
+        .await,
+    )?;
+    decode_page(ids, position.after, ceiling)
+}
+
+/// Resolve at most one group of selector IDs and one page of their siblings.
+/// A selecting row released by an earlier partial apply remains authority for
+/// this intent. A row released before the intent, acquired afterward, belonging
+/// to another identity, or beyond the frozen ceiling cannot select any path.
+async fn sibling_page(
+    cx: &Cx,
+    pool: &DbPool,
+    cutoff: i64,
+    position: &Position,
+    requested: &[i64],
+) -> Result<Page, String> {
+    let authority = position
+        .authority
+        .as_ref()
+        .ok_or_else(|| "release page has no resolved authority".to_string())?;
+    let ceiling = position.ceiling.unwrap_or(0);
+    let selectors = requested_page(cx, requested, position.requested_after, ceiling)?;
+    if selectors.ids.is_empty() {
+        return Ok(selectors);
+    }
+    let selected = super::super::db_value(
+        mcp_agent_mail_db::queries::get_release_replay_selectors(
+            cx,
+            pool,
+            authority.project_id,
+            authority.agent_id,
+            &selectors.ids,
+            cutoff,
+        )
+        .await,
+    )?;
+    if selected.len() > PAGE_SIZE {
+        return Err("release selector payload exceeded its row limit".to_string());
+    }
+    let paths = selected
+        .into_iter()
+        .map(|row| row.path_pattern)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(Page {
+            ids: Vec::new(),
+            after: position.after,
+            finished_requested: Some(selectors.after),
+            complete: selectors.complete,
+        });
+    }
+    cx.checkpoint()
+        .map_err(|_| "release sibling selection cancelled".to_string())?;
+    let ids = super::super::db_value(
+        mcp_agent_mail_db::queries::get_release_replay_candidate_ids(
+            cx,
+            pool,
+            authority.project_id,
+            authority.agent_id,
+            cutoff,
+            position.after,
+            ceiling,
+            Some(&paths),
+            i64::try_from(PAGE_SIZE).expect("bounded page size"),
+        )
+        .await,
+    )?;
+    let mut page = decode_page(ids, position.after, ceiling)?;
+    page.finished_requested = page.complete.then_some(selectors.after);
+    page.complete &= selectors.complete;
+    Ok(page)
+}
+
+fn decode_page(ids: Vec<i64>, mut after: i64, ceiling: i64) -> Result<Page, String> {
+    if ids.len() > PAGE_SIZE {
         return Err("release page exceeded its row limit".to_string());
     }
-    for row in rows {
-        let id = row.get_named::<i64>("id").map_err(source_error)?;
+    for &id in &ids {
         if id <= after || id <= 0 || id > ceiling {
             return Err("release page IDs are outside the ordered scan window".to_string());
         }
         after = id;
-        ids.push(id);
     }
     Ok(Page {
         complete: ids.len() < PAGE_SIZE,
         ids,
         after,
+        finished_requested: None,
     })
 }
 
@@ -208,6 +264,7 @@ fn requested_page(cx: &Cx, requested: &[i64], after: i64, ceiling: i64) -> Resul
         after: selected.last().copied().unwrap_or(after),
         ids: selected.into_iter().collect(),
         complete,
+        finished_requested: None,
     })
 }
 
@@ -276,6 +333,7 @@ mod tests {
                 ids: vec![64],
                 after: 64,
                 complete: false,
+                finished_requested: None,
             },
             5,
         );
@@ -300,6 +358,7 @@ mod tests {
                     ids: vec![90],
                     after: 90,
                     complete: false,
+                    finished_requested: None,
                 },
                 2,
             );
@@ -557,6 +616,113 @@ mod tests {
     }
 
     #[test]
+    fn explicit_id_replay_rejects_newer_foreign_and_terminal_selectors() {
+        with_id_replay_mailbox(|cx, pool, config| {
+            let conn = block_on(pool.acquire(cx)).into_result().unwrap();
+            let future = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \
+                 \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES \
+                 (1, 71, 81, 'src/a.rs', 1, '', 1, {future}, NULL), \
+                 (2, 71, 81, 'src/a.rs', 1, '', 11, {future}, NULL), \
+                 (3, 71, 81, 'src/b.rs', 1, '', 1, {future}, NULL), \
+                 (4, 71, 81, 'src/b.rs', 1, '', 1, {future}, 2), \
+                 (5, 71, 81, 'src/c.rs', 1, '', 1, {future}, NULL), \
+                 (6, 71, 81, 'src/c.rs', 1, '', 1, {future}, NULL), \
+                 (7, 71, 82, 'src/d.rs', 1, '', 1, {future}, NULL), \
+                 (8, 71, 81, 'src/d.rs', 1, '', 1, {future}, NULL), \
+                 (9, 72, 83, 'src/e.rs', 1, '', 1, {future}, NULL), \
+                 (10, 71, 81, 'src/e.rs', 1, '', 1, {future}, NULL), \
+                 (11, 71, 81, 'src/f.rs', 1, '', 1, {future}, NULL), \
+                 (12, 71, 81, 'src/f.rs', 1, '', 1, {future}, NULL), \
+                 (13, 71, 81, 'src/g.rs', 1, '', 1, {future}, NULL), \
+                 (14, 71, 81, 'src/g.rs', 1, '', 1, {future}, NULL), \
+                 (15, 71, 81, 'src/h.rs', 1, '', 1, {future}, NULL), \
+                 (16, 71, 81, 'src/h.rs', 1, '', 1, {future}, 1), \
+                 (17, 71, 81, 'src/i.rs', 1, '', 1, {future}, NULL), \
+                 (18, 71, 81, 'src/i.rs', 1, '', 1, {future}, 20), \
+                 (19, 71, 81, 'src/j.rs', 1, '', 1, {future}, NULL), \
+                 (20, 71, 81, 'src/j.rs', 1, '', 1, {future}, 'garbage'), \
+                 (21, 71, 81, 'src/k.rs', 1, '', 1, {future}, NULL), \
+                 (22, 71, 81, 'src/k.rs', 1, '', 1, {future}, NULL), \
+                 (23, 71, 81, 'src/l.rs', 1, '', 1, {future}, NULL), \
+                 (24, 71, 81, 'src/l.rs', 1, '', 1, {future}, NULL), \
+                 (25, 71, 81, 'src/m.rs', 1, '', 1, {future}, NULL), \
+                 (26, 71, 81, 'src/m.rs', 1, '', 1, {future}, 20), \
+                 (27, 71, 81, 'src/n.rs', 1, '', 1, {future}, NULL), \
+                 (28, 71, 81, 'src/n.rs', 1, '', 1, {future}, NULL), \
+                 (29, 71, 81, 'src/o.rs', 1, '', 1, {future}, NULL), \
+                 (30, 71, 81, 'src/o.rs', 1, '', 1, {future}, 'none')"
+            ))
+            .unwrap();
+            conn.execute_raw(
+                "INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES \
+                 (6, 2), (14, 0), (16, 20), (18, 1), (22, 'garbage'), (24, -1), (28, 20)",
+            )
+            .unwrap();
+            drop(conn);
+            queue_requested_ids(
+                config,
+                &[2, 4, 6, 7, 9, 11, 14, 16, 18, 20, 22, 24, 26, 28, 30],
+                serde_json::Value::Null,
+            );
+            let report = replay_requested_ids(cx, pool, config, &mut Cursor::default());
+            assert_eq!(
+                (report.rows_released, report.completed, report.deferred),
+                (6, 1, 0)
+            );
+            assert!(!report.more);
+            // The general typed query rejects malformed terminal payloads;
+            // inspect those directly below instead of hiding decode errors.
+            let ids: Vec<_> = (1..=30).filter(|id| ![20, 22].contains(id)).collect();
+            let rows = block_on(queries::get_reservations_by_ids(cx, pool, &ids))
+                .into_result()
+                .unwrap();
+            assert_eq!(rows.len(), 28);
+            for row in rows {
+                match row.id.unwrap() {
+                    4 | 6 => assert_eq!(row.released_ts, Some(2)),
+                    14 => assert_eq!(row.released_ts, Some(0)),
+                    16 | 26 | 28 => assert_eq!(row.released_ts, Some(20)),
+                    18 => assert_eq!(row.released_ts, Some(1)),
+                    24 => assert_eq!(row.released_ts, Some(-1)),
+                    11 | 12 | 25 | 27 | 29 | 30 => {
+                        assert!(row.released_ts.is_some_and(|ts| ts >= 10));
+                    }
+                    _ => assert!(row.released_ts.is_none(), "out-of-scope selector: {row:?}"),
+                }
+            }
+            let conn = block_on(pool.acquire(cx)).into_result().unwrap();
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservations WHERE id = 20",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_named::<String>("released_ts")
+                    .unwrap(),
+                "garbage"
+            );
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservation_releases WHERE reservation_id = 22",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_named::<String>("released_ts")
+                    .unwrap(),
+                "garbage"
+            );
+            drop(conn);
+            assert!(
+                journal::read_queued_release_intents(config)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
     fn sparse_requested_pages_keep_scope_and_finish_only_after_the_last_candidate() {
         with_id_replay_mailbox(|cx, pool, config| {
             let conn = block_on(pool.acquire(cx)).into_result().unwrap();
@@ -571,10 +737,12 @@ mod tests {
                  (65, 71, 81, 'src/target.rs', 1, '', 1, {future})"
             ))
             .unwrap();
+            conn.execute_raw("UPDATE file_reservations SET released_ts = 2 WHERE id = 4")
+                .unwrap();
             drop(conn);
             let mut requested: Vec<_> = (1..=65).rev().collect();
             requested.extend([0, -1, 1, 500]);
-            queue_requested_ids(config, &requested, serde_json::json!(["src/*.rs"]));
+            queue_requested_ids(config, &requested, serde_json::Value::Null);
             let mut cursor = Cursor::default();
             let first = replay_requested_ids(cx, pool, config, &mut cursor);
             assert_eq!(
@@ -622,7 +790,11 @@ mod tests {
             .unwrap();
             assert_eq!(rows.len(), 6);
             for row in rows {
-                assert_eq!(row.released_ts.is_some_and(|ts| ts > 0), row.id == Some(65));
+                match row.id.unwrap() {
+                    4 => assert_eq!(row.released_ts, Some(2)),
+                    65 => assert!(row.released_ts.is_some_and(|ts| ts >= 10)),
+                    _ => assert!(row.released_ts.is_none()),
+                }
             }
         });
     }

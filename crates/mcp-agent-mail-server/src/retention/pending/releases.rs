@@ -1,8 +1,8 @@
 //! Replay reservation closeouts with their original scope and creation cutoff.
 //!
 //! A queued release is not a standing order against future leases. Resolve
-//! only existing identities, intersect path and ID filters, and recheck the
-//! original creation cutoff inside the database mutation transaction. Archive
+//! only existing identities, give paths precedence over ID selectors, and recheck
+//! the original creation cutoff inside the database mutation transaction. Archive
 //! repair re-reads live terminal authority and writes only a generation-stamped
 //! stable artifact. Captured release payloads are never queued: a digest alias
 //! may already name a newer lease. Completion receipts certify the DB operation,
@@ -280,11 +280,9 @@ fn matches_scope(
     {
         return false;
     }
-    if let Some(ids) = &intent.file_reservation_ids
-        && row.id.is_none_or(|id| !ids.contains(&id))
-    {
-        return false;
-    }
+    // ID-only selection already resolved exact-path siblings in the bounded
+    // database page. Requiring the sibling's own ID in the original request
+    // would strand duplicate leases after claiming the intent was complete.
     paths.is_none_or(|patterns| {
         let row_pattern = CompiledPattern::cached(&row.path_pattern);
         patterns.iter().any(|pattern| {
@@ -346,12 +344,11 @@ async fn apply_release(
         });
     }
     // An explicit empty filter is complete without scanning any lease rows.
-    if paths.as_ref().is_some_and(Vec::is_empty)
-        || intent
-            .file_reservation_ids
-            .as_ref()
-            .is_some_and(Vec::is_empty)
-    {
+    let requested_ids = paths
+        .is_none()
+        .then_some(intent.file_reservation_ids.as_deref())
+        .flatten();
+    if paths.as_ref().is_some_and(Vec::is_empty) || requested_ids.is_some_and(<[i64]>::is_empty) {
         return Ok(AppliedPage {
             released: Vec::new(),
             generation: None,
@@ -363,18 +360,21 @@ async fn apply_release(
     // restarts the finite scan rather than carrying a numeric cursor across it.
     let generation = db_value(queries::db_generation_id(ctx.cx(), pool).await)?;
     position.bind(project_id, agent_id, generation.clone());
-    let page = paging::select(
-        ctx.cx(),
-        pool,
-        intent.created_ts,
-        position,
-        intent.file_reservation_ids.as_deref(),
-    )
-    .await?;
+    let page = paging::select(ctx.cx(), pool, intent.created_ts, position, requested_ids).await?;
     let rows = if page.ids.is_empty() {
         Vec::new()
     } else {
-        db_value(queries::get_reservations_by_ids(ctx.cx(), pool, &page.ids).await)?
+        db_value(
+            queries::get_release_replay_selectors(
+                ctx.cx(),
+                pool,
+                project_id,
+                agent_id,
+                &page.ids,
+                intent.created_ts,
+            )
+            .await,
+        )?
     };
     if rows.len() > paging::PAGE_SIZE {
         return Err("release page payload exceeded its row limit".to_string());
@@ -1270,8 +1270,74 @@ mod tests {
     }
 
     #[test]
+    fn id_selected_siblings_stay_pending_across_pages_and_restart() {
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            for id in 1..=129 {
+                seed_replay_lease(cx, pool, id, "src/shared.rs", cutoff - 1);
+            }
+            seed_replay_lease(cx, pool, 130, "src/shared.rs", cutoff + 1);
+            seed_replay_lease(cx, pool, 131, "docs/keep.md", cutoff - 1);
+            queue_fixture_release(config, cutoff, 1);
+            let first = page_pass(cx, pool, config, &mut Cursor::default());
+            assert_eq!(
+                (first.rows_released, first.completed, first.deferred),
+                (64, 0, 0)
+            );
+            assert!(first.more);
+            let first_release =
+                fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[1]))
+                    .into_result()
+                    .unwrap()[0]
+                    .released_ts;
+            assert!(first_release.is_some_and(|released| released >= cutoff));
+            // The selecting row was released in the first page. After a
+            // restart it still selects the older siblings, without treating
+            // the future same-path lease as part of this closeout.
+            let mut restarted = Cursor::default();
+            for (released, completed) in [(0, 0), (64, 0), (1, 1)] {
+                let report = page_pass(cx, pool, config, &mut restarted);
+                assert_eq!(
+                    (report.rows_released, report.completed, report.deferred),
+                    (released, completed, 0)
+                );
+                assert_eq!(
+                    journal::read_queued_release_intents(config)
+                        .unwrap()
+                        .is_empty(),
+                    completed == 1
+                );
+            }
+            let ids: Vec<_> = (1..=131).collect();
+            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
+                .into_result()
+                .unwrap();
+            assert_eq!(rows.len(), 131);
+            for row in &rows {
+                assert_eq!(
+                    row.released_ts.is_some(),
+                    row.id.is_some_and(|id| id <= 129)
+                );
+            }
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.id == Some(1))
+                    .unwrap()
+                    .released_ts,
+                first_release,
+                "restart cannot rewrite an earlier terminal timestamp"
+            );
+            assert_eq!(
+                page_pass(cx, pool, config, &mut restarted).attempted,
+                0,
+                "the completed intent is no longer replayed"
+            );
+        });
+    }
+
+    #[test]
     fn sparse_paths_advance_without_releasing_unmatched_or_future_leases() {
-        for explicit_ids in [false, true] {
+        for requested_ids in [None, Some(vec![1]), Some(vec![])] {
             with_replay_mailbox(|cx, pool, config, _, _| {
                 let cutoff = mcp_agent_mail_db::now_micros();
                 for id in 1..=128 {
@@ -1284,13 +1350,13 @@ mod tests {
                     cutoff,
                     "BlueLake",
                     Some(vec!["src/*.rs".into()]),
-                    explicit_ids.then(|| vec![129, 130]),
+                    requested_ids,
                 );
                 let mut cursor = Cursor::default();
-                // A path-only request still walks bounded sparse pages. An
-                // explicit-ID intersection must not walk unrelated history.
-                let empty_pages = if explicit_ids { 0 } else { 2 };
-                for _ in 0..empty_pages {
+                // Paths retain their complete scope even if accompanying IDs
+                // are stale, incomplete or empty. Every variant makes bounded
+                // progress through the same sparse path window.
+                for _ in 0..2 {
                     let report = page_pass(cx, pool, config, &mut cursor);
                     assert_eq!(
                         (
