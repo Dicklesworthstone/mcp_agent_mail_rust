@@ -1819,6 +1819,11 @@ mod tests {
 
     fn database() -> crate::CanonicalDbConn {
         let conn = crate::CanonicalDbConn::open_memory().unwrap();
+        populate_database(&conn);
+        conn
+    }
+
+    fn populate_database(conn: &impl SyncQuery) {
         conn.execute_raw(
             "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY, generation_id TEXT NOT NULL);
              CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL);
@@ -1834,7 +1839,6 @@ mod tests {
              INSERT INTO project_mailbox_receipts VALUES (52, 29, 222, 333);
              INSERT INTO agent_links VALUES (93, 7, 17, 19, 29, 'ApPrOvEd', 'review', 10, 20, 999999);",
         ).unwrap();
-        conn
     }
 
     fn records(root: &Path) -> (Manifest, Vec<RecoveryRecord>) {
@@ -2043,6 +2047,159 @@ mod tests {
                 "clock order must not restore approval"
             );
         }
+    }
+
+    fn assert_reconciliation_retains_concurrent_ack<C: SyncQuery>(conn: &C, peer: &C, root: &Path) {
+        struct ConcurrentAck<'a, C> {
+            source: &'a C,
+            peer: &'a C,
+            root: &'a Path,
+            attempted: std::cell::Cell<bool>,
+            committed: std::cell::Cell<bool>,
+        }
+
+        impl<C: SyncQuery> SyncQuery for ConcurrentAck<'_, C> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<Row>, sqlmodel_core::Error> {
+                let rows = self.source.query_sync(sql, params)?;
+                if sql.contains("ORDER BY r.agent_id, r.message_id LIMIT")
+                    && !self.attempted.replace(true)
+                {
+                    // The repair has read the old receipt. Attempt a real
+                    // commit through an independent connection before it
+                    // publishes those rows and a completed revision.
+                    match self
+                        .peer
+                        .execute_raw("UPDATE message_recipients SET ack_ts=999 WHERE message_id=41")
+                    {
+                        Ok(()) => {
+                            self.committed.set(true);
+                            let error = persist_receipts(self.peer, self.root, 29, &[41])
+                                .expect_err("the repair still owns the archive state lock");
+                            assert!(error.to_string().contains("lock acquisition"), "{error}");
+                        }
+                        Err(error) => {
+                            let detail = error.to_string().to_ascii_lowercase();
+                            assert!(
+                                detail.contains("locked") || detail.contains("busy"),
+                                "unexpected competing commit failure: {error}"
+                            );
+                        }
+                    }
+                }
+                Ok(rows)
+            }
+
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.source.execute_raw(sql)
+            }
+        }
+
+        peer.execute_raw("PRAGMA busy_timeout=0").unwrap();
+        ensure_checkpoint(conn, root).unwrap();
+        conn.execute_raw(
+            "UPDATE message_recipients SET ack_ts=444 WHERE message_id=41; \
+             CREATE TEMP VIEW project_mailbox_receipts AS SELECT * FROM missing_shared_receipts;",
+        )
+        .unwrap();
+        let error = persist_receipts(conn, root, 29, &[41]).unwrap_err();
+        assert!(
+            error.to_string().contains("missing_shared_receipts"),
+            "{error}"
+        );
+        assert_eq!(read_revision_witness(root).unwrap(), None);
+        assert!(records(root).1.iter().any(|record| matches!(
+            record,
+            RecoveryRecord::Receipt(receipt)
+                if receipt.message_id == 41 && !receipt.shared && receipt.ack_ts == Some(444)
+        )));
+        conn.execute_raw("DROP VIEW temp.project_mailbox_receipts")
+            .unwrap();
+
+        let concurrent = ConcurrentAck {
+            source: conn,
+            peer,
+            root,
+            attempted: std::cell::Cell::new(false),
+            committed: std::cell::Cell::new(false),
+        };
+        persist_contact(&concurrent, root, 17, 29).unwrap();
+        assert!(
+            concurrent.attempted.get(),
+            "the competing commit was exercised"
+        );
+        if !concurrent.committed.get() {
+            // Writer exclusion is one valid solution. Once repair releases
+            // admission, the ordinary commit and publication must still work.
+            peer.execute_raw("UPDATE message_recipients SET ack_ts=999 WHERE message_id=41")
+                .unwrap();
+            persist_receipts(peer, root, 29, &[41]).unwrap();
+        }
+        let committed = query(
+            peer,
+            "SELECT ack_ts FROM message_recipients WHERE message_id=41",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(committed[0].get_named::<i64>("ack_ts").unwrap(), 999);
+        assert!(read_revision_witness(root).unwrap().is_some());
+        let recovered = records(root).1;
+        let latest = recovered
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                RecoveryRecord::Receipt(receipt) if receipt.message_id == 41 && !receipt.shared => {
+                    Some(receipt)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            latest.ack_ts,
+            Some(999),
+            "a completed repair must retain the actual committed ACK"
+        );
+    }
+
+    #[test]
+    fn reconciliation_retains_concurrent_ack_on_canonical_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("canonical.sqlite3");
+        let conn = crate::CanonicalDbConn::open_file(database.to_str().unwrap()).unwrap();
+        conn.execute_raw("PRAGMA journal_mode=WAL").unwrap();
+        populate_database(&conn);
+        let peer = crate::CanonicalDbConn::open_file(database.to_str().unwrap()).unwrap();
+        assert_reconciliation_retains_concurrent_ack(
+            &conn,
+            &peer,
+            &directory.path().join("archive"),
+        );
+    }
+
+    #[test]
+    fn reconciliation_retains_concurrent_ack_on_runtime_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("runtime.sqlite3");
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(database.to_str().unwrap()).unwrap(),
+            "concurrent ACK repair source",
+        );
+        conn.execute_raw("PRAGMA journal_mode=WAL").unwrap();
+        populate_database(&*conn);
+        let peer = crate::guard_db_conn(
+            crate::DbConn::open_file(database.to_str().unwrap()).unwrap(),
+            "concurrent ACK repair peer",
+        );
+        peer.execute_raw(crate::pool::AUTOCOMMIT_CONCURRENT_MODE_PRAGMA)
+            .unwrap();
+        assert_reconciliation_retains_concurrent_ack(
+            &*conn,
+            &*peer,
+            &directory.path().join("archive"),
+        );
     }
 
     #[test]
