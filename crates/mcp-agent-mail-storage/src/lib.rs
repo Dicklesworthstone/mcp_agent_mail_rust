@@ -1951,9 +1951,11 @@ pub fn write_op_sync_direct_with_cancel(
             deadline: started + DIRECT_FENCE_ADMISSION_BUDGET,
             cancelled: &mut observe_cancellation,
         };
-        let result = ensure_archive(config, project_slug).and_then(|archive| {
+        let result = (|| {
+            admission.check_cancelled()?;
+            let archive = open_prepared_reservation_archive(config, project_slug)?;
             write_file_reservation_records_admitted(&archive, config, reservations, &mut admission)
-        });
+        })();
         return finish_direct_write(op, started, result, cancellation_observed);
     }
     write_archive_sync_direct_with_cancel(op, cancelled, || wbq_execute_op(op, "archive-direct"))
@@ -10041,15 +10043,32 @@ pub struct HealResult {
 // Repo cache  (process-global, thread-safe)
 // ---------------------------------------------------------------------------
 
-/// Simple LRU-ish repo path cache. We don't cache `Repository` handles across
-/// calls because `git2::Repository` is `!Send` on some platforms, but we cache
-/// the *path* so repeated lookups avoid re-scanning.
+/// Initialized repository paths. Handles are never retained across calls; a
+/// read-only reopen checks that a cached path still names a usable repository.
+/// Valid hits skip configuration and initialization-metadata publication.
 static REPO_CACHE: LazyLock<OrderedMutex<Option<HashMap<PathBuf, bool>>>> =
     LazyLock::new(|| OrderedMutex::new(LockLevel::StorageRepoCache, None));
 
 fn repo_cache_contains(root: &Path) -> bool {
-    let guard = REPO_CACHE.lock();
-    guard.as_ref().is_some_and(|m| m.contains_key(root))
+    let cached = {
+        let guard = REPO_CACHE.lock();
+        guard.as_ref().is_some_and(|m| m.contains_key(root))
+    };
+    if !cached {
+        return false;
+    }
+    // Cache membership records completed initialization, not permanent
+    // filesystem authority. Never hold the cache mutex during filesystem or
+    // Git work, and never discover an enclosing repository after .git moves.
+    // Publication retains its separate authority checks. An opened repository
+    // can still be an unborn replacement of the cached one. Require a committed
+    // HEAD so the cold path publishes initialization metadata before reuse.
+    let git_path = root.join(".git");
+    fs::symlink_metadata(&git_path)
+        .is_ok_and(|meta| meta.file_type().is_dir() || meta.file_type().is_file())
+        && !path_existing_prefix_has_symlink(&git_path).unwrap_or(true)
+        && Repository::open(root)
+            .is_ok_and(|repo| repo.head().and_then(|head| head.peel_to_commit()).is_ok())
 }
 
 fn repo_cache_insert(root: &Path) {
@@ -10060,7 +10079,7 @@ fn repo_cache_insert(root: &Path) {
 
 /// Number of distinct git repo roots currently tracked in the path cache.
 ///
-/// This cache stores repo *paths* so repeated lookups skip a filesystem scan;
+/// This cache stores initialized repo *paths*, revalidating them on lookup;
 /// it does **not** hold open file descriptors. Its size is therefore an upper
 /// bound on distinct repos touched by this process, not a count of held FDs —
 /// evicting it frees zero descriptors. This distinction is why FD-exhaustion
@@ -10085,11 +10104,45 @@ fn repo_cache_clear_for_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Directory existence cache — avoids repeated stat() syscalls from
-// create_dir_all() on directories that already exist.
+// Prepared directory hints — current path/type checks keep relocated or
+// replaced directories from being mistaken for usable preparation.
 // ---------------------------------------------------------------------------
 
 static DIR_CACHE: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// A preparation hint is usable only while its directory still exists at a
+/// non-symlink path. Do not retain the cache mutex across filesystem work.
+/// Publication retains its separate authority checks.
+fn cached_directory_is_usable(dir: &Path) -> std::io::Result<bool> {
+    let cached = DIR_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(dir);
+    if !cached {
+        return Ok(false);
+    }
+    if path_existing_prefix_has_symlink(dir)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to use symlinked directory path: {}", dir.display()),
+        ));
+    }
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("archive directory is not a directory: {}", dir.display()),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DIR_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(dir);
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
 
 #[derive(Clone, Debug)]
 struct CanonicalPathCacheEntry {
@@ -10106,9 +10159,8 @@ const CANONICAL_PATH_CACHE_FRESHNESS: Duration = Duration::from_secs(2);
 static CANONICAL_PATH_CACHE: LazyLock<Mutex<HashMap<PathBuf, CanonicalPathCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Create parent directories for `path`, skipping `create_dir_all` when the
-/// parent has already been seen. This eliminates redundant `stat`/`access`
-/// syscalls in the hot message-write path.
+/// Create parent directories for `path`, revalidating cached preparation
+/// before skipping `create_dir_all`.
 fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -10116,38 +10168,65 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Create a directory (and parents) only if we haven't already created it.
 /// Whether a reservation write for `slug` would create nothing before its
 /// publication: the archive root, its repository, the project root and the
-/// reservation directory are all cached, so preparing the write takes no
-/// fence. Otherwise preparation takes the blocking fence, which a request path
-/// may only do inside a bounded window (GH#351).
+/// reservation directory have usable preparation hints. Otherwise preparation
+/// takes the blocking fence, which a request path may only do inside a bounded
+/// window (GH#351). This observation does not authorize later path creation.
 fn reservation_archive_prepared(config: &Config, slug: &str) -> bool {
     let root = archive_storage_root(config);
     let project_root = root.join("projects").join(slug);
     let reservation_dir = project_root.join("file_reservations");
-    let dirs_cached = {
-        let cache = DIR_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        [&root, &project_root, &reservation_dir]
-            .iter()
-            .all(|dir| cache.contains(dir.as_path()))
-    };
+    let dirs_cached = [&root, &project_root, &reservation_dir]
+        .iter()
+        .all(|dir| cached_directory_is_usable(dir).unwrap_or(false));
     dirs_cached && repo_cache_contains(&root)
 }
 
-fn ensure_dir(dir: &Path) -> std::io::Result<()> {
-    {
-        let cache = DIR_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.contains(dir) {
-            return Ok(());
-        }
+/// Open a previously prepared reservation archive without creating anything.
+/// The initial prepared predicate is only a hint: an external rename can
+/// invalidate it before this request reaches staging. Setup repair belongs to
+/// a later bounded admission, never to this unfenced fast path.
+fn open_prepared_reservation_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
+    let root = archive_storage_root(config);
+    refuse_default_storage_root_under_test_harness(&root)?;
+    // This also validates the slug before it is used to construct paths.
+    let archive = open_archive(config, slug)?;
+    let project_root = root.join("projects").join(slug);
+    let changed = || StorageError::LockContention {
+        message: "prepared reservation archive changed; retry archive preparation".to_string(),
+    };
+    if !cached_directory_is_usable(&root)? || !cached_directory_is_usable(&project_root)? {
+        return Err(changed());
     }
-    // A cached directory is no mutation: it must not wait for the global
-    // publication fence behind a draining batch (br-kp1in.13).
+    let git_dir = root.join(".git");
+    if path_existing_prefix_has_symlink(&git_dir)? {
+        return Err(StorageError::InvalidPath(
+            "archive repository path must not be symlinked".to_string(),
+        ));
+    }
+    match fs::symlink_metadata(&git_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() || metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(StorageError::InvalidPath(
+                "archive .git must be a directory or regular file".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(changed()),
+        Err(error) => return Err(error.into()),
+    }
+    if !repo_cache_contains(&root) {
+        return Err(changed());
+    }
+    archive.ok_or_else(changed)
+}
+
+fn ensure_dir(dir: &Path) -> std::io::Result<()> {
+    if cached_directory_is_usable(dir)? {
+        return Ok(());
+    }
+    // Usable preparation returned above without waiting behind a draining
+    // batch. Missing preparation needs a real mutation window (br-kp1in.13).
     let _mutation = ArchiveMutationGuard::begin_at(dir);
     if path_existing_prefix_has_symlink(dir)? {
         return Err(std::io::Error::new(
@@ -10467,19 +10546,33 @@ fn configure_archive_git_defaults(repo: &Repository) {
 ///
 /// Returns `true` if a new repo was created, `false` if it already existed.
 fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
-    // A cached repo is no mutation: like `ensure_dir`, it must not wait for
-    // the global publication fence (br-9bwnb: every reservation write opens
-    // its archive here before staging outside the fence).
+    let git_dir = root.join(".git");
+    reject_symlinked_archive_root(&git_dir)?;
+    // A usable cached repository performs no mutation and must not wait for
+    // the global publication fence behind an unrelated archive publisher.
     if repo_cache_contains(root) {
         return Ok(false);
     }
     let _mutation = ArchiveMutationGuard::begin_at(root);
+    // Filesystem state may have changed while publication admission waited.
+    reject_symlinked_archive_root(&git_dir)?;
     if repo_cache_contains(root) {
         return Ok(false);
     }
 
-    let git_dir = root.join(".git");
-    if git_dir.exists() {
+    // Existing invalid metadata is an error, never permission to initialize
+    // over it. Keep regular gitfiles supported for linked worktree archives.
+    let git_exists = match fs::symlink_metadata(&git_dir) {
+        Ok(meta) if meta.file_type().is_dir() || meta.file_type().is_file() => true,
+        Ok(_) => {
+            return Err(StorageError::InvalidPath(
+                "archive .git must be a directory or regular gitfile".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if git_exists {
         // Pre-existing archive: apply gc defaults once. `configure_archive_git_defaults`
         // is idempotent and respects operator-set values, so this is safe to run
         // every time a cold process first opens the archive.
@@ -11434,7 +11527,18 @@ fn write_file_reservation_records_admitted(
 
     let project_root = archive_project_root_checked(archive)?;
     let reservation_dir = project_root.join("file_reservations");
-    ensure_dir(&reservation_dir)?;
+    admission.check_cancelled()?;
+    match admission {
+        ReservationAdmission::Blocking => ensure_dir(&reservation_dir)?,
+        ReservationAdmission::Direct { .. } => {
+            if !cached_directory_is_usable(&reservation_dir)? {
+                return Err(StorageError::LockContention {
+                    message: "prepared reservation directory changed; retry archive preparation"
+                        .to_string(),
+                });
+            }
+        }
+    }
 
     let mut files = Vec::with_capacity(normalized_reservations.len() * 2);
     for (normalized, path_pattern, agent_name) in normalized_reservations {
@@ -19047,12 +19151,285 @@ mod tests {
     }
 
     #[test]
+    fn archive_init_cache_recreates_moved_parent_before_publishing() {
+        let tmp = TempDir::new().unwrap();
+        let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
+            &tmp.path().canonicalize().unwrap(),
+        );
+        let config = test_config(&root);
+        ensure_repo(&root, &config).unwrap();
+        let parent = root.join("messages");
+        let retained = root.join("preserved-messages");
+        write_text(&parent.join("first.md"), "retained first message", true).unwrap();
+        commit_paths_with_retry(&root, &config, "first message", &["messages/first.md"])
+            .unwrap();
+        fs::rename(&parent, &retained).unwrap();
+
+        write_text(&parent.join("second.md"), "second message", true)
+            .expect("an old directory hint must not prevent recreating a missing parent");
+        commit_paths_with_retry(&root, &config, "second message", &["messages/second.md"])
+            .unwrap();
+        assert_eq!(
+            fs::read(retained.join("first.md")).unwrap(),
+            b"retained first message",
+        );
+        assert_eq!(fs::read(parent.join("second.md")).unwrap(), b"second message");
+        let repo = Repository::open(&root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let entry = tree.get_path(Path::new("messages/second.md")).unwrap();
+        assert_eq!(
+            repo.find_blob(entry.id()).unwrap().content(),
+            b"second message",
+        );
+    }
+
+    #[test]
+    fn archive_init_cache_rejects_regular_files_on_cold_and_warm_paths() {
+        for cached in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
+                &tmp.path().canonicalize().unwrap(),
+            );
+            let dir = root.join("messages");
+            let retained = root.join("preserved-messages");
+            if cached {
+                ensure_dir(&dir).unwrap();
+                fs::write(dir.join("sentinel"), b"preserved directory").unwrap();
+                fs::rename(&dir, &retained).unwrap();
+            }
+            fs::write(&dir, b"blocking regular file").unwrap();
+            assert!(ensure_dir(&dir).is_err(), "cached={cached}");
+            assert!(write_text(&dir.join("message.md"), "must not publish", true).is_err());
+            assert_eq!(fs::read(&dir).unwrap(), b"blocking regular file");
+            if cached {
+                assert_eq!(
+                    fs::read(retained.join("sentinel")).unwrap(),
+                    b"preserved directory",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn archive_init_cache_revalidates_reservation_preparation() {
+        let tmp = TempDir::new().unwrap();
+        let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
+            &tmp.path().canonicalize().unwrap(),
+        );
+        let config = test_config(&root);
+        let slug = "prepared-revalidation";
+        let archive = ensure_archive(&config, slug).unwrap();
+        let reservations = archive.root.join("file_reservations");
+        ensure_dir(&reservations).unwrap();
+        assert!(reservation_archive_prepared(&config, slug));
+        fs::rename(&reservations, root.join("preserved-reservations")).unwrap();
+        assert!(!reservation_archive_prepared(&config, slug));
+        ensure_dir(&reservations).unwrap();
+        assert!(reservation_archive_prepared(&config, slug));
+        fs::rename(root.join(".git"), root.join("preserved-git")).unwrap();
+        assert!(!reservation_archive_prepared(&config, slug));
+    }
+
+    #[test]
+    fn archive_init_cache_reopens_missing_or_invalid_git_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
+            &tmp.path().canonicalize().unwrap(),
+        );
+        let config = test_config(&root);
+        ensure_repo(&root, &config).unwrap();
+        let original_tip = Repository::open(&root)
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        let retained = root.join("preserved-git");
+        fs::rename(root.join(".git"), &retained).unwrap();
+        fs::write(root.join(".git"), b"invalid git metadata\n").unwrap();
+        assert!(!repo_cache_contains(&root));
+        for _ in 0..2 {
+            assert!(ensure_repo(&root, &config).is_err());
+            assert_eq!(
+                fs::read(root.join(".git")).unwrap(),
+                b"invalid git metadata\n",
+            );
+        }
+        fs::rename(root.join(".git"), root.join("preserved-invalid-git")).unwrap();
+        assert!(ensure_repo(&root, &config).expect("genuinely missing .git is initialized"));
+        assert!(repo_cache_contains(&root));
+        let repo = Repository::open(&root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        for path in [".gitignore", ".gitattributes"] {
+            let entry = tree.get_path(Path::new(path)).unwrap();
+            assert_eq!(
+                repo.find_blob(entry.id()).unwrap().content(),
+                fs::read(root.join(path)).unwrap()
+            );
+        }
+        assert_eq!(
+            Repository::open(&retained)
+                .unwrap()
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            original_tip,
+        );
+    }
+
+    #[test]
+    fn archive_init_cache_repairs_valid_unborn_repository_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
+            &tmp.path().canonicalize().unwrap(),
+        );
+        let config = test_config(&root);
+        ensure_repo(&root, &config).unwrap();
+        let original_tip = Repository::open(&root)
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert!(repo_cache_contains(&root));
+
+        let retained = root.join("preserved-git");
+        fs::rename(root.join(".git"), &retained).unwrap();
+        {
+            let replacement = Repository::init(&root).unwrap();
+            assert_eq!(
+                replacement.head().err().map(|error| error.code()),
+                Some(ErrorCode::UnbornBranch),
+                "the replacement must be a valid repository without a first commit",
+            );
+        }
+        assert!(
+            !repo_cache_contains(&root),
+            "the old initialization hint cannot certify an unborn replacement",
+        );
+
+        // Existing metadata takes the ordinary cold-open path. It must
+        // publish the initialization files without reinitializing the repo.
+        assert!(!ensure_repo(&root, &config).expect("repair replacement initialization"));
+        assert!(repo_cache_contains(&root));
+        let repo = Repository::open(&root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        for path in [".gitignore", ".gitattributes"] {
+            let entry = tree.get_path(Path::new(path)).unwrap();
+            assert_eq!(
+                repo.find_blob(entry.id()).unwrap().content(),
+                fs::read(root.join(path)).unwrap(),
+            );
+        }
+        assert_eq!(
+            Repository::open(&retained)
+                .unwrap()
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            original_tip,
+            "repair must preserve the previous repository's history",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_init_cache_rejects_symlinked_directory_paths() {
+        use std::os::unix::fs::symlink;
+
+        for ancestor in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let dir = root.join("parent/messages");
+            ensure_dir(&dir).unwrap();
+            fs::write(dir.join("sentinel"), b"preserved directory").unwrap();
+            let replaced = if ancestor {
+                root.join("parent")
+            } else {
+                dir.clone()
+            };
+            let retained = root.join("preserved-directory");
+            fs::rename(&replaced, &retained).unwrap();
+            let foreign = root.join("foreign");
+            fs::create_dir_all(foreign.join("messages")).unwrap();
+            fs::write(foreign.join("sentinel"), b"foreign directory").unwrap();
+            symlink(&foreign, &replaced).unwrap();
+            assert!(ensure_dir(&dir).is_err(), "ancestor={ancestor}");
+            assert!(write_text(&dir.join("message.md"), "must not publish", true).is_err());
+            assert!(!foreign.join("message.md").exists());
+            assert!(!foreign.join("messages/message.md").exists());
+            assert_eq!(
+                fs::read(foreign.join("sentinel")).unwrap(),
+                b"foreign directory",
+            );
+            let retained_file = if ancestor {
+                retained.join("messages/sentinel")
+            } else {
+                retained.join("sentinel")
+            };
+            assert_eq!(fs::read(retained_file).unwrap(), b"preserved directory");
+
+            let cold = root.join("cold-symlink");
+            symlink(&foreign, &cold).unwrap();
+            assert!(ensure_dir(&cold).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_init_cache_rejects_symlinked_git_on_cold_and_warm_paths() {
+        use std::os::unix::fs::symlink;
+
+        for cached in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let base = tmp.path().canonicalize().unwrap();
+            let root = base.join("archive");
+            fs::create_dir(&root).unwrap();
+            let config = test_config(&root);
+            if cached {
+                ensure_repo(&root, &config).unwrap();
+                fs::rename(root.join(".git"), base.join("preserved-git")).unwrap();
+            }
+            let foreign = base.join("foreign");
+            Repository::init(&foreign).unwrap();
+            let original_config = fs::read(foreign.join(".git/config")).unwrap();
+            let original_head = fs::read(foreign.join(".git/HEAD")).unwrap();
+            symlink(foreign.join(".git"), root.join(".git")).unwrap();
+            assert!(!repo_cache_contains(&root));
+            assert!(matches!(
+                ensure_repo(&root, &config),
+                Err(StorageError::InvalidPath(_))
+            ));
+            assert_eq!(
+                fs::read(foreign.join(".git/config")).unwrap(),
+                original_config,
+            );
+            assert_eq!(fs::read(foreign.join(".git/HEAD")).unwrap(), original_head);
+            if !cached {
+                assert!(!root.join(".gitignore").exists());
+                assert!(!root.join(".gitattributes").exists());
+            }
+        }
+    }
+
+    #[test]
     fn signal_io_and_cached_dirs_do_not_wait_for_a_held_fence() {
         let tmp = TempDir::new().unwrap();
-        let cached_dir = tmp.path().join("cached");
+        let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
+            &tmp.path().canonicalize().unwrap(),
+        );
+        let cached_dir = root.join("cached");
         ensure_dir(&cached_dir).expect("create and cache the directory");
-        let mut config = test_config(tmp.path());
-        config.notifications_signals_dir = tmp.path().join("signals");
+        let mut config = test_config(&root);
+        config.notifications_signals_dir = root.join("signals");
+        let prepared = ensure_archive(&config, "prepared-hit").unwrap();
+        ensure_dir(&prepared.root.join("file_reservations")).unwrap();
         let signal = config
             .notifications_signals_dir
             .join("projects/proj/agents/BlueLake.signal");
@@ -19081,6 +19458,9 @@ mod tests {
             // First delivery creates an uncached directory under a new project.
             let emitted = emit_notification_signal(&config, "cold-project", "BlueLake", None);
             ensure_dir(&cached_dir).expect("cached directory");
+            assert!(!ensure_repo(&config.storage_root, &config).expect("usable cached repository"));
+            ensure_archive(&config, "prepared-hit").expect("usable cached archive");
+            assert!(reservation_archive_prepared(&config, "prepared-hit"));
             done_tx.send((outcomes, emitted)).expect("report outcomes");
         });
         let outcomes = done_rx.recv_timeout(Duration::from_secs(5));
@@ -21262,6 +21642,111 @@ mod tests {
         assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
         assert!(reservation_dir.join("id-8.json").exists());
         assert!(staged_temp_files(&reservation_dir).is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn direct_reservation_setup_loss_refuses_without_waiting_for_the_fence() {
+        if !isolated_coalescer_regression(
+            "tests::direct_reservation_setup_loss_refuses_without_waiting_for_the_fence",
+        ) {
+            return;
+        }
+        let _pressure = DiskPressureReset::set(0);
+        for (case, move_at) in [("project", 1_usize), ("repository", 1), ("reservations", 2)] {
+            let tmp = TempDir::new().unwrap();
+            let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
+                &fs::canonicalize(tmp.path()).unwrap(),
+            );
+            let config = test_config(&root);
+            let slug = format!("prepared-loss-{case}");
+            let archive = ensure_archive(&config, &slug).unwrap();
+            let reservation_dir = archive.root.join("file_reservations");
+            ensure_dir(&reservation_dir).unwrap();
+            assert!(reservation_archive_prepared(&config, &slug));
+            let victim = match case {
+                "project" => archive.root.clone(),
+                "repository" => root.join(".git"),
+                "reservations" => reservation_dir.clone(),
+                _ => unreachable!(),
+            };
+            let retained = root.join(format!("retained-{case}"));
+            fs::write(victim.join("retained-marker"), b"preserve existing bytes").unwrap();
+            let op = WriteOp::FileReservation {
+                project_slug: slug.clone(),
+                config,
+                reservations: vec![serde_json::json!({
+                    "id": 91,
+                    "agent": "GreenCastle",
+                    "path_pattern": "src/**",
+                    "exclusive": true,
+                })],
+            };
+            let (release, holder) = hold_publication_fence();
+            let rename_from = victim.clone();
+            let rename_to = retained.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let mut checks = 0_usize;
+                let result = write_op_sync_direct_with_cancel(&op, || {
+                    checks += 1;
+                    // Poll 1 is after the prepared predicate, before archive
+                    // opening. Poll 2 is immediately before directory setup.
+                    if checks == move_at {
+                        fs::rename(&rename_from, &rename_to).unwrap();
+                    }
+                    false
+                });
+                done_tx.send((result, checks)).unwrap();
+                op
+            });
+            let outcome = done_rx.recv_timeout(Duration::from_secs(2));
+            let missing_while_held = !victim.exists();
+            let retained_while_held = fs::read(retained.join("retained-marker")).ok();
+            // A regression must release its real blocker before asserting,
+            // so the writer can unwind even if setup waited on the fence.
+            release.send(()).expect("release the fence");
+            holder.join().expect("holder thread");
+            let op = writer.join().expect("writer thread");
+            flush_async_commits();
+
+            let (result, checks) = outcome.unwrap_or_else(|error| {
+                panic!("{case}: changed setup waited for the held fence: {error}")
+            });
+            assert!(
+                matches!(&result, DirectArchiveWrite::Failed(StorageError::LockContention { .. })),
+                "{case}: {result:?}"
+            );
+            assert_eq!(checks, move_at, "{case}: refusal must happen at setup");
+            assert!(missing_while_held, "{case}: setup must not recreate the path");
+            assert_eq!(
+                retained_while_held.as_deref(),
+                Some(b"preserve existing bytes".as_slice()),
+                "{case}: the moved directory must remain intact"
+            );
+            assert!(!victim.exists(), "{case}: refusal must not repair setup");
+            let key = format!("{}::{slug}", root.display());
+            assert!(
+                wbq_circuit_breaker_snapshot()
+                    .iter()
+                    .all(|entry| entry.archive_key != key),
+                "{case}: stale preparation must not poison the archive breaker"
+            );
+
+            // An ordinary retry is allowed to prepare missing state through
+            // the bounded slow path once the real fence owner has released it.
+            let retry = write_op_sync_direct(&op);
+            flush_async_commits();
+            assert!(matches!(&retry, DirectArchiveWrite::Written), "{case}: {retry:?}");
+            let published: serde_json::Value =
+                serde_json::from_slice(&fs::read(reservation_dir.join("id-91.json")).unwrap())
+                    .unwrap();
+            assert_eq!(published["agent"], "GreenCastle");
+            assert_eq!(
+                fs::read(retained.join("retained-marker")).unwrap(),
+                b"preserve existing bytes"
+            );
+        }
     }
 
     #[test]

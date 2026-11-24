@@ -6638,8 +6638,8 @@ mod tests {
                 Some(false),
             )
         };
-        let combined = vec!["alpha\u{1f}beta".to_string()];
-        let separate = vec!["alpha".to_string(), "beta".to_string()];
+        let combined = ["alpha\u{1f}beta".to_string()];
+        let separate = ["alpha".to_string(), "beta".to_string()];
         assert_ne!(
             fingerprint(&combined),
             fingerprint(&separate),
