@@ -96,7 +96,7 @@ fn parse_search_messages_window(
 fn invalid_message_search_cursor() -> McpError {
     legacy_tool_error(
         "INVALID_ARGUMENT",
-        "invalid search cursor. Use next_cursor from the same project, query, and read route.",
+        "invalid search cursor. Use next_cursor from the same project, query, filters, and read route, or start again without cursor.",
         true,
         json!({"field": "cursor"}),
     )
@@ -1313,20 +1313,8 @@ pub async fn search_messages(
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     phase.mark("scope_resolution");
-    let cursor_scope =
-        MessageSearchCursorScope::live(project_id, std::path::Path::new(pool.sqlite_path()));
-    let cursor = cursor
-        .as_deref()
-        .map(|token| {
-            cursor_scope
-                .position(token)
-                .map(str::to_owned)
-                .ok_or_else(invalid_message_search_cursor)
-        })
-        .transpose()?;
-
-    // Build a SearchQuery with all facets
-    let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
+    // Build a SearchQuery with all facets before validating its continuation.
+    let mut search_query = mcp_agent_mail_db::search_planner::SearchQuery {
         text: trimmed.to_string(),
         doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
         project_id: Some(project_id),
@@ -1339,12 +1327,27 @@ pub async fn search_messages(
         time_range,
         ranking: ranking_mode,
         limit: Some(planner_limit),
-        cursor,
+        cursor: None,
         // Always collect explain internally so degraded diagnostics remain deterministic
         // even when `explain=false` for the caller.
         explain: true,
         ..Default::default()
     };
+    let cursor_scope = MessageSearchCursorScope::live(
+        project_id,
+        std::path::Path::new(pool.sqlite_path()),
+        &search_query,
+        recipient_kind.as_deref(),
+    );
+    search_query.cursor = cursor
+        .as_deref()
+        .map(|token| {
+            cursor_scope
+                .position(token)
+                .map(str::to_owned)
+                .ok_or_else(invalid_message_search_cursor)
+        })
+        .transpose()?;
     phase.mark("planner_query_build");
 
     let search_options = mcp_agent_mail_db::search_service::SearchOptions {
@@ -2097,12 +2100,9 @@ mod tests {
         });
     }
 
-    async fn call_recipient_search_tool(
+    async fn call_search_tool(
         ctx: &McpContext,
-        project_key: &str,
-        kind: &str,
-        offset: Option<i32>,
-        cursor: Option<String>,
+        arguments: serde_json::Value,
     ) -> Result<serde_json::Value, serde_json::Value> {
         let router = fastmcp_server::ServerBuilder::new("recipient-kind-search-test", "0")
             .tool(crate::SearchMessages)
@@ -2113,17 +2113,7 @@ mod tests {
                 ctx,
                 fastmcp::CallToolParams {
                     name: "search_messages".to_string(),
-                    arguments: Some(json!({
-                        "project_key": project_key,
-                        "query": "needle",
-                        "limit": 2,
-                        "offset": offset,
-                        "cursor": cursor,
-                        "ranking": "recency",
-                        "explain": true,
-                        "include_body_md": true,
-                        "recipient_kind": kind,
-                    })),
+                    arguments: Some(arguments),
                     meta: None,
                 },
                 fastmcp_core::SessionState::new(),
@@ -2147,6 +2137,99 @@ mod tests {
         } else {
             Ok(payload)
         }
+    }
+
+    async fn call_recipient_search_tool(
+        ctx: &McpContext,
+        project_key: &str,
+        kind: &str,
+        offset: Option<i32>,
+        cursor: Option<String>,
+    ) -> Result<serde_json::Value, serde_json::Value> {
+        call_search_tool(
+            ctx,
+            json!({
+                "project_key": project_key,
+                "query": "needle",
+                "limit": 2,
+                "offset": offset,
+                "cursor": cursor,
+                "ranking": "recency",
+                "explain": true,
+                "include_body_md": true,
+                "recipient_kind": kind,
+            }),
+        )
+        .await
+    }
+
+    #[test]
+    fn search_tool_cursor_binds_query_facets_and_allows_page_controls() {
+        with_recipient_search_corpus(|ctx, _| async move {
+            let arguments = json!({
+                "project_key": "kind-search",
+                "query": "needle",
+                "limit": 2,
+                "ranking": "recency",
+                "sender": "BlueLake",
+                "importance": "normal,high",
+                "date_start": "1970-01-01T00:00:00Z",
+                "date_end": "1970-01-02T00:00:00Z",
+                "recipient_kind": "cc",
+            });
+            let first = call_search_tool(&ctx, arguments.clone())
+                .await
+                .expect("first filtered page");
+            let cursor = first["next_cursor"].as_str().expect("nonterminal page");
+            assert_eq!(first["result"][0]["id"], 96);
+            assert_eq!(first["result"][1]["id"], 93);
+
+            for (field, value) in [
+                ("query", "body"),
+                ("query", "needle thread:other"),
+                ("ranking", "relevance"),
+                ("sender", "RedFox"),
+                ("importance", "normal"),
+                ("thread_id", "other"),
+                ("date_start", "1970-01-01T00:00:01Z"),
+                ("date_end", "1970-01-03T00:00:00Z"),
+                ("recipient_kind", "to"),
+            ] {
+                let mut changed = arguments.clone();
+                changed["cursor"] = cursor.into();
+                changed[field] = value.into();
+                let error = call_search_tool(&ctx, changed)
+                    .await
+                    .expect_err("a different search must restart pagination");
+                assert_eq!(error["error"]["type"], "INVALID_ARGUMENT", "{field}");
+                assert_eq!(error["error"]["data"]["field"], "cursor", "{field}");
+            }
+
+            let mut continued = arguments;
+            continued["cursor"] = cursor.into();
+            continued["limit"] = 3.into();
+            continued["explain"] = true.into();
+            continued["include_body_md"] = true.into();
+            continued["importance"] = "HIGH,normal,high".into();
+            continued["recipient_kind"] = " CC ".into();
+            continued["sender"] = serde_json::Value::Null;
+            continued["from_agent"] = "BlueLake".into();
+            continued["date_start"] = serde_json::Value::Null;
+            continued["after"] = "1970-01-01T01:00:00+01:00".into();
+            continued["date_end"] = "1970-01-02T01:00:00+01:00".into();
+            let second = call_search_tool(&ctx, continued)
+                .await
+                .expect("same normalized request with different presentation");
+            let ids: Vec<_> = second["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["id"].as_i64().unwrap())
+                .collect();
+            assert_eq!(ids, [90, 87, 84], "resume at the last visible match");
+            assert_eq!(second["result"][0]["body_md"], "needle body");
+            assert!(second["result"][0]["score"].is_number());
+        });
     }
 
     #[test]

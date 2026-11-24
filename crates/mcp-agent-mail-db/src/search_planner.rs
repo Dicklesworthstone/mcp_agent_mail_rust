@@ -475,7 +475,7 @@ impl SearchCursor {
     }
 }
 
-/// Binds a public message-search cursor to a project and mailbox read route.
+/// Binds a public message-search cursor to its request and mailbox read route.
 ///
 /// The tag prevents accidental replay in another scope. Result authorization
 /// still comes from the resolved project and the search query.
@@ -486,26 +486,73 @@ pub struct MessageSearchCursorScope {
 
 impl MessageSearchCursorScope {
     /// Capability announced by servers that validate scoped continuations.
-    pub const CAPABILITY: &'static str = "scoped_v1";
+    pub const CAPABILITY: &'static str = "scoped_query_v2";
 
-    const LIVE: &'static str = "ml1";
-    const SNAPSHOT: &'static str = "ms1";
+    const LIVE: &'static str = "ml2";
+    const SNAPSHOT: &'static str = "ms2";
 
     #[must_use]
-    pub fn live(project_id: i64, database_path: &Path) -> Self {
-        Self::new(Self::LIVE, project_id, database_path)
+    pub fn live(
+        project_id: i64,
+        database_path: &Path,
+        query: &SearchQuery,
+        recipient_kind: Option<&str>,
+    ) -> Self {
+        Self::new(Self::LIVE, project_id, database_path, query, recipient_kind)
     }
 
     #[must_use]
-    pub fn snapshot(project_id: i64, database_path: &Path) -> Self {
-        Self::new(Self::SNAPSHOT, project_id, database_path)
+    pub fn snapshot(
+        project_id: i64,
+        database_path: &Path,
+        query: &SearchQuery,
+        recipient_kind: Option<&str>,
+    ) -> Self {
+        Self::new(
+            Self::SNAPSHOT,
+            project_id,
+            database_path,
+            query,
+            recipient_kind,
+        )
     }
 
-    fn new(route: &'static str, project_id: i64, database_path: &Path) -> Self {
+    fn new(
+        route: &'static str,
+        project_id: i64,
+        database_path: &Path,
+        query: &SearchQuery,
+        recipient_kind: Option<&str>,
+    ) -> Self {
+        // Bind every membership, visibility and ordering input. Page size and
+        // presentation may change; the position must not enter its own scope.
+        // Preserve inline hints, case and quoted whitespace in the query text.
+        let mut request = query.clone();
+        request.text = request.text.trim().to_string();
+        request.limit = None;
+        request.cursor = None;
+        request.explain = false;
+        request
+            .importance
+            .sort_unstable_by_key(|value| value.as_str());
+        request.importance.dedup();
+        if let ScopePolicy::ProjectSet {
+            allowed_project_ids,
+        } = &mut request.scope
+        {
+            allowed_project_ids.sort_unstable();
+            allowed_project_ids.dedup();
+        }
+        let request = serde_json::json!({
+            "query": request,
+            "recipient_kind": recipient_kind,
+        });
         let mut hash = Sha256::new();
         hash.update(route.as_bytes());
         hash.update(project_id.to_be_bytes());
-        hash.update(database_path.as_os_str().as_encoded_bytes());
+        // A fixed-width path digest separates the path from the request.
+        hash.update(Sha256::digest(database_path.as_os_str().as_encoded_bytes()));
+        hash.update(request.to_string().as_bytes());
         Self {
             route,
             tag: hex::encode(hash.finalize()),
@@ -1717,7 +1764,8 @@ mod tests {
     #[test]
     fn message_page_cursor_binds_project_mailbox_and_read_route() {
         let db = Path::new("storage.sqlite3");
-        let scope = MessageSearchCursorScope::live(7, db);
+        let query = SearchQuery::messages("needle", 7);
+        let scope = MessageSearchCursorScope::live(7, db, &query, None);
         let position = SearchCursor {
             score: -2.5,
             id: 42,
@@ -1728,16 +1776,16 @@ mod tests {
         assert_eq!(scope.position(&token), Some(position.as_str()));
         assert!(scope.position(&position).is_none());
         assert!(
-            MessageSearchCursorScope::live(8, db)
+            MessageSearchCursorScope::live(8, db, &query, None)
                 .position(&token)
                 .is_none()
         );
         assert!(
-            MessageSearchCursorScope::live(7, Path::new("other.sqlite3"))
+            MessageSearchCursorScope::live(7, Path::new("other.sqlite3"), &query, None)
                 .position(&token)
                 .is_none()
         );
-        let snapshot = MessageSearchCursorScope::snapshot(7, db);
+        let snapshot = MessageSearchCursorScope::snapshot(7, db, &query, None);
         assert!(snapshot.position(&token).is_none());
         assert!(!MessageSearchCursorScope::is_snapshot_token(&token));
         let snapshot_token = snapshot.bind(&position);
@@ -1753,6 +1801,132 @@ mod tests {
             scope
                 .position(&scope.bind(&format!("s0:i{}42", "0".repeat(60))))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn message_page_cursor_rejects_changed_query_filters_and_order() {
+        let db = Path::new("storage.sqlite3");
+        let query = SearchQuery::messages("needle", 7);
+        let token = MessageSearchCursorScope::live(7, db, &query, Some("cc"))
+            .bind(&SearchCursor { score: 1.5, id: 42 }.encode());
+        let variants = [
+            SearchQuery {
+                text: "different".into(),
+                ..query.clone()
+            },
+            SearchQuery {
+                text: "needle from:BlueFox".into(),
+                ..query.clone()
+            },
+            SearchQuery {
+                text_fields: TextFieldScope::Subject,
+                ..query.clone()
+            },
+            SearchQuery {
+                doc_kind: DocKind::Thread,
+                ..query.clone()
+            },
+            SearchQuery {
+                project_id: Some(8),
+                ..query.clone()
+            },
+            SearchQuery {
+                product_id: Some(1),
+                ..query.clone()
+            },
+            SearchQuery {
+                importance: vec![Importance::Urgent],
+                ..query.clone()
+            },
+            SearchQuery {
+                direction: Some(Direction::Outbox),
+                agent_name: Some("BlueFox".into()),
+                ..query.clone()
+            },
+            SearchQuery {
+                thread_id: Some("thread-2".into()),
+                ..query.clone()
+            },
+            SearchQuery {
+                ack_required: Some(true),
+                ..query.clone()
+            },
+            SearchQuery {
+                time_range: TimeRange {
+                    min_ts: Some(1),
+                    max_ts: None,
+                },
+                ..query.clone()
+            },
+            SearchQuery {
+                time_range: TimeRange {
+                    min_ts: None,
+                    max_ts: Some(2),
+                },
+                ..query.clone()
+            },
+            SearchQuery {
+                ranking: RankingMode::Recency,
+                ..query.clone()
+            },
+            SearchQuery {
+                scope: ScopePolicy::CallerScoped {
+                    caller_agent: "BlueFox".into(),
+                },
+                ..query.clone()
+            },
+        ];
+        for changed in variants {
+            assert!(
+                MessageSearchCursorScope::live(7, db, &changed, Some("cc"))
+                    .position(&token)
+                    .is_none(),
+                "changed request must not reuse the previous position: {changed:?}"
+            );
+        }
+        for kind in [None, Some("to"), Some("bcc")] {
+            assert!(
+                MessageSearchCursorScope::live(7, db, &query, kind)
+                    .position(&token)
+                    .is_none(),
+                "recipient kind must remain bound: {kind:?}"
+            );
+        }
+        for route in ["ml1", "ms1"] {
+            let old = format!("{route}:{}", token.split_once(':').unwrap().1);
+            assert!(!MessageSearchCursorScope::accepts_syntax(&old));
+        }
+    }
+
+    #[test]
+    fn message_page_cursor_preserves_normalized_filters_and_page_controls() {
+        let db = Path::new("storage.sqlite3");
+        let mut query = SearchQuery::messages("  needle \"two  words\"  ", 7);
+        query.importance = vec![Importance::Urgent, Importance::Normal];
+        query.scope = ScopePolicy::ProjectSet {
+            allowed_project_ids: vec![7, 8],
+        };
+        let position = SearchCursor { score: 1.5, id: 42 }.encode();
+        let token = MessageSearchCursorScope::snapshot(7, db, &query, None).bind(&position);
+        query.text = query.text.trim().to_string();
+        query.importance = vec![Importance::Normal, Importance::Urgent, Importance::Normal];
+        query.scope = ScopePolicy::ProjectSet {
+            allowed_project_ids: vec![8, 7, 8],
+        };
+        query.limit = Some(100);
+        query.cursor = Some(position.clone());
+        query.explain = true;
+        assert_eq!(
+            MessageSearchCursorScope::snapshot(7, db, &query, None).position(&token),
+            Some(position.as_str())
+        );
+        query.text = "needle \"two words\"".into();
+        assert!(
+            MessageSearchCursorScope::snapshot(7, db, &query, None)
+                .position(&token)
+                .is_none(),
+            "whitespace within quoted text must not be normalized"
         );
     }
 

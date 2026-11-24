@@ -8188,21 +8188,25 @@ fn search_hit_age(now_us: i64, created_ts: i64) -> String {
 
 fn invalid_robot_search_cursor() -> CliError {
     CliError::InvalidArgument(
-        "invalid search cursor. Use next_cursor from the same project, query, and read route."
+        "invalid search cursor. Use next_cursor from the same project, query, filters, and read route, or start again without --cursor on a current server."
             .to_string(),
     )
 }
 
-fn validate_robot_search_window(limit: usize, cursor: Option<&str>) -> Result<(), CliError> {
-    use mcp_agent_mail_db::search_planner::{MessageSearchCursorScope, SearchCursor};
+fn validate_robot_search_limit(limit: usize) -> Result<(), CliError> {
     if !(1..=1000).contains(&limit) {
         return Err(CliError::InvalidArgument(
             "search --limit must be between 1 and 1000".to_string(),
         ));
     }
+    Ok(())
+}
+
+fn validate_robot_search_window(limit: usize, cursor: Option<&str>) -> Result<(), CliError> {
+    use mcp_agent_mail_db::search_planner::MessageSearchCursorScope;
+    validate_robot_search_limit(limit)?;
     if let Some(cursor) = cursor
         && !MessageSearchCursorScope::accepts_syntax(cursor)
-        && SearchCursor::decode(cursor).is_none()
     {
         return Err(invalid_robot_search_cursor());
     }
@@ -8221,7 +8225,6 @@ fn search_via_server(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<Option<(crate::context::ResolvedProject, SearchData)>, CliError> {
-    use mcp_agent_mail_db::search_planner::MessageSearchCursorScope;
     validate_robot_search_window(limit, cursor)?;
     let recipient_kind = parse_search_recipient_kind(recipient_kind)?;
     if !selection.permits_automatic_read(config) {
@@ -8244,7 +8247,7 @@ fn search_via_server(
         arguments["importance"] = importance.into();
     }
     if let Some(since) = since.map(str::trim).filter(|value| !value.is_empty()) {
-        // The relative forms the direct path accepts, sent as an instant.
+        // Normalize the absolute timestamp forms accepted by the direct path.
         arguments["since"] =
             mcp_agent_mail_core::timestamps::micros_to_iso(parse_since_micros(since)?).into();
     }
@@ -8254,13 +8257,16 @@ fn search_via_server(
         else {
             return Ok(None);
         };
-        if cursor.is_some_and(MessageSearchCursorScope::accepts_syntax)
-            && !session.supports_search_cursor_scope()
-        {
-            return Err(CliError::InvalidArgument(
-                "the running server cannot resume this search cursor. Start again without --cursor."
-                    .to_string(),
-            ));
+        if !session.supports_search_cursor_scope() {
+            if cursor.is_some() {
+                return Err(CliError::InvalidArgument(
+                    "the running server cannot resume this search cursor. Start again without --cursor."
+                        .to_string(),
+                ));
+            }
+            // Older daemons can emit a first-page cursor this client cannot
+            // resume. Start on the private-snapshot route instead.
+            return Ok(None);
         }
         if !selection.supported_by(&session)
             || (recipient_kind.is_some() && !session.supports_search_recipient_kind())
@@ -8348,6 +8354,43 @@ fn search_data_from_server_response(
     })
 }
 
+/// Parse the request once consistently for snapshot cursor identity and search.
+/// The cursor here is an internal backend position, already scope-checked by
+/// the public command before any search or persistent-index refresh.
+fn robot_search_query(
+    project_id: i64,
+    query: &str,
+    importance_filter: Option<&str>,
+    since: Option<&str>,
+    cursor: Option<&str>,
+) -> Result<mcp_agent_mail_db::search_planner::SearchQuery, CliError> {
+    use mcp_agent_mail_db::search_planner::{Importance, SearchCursor, SearchQuery, TimeRange};
+
+    if cursor.is_some_and(|token| SearchCursor::decode(token).is_none()) {
+        return Err(invalid_robot_search_cursor());
+    }
+    let mut search_query = SearchQuery::messages(query.trim(), project_id);
+    search_query.explain = true;
+    search_query.cursor = cursor.map(str::to_string);
+    if let Some(list) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        for imp in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some(parsed) = Importance::parse(imp) else {
+                return Err(CliError::InvalidArgument(format!(
+                    "invalid importance filter: {imp}"
+                )));
+            };
+            search_query.importance.push(parsed);
+        }
+    }
+    if let Some(since) = since.map(str::trim).filter(|s| !s.is_empty()) {
+        search_query.time_range = TimeRange {
+            min_ts: Some(parse_since_micros(since)?),
+            max_ts: None,
+        };
+    }
+    Ok(search_query)
+}
+
 fn build_search(
     conn: &DbConn,
     pool: &mcp_agent_mail_db::DbPool,
@@ -8359,7 +8402,7 @@ fn build_search(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<SearchData, CliError> {
-    validate_robot_search_window(limit, cursor)?;
+    validate_robot_search_limit(limit)?;
     let raw_query = query.trim();
     if raw_query.is_empty() {
         return Ok(SearchData {
@@ -8389,31 +8432,7 @@ fn build_search(
     }
 
     let now_us = mcp_agent_mail_db::now_micros();
-    let mut search_query =
-        mcp_agent_mail_db::search_planner::SearchQuery::messages(raw_query.to_string(), project_id);
-    search_query.explain = true;
-    search_query.cursor = cursor.map(str::to_string);
-
-    // A comma-separated list, as the server-routed search accepts.
-    if let Some(list) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
-        for imp in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let Some(parsed) = mcp_agent_mail_db::search_planner::Importance::parse(imp) else {
-                return Err(CliError::InvalidArgument(format!(
-                    "invalid importance filter: {imp}"
-                )));
-            };
-            search_query.importance.push(parsed);
-        }
-    }
-
-    if let Some(since_str) = since.map(str::trim).filter(|s| !s.is_empty()) {
-        let since_us = parse_since_micros(since_str)?;
-        search_query.time_range = mcp_agent_mail_db::search_planner::TimeRange {
-            min_ts: Some(since_us),
-            max_ts: None,
-        };
-    }
-
+    let search_query = robot_search_query(project_id, raw_query, importance_filter, since, cursor)?;
     let recipient_kind = parse_search_recipient_kind(kind_filter)?;
     let plan_diagnostic =
         mcp_agent_mail_db::query_plan_diagnostics::search_fallback_plan_diagnostic(
@@ -16880,10 +16899,22 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             })?;
             let (project_id, project_slug) =
                 resolve_project(read_db.conn(), args.project.as_deref())?;
-            let cursor_scope =
-                MessageSearchCursorScope::snapshot(project_id, read_db._source.reported_path());
-            // Unscoped tokens may be sent to an older live server. The local
-            // snapshot cannot continue a page from that server or another source.
+            let cursor_query = robot_search_query(
+                project_id,
+                &query,
+                importance.as_deref(),
+                since.as_deref(),
+                None,
+            )?;
+            let recipient_kind = parse_search_recipient_kind(kind.as_deref())?;
+            let cursor_scope = MessageSearchCursorScope::snapshot(
+                project_id,
+                read_db._source.reported_path(),
+                &cursor_query,
+                recipient_kind.as_deref(),
+            );
+            // A snapshot cannot continue a page from another request, server,
+            // or mailbox. Its source path survives private snapshot recreation.
             let cursor = cursor
                 .as_deref()
                 .map(|token| {
@@ -24366,6 +24397,12 @@ mod tests {
         );
     }
 
+    fn with_search_cursor_scope(mut payload: serde_json::Value) -> serde_json::Value {
+        payload["search_cursor_scope"] =
+            mcp_agent_mail_db::search_planner::MessageSearchCursorScope::CAPABILITY.into();
+        payload
+    }
+
     #[test]
     fn robot_search_uses_verified_server_project_and_never_opens_local_files() {
         use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
@@ -24374,7 +24411,7 @@ mod tests {
         let (result, requests) = with_test_server(
             |config| {
                 vec![
-                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Resource(with_search_cursor_scope(mailbox_payload(config))),
                     TestReply::Resource(project.clone()),
                     TestReply::Tool(serde_json::json!({"result":[{
                         "id":7,"subject":"Deploy","importance":"high","ack_required":0,
@@ -24382,7 +24419,7 @@ mod tests {
                         "to":[],"cc":[],"body_md":"Ready to deploy","score":1.5
                     }]})),
                     TestReply::Resource(project.clone()),
-                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Resource(with_search_cursor_scope(mailbox_payload(config))),
                 ]
             },
             |config| {
@@ -24421,7 +24458,7 @@ mod tests {
             "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
         let ((result, output), requests) = with_test_server(
             |config| {
-                let mut capability = mailbox_payload(config);
+                let mut capability = with_search_cursor_scope(mailbox_payload(config));
                 capability["search_recipient_kind"] = "delivery_v1".into();
                 vec![
                     TestReply::Resource(capability.clone()),
@@ -24475,7 +24512,7 @@ mod tests {
         for fault in ["missing", "future", "malformed", "changed"] {
             let (result, requests) = with_test_server(
                 |config| {
-                    let mut capability = mailbox_payload(config);
+                    let mut capability = with_search_cursor_scope(mailbox_payload(config));
                     match fault {
                         "future" => capability["search_recipient_kind"] = "delivery_v2".into(),
                         "malformed" => capability["search_recipient_kind"] = true.into(),
@@ -24488,7 +24525,7 @@ mod tests {
                             TestReply::Resource(project.clone()),
                             TestReply::Tool(serde_json::json!({"result":[]})),
                             TestReply::Resource(project.clone()),
-                            TestReply::Resource(mailbox_payload(config)),
+                            TestReply::Resource(with_search_cursor_scope(mailbox_payload(config))),
                         ]);
                     }
                     replies
@@ -24519,6 +24556,48 @@ mod tests {
     }
 
     #[test]
+    fn robot_search_first_page_requires_resumable_server_cursors() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+
+        for fault in ["missing", "legacy", "future", "malformed"] {
+            let (result, requests) = with_test_server(
+                |config| {
+                    let mut payload = mailbox_payload(config);
+                    match fault {
+                        "legacy" => payload["search_cursor_scope"] = "scoped_v1".into(),
+                        "future" => payload["search_cursor_scope"] = "scoped_query_v3".into(),
+                        "malformed" => payload["search_cursor_scope"] = true.into(),
+                        _ => (),
+                    }
+                    vec![TestReply::Resource(payload)]
+                },
+                |config| {
+                    search_via_server(
+                        config,
+                        &crate::message_read::ProjectSelection::Exact("registered-project".into()),
+                        "needle",
+                        None,
+                        None,
+                        None,
+                        2,
+                        None,
+                    )
+                },
+            );
+            if fault == "malformed" {
+                assert!(result.is_err(), "malformed capability must fail closed");
+            } else {
+                assert!(
+                    result.unwrap().is_none(),
+                    "{fault} daemon must use the private-snapshot route"
+                );
+            }
+            assert_eq!(requests.len(), 1, "do not dispatch an unsupported search");
+            assert_eq!(requests[0]["method"], "resources/read");
+        }
+    }
+
+    #[test]
     fn robot_search_cursor_negotiates_scope_across_server_versions() {
         use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
         use mcp_agent_mail_db::search_planner::{MessageSearchCursorScope, SearchCursor};
@@ -24526,15 +24605,22 @@ mod tests {
         let project = serde_json::json!({"id":7,"slug":"registered-project",
             "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
         let raw = SearchCursor { score: 1.5, id: 7 }.encode();
-        let scoped = MessageSearchCursorScope::live(7, Path::new("mailbox.sqlite3")).bind(&raw);
-        for (cursor, capability_before, capability_after, dispatch, succeeds) in [
-            (raw.as_str(), false, false, true, true),
-            (scoped.as_str(), false, false, false, false),
-            (scoped.as_str(), true, true, true, true),
-            (scoped.as_str(), true, false, true, false),
+        let query = robot_search_query(7, "needle", None, None, None).unwrap();
+        let scoped = MessageSearchCursorScope::live(7, Path::new("mailbox.sqlite3"), &query, None)
+            .bind(&raw);
+        let old = format!("ml1:{}", scoped.split_once(':').unwrap().1);
+        for (cursor, capability_before, capability_after, request_count, succeeds) in [
+            (raw.as_str(), false, false, 0, false),
+            (old.as_str(), false, false, 0, false),
+            (scoped.as_str(), false, false, 1, false),
+            (scoped.as_str(), true, true, 5, true),
+            (scoped.as_str(), true, false, 5, false),
         ] {
             let (result, requests) = with_test_server(
                 |config| {
+                    if request_count == 0 {
+                        return Vec::new();
+                    }
                     let mailbox = |scope| {
                         let mut payload = mailbox_payload(config);
                         if scope {
@@ -24544,7 +24630,7 @@ mod tests {
                         TestReply::Resource(payload)
                     };
                     let mut replies = vec![mailbox(capability_before)];
-                    if dispatch {
+                    if request_count == 5 {
                         replies.extend([
                             TestReply::Resource(project.clone()),
                             TestReply::Tool(serde_json::json!({"result":[]})),
@@ -24567,8 +24653,8 @@ mod tests {
                     )
                 },
             );
-            assert_eq!(requests.len(), if dispatch { 5 } else { 1 });
-            if dispatch {
+            assert_eq!(requests.len(), request_count);
+            if request_count == 5 {
                 assert_eq!(requests[2]["params"]["arguments"]["cursor"], cursor);
             }
             if succeeds {
@@ -24601,11 +24687,11 @@ mod tests {
         let (result, requests) = with_test_server(
             |config| {
                 vec![
-                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                    TestReply::Resource(with_search_cursor_scope(ancestor_mailbox_payload(config))),
                     TestReply::Resource(project.clone()),
                     TestReply::Tool(serde_json::json!({"result":[]})),
                     TestReply::Resource(project.clone()),
-                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                    TestReply::Resource(with_search_cursor_scope(ancestor_mailbox_payload(config))),
                 ]
             },
             |config| search_via_server(config, &selection, "deploy", None, None, None, 20, None),
@@ -31350,7 +31436,7 @@ mod tests {
 
     #[test]
     fn robot_search_rejects_invalid_windows_before_opening_a_mailbox() {
-        use mcp_agent_mail_db::search_planner::SearchCursor;
+        use mcp_agent_mail_db::search_planner::{MessageSearchCursorScope, SearchCursor};
         for limit in [0, 1001, usize::MAX] {
             assert!(validate_robot_search_window(limit, None).is_err());
         }
@@ -31359,6 +31445,7 @@ mod tests {
             "not-a-cursor",
             "s7ff0000000000000:i1",
             "s7ff8000000000000:i1",
+            "s0000000000000000:i42",
         ] {
             assert!(validate_robot_search_window(20, Some(cursor)).is_err());
         }
@@ -31368,8 +31455,66 @@ mod tests {
                 id: 42,
             }
             .encode();
+            let query = robot_search_query(7, "needle", None, None, None).unwrap();
+            let cursor =
+                MessageSearchCursorScope::live(7, Path::new("storage.sqlite3"), &query, None)
+                    .bind(&cursor);
             assert!(validate_robot_search_window(limit, Some(&cursor)).is_ok());
         }
+    }
+
+    #[test]
+    fn robot_snapshot_cursor_binds_normalized_request_and_original_source() {
+        use mcp_agent_mail_db::search_planner::{MessageSearchCursorScope, SearchCursor};
+
+        let source = Path::new("/mailbox/storage.sqlite3");
+        let query = robot_search_query(
+            7,
+            "needle",
+            Some("normal,HIGH"),
+            Some("2026-01-01T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+        let position = SearchCursor { score: 1.5, id: 42 }.encode();
+        let scope = MessageSearchCursorScope::snapshot(7, source, &query, Some("cc"));
+        let token = scope.bind(&position);
+        let equivalent = robot_search_query(
+            7,
+            "  needle  ",
+            Some("high,normal,high"),
+            Some("2026-01-01T01:00:00+01:00"),
+            Some(&position),
+        )
+        .unwrap();
+        assert_eq!(
+            MessageSearchCursorScope::snapshot(7, source, &equivalent, Some("cc")).position(&token),
+            Some(position.as_str()),
+            "recreating a snapshot must retain its original source and request"
+        );
+        for (text, importance, since, kind) in [
+            ("different", "normal,high", "2026-01-01T00:00:00Z", "cc"),
+            ("needle", "high", "2026-01-01T00:00:00Z", "cc"),
+            ("needle", "normal,high", "2026-01-02T00:00:00Z", "cc"),
+            ("needle", "normal,high", "2026-01-01T00:00:00Z", "to"),
+        ] {
+            let changed = robot_search_query(7, text, Some(importance), Some(since), None).unwrap();
+            assert!(
+                MessageSearchCursorScope::snapshot(7, source, &changed, Some(kind))
+                    .position(&token)
+                    .is_none()
+            );
+        }
+        assert!(
+            MessageSearchCursorScope::snapshot(
+                7,
+                Path::new("/other-mailbox/storage.sqlite3"),
+                &query,
+                Some("cc"),
+            )
+            .position(&token)
+            .is_none()
+        );
     }
 
     #[test]
