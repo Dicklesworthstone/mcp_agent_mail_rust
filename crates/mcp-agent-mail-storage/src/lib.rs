@@ -6770,6 +6770,26 @@ fn coalescer_worker_count() -> usize {
         .clamp(2, max_workers)
 }
 
+/// Keep partially constructed pools out of archive publication. The caller can
+/// hold the publication fence while initializing this lazy pool. If a later
+/// spawn fails, rollback must join workers without waiting for that fence.
+fn coalescer_wait_for_startup(
+    ready: &AtomicBool,
+    shutdown: &AtomicBool,
+    work_cv: &(Mutex<u64>, std::sync::Condvar),
+) -> bool {
+    let (lock, wake) = work_cv;
+    let mut guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while !ready.load(Ordering::Acquire) && !shutdown.load(Ordering::Acquire) {
+        guard = wake
+            .wait(guard)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    !shutdown.load(Ordering::Acquire)
+}
+
 struct CoalescerStartup {
     handles: Vec<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
@@ -6809,6 +6829,7 @@ impl CommitCoalescer {
             Arc::new(Mutex::new(HashMap::new()));
         let work_cv = Arc::new((Mutex::new(0_u64), std::sync::Condvar::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let startup_ready = Arc::new(AtomicBool::new(false));
         let force_flush = Arc::new(AtomicBool::new(false));
 
         let worker_count = coalescer_worker_count();
@@ -6823,6 +6844,7 @@ impl CommitCoalescer {
             let w_repos = Arc::clone(&repos);
             let w_cv = Arc::clone(&work_cv);
             let w_shutdown = Arc::clone(&shutdown);
+            let w_ready = Arc::clone(&startup_ready);
             let w_force_flush = Arc::clone(&force_flush);
             let w_stats = Arc::clone(&stats);
             let w_sizes = Arc::clone(&batch_sizes);
@@ -6836,6 +6858,9 @@ impl CommitCoalescer {
                     // lifetime. The guard's Drop decrements even on panic unwind,
                     // so a dead worker is detectable via `alive < expected`.
                     let _alive = CoalescerAliveGuard::new(&COMMIT_COALESCER_WORKERS_ALIVE);
+                    if !coalescer_wait_for_startup(&w_ready, &w_shutdown, &w_cv) {
+                        return;
+                    }
                     coalescer_pool_worker(
                         w_repos,
                         w_cv,
@@ -6879,6 +6904,14 @@ impl CommitCoalescer {
             _batch_sizes: batch_sizes,
             worker_count,
         };
+        {
+            let (lock, wake) = &*startup.work_cv;
+            let _guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            startup_ready.store(true, Ordering::Release);
+            wake.notify_all();
+        }
         startup.committed = true;
         coalescer
     }
@@ -31957,6 +31990,160 @@ mod tests {
             repo.find_blob(entry.id()).unwrap().content(),
             b"real commit after spawn refusal\n"
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn coalescer_spawn_failure_with_pending_recovery_releases_archive_writer() {
+        use mcp_agent_mail_db::recovery_state;
+
+        const NAME: &str =
+            "tests::coalescer_spawn_failure_with_pending_recovery_releases_archive_writer";
+        const CHILD: &str = "AM_TEST_COALESCER_STARTUP_FENCE";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = TempDir::new().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .env("STORAGE_ROOT", isolated.path())
+                .env("AM_ARCHIVE_BATCH_EVENTS", "1")
+                .env("AM_COALESCER_MAX_WORKERS", "2")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut expired = false;
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    expired = true;
+                    child.kill().unwrap();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !expired && output.status.success(),
+                "coalescer startup must unwind while its caller owns the fence: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "the isolated regression must actually run"
+            );
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "startup").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_memory().unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(7,'startup','/startup',1)",
+        )
+        .unwrap();
+        let manifest = recovery_state::ensure_checkpoint(&conn, &config.storage_root).unwrap();
+        drop(conn);
+        let pending_before = recovery_state::take_pending_archive_paths();
+        assert_eq!(pending_before.len(), 1);
+        for (root, paths) in &pending_before {
+            recovery_state::note_pending_archive_paths(root, paths.iter().cloned());
+        }
+
+        assert_eq!(coalescer_worker_count(), 2);
+        assert!(COMMIT_COALESCER.get().is_none());
+        let fence = ArchiveMutationGuard::begin_at(&archive.repo_root);
+        COALESCER_AFTER_SPAWN_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|index| {
+                assert_eq!(index, 0);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                // Let the first worker pass its one-second idle safety wake.
+                // Before the fix it consumes recovery debt and waits on the
+                // constructor caller's fence. The next OS spawn failure then
+                // joins that worker while retaining the fence it needs.
+                while FENCE_WAITS.lock().unwrap().is_empty() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed), 1);
+            }));
+        });
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| remaining.set(Some(1)));
+        let failure = std::panic::catch_unwind(get_commit_coalescer);
+        COALESCER_AFTER_SPAWN_TEST_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| assert_eq!(remaining.get(), None));
+        let Err(panic) = failure else {
+            panic!("the second worker spawn must fail");
+        };
+        assert!(
+            panic.downcast_ref::<String>().is_some_and(|message| {
+                message.starts_with("failed to spawn commit-coalescer-1 thread: ")
+            }),
+            "the intended OS spawn failure must reach the caller"
+        );
+        assert!(COMMIT_COALESCER.get().is_none());
+        assert_eq!(COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed), 0);
+        assert!(FENCE_WAITS.lock().unwrap().is_empty());
+        assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 1);
+        let pending_after = recovery_state::take_pending_archive_paths();
+        assert_eq!(
+            pending_after, pending_before,
+            "failed startup cannot take recovery work"
+        );
+        for (root, paths) in pending_after {
+            recovery_state::note_pending_archive_paths(&root, paths);
+        }
+
+        // The lazy initializer remains retryable even inside a writer. Once
+        // the complete pool is published, its workers can commit retained debt.
+        let coalescer = get_commit_coalescer();
+        drop(fence);
+        let path = archive.repo_root.join("retry.txt");
+        fs::write(
+            &path,
+            b"archive remains writable after startup refusal\n",
+        )
+        .unwrap();
+        coalescer.enqueue(
+            archive.repo_root.clone(),
+            &config,
+            "retry after startup refusal".into(),
+            vec!["retry.txt".into()],
+        );
+        coalescer.flush_sync();
+        let expected = [
+            "retry.txt".to_string(),
+            "recovery-state/active.json".to_string(),
+            format!("recovery-state/g{}/baseline.jsonl", manifest.generation),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let tree = loop {
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            if expected
+                .iter()
+                .all(|path| tree.get_path(Path::new(path)).is_ok())
+            {
+                break tree;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restarted workers must publish recovery debt"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        for path in expected {
+            let entry = tree.get_path(Path::new(&path)).unwrap();
+            assert_eq!(
+                repo.find_blob(entry.id()).unwrap().content(),
+                fs::read(archive.repo_root.join(path)).unwrap()
+            );
+        }
     }
 
     #[test]
