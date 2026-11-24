@@ -178,6 +178,8 @@ export function modelIO(mode = 'healthy') {
           return { exited: true, exit_code: forced ? 137 : 0, forced,
             remaining_pids: mode === 'child_leaked' ? [99999] : [],
             port_closed: mode !== 'port_left_open', quiet: mode !== 'post_shutdown_mutation',
+            already_exited_before_shutdown: mode === 'exited_before_shutdown',
+            sigterm_sent: !['exited_before_shutdown', 'sigterm_not_sent'].includes(mode),
             identity_unchanged: mode !== 'identity_changed' };
         },
       };
@@ -203,6 +205,8 @@ const expectations = [
   ['idle_cpu_runaway', 'FAIL'],
   ['unbounded_probe_rate', 'FAIL'],
   ['forced_shutdown', 'FAIL'],
+  ['exited_before_shutdown', 'FAIL'],
+  ['sigterm_not_sent', 'FAIL'],
   ['port_left_open', 'FAIL'],
   ['post_shutdown_mutation', 'FAIL'],
   ['identity_changed', 'FAIL'],
@@ -229,6 +233,11 @@ for (const [mode, expected] of expectations) {
     assert.equal(report.status, expected, failureSummary(report));
     assert.equal(report.exit_code, { PASS: 0, FAIL: 1, INCOMPLETE: 2 }[expected]);
     assert.ok(report.cases.length > 0, 'zero-case result cannot qualify anything');
+    if (['exited_before_shutdown', 'sigterm_not_sent'].includes(mode)) {
+      assert.deepEqual(report.cases.filter((c) => c.status !== 'PASS').map((c) => c.name),
+        ['healthy_shutdown', 'shutdown_with_database_unavailable', 'outage_process_cleanup'],
+        'the shutdown oracle must reject the receipt in both server lifetimes');
+    }
     if (mode === 'healthy') {
       assert.equal(io.sessions.length, 2, 'healthy and active-fault shutdown need separate lifetimes');
       const idleWindows = io.events.filter((e) => e.kind === 'idle_begin' && e.seconds >= 8);

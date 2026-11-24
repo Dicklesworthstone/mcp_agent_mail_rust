@@ -9,6 +9,7 @@ on:
       - 'scripts/qualify_health_idle.mjs'
       - 'tests/ci/test_qualify_issue407.py'
       - 'tests/test_qualify_health_idle.mjs'
+      - 'tests/test_qualify_health_shutdown.mjs'
       - 'tests/fixtures/gh407_agent_mail_surrogate.mjs'
       - 'crates/**'
       - '.cargo/**'
@@ -43,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tests/ci -p test_qualify_issue407.py -v
-          node --test tests/test_qualify_health_idle.mjs
+          node --test tests/test_qualify_health_idle.mjs tests/test_qualify_health_shutdown.mjs
 
   native:
     name: Exact-source native regression and binary qualification

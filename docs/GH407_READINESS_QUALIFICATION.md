@@ -23,6 +23,7 @@ production Rust, dependency manifests, and Beads status unchanged.
 | --- | --- |
 | `scripts/qualify_health_idle.mjs` | Linux black-box runner using Node built-ins; no package installation or native source hooks. |
 | `tests/test_qualify_health_idle.mjs` | Adversarial model tests of the runner's exact orchestration and verdict logic. |
+| `tests/test_qualify_health_shutdown.mjs` | Real Linux child-process controls for requested shutdown versus an earlier successful exit. |
 | `tests/fixtures/gh407_agent_mail_surrogate.mjs` | Clearly labelled process/HTTP/system-SQLite surrogate for testing the runner's real adapter. |
 | `scripts/ci/qualify_issue407.py` | Exact-source native qualification driver with owned process cleanup and retained failure receipts. |
 | `tests/ci/test_qualify_issue407.py` | Adversarial source, artifact, verdict, and real process-ownership controls for the native driver. |
@@ -33,13 +34,13 @@ The harness requires Linux `/proc`, Node 20 or newer, and `getconf`. The optiona
 surrogate uses `node:sqlite` and was exercised with Node 24.22.3. It is not
 FrankenSQLite, Asupersync, or an Agent Mail build.
 
-## Measured harness validation
+## Original measured harness validation
 
-The final executable harness source SHA-256 is
+The executable harness validated by these runs, published in `bc407d6b`, had SHA-256
 `0a267ad29966761cc94c3f7bcad7dd06d067dceea31791459c8217e982e30ce4`.
 The process surrogate source SHA-256 is
 `4d7284ffbd6cd532b995623d7437a7f173933ef31fc3611a7414433654f2fd60`.
-The final integration audit verifies that the files remained identical to the
+That integration audit verified that the files remained identical to the
 frozen copies used by each run. Earlier source receipts are retained separately.
 
 | Validation | Measured result | What it supports |
@@ -71,6 +72,68 @@ two-second diagnostic grace (3.016 seconds including the quiet window), and
 interrupting a confirmed suspended healthy surrogate resumed and stopped it
 cleanly in 1.026 seconds. Those receipts are bounded surrogate process-control
 evidence and remain labelled with their own source/version scope.
+
+## Shutdown qualification correction, November 24, 2026
+
+Independent review found that the original shutdown oracle could accept exit 0
+when the server had already exited before `stop()` sent any signal. Absence from
+`/proc` also counted as an unchanged identity. This was a harness false pass,
+not an observed Agent Mail shutdown failure.
+
+The corrected adapter records `already_exited_before_shutdown`, `sigterm_sent`,
+and the process state observed immediately before shutdown. A pass now requires
+a live process with the original start identity and a successful SIGTERM syscall,
+in addition to the existing clean exit, closed listener, empty process group,
+and quiet-file checks. The signal helper rechecks the leader and returns false
+on `ESRCH`. Earlier exit still runs cleanup and produces a receipt; subsequent
+`stop()` calls retain that original receipt. A successful signal syscall and a
+live-process witness do not by themselves prove which event caused an arbitrary
+native process to exit.
+
+The corrected harness SHA-256 is
+`f04b1c3be0d6a5cbb1a3cbfe192bf78ddb5cbd7e19789cc0ebc3aec9f53cfbe5`.
+The tests ran on Linux with Node 24.22.3:
+
+| Validation | Result |
+| --- | --- |
+| Exact orchestrator models plus focused real-process controls | 32/32 passed, zero skipped, in 2.732 seconds: 30 model cases and two actual Linux child-process cases. |
+| New adversaries against the original `c2944c1c` harness | Both failed their assertions as expected: the old harness incorrectly returned PASS for an earlier exit 0 and for an unsent SIGTERM. |
+| Live-child adapter control | The child independently wrote a SIGTERM witness; receipt records live original identity, signal sent, clean exit 0, closed listener, and quiet files. |
+| Earlier-exit adapter control | The child voluntarily exited 0; its `/proc` entry disappeared before `stop()`. Receipt records earlier exit and no SIGTERM while retaining successful cleanup evidence. |
+| Native qualification driver controls | 24/24 passed in 13.110 seconds; includes real timeout, interruption, and detached-descendant cleanup. |
+| Workflow structure, pinned action references, four embedded shell blocks, and whitespace check | Passed. |
+
+The two new adapter tests also verify that repeated shutdown calls return the
+same receipt. CI runs them with the existing model suite before native
+qualification. These measurements validate the correction; they do not repeat
+the original full HTTP/SQLite surrogate qualification or execute any Agent Mail
+native regression. The original longer runs above remain bound to their original
+source hash.
+
+### Historical native release preflight
+
+The official v0.3.41 Linux GNU archive was downloaded and verified against its
+signed checksum manifest. Both the manifest signature and authenticated trusted
+comment passed under the installer-pinned key ID `1BBD79B28BF718D0`; modified
+manifest and modified-comment controls were rejected. The archive SHA-256 was
+`962a34d0aba41d08432e6873cb8bf96c7a547bfad7ac273c7dabc499639b86f4`.
+The extracted `am` SHA-256 was
+`0427aeb52d0982f1d903c97f4cc15493afb8680b80433ab33fa8a9bac9d4c1ed`.
+
+Three guarded native CLI invocations passed: `am --version` reported `am 0.3.41`,
+and `serve-http --help` plus `tooling db-exec --help` confirmed the required
+flags. Each completed in approximately 0.104 seconds, without forced cleanup,
+remaining descendants, or database creation. The signed comment identifies the
+release and checksum file, not a source commit; the observed tag separately
+resolved to `6eca1c4dfeb9b1eedb2ff3ebb06faef23018342c`. Its published portable
+feature selection also differs from the default-feature current-source lane.
+
+No historical HTTP server or black-box qualification was started. Before that
+stage, `/tmp` free space fell to 510,918,656 bytes, below the unchanged 2 GiB
+reserve, and the executor became unavailable. After restoration the extracted
+binary was absent. The completed preflight measurements are preserved in the
+session transcript; recovered raw historical receipts are not claimed. This is
+neither a measured historical idle reproduction nor a current-main native pass.
 
 ## What the source review establishes
 
@@ -167,7 +230,9 @@ commit. A supplied old release is never relabelled as a current-main build.
    reason. Record which branch actually won the scheduling race. Restore and
    verify recovery again. Always resume a partially suspended process before
    restoration or shutdown.
-8. Require a clean SIGTERM shutdown, listener closure, no surviving process-group
+8. Require a live, same-start-identity process immediately before the shutdown
+   signal and a successful SIGTERM syscall. An earlier exit, including exit 0,
+   cannot satisfy this check. Require listener closure, no surviving process-group
    members, and no database/archive mutation during a one-second quiet window.
    Repeat shutdown in a separate fresh lifetime while the database fault is
    still active. Forced SIGKILL cleanup is a failed clean-shutdown check.
@@ -315,7 +380,7 @@ they still execute zero Agent Mail native regression bodies.
 
 ```bash
 python3 -m unittest discover -s tests/ci -p test_qualify_issue407.py -v
-node --test tests/test_qualify_health_idle.mjs
+node --test tests/test_qualify_health_idle.mjs tests/test_qualify_health_shutdown.mjs
 ```
 
 For a compiler provisioned without rustup, set PATH and RUSTC to the verified
@@ -443,7 +508,7 @@ preserves the real two-second refresh/six-second age/eight-second idle contract.
 
 ```bash
 node --check scripts/qualify_health_idle.mjs
-node --test tests/test_qualify_health_idle.mjs
+node --test tests/test_qualify_health_idle.mjs tests/test_qualify_health_shutdown.mjs
 ```
 
 To exercise the real OS/HTTP adapter with the healthy surrogate, use Node 24:

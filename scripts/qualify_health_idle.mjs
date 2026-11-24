@@ -193,7 +193,8 @@ export async function runQualification(io, options = {}) {
   async function shutdown(s) {
     const stopped = await s.stop();
     observation('shutdown', {session: s.label, result: stopped});
-    requireThat(stopped.exited && stopped.exit_code === 0 && !stopped.forced
+    requireThat(stopped.already_exited_before_shutdown === false && stopped.sigterm_sent === true
+      && stopped.exited && stopped.exit_code === 0 && !stopped.forced
       && stopped.remaining_pids.length === 0 && stopped.port_closed
       && stopped.quiet && stopped.identity_unchanged,
     'Shutdown did not meet clean exit/ownership/quiet criteria: ' + JSON.stringify(stopped));
@@ -368,13 +369,15 @@ function groupMembers(group) {
   return fs.readdirSync('/proc').filter(name => /^\d+$/.test(name)).map(name => procStat(Number(name)))
     .filter(p => p && p.group === group && p.session === group);
 }
-function signalOwnedGroup(child, signal) {
-  if (!child.pid) return;
+function signalOwnedGroup(child, signal, requireLiveLeader = false) {
+  if (!child.pid) return false;
   const current = procStat(child.pid);
   if (current && child.qualificationStart && current.start !== child.qualificationStart) {
     throw new QualificationError('Refusing to signal a process whose start identity changed');
   }
-  try { process.kill(-child.pid, signal); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  if (requireLiveLeader && (!current || ['Z', 'X', 'x'].includes(current.state))) return false;
+  try { process.kill(-child.pid, signal); return true; }
+  catch (error) { if (error.code !== 'ESRCH') throw error; return false; }
 }
 async function sha256(filename) {
   const digest = crypto.createHash('sha256');
@@ -636,10 +639,14 @@ export async function makeNodeIO(binary, outputDirectory, options = {}) {
           if (stopped) return stopped;
           clearInterval(monitor);
           await session.resume();
-          const identityUnchanged = !procStat(child.pid) || procStat(child.pid).start === birth;
-          requireThat(identityUnchanged, 'Refusing shutdown signals after a process start-identity change');
+          const beforeSignal = procStat(child.pid);
+          const identityUnchanged = Boolean(beforeSignal && beforeSignal.start === birth);
+          requireThat(!beforeSignal || identityUnchanged, 'Refusing shutdown signals after a process start-identity change');
+          const alreadyExited = exited || !beforeSignal || ['Z', 'X', 'x'].includes(beforeSignal.state);
           let forced = false;
-          if (!exited) signalOwnedGroup(child, 'SIGTERM');
+          // A prior exit, even exit 0, does not exercise the shutdown handler.
+          // Still clean up descendants and collect closure/quiet evidence.
+          const sigtermSent = !alreadyExited && signalOwnedGroup(child, 'SIGTERM', true);
           await waitWithin(exitPromise, cfg.shutdownTimeout);
           if (!exited || groupMembers(child.pid).some(p => p.state !== 'Z')) {
             forced = true; signalOwnedGroup(child, 'SIGKILL');
@@ -651,7 +658,9 @@ export async function makeNodeIO(binary, outputDirectory, options = {}) {
           const after = await fingerprintTree([path.join(directory, 'db'), path.join(directory, 'archive')]);
           stopped = {exited, exit_code: exitCode, signal: exitSignal, spawn_error: spawnError, forced,
             remaining_pids: remaining, port_closed: await portClosed(port), quiet: before === after,
-            quiet_seconds: 1, identity_unchanged: identityUnchanged};
+            quiet_seconds: 1, identity_unchanged: identityUnchanged,
+            already_exited_before_shutdown: alreadyExited, sigterm_sent: sigtermSent,
+            process_state_before_shutdown: beforeSignal?.state || null};
           return stopped;
         },
       };
