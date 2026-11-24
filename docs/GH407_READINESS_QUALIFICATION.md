@@ -5,14 +5,15 @@ It complements the supervisor change in `c56722595d20182d37b0fced7313b7030794006
 and its real-supervisor regression. It does not alter the supervisor or any
 production Rust code.
 
-Reviewed source: `6eb6264d5d6becc2a7609d795c7209c88aac9d55`, rechecked against
+Initial reviewed source: `6eb6264d5d6becc2a7609d795c7209c88aac9d55`, rechecked against
 `462914b703b93ea0d3d070dccf990e225a0a189a` before publication. The intervening
 changes do not alter the supervisor, native readiness tests, or pinned
-dependencies. Native Agent Mail compilation and test execution remain
-**unverified** by the measurements below. The harness-validation executor had
-Node and Python but no Rust toolchain or supplied Agent Mail executable. An
-earlier executor disconnected during preflight and produced no retained build
-result. This is not evidence that the pinned dependencies are unavailable.
+dependencies. Current-main native compilation and execution of the existing
+Rust regression bodies remain **unverified**. The completed historical native
+control below independently reproduces the v0.3.41 bug and validates the real
+database-fault adapter; it does not qualify the current supervisor fix. Earlier
+harness-only and incomplete native attempts are retained with their original
+scope and measurements.
 
 This contribution adds qualification tooling and documentation. It leaves
 production Rust, dependency manifests, and Beads status unchanged.
@@ -200,6 +201,77 @@ shutdown under interruption. It establishes neither an idle reproduction nor
 outage/recovery/resource-bound qualification, and is not a current-main native
 pass. It also predates the `c27452ad` helper-containment correction.
 
+## Completed historical native negative control
+
+A restored executor subsequently completed both the exact reporter control and
+the full unchanged harness (SHA-256 prefix `c27452ad`) against the same
+authenticated v0.3.41 binary. This establishes a native negative control for the reported bug and
+validates the real adapter's database-fault mechanism. It does not qualify the
+current supervisor fix or a current-main build.
+
+The reporter control obtained 200/ready, then issued no client HTTP, MCP, or
+database request for **8.00119198 seconds**. Its first `/health` response was retained
+before any further operation: **503, `database_probe_stale`, all three capability
+flags false**, in **3.606357 ms**. A new-key MCP `ensure_project` immediately
+afterward succeeded with HTTP 200 in **22.712463 ms**. No readiness retry was
+made before or after that database operation. The controller completed in
+22.511536 seconds and recorded clean SIGTERM shutdown and unchanged binary
+identity. This directly demonstrates a stale health failure while the serving
+database remains usable.
+
+The full harness then completed in **107.637374 seconds** externally
+(106.646850277 seconds inside orchestration), with exit 1 and an overall
+**FAIL**: nine passing and nine failing case records. These are raw outcome
+counts, with precondition failures and a no-op restoration described below.
+The outer runner recorded
+no resource termination, no forced cleanup, and no remaining processes.
+
+| Full historical run | Measured result |
+| --- | --- |
+| Initial baseline | Passed, including a fresh MCP project operation. |
+| First request after eight seconds idle | 503 with `database_probe_stale`. |
+| Concurrent first requests after another eight-second idle | All 16 were 503/stale; response latencies were 8.894–36.466 ms. |
+| Thirty-second idle soak | The first health response remained stale. |
+| Genuine database fault | Same-engine table rename produced an independently attributed fresh-key MCP database error in both fixture lifetimes. |
+| Both actual inverse renames | Preserved the single project row and schema-object identities. |
+| Recovery without readiness polling | First response after eight seconds remained stale. |
+| Both server shutdowns | Exit 0 after SIGTERM, no forced kill or survivors, closed listener, quiet files. The second cleanup occurred before schema restoration, while the fault remained active. |
+| Five settled resource samples | Threads 47 to 47, descriptors 54 to 56, RSS 134,983,680 to 138,317,824 bytes; the configured finite-growth check passed. |
+| Final executable identity | Matched the authenticated release hash. |
+
+The real fault witnesses returned correlated MCP results with `isError: true`,
+`DATABASE_ERROR`, `Query error: no such table: projects`, and classification
+`schema_drift_or_missing_tables`. Their HTTP transport returned 200; the MCP
+result established the database failure. These observations validate the chosen
+fault against live FrankenSQLite connections. Pool exhaustion and blocked
+synchronous database operations require separate controls.
+
+During those outages, health still returned **503 with all capabilities false**.
+The failing assertion required a fresh `database_probe_failed` result but
+observed `database_probe_stale`. Despite the generic assertion's wording about
+fail-closed reporting, this was a freshness/reason failure, not false readiness.
+The observed failures match the historical absence of continued probe refresh.
+
+Coverage remains explicit: idle cases two and three failed their healthy
+precondition before another eight-second wait. The suspended stale-success
+challenge also failed its healthy precondition, and its recorded restore pass
+was a no-op (`needed: false`). Outage liveness and fresh failed-probe cadence/CPU
+checks were not reached after the stale-outage assertion failed. The finite
+resource pass does not establish lifetime bounds or the current fix's behavior.
+
+Both runs retained the unchanged 2 GiB disk and 1 GiB available-memory guards.
+The raw reporter report SHA-256 is
+`b34e7a4d2df02616139ff0a0b17e829bcb12c58163ea46d54b76cd2f84bc06f8`;
+the full report SHA-256 is
+`55cf9628b4e7201a3637b14451ed3c016f83f42a0b3f11f5c0f5908fd2584c92`.
+The completed evidence archive retains 263 evidence files, including reports,
+append-only reporter observations, native logs, all SQL receipts, signed release
+manifests, controllers, and synthetic fixtures. Its SHA-256 is
+`227118d7f8a841a159c1b57d467cd676a31ac5895c13fb3ed3526d10742d24c5`.
+Public release binaries and GitHub-backed source snapshots are omitted; their
+identities are recorded separately. Current-main native compilation and the
+three native regression bodies remain unverified.
+
 ## What the source review establishes
 
 The supervisor now invokes `mail_readiness()` outside the one-time startup
@@ -377,7 +449,7 @@ prove an in-process lifecycle barrier; that requires the existing native tests.
 ```bash
 node scripts/qualify_health_idle.mjs \
   --binary /absolute/path/to/current-build/am \
-  --source-sha 6eb6264d5d6becc2a7609d795c7209c88aac9d55 \
+  --source-sha REPLACE_WITH_BUILD_RECEIPT_COMMIT \
   --expected-sha256 REPLACE_WITH_BUILD_RECEIPT_SHA256 \
   --output-parent /absolute/private/qualification-output
 ```
@@ -595,12 +667,14 @@ hashes. All such results are harness validation only.
 
 ## Remaining native uncertainties
 
-Native execution must still confirm the exact pinned compiler/dependency graph,
-the current real-supervisor regression, the real pool-exhaustion/concurrency and
-generation controls, compatibility of the reversible schema fault with live
-FrankenSQLite connections, native SIGTERM behavior during failure, and observed
-native resource/cadence bounds. A successful native run would qualify only its
-recorded source, binary, feature graph, isolated workload, and observation window.
+For current main, native execution must still confirm the exact pinned
+compiler/dependency graph, all three existing readiness regressions, and the
+full black-box qualification matrix, including the suspended stale-success
+challenge, outage liveness, failed-probe cadence, and resource behavior. The
+historical control above confirms the schema-fault adapter and clean SIGTERM
+only for v0.3.41; it does not establish the current fix's behavior. A successful
+native run would qualify only its recorded source, binary, feature graph,
+isolated workload, and observation window.
 
 No production correction was indicated by the independent source review.
 The existing supervisor fix remains the implementation under qualification.
