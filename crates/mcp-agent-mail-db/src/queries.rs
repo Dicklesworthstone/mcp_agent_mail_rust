@@ -7195,6 +7195,129 @@ pub async fn list_atc_population_snapshot(
     }
 }
 
+/// Read activity for the original project and agent of an ATC experience.
+///
+/// Agent names are only unique within a project. Both registrations must
+/// predate the experience: a replacement project or agent cannot certify an
+/// intervention aimed at its predecessor. Exact stored paths and stored
+/// slugs are supported; an unknown path never falls back to a colliding slug.
+/// The canonical lowest-ID agent owns lifecycle and activity even when legacy
+/// case-variant aliases exist. Missing or ambiguous authority supplies no
+/// evidence. These bounded reads bypass caches and share one fresh snapshot.
+pub async fn get_atc_agent_activity(
+    cx: &Cx,
+    pool: &DbPool,
+    project_key: &str,
+    agent_name: &str,
+    experience_created_ts: i64,
+) -> Outcome<Option<i64>, DbError> {
+    let project_key = project_key.trim();
+    let agent_name = agent_name.trim();
+    if project_key.is_empty()
+        || project_key.len() > ATC_POPULATION_MAX_PROJECT_BYTES
+        || agent_name.is_empty()
+        || agent_name.len() > ATC_POPULATION_MAX_NAME_BYTES
+        || experience_created_ts <= 0
+    {
+        return Outcome::Ok(None);
+    }
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    };
+    // Dropping the future between these reads must not return an open
+    // transaction to the pool.
+    conn.retire_on_drop.store(true, Ordering::Release);
+    let tracked = tracked(&*conn);
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
+    let activity = try_in_tx!(
+        cx,
+        &tracked,
+        get_atc_agent_activity_in_tx(cx, &tracked, project_key, agent_name, experience_created_ts)
+            .await
+    );
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+    conn.retire_on_drop.store(false, Ordering::Release);
+    Outcome::Ok(activity)
+}
+
+async fn get_atc_agent_activity_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    project_key: &str,
+    agent_name: &str,
+    experience_created_ts: i64,
+) -> Outcome<Option<i64>, DbError> {
+    let sql = if Path::new(project_key).is_absolute() {
+        "SELECT id, created_at FROM projects WHERE human_key = ? ORDER BY id LIMIT 2"
+    } else {
+        "SELECT id, created_at FROM projects WHERE slug = ? COLLATE NOCASE ORDER BY id LIMIT 2"
+    };
+    let projects = match map_sql_outcome(
+        traw_query(cx, tracked, sql, &[Value::Text(project_key.to_string())]).await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    };
+    let [project] = projects.as_slice() else {
+        return Outcome::Ok(None);
+    };
+    let (project_id, project_created_ts) = match (
+        project.get_named::<i64>("id"),
+        project.get_named::<i64>("created_at"),
+    ) {
+        (Ok(id), Ok(created)) => (id, created),
+        (Err(error), _) | (_, Err(error)) => return Outcome::Err(map_sql_error(&error)),
+    };
+    if project_id <= 0 || project_created_ts <= 0 || project_created_ts > experience_created_ts {
+        return Outcome::Ok(None);
+    }
+    let agents = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT a.inception_ts, a.last_active_ts, a.retired_at, \
+                    d.agent_id AS deregistered_id \
+             FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+             WHERE a.project_id = ? AND a.name = ? COLLATE NOCASE \
+             ORDER BY a.id ASC LIMIT 1",
+            &[
+                Value::BigInt(project_id),
+                Value::Text(agent_name.to_string()),
+            ],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    };
+    let Some(agent) = agents.first() else {
+        return Outcome::Ok(None);
+    };
+    let activity = (|| -> std::result::Result<Option<i64>, SqlError> {
+        let inception_ts = agent.get_named::<i64>("inception_ts")?;
+        let last_active_ts = agent.get_named::<i64>("last_active_ts")?;
+        let retired_at = agent.get_named::<Option<i64>>("retired_at")?;
+        let deregistered_id = agent.get_named::<Option<i64>>("deregistered_id")?;
+        Ok((inception_ts > 0
+            && inception_ts <= experience_created_ts
+            && last_active_ts > 0
+            && retired_at.is_none()
+            && deregistered_id.is_none())
+        .then_some(last_active_ts))
+    })();
+    match activity {
+        Ok(activity) => Outcome::Ok(activity),
+        Err(error) => Outcome::Err(map_sql_error(&error)),
+    }
+}
+
 /// List a project's agents with an optional activity floor and result cap
 /// (GH#154 item 3).
 ///
@@ -30428,6 +30551,130 @@ mod tests {
             assert_eq!(
                 recent_capped.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
                 vec!["Newest", "Newer"]
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn atc_agent_activity_requires_original_canonical_registration() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build activity runtime");
+        let (cx, pool, _dir) = setup_test_pool("atc-scoped-activity.db");
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+                .expect("allow historical aliases");
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                 (1, 'activity-a', '/tmp/activity-a', 100), \
+                 (2, 'activity-b', '/tmp/activity-b', 100), \
+                 (3, 'replacement', '/tmp/replacement', 201), \
+                 (4, 'unknown-age', '/tmp/unknown-age', 0), \
+                 (5, 'ambiguous-a', '/tmp/ambiguous', 100), \
+                 (6, 'ambiguous-b', '/tmp/ambiguous', 100); \
+                 INSERT INTO agents \
+                 (id, project_id, name, program, model, inception_ts, last_active_ts, retired_at) \
+                 VALUES \
+                 (10, 1, 'BlueLake', 'test', 'test', 100, 150, NULL), \
+                 (11, 1, 'bluelake', 'alias', 'test', 100, 900, NULL), \
+                 (20, 2, 'BlueLake', 'test', 'test', 100, 350, NULL), \
+                 (30, 1, 'OldTree', 'test', 'test', 100, 350, 300), \
+                 (31, 1, 'oldtree', 'alias', 'test', 100, 900, NULL), \
+                 (40, 1, 'RedFox', 'test', 'test', 100, 350, NULL), \
+                 (41, 1, 'redfox', 'alias', 'test', 100, 900, NULL), \
+                 (50, 1, 'NewBird', 'test', 'test', 201, 350, NULL), \
+                 (60, 1, 'UnknownBird', 'test', 'test', 0, 350, NULL), \
+                 (70, 1, 'YoungBird', 'test', 'test', 200, 350, NULL), \
+                 (80, 3, 'BlueLake', 'test', 'test', 100, 350, NULL), \
+                 (90, 4, 'BlueLake', 'test', 'test', 100, 350, NULL); \
+                 INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (40, 300)",
+            )
+            .expect("seed original, foreign, replacement and ambiguous identities");
+            drop(conn);
+
+            for (project, agent, expected) in [
+                ("/tmp/activity-a", "BlueLake", Some(150)),
+                ("ACTIVITY-A", "BLUELAKE", Some(150)),
+                ("/tmp/activity-b", "BlueLake", Some(350)),
+                ("activity-b", "BlueLake", Some(350)),
+                ("/tmp/activity-a", "OldTree", None),
+                ("/tmp/activity-a", "RedFox", None),
+                ("/tmp/activity-a", "NewBird", None),
+                ("/tmp/activity-a", "UnknownBird", None),
+                ("/tmp/activity-a", "YoungBird", Some(350)),
+                ("/tmp/replacement", "BlueLake", None),
+                ("/tmp/unknown-age", "BlueLake", None),
+                ("/tmp/ambiguous", "BlueLake", None),
+                ("/tmp/activity-a", "MissingAgent", None),
+                ("missing-project", "BlueLake", None),
+                ("/tmp/Activity-A", "BlueLake", None),
+                ("", "BlueLake", None),
+            ] {
+                assert_eq!(
+                    get_atc_agent_activity(&cx, &pool, project, agent, 200)
+                        .await
+                        .into_result()
+                        .expect("read scoped activity"),
+                    expected,
+                    "{project}:{agent}"
+                );
+            }
+
+            let cached = get_agent(&cx, &pool, 1, "BlueLake")
+                .await
+                .into_result()
+                .expect("warm ordinary read cache");
+            assert_eq!(cached.last_active_ts, 150);
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("UPDATE agents SET last_active_ts = 400 WHERE id = 10")
+                .expect("advance original agent independently of cache");
+            drop(conn);
+            assert_eq!(
+                get_atc_agent_activity(&cx, &pool, "/tmp/activity-a", "BlueLake", 200)
+                    .await
+                    .into_result()
+                    .unwrap(),
+                Some(400),
+                "authoritative activity bypasses the warm cache"
+            );
+
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("DELETE FROM agents WHERE id = 20; DELETE FROM projects WHERE id = 2")
+                .expect("remove original project and agent");
+            drop(conn);
+            assert_eq!(
+                get_atc_agent_activity(&cx, &pool, "activity-b", "BlueLake", 200)
+                    .await
+                    .into_result()
+                    .unwrap(),
+                None
+            );
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (7, 'activity-b', '/tmp/activity-b', 250); \
+                 INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (7, 'BlueLake', 'test', 'test', 250, 500)",
+            )
+            .expect("recreate same project and agent names");
+            drop(conn);
+            assert_eq!(
+                get_atc_agent_activity(&cx, &pool, "activity-b", "BlueLake", 200)
+                    .await
+                    .into_result()
+                    .unwrap(),
+                None,
+                "replacement identities cannot certify the original experience"
+            );
+            assert_eq!(
+                get_atc_agent_activity(&cx, &pool, "activity-b", "BlueLake", 250)
+                    .await
+                    .into_result()
+                    .unwrap(),
+                Some(500),
+                "the replacement may certify its own later experience"
             );
         });
     }

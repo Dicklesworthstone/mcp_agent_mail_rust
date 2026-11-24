@@ -8480,6 +8480,7 @@ fn atc_resolution_outcome_from_activity(
         evidence: Some(serde_json::json!({
             "resolution_signal": "agent_activity",
             "agent": experience.subject,
+            "project_key": experience.project_key,
             "activity_ts_micros": agent_active_since,
             "latency_micros": agent_active_since - resolution_anchor_micros,
         })),
@@ -8756,10 +8757,36 @@ fn sweep_open_experiences_with_before_message_mutation(
         } else {
             None
         };
-        let agent_active_since = atc::atc_agent_last_activity(&experience.subject).unwrap_or(0);
-        // General activity is indexed by agent name, which is only unique
-        // within a project. It cannot establish a reservation outcome: an
-        // unrelated same-name agent may have made the observed tool call.
+        // The engine's liveness history is indexed by bare agent name. Only
+        // the original project's canonical registration can supply outcome
+        // evidence; a same-name agent or a later replacement cannot certify
+        // this intervention. A failed read leaves the experience unchanged.
+        let agent_active_since =
+            if !reservation_related && let Some(project_key) = experience.project_key.as_deref() {
+                match block_on(mcp_agent_mail_db::queries::get_atc_agent_activity(
+                    &cx,
+                    pool,
+                    project_key,
+                    &experience.subject,
+                    experience.created_ts_micros,
+                )) {
+                    asupersync::Outcome::Ok(activity) => activity.unwrap_or(0),
+                    asupersync::Outcome::Err(error) => {
+                        mcp_agent_mail_core::global_metrics()
+                            .atc
+                            .record_derivation_error("sweep_agent_activity");
+                        tracing::debug!(
+                            experience_id = experience.experience_id,
+                            %error,
+                            "failed to read project-scoped activity for resolution sweep"
+                        );
+                        continue;
+                    }
+                    _ => continue,
+                }
+            } else {
+                0
+            };
         let activity_outcome = if reservation_related {
             None
         } else {
@@ -8827,9 +8854,8 @@ fn sweep_open_experiences_with_before_message_mutation(
             continue;
         }
 
-        // Check if the subject agent has been active since this effect was
-        // actually dispatched/executed. Agent activity is tracked by the
-        // ATC engine.
+        // Check whether the original project-scoped identity was active
+        // after this effect was actually dispatched/executed.
         if let Some(outcome) = activity_outcome {
             // Positive resolution: the agent showed activity after the
             // advisory/probe, indicating the decision was correct.
@@ -26409,6 +26435,219 @@ first body
 
         assert!(atc_resolution_outcome_from_activity(&experience, 1_700_000_000_000_200).is_none());
         assert!(atc_resolution_outcome_from_activity(&experience, 1_700_000_000_000_150).is_none());
+    }
+
+    #[test]
+    fn resolution_sweep_requires_activity_from_the_original_project_identity() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("scoped resolution fixture");
+        let db_path = dir.path().join("scoped-resolution.sqlite3");
+        let pool = create_pool(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("file-backed resolution pool");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_ENABLED", "true"),
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("ATC_LEARNING_DISABLED", "0"),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let config = mcp_agent_mail_core::Config::get();
+                atc::reset_global_atc_state_for_test(&config);
+                let cx = Cx::for_testing();
+                let created = mcp_agent_mail_db::now_micros();
+                let original = created - 100;
+                let replacement = created + 1;
+                let before_effect = created + 150;
+                let foreign_activity = created + 350;
+                let conn = block_on(pool.acquire(&cx))
+                    .into_result()
+                    .expect("seed project identities");
+                conn.execute_raw(&format!(
+                    "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                     (1, 'activity-a', '/tmp/activity-a', {original}), \
+                     (2, 'activity-b', '/tmp/activity-b', {original}), \
+                     (3, 'activity-c', '/tmp/activity-c', {original}), \
+                     (4, 'activity-d', '/tmp/activity-d', {original}); \
+                     INSERT INTO agents \
+                     (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES \
+                     (10, 1, 'BlueLake', 'test', 'test', {original}, {before_effect}), \
+                     (11, 1, 'GreenPond', 'test', 'test', {original}, {before_effect}), \
+                     (20, 2, 'BlueLake', 'test', 'test', {original}, {foreign_activity}), \
+                     (30, 3, 'BlueLake', 'test', 'test', {original}, {before_effect}), \
+                     (40, 4, 'BlueLake', 'test', 'test', {original}, {before_effect})"
+                ))
+                .expect("seed original scoped registrations");
+                drop(conn);
+
+                let append = |id: u64, project: Option<&str>, subject: &str| {
+                    let mut row = sample_resolution_experience(
+                        created,
+                        Some(created + 100),
+                        Some(created + 200),
+                    );
+                    row.experience_id = 0;
+                    row.decision_id = id;
+                    row.effect_id = id;
+                    row.trace_id = format!("scoped-activity-trace-{id}");
+                    row.claim_id = format!("scoped-activity-claim-{id}");
+                    row.evidence_id = format!("scoped-activity-evidence-{id}");
+                    row.state = ExperienceState::Executed;
+                    row.project_key = project.map(str::to_string);
+                    row.subject = subject.to_string();
+                    block_on(mcp_agent_mail_db::queries::append_atc_experience(
+                        &cx, &pool, &row,
+                    ))
+                    .into_result()
+                    .expect("persist original intervention")
+                };
+                for (id, project, subject) in [
+                    (1, Some("/tmp/activity-a"), "BlueLake"),
+                    (2, Some("ACTIVITY-A"), "BLUELAKE"),
+                    (3, Some("/tmp/activity-b"), "BlueLake"),
+                    (4, Some("activity-b"), "BlueLake"),
+                    (5, None, "BlueLake"),
+                    (6, Some(" "), "BlueLake"),
+                    (7, Some("missing-project"), "BlueLake"),
+                    (8, Some("/tmp/activity-a"), "MissingAgent"),
+                    (9, Some("/tmp/activity-a"), "GreenPond"),
+                    (10, Some("/tmp/activity-c"), "BlueLake"),
+                    (11, Some("/tmp/activity-d"), "BlueLake"),
+                ] {
+                    append(id, project, subject);
+                }
+
+                // Replacements are born after the decision but before its
+                // dispatch/execution. Checking only the execution anchor would
+                // incorrectly let them certify their predecessors' effects.
+                let conn = block_on(pool.acquire(&cx)).into_result().unwrap();
+                conn.execute_raw(&format!(
+                    "DELETE FROM agents WHERE id IN (11, 30, 40); \
+                     DELETE FROM projects WHERE id IN (3, 4); \
+                     INSERT INTO projects (id, slug, human_key, created_at) \
+                     VALUES (5, 'activity-c', '/tmp/activity-c', {replacement}); \
+                     INSERT INTO agents \
+                     (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES \
+                     (50, 1, 'GreenPond', 'test', 'test', {replacement}, {foreign_activity}), \
+                     (60, 5, 'BlueLake', 'test', 'test', {replacement}, {foreign_activity})"
+                ))
+                .expect("replace identities without changing their names");
+                drop(conn);
+                atc::atc_register_agent_with_project(
+                    "BlueLake",
+                    "codex-cli",
+                    Some("/tmp/activity-b"),
+                );
+                atc::atc_observe_activity_with_project(
+                    "BlueLake",
+                    Some("/tmp/activity-b"),
+                    foreign_activity,
+                );
+                assert_eq!(
+                    atc::atc_agent_last_activity("BlueLake"),
+                    Some(foreign_activity),
+                    "wrong-project activity is present in the historical engine"
+                );
+                let stored_outcomes = || {
+                    let sidecar =
+                        mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(pool.sqlite_path());
+                    let verify = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+                        .expect("independently reopen durable outcomes");
+                    verify
+                        .query_sync(
+                            "SELECT effect_id, state, outcome_json FROM atc_experiences ORDER BY effect_id",
+                            &[],
+                        )
+                        .expect("read durable outcomes")
+                        .into_iter()
+                        .map(|row| {
+                            (
+                                row.get_named::<i64>("effect_id").unwrap(),
+                                (
+                                    row.get_named::<String>("state").unwrap(),
+                                    row.get_named::<Option<String>>("outcome_json").unwrap(),
+                                ),
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                };
+                sweep_open_experiences_for_resolution(&pool, created + 400, 600_000_000);
+                let stored = stored_outcomes();
+                assert_eq!(stored.len(), 11);
+                for (id, (state, outcome)) in &stored {
+                    if matches!(*id, 3 | 4) {
+                        assert_eq!(state, "resolved", "positive control {id}");
+                        let outcome: serde_json::Value =
+                            serde_json::from_str(outcome.as_deref().unwrap()).unwrap();
+                        assert_eq!(outcome["label"], "later_activity");
+                        assert_eq!(outcome["observed_ts_micros"], foreign_activity);
+                    } else {
+                        assert_eq!(state, "open", "unproven experience {id}");
+                        assert!(outcome.is_none(), "unproven experience {id}");
+                    }
+                }
+
+                // Actual activity in A resolves both path and slug spellings
+                // even while the in-memory engine still only knows about B.
+                let original_activity = created + 500;
+                let conn = block_on(pool.acquire(&cx)).into_result().unwrap();
+                conn.execute_raw(&format!(
+                    "UPDATE agents SET last_active_ts = {original_activity} WHERE id = 10"
+                ))
+                .expect("observe original project's agent");
+                drop(conn);
+                sweep_open_experiences_for_resolution(&pool, created + 600, 600_000_000);
+                let stored = stored_outcomes();
+                for id in [1, 2] {
+                    assert_eq!(stored[&id].0, "resolved");
+                    let outcome: serde_json::Value =
+                        serde_json::from_str(stored[&id].1.as_deref().unwrap()).unwrap();
+                    assert_eq!(outcome["observed_ts_micros"], original_activity);
+                    assert_eq!(
+                        outcome["evidence"]["project_key"],
+                        if id == 1 {
+                            "/tmp/activity-a"
+                        } else {
+                            "ACTIVITY-A"
+                        }
+                    );
+                }
+                for id in 5..=11 {
+                    assert_eq!(stored[&id].0, "open");
+                    assert!(stored[&id].1.is_none());
+                }
+
+                // A failed authority read cannot fall back to cached or global
+                // activity, nor expire the row merely because a window elapsed.
+                append(12, Some("/tmp/activity-a"), "BlueLake");
+                let conn = block_on(pool.acquire(&cx)).into_result().unwrap();
+                conn.execute_raw("UPDATE projects SET created_at = 'unreadable' WHERE id = 1")
+                    .expect("make identity authority unreadable");
+                drop(conn);
+                sweep_open_experiences_for_resolution(&pool, created + 700, 0);
+                let stored = stored_outcomes();
+                assert_eq!(stored[&12].0, "executed");
+                assert!(stored[&12].1.is_none());
+                let conn = block_on(pool.acquire(&cx)).into_result().unwrap();
+                conn.execute_raw(&format!(
+                    "UPDATE projects SET created_at = {original} WHERE id = 1"
+                ))
+                .expect("restore identity authority");
+                drop(conn);
+                sweep_open_experiences_for_resolution(&pool, created + 800, 0);
+                assert_eq!(stored_outcomes()[&12].0, "resolved");
+                atc::reset_global_atc_state_for_test(&config);
+            },
+        );
+        mcp_agent_mail_core::Config::reset_cached();
     }
 
     #[test]
