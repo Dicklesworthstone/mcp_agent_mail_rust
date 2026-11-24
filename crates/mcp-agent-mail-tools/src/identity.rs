@@ -2549,20 +2549,16 @@ fn lifecycle_mutation_result(
     action: &str,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
     match result {
-        Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument { field, .. })
-            if matches!(
-                field,
-                "agent_credential_mismatch" | "agent_credential_unavailable"
-            ) =>
-        {
-            Err(lifecycle_auth_error(
-                project,
-                agent,
-                transport,
-                action,
-                LifecycleAuthRefusal::TokenMismatch,
-            ))
-        }
+        Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
+            field: "agent_credential_mismatch" | "agent_credential_unavailable",
+            ..
+        }) => Err(lifecycle_auth_error(
+            project,
+            agent,
+            transport,
+            action,
+            LifecycleAuthRefusal::TokenMismatch,
+        )),
         other => db_outcome_to_mcp_result(other),
     }
 }

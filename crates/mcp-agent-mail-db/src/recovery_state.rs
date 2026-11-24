@@ -738,7 +738,7 @@ fn append_git_pending_path(state: &LockedState, path: &str) -> DbResult<()> {
         let mut last = [0u8];
         file.read_exact(&mut last)
             .map_err(|error| state_error("Git pending tail", error))?;
-        if last != [b'\n'] {
+        if last != *b"\n" {
             return Err(state_error(
                 "Git pending tail",
                 "incomplete publication record",
@@ -2668,13 +2668,13 @@ mod tests {
         ensure_checkpoint(&conn, root.path()).unwrap();
         with_archive_publication(root.path(), &[], |_| Ok(())).unwrap();
         let journal = root.path().join(DIRECTORY).join(GIT_PENDING_FILE);
-        assert!(std::fs::read(&journal).unwrap().is_empty());
+        assert_eq!(std::fs::read(&journal).unwrap().as_slice(), b"");
 
         conn.execute_raw("UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41")
             .unwrap();
         persist_receipts(&conn, root.path(), 29, &[41]).unwrap();
         let debt = std::fs::read(&journal).unwrap();
-        assert!(!debt.is_empty());
+        assert_ne!(debt.as_slice(), b"");
         let mut first_paths = Vec::new();
         let failure = with_archive_publication(root.path(), &[], |paths| {
             first_paths = paths.to_vec();
@@ -2719,7 +2719,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(std::fs::read(&journal).unwrap().is_empty());
+        assert_eq!(std::fs::read(&journal).unwrap().as_slice(), b"");
 
         // Healthy publications do not rescan all prior per-key artifacts.
         conn.execute_raw("UPDATE project_mailbox_receipts SET read_ts = 777 WHERE message_id = 52")
@@ -2866,10 +2866,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(
+        assert_eq!(
             std::fs::read(root.path().join(DIRECTORY).join(GIT_PENDING_FILE))
                 .unwrap()
-                .is_empty()
+                .as_slice(),
+            b""
         );
     }
 

@@ -3222,7 +3222,7 @@ fn credential_tools_rotate_and_revoke_through_the_router_without_exposing_secret
             let replacement = rotated["registration_token"]
                 .as_str()
                 .expect("explicit opt-in returns replacement");
-            assert!(!replacement.is_empty());
+            assert_ne!(replacement, "");
             assert_ne!(replacement, original_token);
             let revoked = invoke(
                 "revoke_agent_token",

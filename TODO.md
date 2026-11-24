@@ -1,5 +1,63 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## Active recovery qualification (`br-u9bhg`, MossyTern)
+
+Current base: `c5672259`. Its durable Git outbox is upstream work, reviewed
+here without claiming authorship or native qualification. The superseded
+inventory candidate and its complete source/Beads history remain intact at
+`/data/projects/am-mossytern-b4-v5-preserved-20261124`; earlier work remains at
+`/data/projects/mcp_agent_mail_rust-mossytern-20261123`.
+
+- [x] Read the new upstream outbox, publication ordering, input bounds,
+  compaction, runtime-file exclusion, and real cross-process controls.
+- [x] Incorporate and read the disjoint upstream readiness refresh and its
+  real-supervisor regression; keep its native proof separate and unclaimed.
+- [x] Preserve all failed RCH/scanner receipts and the older candidate;
+  recover the timed-out wrapper with terminal ownership acknowledged.
+- [x] Carry only observed compiler repairs: separate the credential lookup's
+  doc summary, use equivalent lifecycle error patterns, and retain the
+  conformance nonempty credential assertion with strict-Clippy syntax.
+- [x] Apply the equivalent byte-string newline comparison in the upstream
+  outbox and retain its nonempty-debt test with a concrete byte-slice assertion.
+- [x] Preserve the outbox-empty and zero-hint requirements with concrete
+  comparisons in the DB and exited-producer storage regressions.
+- [x] Strengthen the existing production flush/clone regression by draining
+  old hints, discarding later receipt/contact/cursor hints, restoring the old
+  batch, and requiring the cloned completion witness. Keep all prior checks.
+- [x] Correct the README FAQ native-tool count to 9 (47 total minus 38
+  compatibility tools). No inventory or compatibility gate was weakened.
+- [x] Pass formatting and whitespace on this current candidate.
+- [x] Complete normal-rule UBS across the same 36 Rust paths, refreshing
+  changed files and reusing completed reports only for identical source.
+- [x] Pass locked workspace all-targets check through strict RCH.
+- [x] Pass locked workspace production lib/bins check through strict RCH.
+- [x] Pass strict locked workspace all-targets Clippy through RCH.
+- [x] Verify identical maps of 3,946 files across the three final receipts,
+  with zero local hash, length or executable-mode mismatches.
+- [x] Attempt the original DB native suite through strict RCH with unchanged
+  limits: admission refused before Cargo (E330, exit 120), zero assertions.
+- [ ] Execute DB outbox/reconstruction/cursor/sync regressions with nonzero
+  counts, including malformed inputs, interrupted publication and retries.
+- [ ] Execute storage Git/flush/clone, exited-producer, envelope and backlog
+  controls; execute tools consuming-read/admission/committed-ACK replay and
+  CLI metadata preservation lanes from the original acceptance.
+- [ ] Resolve the retained concurrent-commit publication uncertainty through
+  actual runtime evidence; the earlier writer-admission experiment is unrun.
+- [x] Verify final source identity, retain every failure, update only this
+  bead, flush its scoped JSONL and confirm zero dependency cycles.
+- [ ] Commit and push the reviewable work with any missing native evidence
+  explicit; keep the original bead open and merge only qualified source.
+- [ ] Hand off current results and release source/TODO reservations.
+
+The final `c5672259` candidate passed all three static graphs with identical
+maps of 3,946 files. Evidence is retained in
+`/data/tmp/am-mossytern-20261123/mainc567-v1-three-gates-verified.json` and
+`mainc567-v1-ubs-final-report.json`. The qualified pre-handoff source patch
+SHA-256 is `1b5c383cebce69fee610b1da3998e793388e7e0195d049aa003e35e52f33b99e`.
+Native assertions remain zero: disk admission and a draining worker refused
+the requests. Compiler calls use a 3600-second outer envelope after a cold
+1800-second timeout; test limits, disk budgets and assertions are unchanged.
+
 ## Current operational reliability improvements
 
 - [x] Bound project identity cache retention by freshness, entry count, aggregate

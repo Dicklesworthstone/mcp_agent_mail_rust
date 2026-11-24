@@ -10444,8 +10444,10 @@ pub async fn lookup_idempotency_result<T: DeserializeOwned>(
 }
 
 /// Look up a committed result and, when supplied, authorize its bearer in the
-/// same read snapshot. A credential revoked while a request waited after
-/// preflight cannot disclose an old result or a conflicting claim.
+/// same read snapshot.
+///
+/// A credential revoked while a request waited after preflight cannot disclose
+/// an old result or a conflicting claim.
 pub async fn lookup_idempotency_result_with_credential<T: DeserializeOwned>(
     cx: &Cx,
     pool: &DbPool,
