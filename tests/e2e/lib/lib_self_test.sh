@@ -175,6 +175,99 @@ e2e_pass "ordinary assertion has no exit fields"
 print("9 allowed-exit cases passed; actual=1 is preserved, signals and malformed sets fail")
 PY
 
+assert_cmd "s9_stdio_initialize_metadata" "stdio rejects malformed initialization before notifying the peer" \
+    python3 - "${SCRIPT_DIR}/../../../scripts/e2e_lib.sh" "${WORK}" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+harness = Path(sys.argv[1]).resolve()
+work = Path(sys.argv[2])
+peer = work / "initialize-peer.py"
+with peer.open("x", encoding="utf-8") as script:
+    script.write('''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    with Path(os.environ["STDIO_INIT_SEEN"]).open("a", encoding="utf-8") as seen:
+        seen.write(json.dumps(request) + "\\n")
+    if "id" not in request:
+        continue
+    reply = {"jsonrpc": "2.0", "id": request["id"]}
+    if request.get("method") != "initialize":
+        reply["result"] = {"tools": []}
+    elif os.environ["STDIO_INIT_CASE"] == "jsonrpc-error":
+        reply["error"] = {"code": -32600, "message": "initialization refused"}
+    else:
+        reply["result"] = json.loads(os.environ["STDIO_INIT_RESULT"])
+    print(json.dumps(reply), flush=True)
+''')
+peer.chmod(0o755)
+valid = {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {},
+    "serverInfo": {"name": "initialize-control", "version": "1.0"},
+}
+cases = [
+    ("valid", valid, True),
+    ("valid-extension", {**valid, "instructions": "allowed extension"}, True),
+    ("null-result", None, False),
+    ("missing-protocol", {k: v for k, v in valid.items() if k != "protocolVersion"}, False),
+    ("numeric-protocol", {**valid, "protocolVersion": 1}, False),
+    ("array-capabilities", {**valid, "capabilities": []}, False),
+    ("array-server-info", {**valid, "serverInfo": []}, False),
+    ("missing-server-name", {**valid, "serverInfo": {"version": "1.0"}}, False),
+    ("numeric-server-version", {**valid, "serverInfo": {"name": "control", "version": 1}}, False),
+    ("jsonrpc-error", None, False),
+]
+initialize = json.dumps({
+    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+    "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+               "clientInfo": {"name": "initialize-self-test", "version": "1.0"}},
+})
+list_tools = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+failures = []
+for name, result, accepted in cases:
+    case = work / ("initialize-" + name)
+    case.mkdir()
+    seen = case / "seen.jsonl"
+    outcome = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+E2E_ARTIFACT_DIR="$2"
+e2e_init_artifacts
+e2e_stdio_session "$3" "$4" "$5"
+''', "initialize-self-test", str(harness), str(case), str(case / "db.sqlite3"), initialize, list_tools],
+        env={**os.environ, "AM_E2E_KEEP_TMP": "1", "E2E_STDIO_BINARY": str(peer),
+             "E2E_STDIO_DEFAULT_ENTRYPOINT": "1", "STDIO_INIT_CASE": name,
+             "STDIO_INIT_RESULT": json.dumps(result), "STDIO_INIT_SEEN": str(seen)},
+        capture_output=True, text=True, timeout=25,
+    )
+    (case / "stdout.log").write_text(outcome.stdout, encoding="utf-8")
+    (case / "stderr.log").write_text(outcome.stderr, encoding="utf-8")
+    frames = [json.loads(line) for line in seen.read_text().splitlines()]
+    assert frames[0]["method"] == "initialize", frames
+    methods = [frame["method"] for frame in frames]
+    notified = any(frame.get("method") == "notifications/initialized" for frame in frames)
+    expected_methods = ["initialize", "notifications/initialized", "tools/list"] if accepted else ["initialize"]
+    ok = (outcome.returncode == (0 if accepted else 1) and methods == expected_methods)
+    if not accepted:
+        diagnostic = "MCP initialize failed" if name == "jsonrpc-error" else "Invalid MCP initialize result metadata"
+        ok = ok and diagnostic in outcome.stderr
+    print(f"{name}: exit={outcome.returncode} notified={notified} expected_accept={accepted}")
+    if not ok:
+        failures.append(name)
+if failures:
+    raise SystemExit("incorrect initialization acceptance: " + ", ".join(failures))
+print("10 initialization controls passed; malformed peers are negative controls only")
+PY
+
 log_summary "lib_self_test" "${TOTAL}" "${PASS}" "${FAIL}" "${WORK}" "bash tests/e2e/lib/lib_self_test.sh"
 if [ "${FAIL}" -ne 0 ]; then
     exit 1

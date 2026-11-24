@@ -3003,8 +3003,20 @@ writer.start()
 try:
     threading.Thread(target=read_stdout, daemon=True).start()
     send(first)
-    if "error" in receive({first["id"]}, deadline):
+    initialized = receive({first["id"]}, deadline)
+    if "error" in initialized:
         sys.exit("MCP initialize failed")
+    result = initialized.get("result")
+    server_info = result.get("serverInfo") if isinstance(result, dict) else None
+    # A successful JSON-RPC envelope can still contain an invalid
+    # InitializeResult. Reject it before notifying the peer or sending tools.
+    if (not isinstance(result, dict)
+            or not isinstance(result.get("protocolVersion"), str)
+            or not isinstance(result.get("capabilities"), dict)
+            or not isinstance(server_info, dict)
+            or not isinstance(server_info.get("name"), str)
+            or not isinstance(server_info.get("version"), str)):
+        sys.exit(f"Invalid MCP initialize result metadata. See {log.name}")
     if not any(request.get("method") == "notifications/initialized" for request in requests):
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
     pending = set()
