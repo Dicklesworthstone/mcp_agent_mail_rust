@@ -679,6 +679,175 @@ fn reply_message_attachment_replay_ignores_missing_and_changed_sources() {
     run_with_storage(|cx, storage_root| attachment_replay_case(cx, storage_root, true));
 }
 
+#[cfg(unix)]
+async fn attachment_list_request(
+    ctx: &McpContext,
+    project_key: &str,
+    parent: Option<i64>,
+    paths: &[String],
+    key: &str,
+) -> Result<String, fastmcp::McpError> {
+    let attachments = Some(paths.to_vec());
+    let key = Some(key.to_string());
+    if let Some(parent) = parent {
+        reply_message(
+            ctx,
+            project_key.to_string(),
+            parent,
+            "GreenCastle".to_string(),
+            "The attachment list is part of this request.".to_string(),
+            Some(vec!["BlueLake".to_string()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            attachments,
+            Some(false),
+            None,
+            key,
+        )
+        .await
+    } else {
+        send_message(
+            ctx,
+            project_key.to_string(),
+            "GreenCastle".to_string(),
+            vec!["BlueLake".to_string()],
+            "Attachment list boundaries".to_string(),
+            "The attachment list is part of this request.".to_string(),
+            None,
+            None,
+            attachments,
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            key,
+        )
+        .await
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+async fn attachment_list_boundaries_case(cx: Cx, storage_root: String, is_reply: bool) {
+    let ctx = McpContext::new(cx, 1);
+    let project_key = format!("{storage_root}/workspace");
+    std::fs::create_dir_all(&project_key).unwrap();
+    for agent in ["GreenCastle", "BlueLake"] {
+        setup_project_and_agent(&ctx, &project_key, agent).await;
+    }
+    let parent = if is_reply {
+        let original = send_with_key(
+            &ctx,
+            &project_key,
+            "BlueLake",
+            "GreenCastle",
+            "Parent",
+            "Original body",
+            None,
+        )
+        .await
+        .expect("reply parent");
+        Some(
+            serde_json::from_str::<Value>(&original).unwrap()["deliveries"][0]["payload"]["id"]
+                .as_i64()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+
+    let source_files: [(&str, &[u8]); 4] = [
+        ("alpha\u{1f}beta.bin", b"one separator-containing source"),
+        ("alpha", b"first separate source"),
+        ("beta.bin", b"second separate source"),
+        ("zeta.bin", b"shared trailing source"),
+    ];
+    for (name, bytes) in source_files {
+        std::fs::write(Path::new(&project_key).join(name), bytes).unwrap();
+    }
+    let combined = vec!["alpha\u{1f}beta.bin".to_string(), "zeta.bin".to_string()];
+    let separate = vec![
+        "alpha".to_string(),
+        "beta.bin".to_string(),
+        "zeta.bin".to_string(),
+    ];
+
+    // Both interpretations are valid attachment requests. The previous
+    // separator encoding made each one a false replay of the other.
+    for (key, original, changed) in [
+        ("combined-filename", &combined, &separate),
+        ("separate-filenames", &separate, &combined),
+    ] {
+        let before = delivery_counts(&ctx).await;
+        let fresh = attachment_list_request(&ctx, &project_key, parent, original, key)
+            .await
+            .expect("each distinct attachment request must be accepted with its own key");
+        let fresh: Value = serde_json::from_str(&fresh).unwrap();
+        assert!(fresh.get("idempotent_replay").is_none());
+        assert_eq!(
+            fresh["deliveries"][0]["payload"]["attachments"]
+                .as_array()
+                .expect("persisted attachment metadata")
+                .len(),
+            original.len()
+        );
+        mcp_agent_mail_storage::wbq_flush();
+        let counts = delivery_counts(&ctx).await;
+        assert_eq!(counts, (before.0 + 1, before.1 + 1, before.2 + 1));
+        let archive_count = count_canonical_messages(&storage_root);
+        assert_eq!(i64::try_from(archive_count).unwrap(), counts.0);
+        let files = snapshot_delivery_files(&storage_root);
+        let inbox = inbox_snapshot(&ctx, &project_key).await;
+
+        let mut reordered = original.to_vec();
+        reordered.reverse();
+        let replay = attachment_list_request(&ctx, &project_key, parent, &reordered, key)
+            .await
+            .expect("reordering the same list must replay exactly");
+        assert_exact_replay(&fresh, &replay);
+
+        let mut duplicated = original.to_vec();
+        duplicated.push(original[0].clone());
+        for changed_paths in [changed.to_vec(), duplicated] {
+            let error = attachment_list_request(&ctx, &project_key, parent, &changed_paths, key)
+                .await
+                .expect_err("a changed attachment list must not replay an accepted result");
+            assert_error_type(&error, "IDEMPOTENCY_KEY_CONFLICT");
+        }
+
+        mcp_agent_mail_storage::wbq_flush();
+        assert_eq!(delivery_counts(&ctx).await, counts);
+        assert_eq!(count_canonical_messages(&storage_root), archive_count);
+        assert_eq!(snapshot_delivery_files(&storage_root), files);
+        assert_eq!(inbox_snapshot(&ctx, &project_key).await, inbox);
+    }
+    for (name, bytes) in source_files {
+        assert_eq!(
+            std::fs::read(Path::new(&project_key).join(name)).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn send_message_idempotency_preserves_attachment_list_boundaries() {
+    run_with_storage(|cx, storage_root| attachment_list_boundaries_case(cx, storage_root, false));
+}
+
+#[cfg(unix)]
+#[test]
+fn reply_message_idempotency_preserves_attachment_list_boundaries() {
+    run_with_storage(|cx, storage_root| attachment_list_boundaries_case(cx, storage_root, true));
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn attachment_replays_require_current_sender_proof_during_recovery() {

@@ -3108,6 +3108,20 @@ pub async fn send_message(
     .await
 }
 
+/// Encode message-list arguments without ambiguous separator boundaries.
+///
+/// A separator can occur in a filename, so joining would let a different
+/// attachment request replay an accepted result. Keep ordering insignificant
+/// without dropping duplicates: attachment multiplicity affects stored metadata
+/// and size validation. String-only JSON has an unambiguous, stable encoding.
+/// Legacy joined fingerprints are not replayed because their original list
+/// boundaries cannot be recovered safely from stored results.
+fn canonical_message_list(values: &[String]) -> String {
+    let mut values: Vec<&str> = values.iter().map(String::as_str).collect();
+    values.sort_unstable();
+    json!(values).to_string()
+}
+
 /// Idempotency fingerprint of a `send_message` request: every logical
 /// argument, with recipient and attachment lists order-insensitive.
 #[allow(clippy::too_many_arguments)]
@@ -3125,25 +3139,23 @@ fn send_message_fingerprint(
     attachment_paths: Option<&[String]>,
     convert_images: Option<bool>,
 ) -> String {
-    let sorted = |v: &[String]| {
-        let mut x = v.to_vec();
-        x.sort();
-        x.join("\u{1f}")
-    };
     crate::idempotency::compute_fingerprint(
         "send_message",
         &[
             ("sender", sender_name.to_string()),
-            ("to", sorted(to)),
-            ("cc", sorted(cc.unwrap_or(&[]))),
-            ("bcc", sorted(bcc.unwrap_or(&[]))),
+            ("to", canonical_message_list(to)),
+            ("cc", canonical_message_list(cc.unwrap_or(&[]))),
+            ("bcc", canonical_message_list(bcc.unwrap_or(&[]))),
             ("subject", subject.to_string()),
             ("body_md", body_md.to_string()),
             ("importance", importance.unwrap_or_default().to_string()),
             ("ack_required", ack_required.unwrap_or(false).to_string()),
             ("thread_id", thread_id.unwrap_or_default().to_string()),
             ("topic", topic.unwrap_or_default().to_string()),
-            ("attachments", sorted(attachment_paths.unwrap_or(&[]))),
+            (
+                "attachments",
+                canonical_message_list(attachment_paths.unwrap_or(&[])),
+            ),
             (
                 "convert_images",
                 convert_images.map(|b| b.to_string()).unwrap_or_default(),
@@ -4161,23 +4173,16 @@ pub async fn reply_message(
     // The added presence fields intentionally conflict with older, ambiguous
     // reply fingerprints rather than reinterpret a retained key's intent.
     let idempotency_fingerprint = idempotency_key.as_ref().map(|_| {
-        let sorted = |v: Option<&Vec<String>>| {
-            let mut x = v.cloned().unwrap_or_default();
-            x.sort();
-            x.join("\u{1f}")
-        };
-        let mut atts = attachment_paths.clone().unwrap_or_default();
-        atts.sort();
         crate::idempotency::compute_fingerprint(
             "reply_message",
             &[
                 ("parent", message_id.to_string()),
                 ("sender", sender_name.clone()),
                 ("body_md", body_md.clone()),
-                ("to", sorted(to.as_ref())),
+                ("to", canonical_message_list(to.as_deref().unwrap_or(&[]))),
                 ("to_provided", to.is_some().to_string()),
-                ("cc", sorted(cc.as_ref())),
-                ("bcc", sorted(bcc.as_ref())),
+                ("cc", canonical_message_list(cc.as_deref().unwrap_or(&[]))),
+                ("bcc", canonical_message_list(bcc.as_deref().unwrap_or(&[]))),
                 ("subject_prefix", subject_prefix.clone().unwrap_or_default()),
                 (
                     "subject_prefix_provided",
@@ -4186,7 +4191,10 @@ pub async fn reply_message(
                 ("importance", importance.clone().unwrap_or_default()),
                 ("ack_required", ack_required.unwrap_or(false).to_string()),
                 ("ack_required_provided", ack_required.is_some().to_string()),
-                ("attachments", atts.join("\u{1f}")),
+                (
+                    "attachments",
+                    canonical_message_list(attachment_paths.as_deref().unwrap_or(&[])),
+                ),
                 (
                     "convert_images",
                     convert_images.map(|b| b.to_string()).unwrap_or_default(),
@@ -6611,6 +6619,48 @@ mod tests {
     use mcp_agent_mail_db::{AgentRow, DbPool, DbPoolConfig, ProjectRow, queries, sqlmodel_core};
 
     static MESSAGING_THREAD_ID_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn send_message_fingerprint_preserves_attachment_list_boundaries() {
+        let fingerprint = |paths: &[String]| {
+            send_message_fingerprint(
+                "GreenCastle",
+                &["BlueLake".to_string()],
+                None,
+                None,
+                "Attachment list boundaries",
+                "Same body",
+                None,
+                None,
+                None,
+                None,
+                Some(paths),
+                Some(false),
+            )
+        };
+        let combined = vec!["alpha\u{1f}beta".to_string()];
+        let separate = vec!["alpha".to_string(), "beta".to_string()];
+        assert_ne!(
+            fingerprint(&combined),
+            fingerprint(&separate),
+            "one filename must not alias two attachment paths"
+        );
+        assert_ne!(
+            fingerprint(&[]),
+            fingerprint(&[String::new()]),
+            "an empty attachment path must not replay an absent attachment list"
+        );
+        assert_eq!(
+            fingerprint(&separate),
+            fingerprint(&["beta".to_string(), "alpha".to_string()]),
+            "the existing order-insensitive retry contract must be preserved"
+        );
+        assert_ne!(
+            fingerprint(&["alpha".to_string()]),
+            fingerprint(&["alpha".to_string(), "alpha".to_string()]),
+            "attachment multiplicity is part of the request"
+        );
+    }
 
     std::thread_local! {
         static BEFORE_MESSAGE_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =

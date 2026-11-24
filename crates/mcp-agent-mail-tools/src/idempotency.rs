@@ -121,8 +121,9 @@ pub fn normalize_idempotency_key(raw: Option<&str>) -> Result<Option<String>, Mc
 /// and hashed with SHA-256, so the fingerprint is deterministic and independent
 /// of the order the caller lists fields. Two calls with the same logical payload
 /// produce the same fingerprint; any change flips it (driving conflict
-/// detection). Multi-valued fields (recipient lists, path sets) must be
-/// pre-canonicalized by the caller (e.g. sorted and joined) before being passed.
+/// detection). Multi-valued fields (recipient lists, path sets) must use an
+/// unambiguous encoding (e.g. a sorted JSON array). Delimiter joining loses list
+/// boundaries when a value contains the delimiter or is empty.
 #[must_use]
 pub fn compute_fingerprint(tool: &str, fields: &[(&str, String)]) -> String {
     let mut sorted: Vec<&(&str, String)> = fields.iter().collect();
