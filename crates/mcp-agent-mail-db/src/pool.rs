@@ -18589,10 +18589,14 @@ pub fn sqlite_private_copy_passes_full_integrity_check(path: &Path) -> Result<bo
 /// state to a renamed generation.
 #[must_use]
 pub fn sqlite_recovery_candidate_is_standalone(path: &Path) -> bool {
-    !SQLITE_RECOVERY_SIDECAR_SUFFIXES
-        .iter()
-        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    !sqlite_recovery_companion_suffixes()
         .any(|suffix| path_is_occupied(&sqlite_sidecar_path(path, suffix)))
+}
+
+pub(crate) fn sqlite_recovery_companion_suffixes() -> impl Iterator<Item = &'static str> {
+    SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .into_iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES)
 }
 
 /// Validate a materialized recovery database through the canonical

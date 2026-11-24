@@ -581,6 +581,18 @@ where
             .flatten(),
         reader_inventory_incomplete,
     };
+    // A WAL or namespace record can arrive while integrity, lineage and
+    // reader verification run, without changing the main inode. Inspect
+    // the directory used by unlinkat, including dangling companion links.
+    for suffix in crate::pool::sqlite_recovery_companion_suffixes() {
+        let mut companion = name.to_os_string();
+        companion.push(suffix);
+        match rustix::fs::statat(&parent, companion.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => return Err(invalid("generation has companion recovery state")),
+        }
+    }
     unlink(&parent, name)?;
     drop(file);
     if let Err(error) = sync(&parent).and_then(|()| validate_directory(parent_path, &parent)) {
@@ -3204,6 +3216,37 @@ mapping.close()
             std::fs::read(&source).unwrap(),
             b"permission-protected backup"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_preserves_companions_created_after_reader_verification() {
+        let _scan_guard = reader_scan_test_guard();
+        for (suffix, evidence) in [
+            ("-wal", None),
+            ("-fsqlite-ns-gate", Some(SnapshotReaderEvidence::default())),
+        ] {
+            let root = fixture();
+            let source = root.join("generation");
+            std::fs::write(&source, b"backup generation").unwrap();
+            let identity = std::fs::metadata(&source).unwrap();
+            let companion = root.join(format!("generation{suffix}"));
+            let error = delete_inventoried_file_with_evidence(
+                &source,
+                &identity,
+                evidence,
+                |_, _| panic!("late companion must prevent unlink"),
+                |parent| {
+                    std::fs::write(&companion, b"new recovery state")?;
+                    parent.sync_all()
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("companion recovery state"));
+            assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+            assert_eq!(std::fs::read(&source).unwrap(), b"backup generation");
+            assert_eq!(std::fs::read(&companion).unwrap(), b"new recovery state");
+        }
     }
 
     #[cfg(target_os = "linux")]
