@@ -45,9 +45,17 @@ inventory candidate and its complete source/Beads history remain intact at
   actual runtime evidence; the earlier writer-admission experiment is unrun.
 - [x] Verify final source identity, retain every failure, update only this
   bead, flush its scoped JSONL and confirm zero dependency cycles.
-- [ ] Commit and push the reviewable work with any missing native evidence
-  explicit; keep the original bead open and merge only qualified source.
-- [ ] Hand off current results and release source/TODO reservations.
+- [x] Commit and push the reviewable work as draft PR #408, with native
+  assertions explicitly zero and `br-u9bhg` still in progress.
+- [ ] Merge only after original native acceptance and current integration
+  qualification; the draft does not establish release readiness.
+- [x] Hand off current results in Agent Mail message 303 and release all
+  nine source/TODO reservations (2026-11-24 01:46:06 UTC).
+
+Draft: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/pull/408
+Code commit: `44787e6b`. Latest target main was `bad3b904`; GitHub reports
+the draft merges without conflicts. The checks above qualify the named
+`c5672259` candidate, and do not claim the moving target's runtime result.
 
 The final `c5672259` candidate passed all three static graphs with identical
 maps of 3,946 files. Evidence is retained in
