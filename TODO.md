@@ -29,7 +29,8 @@
   the contact publisher completes its own revision before that retry, so the
   retry cannot mask its failure. The same six engine/schedule cases remain;
   their new filter is `test(concurrent_ack_retry)`. No production change.
-  Preserve original `00b35dde` in the separate frozen compiler/native checkout.
+  Preserve original baseline commit `00b35dde`; the compiler checkout now holds
+  the corrected candidate for its required gates.
   Its original filter is `test(reconciliation_retains_concurrent_ack)`; any
   failure of that unsupported automatic-durability assertion is not by itself
   a production race. The corrected candidate is still uncompiled/unexecuted.
@@ -56,6 +57,20 @@
   Current reservation source SHA-256
   `9c2b091704697d8bff733ba256a78599ef6eb2c68b58e40c5745bc3d7106a125`.
   Preserve the failed gate and rerun it on both corrections together.
+  The corrected `a4860459` retry also completed with exit 101: build
+  `30097323753221990`, wrapper `rchw-33f5d91c-fd00-47c3-b613-19ac584d4c72`.
+  Its three reservation assertions passed; two server retention assertions
+  have the same denied lint. Preserve their empty-queue conditions using typed
+  empty arrays and keep all surrounding identity, terminal-state and timestamp
+  checks. The failed run's 3,952 source entries match, with receipt root
+  `dca772815787d57763559a25fd3c15983f5ffd6a625836d66a8b9202a08194e9`;
+  ownership is terminal and acknowledged. Both repaired files pass formatting
+  and normal UBS: zero critical, 286 warning and 67 scoped informational
+  findings, plus four retained unscoped informational diagnostics. Report
+  `server-empty-assertions-v1-ubs.summary.json`, SHA-256
+  `46e29adac0de2b39f51626dba9acb1a659afdbe662af2fef5d9c6f35eab6d3d0`.
+  The focused queued-intent assertion search has no remaining matches.
+  Rerun the same strict workspace gate after this second concrete repair.
 - [ ] Obtain ordinary native admission and capture the old six-case baseline,
   then execute the corrected six retry controls with retained fixtures. Require
   actual native results plus the documented contract before any production
@@ -77,8 +92,14 @@
   `replay_release_intent_does_not_recreate_a_missing_project`,
   `replay_release_intent_rejects_ambiguous_terminal_selectors`, and
   `replay_release_intent_finishes_old_siblings_after_partial_apply`.
+  Also include the two repaired server cases:
+  `ack_replay_refuses_post_intent_messages_and_replacement_agents` and
+  `explicit_id_replay_rejects_newer_foreign_and_terminal_selectors`.
 - [ ] Recheck final diffs/static bindings, publish scoped evidence and update
   the existing Bead according to actual execution, without replacing acceptance.
+  GitHub reports PR #410 merged externally at 15:51 UTC as `00b35dde` in
+  merge commit `ab252a31`. Corrections after that head are separately reviewable
+  on draft PR #411; that publication is not native or final gate evidence.
 
 ## ACK reconciliation schedule review (`br-u9bhg`)
 

@@ -491,10 +491,9 @@ mod tests {
                     );
                     let receipts = fixture.receipts(fixture.message);
                     assert!(receipts.0.is_some() && receipts.1.is_some());
-                    assert!(
-                        journal::read_queued_ack_intents(&fixture.config)
-                            .unwrap()
-                            .is_empty()
+                    assert_eq!(
+                        journal::read_queued_ack_intents(&fixture.config).unwrap(),
+                        [] as [mcp_agent_mail_tools::degraded_intents::QueuedAckIntent; 0]
                     );
                     // Even an already-loaded snapshot can be retried without
                     // changing the first committed read and ACK timestamps.

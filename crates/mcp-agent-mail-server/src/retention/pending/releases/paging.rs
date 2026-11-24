@@ -714,10 +714,9 @@ mod tests {
                 "garbage"
             );
             drop(conn);
-            assert!(
-                journal::read_queued_release_intents(config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [mcp_agent_mail_tools::degraded_intents::QueuedReleaseIntentView; 0]
             );
         });
     }
