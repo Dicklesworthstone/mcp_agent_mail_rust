@@ -8692,8 +8692,8 @@ pub fn flush_async_commits() {
 }
 
 /// Commit each recovery publication as one consistent generation. Holding the
-/// DB-owned publication lock keeps an active manifest and its baseline in the
-/// same Git commit; temporary files and lock files never enter the tree.
+/// DB-owned publication lock binds the current witness to durable per-key debt
+/// from every producer; temporary files, the outbox and locks stay out of Git.
 fn publish_pending_recovery_state() {
     for (root, paths) in mcp_agent_mail_db::recovery_state::take_pending_archive_paths() {
         // A healthy database may be checkpointed before the first archive is
@@ -10121,6 +10121,9 @@ const ARCHIVE_GITIGNORE_ENTRIES: &[&str] = &[
     "/doctor/active-reservation-reconcile.json.lock",
     "/doctor/reservation-reconcile.json",
     "/doctor/reservation-reconcile.json.lock",
+    // Durable publication debt is local runtime state, never checkout input.
+    "/recovery-state/.git-pending.jsonl",
+    "/recovery-state/..git-pending.jsonl.*.pending",
     ".tmp-*",
 ];
 
@@ -19285,6 +19288,188 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cursor["issued_through"], 321);
+    }
+
+    #[test]
+    fn gh404_git_publication_keeps_exited_producer_receipts_with_their_witness() {
+        const MODE: &str = "AM_TEST_GH404_GIT_DEBT_MODE";
+        const ROOT: &str = "AM_TEST_GH404_GIT_DEBT_ROOT";
+        const DATABASE: &str = "AM_TEST_GH404_GIT_DEBT_DATABASE";
+        const NAME: &str =
+            "tests::gh404_git_publication_keeps_exited_producer_receipts_with_their_witness";
+        let mode = std::env::var(MODE);
+        if mode.is_err() {
+            // Isolate process-wide coalescer hints from parallel libtests.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(MODE, "observer")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cross-process recovery publication failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use mcp_agent_mail_db::recovery_state::{self, RecoveryRecord};
+        if matches!(mode.as_deref(), Ok("producer")) {
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            let database = PathBuf::from(std::env::var_os(DATABASE).unwrap());
+            let conn =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(database.to_str().unwrap()).unwrap();
+            conn.execute_raw(
+                "UPDATE message_recipients SET read_ts=111,ack_ts=222 WHERE message_id=41; \
+                 UPDATE project_mailbox_receipts SET read_ts=333,ack_ts=444 WHERE message_id=52; \
+                 UPDATE agent_links SET status='blocked',updated_ts=30 WHERE id=93;",
+            )
+            .unwrap();
+            recovery_state::persist_receipts(&conn, &root, 29, &[41, 52]).unwrap();
+            recovery_state::persist_contact(&conn, &root, 17, 29).unwrap();
+            assert!(COMMIT_COALESCER.get().is_none());
+            // Exit without flushing. This process's in-memory hints disappear.
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp.path().join("archive"));
+        let archive = ensure_archive(&config, "receiver").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let database = tmp.path().join("mailbox.sqlite3");
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(database.to_str().unwrap()).unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES \
+             (7,'sender','/work/sender',1),(19,'receiver','/work/receiver',1); \
+             INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES \
+             (17,7,'BlueLake','codex','test',1,1),(29,19,'RedFox','codex','test',1,1); \
+             INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) VALUES \
+             (41,19,17,'Direct receipt','Direct message',100), \
+             (52,19,17,'Shared receipt','Shared message',200); \
+             INSERT INTO message_recipients(message_id,agent_id,kind) VALUES (41,29,'to'); \
+             INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             VALUES (52,19,'to',200); \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id) VALUES (52,29); \
+             INSERT INTO agent_links(id,a_project_id,a_agent_id,b_project_id,b_agent_id,status,reason,created_ts,updated_ts) \
+             VALUES (93,7,17,19,29,'pending','review',10,20);",
+        )
+        .unwrap();
+        let manifest = recovery_state::ensure_checkpoint(&conn, &config.storage_root).unwrap();
+        flush_async_commits();
+        drop(conn);
+        let baseline_commit = repo.head().unwrap().target().unwrap();
+
+        // The publisher has already drained an older wakeup hint when a
+        // different process publishes three mutable records and a new witness.
+        recovery_state::note_pending_archive_paths(
+            &config.storage_root,
+            ["recovery-state/active.json".to_string()],
+        );
+        let (_, stale_paths) = recovery_state::take_pending_archive_paths()
+            .into_iter()
+            .find(|(root, _)| root == &config.storage_root)
+            .unwrap();
+        assert_eq!(stale_paths, ["recovery-state/active.json"]);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(MODE, "producer")
+            .env(ROOT, &config.storage_root)
+            .env(DATABASE, &database)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "independent receipt producer failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(repo.head().unwrap().target().unwrap(), baseline_commit);
+        assert!(recovery_state::take_pending_archive_paths().is_empty());
+        let witness = recovery_state::read_revision_witness(&config.storage_root)
+            .unwrap()
+            .unwrap();
+        {
+            let _mutation = ArchiveMutationGuard::begin_at(&config.storage_root);
+            recovery_state::with_archive_publication(
+                &config.storage_root,
+                &stale_paths,
+                |publication| {
+                    let references = publication.iter().map(String::as_str).collect::<Vec<_>>();
+                    commit_paths_with_retry(
+                        &config.storage_root,
+                        &config,
+                        "Publish recovery after producer exit",
+                        &references,
+                    )
+                    .map_err(|error| mcp_agent_mail_db::DbError::Internal(error.to_string()))
+                },
+            )
+            .unwrap();
+        }
+        // Even the generic overload snapshot must keep this runtime outbox out
+        // of Git; a checkout bootstraps its own publication inventory.
+        fs::write(
+            config.storage_root.join("ordinary.txt"),
+            b"ordinary archive bytes",
+        )
+        .unwrap();
+        commit_all(&repo, &config, "Publish ordinary archive bytes").unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        assert!(tree.get_path(Path::new("ordinary.txt")).is_ok());
+        assert!(
+            tree.get_path(Path::new("recovery-state/.git-pending.jsonl"))
+                .is_err()
+        );
+
+        let recovered_root = tmp.path().join("recovered");
+        let cloned =
+            Repository::clone(config.storage_root.to_str().unwrap(), &recovered_root).unwrap();
+        drop(cloned);
+        assert_eq!(
+            recovery_state::read_revision_witness(&recovered_root).unwrap(),
+            Some(witness)
+        );
+        let mut records = Vec::new();
+        assert_eq!(
+            recovery_state::visit_records(&recovered_root, |record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap(),
+            Some(manifest)
+        );
+        assert!(records.iter().any(|record| matches!(
+            record,
+            RecoveryRecord::Receipt(receipt)
+                if receipt.message_id == 41 && receipt.agent.id == 29
+                    && !receipt.shared
+                    && receipt.read_ts == Some(111) && receipt.ack_ts == Some(222)
+        )));
+        assert!(records.iter().any(|record| matches!(
+            record,
+            RecoveryRecord::Receipt(receipt)
+                if receipt.message_id == 52 && receipt.agent.id == 29
+                    && receipt.shared
+                    && receipt.read_ts == Some(333) && receipt.ack_ts == Some(444)
+        )));
+        assert!(matches!(
+            records.iter().rev().find(|record| matches!(record, RecoveryRecord::Contact(_))),
+            Some(RecoveryRecord::Contact(contact)) if contact.status == "blocked"
+        ));
+        let journal = config
+            .storage_root
+            .join("recovery-state/.git-pending.jsonl");
+        assert!(fs::read(&journal).unwrap().is_empty());
+        for runtime in [
+            "recovery-state/.git-pending.jsonl",
+            "recovery-state/..git-pending.jsonl.123.1.pending",
+        ] {
+            assert!(repo.status_should_ignore(Path::new(runtime)).unwrap());
+        }
     }
 
     #[test]

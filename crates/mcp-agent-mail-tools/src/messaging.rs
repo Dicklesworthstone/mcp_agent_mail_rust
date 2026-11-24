@@ -2585,11 +2585,13 @@ fn sender_credential_proof<'a>(
 ) -> Option<mcp_agent_mail_db::queries::AgentCredentialProof<'a>> {
     sender_token
         .filter(|token| !token.is_empty())
-        .map(|registration_token| mcp_agent_mail_db::queries::AgentCredentialProof {
-            project_id: sender.project_id,
-            agent_name: &sender.name,
-            registration_token,
-        })
+        .map(
+            |registration_token| mcp_agent_mail_db::queries::AgentCredentialProof {
+                project_id: sender.project_id,
+                agent_name: &sender.name,
+                registration_token,
+            },
+        )
 }
 
 /// Mark a session-verified send so audit and diagnostics can tell it from a
@@ -4833,14 +4835,15 @@ effective_free_bytes={free}"
         .iter()
         .map(|(id, kind)| (*id, kind.as_str()))
         .collect();
-    let claim = idempotency_fingerprint.as_deref().map(|fingerprint| {
-        mcp_agent_mail_db::IdempotencyClaim {
-            project_id,
-            tool: "reply_message",
-            key: idempotency_key.as_deref().unwrap_or_default(),
-            fingerprint,
-        }
-    });
+    let claim =
+        idempotency_fingerprint
+            .as_deref()
+            .map(|fingerprint| mcp_agent_mail_db::IdempotencyClaim {
+                project_id,
+                tool: "reply_message",
+                key: idempotency_key.as_deref().unwrap_or_default(),
+                fingerprint,
+            });
     #[cfg(test)]
     tests::run_before_message_admission_hook();
     // Ordinary replies need the same final bearer check as sends and
@@ -8375,14 +8378,23 @@ mod tests {
     }
 
     async fn bearer_admission_counts(cx: &Cx, pool: &DbPool) -> [i64; 4] {
-        let conn = pool.acquire(cx).await.into_result().expect("count connection");
-        ["messages", "message_recipients", "inbox_delivery_events", "idempotency_keys"]
-            .map(|table| {
-                conn.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
-                    .expect("message admission counts")[0]
-                    .get_as::<i64>(0)
-                    .expect("integer count")
-            })
+        let conn = pool
+            .acquire(cx)
+            .await
+            .into_result()
+            .expect("count connection");
+        [
+            "messages",
+            "message_recipients",
+            "inbox_delivery_events",
+            "idempotency_keys",
+        ]
+        .map(|table| {
+            conn.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                .expect("message admission counts")[0]
+                .get_as::<i64>(0)
+                .expect("integer count")
+        })
     }
 
     #[test]

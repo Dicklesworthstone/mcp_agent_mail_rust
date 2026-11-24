@@ -2491,7 +2491,9 @@ fn authenticate_lifecycle_agent<'a>(
                 registration_token: token,
             }));
     };
-    Err(lifecycle_auth_error(project, agent, transport, action, refusal))
+    Err(lifecycle_auth_error(
+        project, agent, transport, action, refusal,
+    ))
 }
 
 fn lifecycle_auth_error(

@@ -25698,7 +25698,11 @@ mod tests {
                     let result = match action {
                         "retire" => {
                             set_agent_retired_at_guarded(
-                                &cx, &pool, agent_id, Some(222), Some(stale),
+                                &cx,
+                                &pool,
+                                agent_id,
+                                Some(222),
+                                Some(stale),
                             )
                             .await
                         }
@@ -25758,7 +25762,11 @@ mod tests {
                     let accepted = match action {
                         "retire" => {
                             set_agent_retired_at_guarded(
-                                &cx, &pool, agent_id, Some(333), Some(fresh),
+                                &cx,
+                                &pool,
+                                agent_id,
+                                Some(333),
+                                Some(fresh),
                             )
                             .await
                         }
@@ -25782,7 +25790,10 @@ mod tests {
                                 Some(333)
                             );
                             update_agent_registration_token(
-                                &cx, &pool, agent_id, "after-deregistration",
+                                &cx,
+                                &pool,
+                                agent_id,
+                                "after-deregistration",
                             )
                             .await
                             .into_result()

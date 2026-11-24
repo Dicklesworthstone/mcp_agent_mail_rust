@@ -25,6 +25,11 @@ const BASELINE_FILE: &str = "baseline.jsonl";
 const SUPERSEDED_FILE: &str = "superseded.json";
 const LOCK_FILE: &str = ".state.lock";
 const READ_REVISION_FILE: &str = "read-revision.json";
+// Runtime-only, write-ahead debt shared by all receipt/contact publishers.
+// In-memory hints wake the coalescer; they are never completeness authority.
+const GIT_PENDING_FILE: &str = ".git-pending.jsonl";
+const MAX_GIT_PENDING_RECORD_BYTES: u64 = 1024;
+const MAX_GIT_PENDING_BYTES: u64 = 64 * 1024 * 1024;
 const SCHEMA_VERSION: u32 = 1;
 const BATCH_ROWS: usize = 256;
 const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
@@ -423,6 +428,7 @@ fn with_read_revision<T>(
             .map_err(|error| state_error("read revision token", error))?,
         manifest: None,
     };
+    ensure_git_pending_journal(state)?;
     write_revision(state, &revision)?;
     if reconcile_pending {
         // A successful write to a different key must not erase evidence that
@@ -622,7 +628,294 @@ fn encode_record(generation: &str, mut record: RecoveryRecord) -> DbResult<Vec<u
     Ok(bytes)
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitPendingEntry {
+    schema_version: u32,
+    /// A missing path requests one complete inventory after upgrading an older
+    /// archive or checking it out without its runtime-only publication journal.
+    path: Option<String>,
+}
+
+fn ensure_git_pending_journal(state: &LockedState) -> DbResult<()> {
+    match state
+        .directory
+        .open_file(GIT_PENDING_FILE, JournalFileMode::Read)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut bytes = serde_json::to_vec(&GitPendingEntry {
+                schema_version: SCHEMA_VERSION,
+                path: None,
+            })
+            .map_err(|error| state_error("Git pending initialization", error))?;
+            bytes.push(b'\n');
+            state
+                .directory
+                .atomic_write(GIT_PENDING_FILE, |file| file.write_all(&bytes))
+                .map_err(|error| state_error("Git pending initialization", error))
+        }
+        Err(error) => Err(state_error("Git pending open", error)),
+    }
+}
+
+/// Return the artifact filename and its optional database generation. Runtime
+/// locks, temporary files and the outbox itself are never publication inputs.
+fn git_artifact_parts(path: &str) -> DbResult<(&str, Option<&str>)> {
+    let invalid = || state_error("Git publication", "path is not a recovery artifact");
+    let mut parts = path.split('/');
+    if parts.next() != Some(DIRECTORY) {
+        return Err(invalid());
+    }
+    let first = parts.next().ok_or_else(invalid)?;
+    let Some(name) = parts.next() else {
+        return if matches!(
+            first,
+            MANIFEST_FILE | READ_REVISION_FILE | "delivery-cursor.json"
+        ) {
+            Ok((first, None))
+        } else {
+            Err(invalid())
+        };
+    };
+    if parts.next().is_some() {
+        return Err(invalid());
+    }
+    let generation = first.strip_prefix('g').ok_or_else(invalid)?;
+    generation_directory(generation)?;
+    let record_digest = name
+        .strip_prefix("receipt-")
+        .or_else(|| name.strip_prefix("contact-"))
+        .and_then(|name| name.strip_suffix(".json"));
+    if !matches!(name, BASELINE_FILE | SUPERSEDED_FILE)
+        && !record_digest.is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        return Err(invalid());
+    }
+    Ok((name, Some(generation)))
+}
+
+/// The path debt must reach durable storage before its artifact can change.
+/// A later publisher in any process can then include every changed key with
+/// the current completed revision, even if the producer exits before enqueue.
+fn append_git_pending_path(state: &LockedState, path: &str) -> DbResult<()> {
+    git_artifact_parts(path)?;
+    ensure_git_pending_journal(state)?;
+    let mut bytes = serde_json::to_vec(&GitPendingEntry {
+        schema_version: SCHEMA_VERSION,
+        path: Some(path.to_string()),
+    })
+    .map_err(|error| state_error("Git pending encode", error))?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_GIT_PENDING_RECORD_BYTES {
+        return Err(state_error(
+            "Git pending append",
+            "path exceeds bounded record size",
+        ));
+    }
+    let mut file = state
+        .directory
+        .open_file(GIT_PENDING_FILE, JournalFileMode::Append)
+        .map_err(|error| state_error("Git pending append", error))?;
+    let length = file
+        .metadata()
+        .map_err(|error| state_error("Git pending metadata", error))?
+        .len();
+    if length > MAX_GIT_PENDING_BYTES.saturating_sub(bytes.len() as u64) {
+        return Err(state_error(
+            "Git pending append",
+            "publication debt exceeds bounded size",
+        ));
+    }
+    if length > 0 {
+        file.seek(io::SeekFrom::End(-1))
+            .map_err(|error| state_error("Git pending tail", error))?;
+        let mut last = [0u8];
+        file.read_exact(&mut last)
+            .map_err(|error| state_error("Git pending tail", error))?;
+        if last != [b'\n'] {
+            return Err(state_error(
+                "Git pending tail",
+                "incomplete publication record",
+            ));
+        }
+    }
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| state_error("Git pending append", error))?;
+    state
+        .directory
+        .sync()
+        .map_err(|error| state_error("Git pending sync", error))?;
+    state
+        .directory
+        .validate_file(GIT_PENDING_FILE, &file)
+        .map_err(|error| state_error("Git pending binding", error))
+}
+
+#[derive(Default)]
+struct GitPublicationPaths {
+    paths: BTreeSet<String>,
+    bytes: u64,
+}
+
+impl GitPublicationPaths {
+    fn insert(&mut self, path: String) -> DbResult<()> {
+        git_artifact_parts(&path)?;
+        if self.paths.contains(&path) {
+            return Ok(());
+        }
+        self.bytes = self.bytes.saturating_add(path.len() as u64);
+        if self.bytes > MAX_GIT_PENDING_BYTES {
+            return Err(state_error(
+                "Git publication inventory",
+                "paths exceed bounded size",
+            ));
+        }
+        self.paths.insert(path);
+        Ok(())
+    }
+}
+
+fn collect_git_pending_paths(
+    state: &LockedState,
+    paths: &mut GitPublicationPaths,
+) -> DbResult<bool> {
+    let file = state
+        .directory
+        .open_file(GIT_PENDING_FILE, JournalFileMode::Read)
+        .map_err(|error| state_error("Git pending open", error))?;
+    let length = file
+        .metadata()
+        .map_err(|error| state_error("Git pending metadata", error))?
+        .len();
+    if length > MAX_GIT_PENDING_BYTES {
+        return Err(state_error(
+            "Git pending read",
+            "publication debt exceeds bounded size",
+        ));
+    }
+    let mut reader = io::BufReader::new(&file);
+    let mut consumed = 0u64;
+    let mut inventory = false;
+    loop {
+        let mut bytes = Vec::new();
+        let count = reader
+            .by_ref()
+            .take(MAX_GIT_PENDING_RECORD_BYTES + 1)
+            .read_until(b'\n', &mut bytes)
+            .map_err(|error| state_error("Git pending read", error))?;
+        if count == 0 {
+            break;
+        }
+        consumed = consumed.saturating_add(count as u64);
+        if consumed > MAX_GIT_PENDING_BYTES
+            || count as u64 > MAX_GIT_PENDING_RECORD_BYTES
+            || bytes.last() != Some(&b'\n')
+        {
+            return Err(state_error(
+                "Git pending read",
+                "oversized or incomplete publication record",
+            ));
+        }
+        let entry: GitPendingEntry = serde_json::from_slice(&bytes)
+            .map_err(|error| state_error("Git pending decode", error))?;
+        if entry.schema_version != SCHEMA_VERSION {
+            return Err(state_error(
+                "Git pending decode",
+                "unsupported schema version",
+            ));
+        }
+        if let Some(path) = entry.path {
+            paths.insert(path)?;
+        } else {
+            inventory = true;
+        }
+    }
+    if consumed != length
+        || file
+            .metadata()
+            .map_err(|error| state_error("Git pending metadata", error))?
+            .len()
+            != length
+    {
+        return Err(state_error(
+            "Git pending read",
+            "publication debt changed during inspection",
+        ));
+    }
+    state
+        .directory
+        .validate_file(GIT_PENDING_FILE, &file)
+        .map_err(|error| state_error("Git pending binding", error))?;
+    Ok(inventory)
+}
+
+/// Legacy archives and fresh Git checkouts have no outbox. Inventory their
+/// active generation once; later publications inspect only accumulated debt.
+fn collect_git_generation_inventory(
+    state: &LockedState,
+    manifest: Option<&Manifest>,
+    paths: &mut GitPublicationPaths,
+) -> DbResult<()> {
+    if let Some(manifest) = manifest {
+        let directory = state.generation(&manifest.generation, false)?;
+        for entry in std::fs::read_dir(directory.directory_path())
+            .map_err(|error| state_error("Git generation inventory", error))?
+        {
+            let name = entry
+                .map_err(|error| state_error("Git generation inventory", error))?
+                .file_name();
+            let Some(name) = name.to_str() else {
+                return Err(state_error(
+                    "Git generation inventory",
+                    "non-UTF-8 recovery filename",
+                ));
+            };
+            if name.starts_with("receipt-") || name.starts_with("contact-") {
+                paths.insert(format!(
+                    "{DIRECTORY}/{}/{name}",
+                    generation_directory(&manifest.generation)?
+                ))?;
+            }
+        }
+    }
+    // Retain supersession witnesses too: a restored old database must not
+    // reactivate an already abandoned archive generation after a Git checkout.
+    for entry in std::fs::read_dir(state.directory.directory_path())
+        .map_err(|error| state_error("Git generation inventory", error))?
+    {
+        let name = entry
+            .map_err(|error| state_error("Git generation inventory", error))?
+            .file_name();
+        let Some(generation) = name.to_str().and_then(|name| name.strip_prefix('g')) else {
+            continue;
+        };
+        let directory = state.generation(generation, false)?;
+        if let Some(manifest) = read_json::<Manifest>(&directory, SUPERSEDED_FILE)? {
+            validate_manifest(&manifest)?;
+            if manifest.generation != generation {
+                return Err(state_error(
+                    "Git generation inventory",
+                    "superseded generation identity mismatch",
+                ));
+            }
+            paths.insert(format!(
+                "{DIRECTORY}/{}/{SUPERSEDED_FILE}",
+                generation_directory(generation)?
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 fn write_record(
+    state: &LockedState,
     root: &Path,
     directory: &JournalDirectory,
     generation: &str,
@@ -648,16 +941,12 @@ fn write_record(
         }
     }
     let bytes = encode_record(generation, record)?;
+    let relative = format!("{DIRECTORY}/{}/{name}", generation_directory(generation)?);
+    append_git_pending_path(state, &relative)?;
     directory
         .atomic_write(&name, |file| file.write_all(&bytes))
         .map_err(|error| state_error("record publication", error))?;
-    note_pending_archive_paths(
-        root,
-        [format!(
-            "{DIRECTORY}/{}/{name}",
-            generation_directory(generation)?
-        )],
-    );
+    note_pending_archive_paths(root, [relative]);
     Ok(())
 }
 
@@ -948,17 +1237,24 @@ fn checkpoint_locked(
         let prior_directory = state.generation(&previous.generation, false)?;
         let bytes = serde_json::to_vec(&previous)
             .map_err(|error| state_error("superseded manifest encode", error))?;
+        let superseded_path = format!(
+            "{DIRECTORY}/{}/{SUPERSEDED_FILE}",
+            generation_directory(&previous.generation)?
+        );
+        append_git_pending_path(state, &superseded_path)?;
         prior_directory
             .atomic_write(SUPERSEDED_FILE, |file| file.write_all(&bytes))
             .map_err(|error| state_error("superseded generation publication", error))?;
-        note_pending_archive_paths(
-            root,
-            [format!(
-                "{DIRECTORY}/{}/{SUPERSEDED_FILE}",
-                generation_directory(&previous.generation)?
-            )],
-        );
+        note_pending_archive_paths(root, [superseded_path]);
     }
+    append_git_pending_path(state, &format!("{DIRECTORY}/{MANIFEST_FILE}"))?;
+    append_git_pending_path(
+        state,
+        &format!(
+            "{DIRECTORY}/{}/{BASELINE_FILE}",
+            generation_directory(generation)?
+        ),
+    )?;
     let manifest = publish_checkpoint(conn, &directory, generation)?;
     state.validate()?;
     let bytes =
@@ -994,13 +1290,13 @@ fn reconcile_incomplete_publication(
     crate::sync::with_read_snapshot(conn, || {
         let mut receipts = 0u64;
         visit_current_receipts(conn, &mut |record| {
-            write_record(root, &directory, generation, record)?;
+            write_record(state, root, &directory, generation, record)?;
             receipts += 1;
             Ok(())
         })?;
         let mut contacts = 0u64;
         visit_current_contacts(conn, &mut |record| {
-            write_record(root, &directory, generation, record)?;
+            write_record(state, root, &directory, generation, record)?;
             contacts += 1;
             Ok(())
         })?;
@@ -1108,47 +1404,100 @@ pub fn checkpoint_all(conn: &impl SyncQuery, root: &Path) -> DbResult<Manifest> 
     ensure_checkpoint(conn, root)
 }
 
-/// Bind a Git commit's manifest and baseline to the same active generation.
+/// Bind a Git commit's completed witness to every changed recovery artifact.
 ///
 /// The storage publisher holds its own archive locks outside this function;
-/// state writers only enqueue paths and never call back into Git while locked.
+/// state writers append durable path debt before changing files and never call
+/// back into Git while locked. The caller's pending paths are only process-local
+/// wakeup hints: they can predate the latest revision or omit another process.
 pub fn with_archive_publication<T>(
     root: &Path,
     pending: &[String],
     publish: impl FnOnce(&[String]) -> DbResult<T>,
 ) -> DbResult<T> {
     let state = LockedState::open(root, false)?;
-    let mut paths = BTreeSet::new();
+    ensure_git_pending_journal(&state)?;
+    let mut paths = GitPublicationPaths::default();
     for path in pending {
-        let mut components = Path::new(path).components();
-        if components.next()
-            != Some(std::path::Component::Normal(std::ffi::OsStr::new(
-                DIRECTORY,
-            )))
-            || !components.all(|component| matches!(component, std::path::Component::Normal(_)))
-        {
-            return Err(state_error(
-                "Git publication",
-                "pending path escapes recovery-state",
-            ));
-        }
-        paths.insert(path.clone());
+        paths.insert(path.clone())?;
     }
-    if let Some(manifest) = read_manifest(&state.directory)? {
+    let inventory = collect_git_pending_paths(&state, &mut paths)?;
+    let manifest = read_manifest(&state.directory)?;
+    if inventory {
+        collect_git_generation_inventory(&state, manifest.as_ref(), &mut paths)?;
+    }
+    if let Some(manifest) = &manifest {
         let generation = state.generation(&manifest.generation, false)?;
         generation
             .open_file(BASELINE_FILE, JournalFileMode::Read)
             .map_err(|error| state_error("Git baseline", error))?;
-        paths.insert(format!("{DIRECTORY}/{MANIFEST_FILE}"));
+        paths.insert(format!("{DIRECTORY}/{MANIFEST_FILE}"))?;
         paths.insert(format!(
             "{DIRECTORY}/{}/{BASELINE_FILE}",
             generation_directory(&manifest.generation)?
-        ));
+        ))?;
     }
-    if read_revision(&state.directory)?.is_some() {
-        paths.insert(format!("{DIRECTORY}/{READ_REVISION_FILE}"));
+    if let Some(revision) = read_revision(&state.directory)? {
+        if revision
+            .manifest
+            .as_ref()
+            .is_some_and(|expected| manifest.as_ref() != Some(expected))
+        {
+            return Err(state_error(
+                "Git publication",
+                "completed revision differs from its active manifest",
+            ));
+        }
+        paths.insert(format!("{DIRECTORY}/{READ_REVISION_FILE}"))?;
     }
-    let result = publish(&paths.into_iter().collect::<Vec<_>>())?;
+    // Cursors have a separate lock and a monotonic ceiling, so include their
+    // current file even when the originating process's hint was lost.
+    match state
+        .directory
+        .open_file("delivery-cursor.json", JournalFileMode::Read)
+    {
+        Ok(_) => paths.insert(format!("{DIRECTORY}/delivery-cursor.json"))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(state_error("Git cursor", error)),
+    }
+    // A write-ahead entry can survive a failed artifact write. Never let Git's
+    // missing-path behavior turn that debt into removal of a committed file.
+    let mut publication = Vec::with_capacity(paths.paths.len());
+    for path in paths.paths {
+        let (name, generation) = git_artifact_parts(&path)?;
+        let file = if let Some(generation) = generation {
+            state
+                .generation(generation, false)?
+                .open_file(name, JournalFileMode::Read)
+        } else {
+            state.directory.open_file(name, JournalFileMode::Read)
+        };
+        if let Err(error) = file {
+            // An interrupted generation switch can leave intent for a baseline
+            // that never became active, or for superseding the still-active
+            // generation. Neither absent file is current recovery authority.
+            // Skip them without touching their existing Git entries, if any.
+            let abandoned_switch = manifest.as_ref().is_some_and(|active| {
+                generation.is_some_and(|generation| {
+                    (name == BASELINE_FILE && generation != active.generation.as_str())
+                        || (name == SUPERSEDED_FILE && generation == active.generation.as_str())
+                })
+            });
+            if error.kind() == io::ErrorKind::NotFound && abandoned_switch {
+                continue;
+            }
+            return Err(state_error("Git artifact", error));
+        }
+        publication.push(path);
+    }
+    let result = publish(&publication)?;
+    state.validate()?;
+    // On an error or unwind the old debt is untouched. A crash after Git's
+    // commit but before this compaction merely republishes the same paths.
+    state
+        .directory
+        .atomic_write(GIT_PENDING_FILE, |_| Ok(()))
+        .map_err(|error| state_error("Git pending completion", error))?;
     state.validate()?;
     Ok(result)
 }
@@ -1184,6 +1533,7 @@ pub fn persist_receipts(
                     params.extend(ids.iter().copied().map(Value::BigInt));
                     for row in query(conn, &sql, &params)? {
                         write_record(
+                            &state,
                             root,
                             &directory,
                             &generation,
@@ -1241,6 +1591,7 @@ pub fn persist_project_receipts(
                         let receipt = receipt(row, shared)?;
                         last_message = receipt.message_id;
                         write_record(
+                            &state,
                             root,
                             &directory,
                             &generation,
@@ -1284,6 +1635,7 @@ pub fn persist_contact(
             }
             for row in &rows {
                 write_record(
+                    &state,
                     root,
                     &directory,
                     &generation,
@@ -2307,6 +2659,283 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn git_publication_uses_durable_debt_and_retains_it_on_failure_or_unwind() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        with_archive_publication(root.path(), &[], |_| Ok(())).unwrap();
+        let journal = root.path().join(DIRECTORY).join(GIT_PENDING_FILE);
+        assert!(std::fs::read(&journal).unwrap().is_empty());
+
+        conn.execute_raw("UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41")
+            .unwrap();
+        persist_receipts(&conn, root.path(), 29, &[41]).unwrap();
+        let debt = std::fs::read(&journal).unwrap();
+        assert!(!debt.is_empty());
+        let mut first_paths = Vec::new();
+        let failure = with_archive_publication(root.path(), &[], |paths| {
+            first_paths = paths.to_vec();
+            Err::<(), _>(DbError::Internal("commit refused".to_string()))
+        });
+        assert!(failure.is_err());
+        assert_eq!(std::fs::read(&journal).unwrap(), debt);
+        assert_eq!(
+            first_paths
+                .iter()
+                .filter(|path| path.contains("/receipt-"))
+                .count(),
+            1
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_archive_publication(root.path(), &[], |_| -> DbResult<()> {
+                panic!("publication interrupted after selecting paths")
+            })
+        }));
+        assert!(panic.is_err());
+        assert_eq!(std::fs::read(&journal).unwrap(), debt);
+
+        // A second key was published after the failed attempt's hint snapshot.
+        // An empty hint list must still publish it with the latest revision.
+        conn.execute_raw(
+            "UPDATE agent_links SET status = 'blocked', updated_ts = 40 WHERE id = 93",
+        )
+        .unwrap();
+        persist_contact(&conn, root.path(), 17, 29).unwrap();
+        with_archive_publication(root.path(), &[], |paths| {
+            assert!(first_paths.iter().all(|path| paths.contains(path)));
+            assert_eq!(
+                paths
+                    .iter()
+                    .filter(|path| path.contains("/contact-"))
+                    .count(),
+                1
+            );
+            assert!(paths.contains(&format!("{DIRECTORY}/{READ_REVISION_FILE}")));
+            assert!(!paths.iter().any(|path| path.ends_with(GIT_PENDING_FILE)));
+            Ok(())
+        })
+        .unwrap();
+        assert!(std::fs::read(&journal).unwrap().is_empty());
+
+        // Healthy publications do not rescan all prior per-key artifacts.
+        conn.execute_raw("UPDATE project_mailbox_receipts SET read_ts = 777 WHERE message_id = 52")
+            .unwrap();
+        persist_receipts(&conn, root.path(), 29, &[52]).unwrap();
+        with_archive_publication(root.path(), &[], |paths| {
+            assert_eq!(
+                paths
+                    .iter()
+                    .filter(|path| path.contains("/receipt-"))
+                    .count(),
+                1
+            );
+            assert!(!paths.iter().any(|path| path.contains("/contact-")));
+            assert!(
+                !first_paths
+                    .iter()
+                    .filter(|path| path.contains("/receipt-"))
+                    .any(|path| paths.contains(path))
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn git_publication_distinguishes_abandoned_switch_intent_from_missing_authority() {
+        for scenario in [
+            "unactivated_baseline",
+            "current_superseded",
+            "current_receipt",
+            "past_superseded",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let first = database();
+            let original = ensure_checkpoint(&first, root.path()).unwrap();
+            with_archive_publication(root.path(), &[], |_| Ok(())).unwrap();
+            let generation = generation_directory(&original.generation).unwrap();
+            let missing = match scenario {
+                "unactivated_baseline" => {
+                    let replacement = database();
+                    // Fail the real replacement checkpoint after it has logged
+                    // write-ahead paths, before it can publish its baseline.
+                    replacement.execute_raw("DROP TABLE agents").unwrap();
+                    assert!(ensure_checkpoint(&replacement, root.path()).is_err());
+                    let replacement_generation = ensure_generation(&replacement).unwrap();
+                    ensure_checkpoint(&first, root.path()).unwrap();
+                    format!(
+                        "{DIRECTORY}/{}/{BASELINE_FILE}",
+                        generation_directory(&replacement_generation).unwrap()
+                    )
+                }
+                "current_superseded" => {
+                    let state = LockedState::open(root.path(), false).unwrap();
+                    let path = format!("{DIRECTORY}/{generation}/{SUPERSEDED_FILE}");
+                    append_git_pending_path(&state, &path).unwrap();
+                    path
+                }
+                "current_receipt" => {
+                    first
+                        .execute_raw(
+                            "UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41",
+                        )
+                        .unwrap();
+                    persist_receipts(&first, root.path(), 29, &[41]).unwrap();
+                    let (_, recovered) = records(root.path());
+                    let updated = recovered
+                        .iter()
+                        .find(|record| {
+                            matches!(
+                                record,
+                                RecoveryRecord::Receipt(receipt)
+                                    if receipt.message_id == 41 && receipt.ack_ts == Some(444)
+                            )
+                        })
+                        .unwrap();
+                    let path =
+                        format!("{DIRECTORY}/{generation}/{}", record_name(updated).unwrap());
+                    std::fs::rename(
+                        root.path().join(&path),
+                        root.path().join("held-receipt.json"),
+                    )
+                    .unwrap();
+                    path
+                }
+                _ => {
+                    ensure_checkpoint(&database(), root.path()).unwrap();
+                    let path = format!("{DIRECTORY}/{generation}/{SUPERSEDED_FILE}");
+                    std::fs::rename(
+                        root.path().join(&path),
+                        root.path().join("held-superseded.json"),
+                    )
+                    .unwrap();
+                    path
+                }
+            };
+            assert!(!root.path().join(&missing).exists(), "{scenario}");
+            let journal = root.path().join(DIRECTORY).join(GIT_PENDING_FILE);
+            let debt = std::fs::read(&journal).unwrap();
+            let mut published = None;
+            let result = with_archive_publication(root.path(), &[], |paths| {
+                published = Some(paths.to_vec());
+                Ok(())
+            });
+            if matches!(scenario, "unactivated_baseline" | "current_superseded") {
+                result.unwrap();
+                assert!(!published.unwrap().contains(&missing), "{scenario}");
+                assert!(read_revision_witness(root.path()).unwrap().is_some());
+            } else {
+                assert!(result.is_err(), "{scenario}");
+                assert!(published.is_none(), "{scenario}");
+                assert_eq!(std::fs::read(&journal).unwrap(), debt, "{scenario}");
+            }
+        }
+    }
+
+    #[test]
+    fn git_publication_inventories_a_checkout_without_its_runtime_outbox() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        persist_receipts(&conn, root.path(), 29, &[41, 52]).unwrap();
+        persist_contact(&conn, root.path(), 17, 29).unwrap();
+        std::fs::rename(
+            root.path().join(DIRECTORY).join(GIT_PENDING_FILE),
+            root.path().join("preserved-git-pending.jsonl"),
+        )
+        .unwrap();
+        with_archive_publication(root.path(), &[], |paths| {
+            assert_eq!(
+                paths
+                    .iter()
+                    .filter(|path| path.contains("/receipt-"))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                paths
+                    .iter()
+                    .filter(|path| path.contains("/contact-"))
+                    .count(),
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            std::fs::read(root.path().join(DIRECTORY).join(GIT_PENDING_FILE))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn git_publication_refuses_malformed_oversized_and_runtime_path_debt() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        let directory = JournalDirectory::open(root.path(), DIRECTORY, false).unwrap();
+        for bytes in [
+            b"{\"schema_version\":1,\"path\":null}".to_vec(),
+            b"not-json\n".to_vec(),
+            b"{\"schema_version\":2,\"path\":null}\n".to_vec(),
+            b"{\"schema_version\":1,\"path\":\"recovery-state/.state.lock\"}\n".to_vec(),
+            b"{\"schema_version\":1,\"path\":\"recovery-state/gvalid/../../outside\"}\n".to_vec(),
+            vec![b' '; usize::try_from(MAX_GIT_PENDING_RECORD_BYTES + 1).unwrap()],
+        ] {
+            directory
+                .atomic_write(GIT_PENDING_FILE, |file| file.write_all(&bytes))
+                .unwrap();
+            let mut published = false;
+            assert!(
+                with_archive_publication(root.path(), &[], |_| {
+                    published = true;
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert!(!published);
+            assert_eq!(
+                std::fs::read(directory.directory_path().join(GIT_PENDING_FILE)).unwrap(),
+                bytes
+            );
+        }
+        directory
+            .atomic_write(GIT_PENDING_FILE, |file| {
+                file.set_len(MAX_GIT_PENDING_BYTES + 1)
+            })
+            .unwrap();
+        assert!(with_archive_publication(root.path(), &[], |_| Ok(())).is_err());
+        assert_eq!(
+            std::fs::metadata(directory.directory_path().join(GIT_PENDING_FILE))
+                .unwrap()
+                .len(),
+            MAX_GIT_PENDING_BYTES + 1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_publication_outbox_symlink_preserves_foreign_bytes_and_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        let journal = root.path().join(DIRECTORY).join(GIT_PENDING_FILE);
+        std::fs::rename(&journal, root.path().join("preserved-git-pending.jsonl")).unwrap();
+        let foreign = root.path().join("foreign-evidence");
+        std::fs::write(&foreign, b"unchanged foreign state").unwrap();
+        std::os::unix::fs::symlink(&foreign, &journal).unwrap();
+        let before = records(root.path());
+        conn.execute_raw("UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41")
+            .unwrap();
+        assert!(persist_receipts(&conn, root.path(), 29, &[41]).is_err());
+        assert!(with_archive_publication(root.path(), &[], |_| Ok(())).is_err());
+        assert_eq!(records(root.path()), before);
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"unchanged foreign state");
     }
 
     #[cfg(unix)]
