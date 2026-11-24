@@ -23,7 +23,7 @@ production Rust, dependency manifests, and Beads status unchanged.
 | --- | --- |
 | `scripts/qualify_health_idle.mjs` | Linux black-box runner using Node built-ins; no package installation or native source hooks. |
 | `tests/test_qualify_health_idle.mjs` | Adversarial model tests of the runner's exact orchestration and verdict logic. |
-| `tests/test_qualify_health_shutdown.mjs` | Real Linux child-process controls for requested shutdown versus an earlier successful exit. |
+| `tests/test_qualify_health_shutdown.mjs` | Real Linux process controls for requested shutdown, earlier exit, and version/SQL helpers that leave background children. |
 | `tests/fixtures/gh407_agent_mail_surrogate.mjs` | Clearly labelled process/HTTP/system-SQLite surrogate for testing the runner's real adapter. |
 | `scripts/ci/qualify_issue407.py` | Exact-source native qualification driver with owned process cleanup and retained failure receipts. |
 | `tests/ci/test_qualify_issue407.py` | Adversarial source, artifact, verdict, and real process-ownership controls for the native driver. |
@@ -110,7 +110,39 @@ the original full HTTP/SQLite surrogate qualification or execute any Agent Mail
 native regression. The original longer runs above remain bound to their original
 source hash.
 
-### Historical native release preflight
+## Helper process containment correction
+
+Two actual-process adversaries demonstrated that the previous `f04b1c3b` adapter
+could accept exit 0 and valid helper output while a child remained alive in the
+helper's process group. One `--version` helper was admitted and one SQL helper
+returned `ok: true`; both children were still live after `io.cleanup()`. These
+are demonstrated harness false passes, not observed Agent Mail child leaks.
+
+Command completion now records the unexpected process-group members, performs
+bounded TERM/KILL cleanup, and preserves the original violation after cleanup.
+The cleanup waits are capped by the existing command timeout plus four-second
+terminal deadline. Version, clock, and SQL admission require an explicitly clean
+process group, complete output, and no timeout. A SQL helper process violation
+is classified as `process`, so it cannot satisfy the database/schema-failure
+witness. Existing server signal and process-identity checks remain in force.
+
+The corrected harness SHA-256 is
+`c27452ad5a7f8d0492febc03a9da0daea278f88dfc0cc875f5c3403ae98dc29f`.
+On Linux with Node 24.22.3, the full model and process suite passed **34/34**,
+zero skipped, in **5.722 seconds**. Against the frozen previous adapter, both
+new regressions failed as expected; the test then terminated the recorded
+same-birth children. Against the correction, neither test needed emergency
+cleanup. The version helper was rejected in 0.306 seconds. The SQL child ignored
+SIGTERM, required SIGKILL, and was no longer live when the call returned after
+1.274 seconds. Its brief zombie state remained visible in the receipt, which
+correctly retained `process_group_clean: false`.
+
+These controls measure the helper's original process group. They do not prove
+containment of arbitrary children that create a new session and escape that
+group. The outer native driver provides additional descendant tracking; finite
+process observations remain separate from absolute lifetime guarantees.
+
+### Historical native release preflight and execution
 
 The official v0.3.41 Linux GNU archive was downloaded and verified against its
 signed checksum manifest. Both the manifest signature and authenticated trusted
@@ -128,12 +160,45 @@ release and checksum file, not a source commit; the observed tag separately
 resolved to `6eca1c4dfeb9b1eedb2ff3ebb06faef23018342c`. Its published portable
 feature selection also differs from the default-feature current-source lane.
 
-No historical HTTP server or black-box qualification was started. Before that
-stage, `/tmp` free space fell to 510,918,656 bytes, below the unchanged 2 GiB
-reserve, and the executor became unavailable. After restoration the extracted
-binary was absent. The completed preflight measurements are preserved in the
-session transcript; recovered raw historical receipts are not claimed. This is
-neither a measured historical idle reproduction nor a current-main native pass.
+That first preflight attempt ended before any HTTP server started: `/tmp` free
+space fell to 510,918,656 bytes, below the unchanged 2 GiB reserve, and the
+executor became unavailable. The extracted binary was absent after restoration.
+The first attempt's measurements remain transcript evidence.
+
+A subsequent attempt reauthenticated the release and ran the unchanged
+`f04b1c3b` harness against a fresh synthetic mailbox. Times below are relative
+to the harness orchestration start:
+
+| Historical native observation | Measured result |
+| --- | --- |
+| First actual HTTP response | 503, `database_initializing`, at 2.8895 seconds. |
+| Startup readiness | Later responses included `database_probe_pending` and `lexical_unverified`; these are not the reported idle-staleness failure. |
+| First ready response | HTTP 200 with all three capability flags true at 11.7873 seconds. |
+| Fresh MCP database operation | `ensure_project` succeeded at 11.8539 seconds. |
+| Idle intervals, schema faults, and recovery cases | Zero executed; no `database_probe_stale` response observed. |
+| Shutdown after interruption | SIGTERM sent, exit 0, no forced kill or surviving process-group members, listener closed, files quiet. |
+| Final binary identity | Matched the authenticated executable hash. |
+
+The outer runner interrupted the command after **18.3736 seconds** because
+shared free disk crossed its 2 GiB reserve. Its receipt records exit 2,
+`INCOMPLETE`, `termination_reason: disk_budget`, no forced termination, and no
+remaining processes. The harness also retained `INCOMPLETE`: baseline burst and
+warmup had not completed, despite the observed 200 response and successful MCP
+operation. No retry was admitted below the reserve. At inspection, the entire
+synthetic fixture allocated 864,256 bytes; the much larger reduction in shared
+free space remains unattributed.
+
+The raw native report SHA-256 is
+`ea28418d8deed2a5049a9c8571a6dbbe209fd8f979648b810833b7dad6e46152`.
+Its raw report, logs, launch settings, resource samples, signed release
+manifests, synthetic fixture and controller receipts were retained in a verified
+80-file evidence archive. The auxiliary acquisition controller's first summary
+hit an `AttributeError` on a null pre-listener response after the harness had
+returned; a separate null-safe inspection preserved the original result and
+logs. This establishes historical native startup, MCP compatibility, and clean
+shutdown under interruption. It establishes neither an idle reproduction nor
+outage/recovery/resource-bound qualification, and is not a current-main native
+pass. It also predates the `c27452ad` helper-containment correction.
 
 ## What the source review establishes
 

@@ -403,6 +403,7 @@ async function fingerprintTree(directories) {
 }
 function captureProcess(argv, env, cwd, destination, timeoutSeconds) {
   return new Promise((resolve, reject) => {
+    const terminalDeadline = nativeNow() + timeoutSeconds + 4;
     const child = spawn(argv[0], argv.slice(1), {env, cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe']});
     child.qualificationStart = procStat(child.pid)?.start;
     let stdout = '', stderr = '', size = 0, timedOut = false, truncated = false, spawnError = null, finished = false;
@@ -414,14 +415,36 @@ function captureProcess(argv, env, cwd, destination, timeoutSeconds) {
     };
     child.stdout?.on('data', collect('stdout')); child.stderr?.on('data', collect('stderr'));
     let killer, terminal;
-    const finish = (code, signal, drainIncomplete = false) => {
+    const finish = async (code, signal, drainIncomplete = false) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer); clearTimeout(killer); clearTimeout(terminal);
-      const result = {argv, exit_code: code, signal, timed_out: timedOut, truncated,
-        drain_incomplete: drainIncomplete, remaining_group_pids: groupMembers(child.pid).map(p => p.pid),
-        spawn_error: spawnError, stdout, stderr};
       try {
+        const afterExit = groupMembers(child.pid);
+        const unexpected = afterExit.filter(p => p.pid !== child.pid).map(p => p.pid);
+        const liveGroup = () => groupMembers(child.pid).some(p => !['Z', 'X', 'x'].includes(p.state));
+        let forcedCleanup = false, cleanupError = null;
+        // Pipe closure can precede the end of a helper's background work.
+        // Retain that violation even when bounded cleanup succeeds.
+        if (liveGroup()) {
+          try {
+            signalOwnedGroup(child, 'SIGTERM');
+            const grace = Math.min(nativeNow() + 1, terminalDeadline);
+            while (liveGroup() && nativeNow() < grace) await delay(0.02);
+            if (liveGroup()) {
+              forcedCleanup = true;
+              signalOwnedGroup(child, 'SIGKILL');
+              const drain = Math.min(nativeNow() + 1, terminalDeadline);
+              while (liveGroup() && nativeNow() < drain) await delay(0.02);
+            }
+          } catch (error) { cleanupError = String(error); }
+        }
+        const remaining = groupMembers(child.pid).map(p => p.pid);
+        const result = {argv, exit_code: code, signal, timed_out: timedOut, truncated,
+          drain_incomplete: drainIncomplete, unexpected_group_pids: unexpected,
+          remaining_group_pids: remaining, forced_cleanup: forcedCleanup, cleanup_error: cleanupError,
+          process_group_clean: unexpected.length === 0 && remaining.length === 0 && !cleanupError,
+          spawn_error: spawnError, stdout, stderr};
         fs.writeFileSync(destination, JSON.stringify(result, null, 2) + '\n', {flag: 'wx', mode: 0o600});
         resolve(result);
       } catch (error) { reject(new QualificationError('Cannot persist command receipt: ' + error, 'INCOMPLETE')); }
@@ -511,12 +534,15 @@ export async function makeNodeIO(binary, outputDirectory, options = {}) {
       const clock = await captureProcess(['/usr/bin/getconf', 'CLK_TCK'], env, directory,
         path.join(directory, 'clock.json'), cfg.commandTimeout);
       const ticksPerSecond = Number(clock.stdout.trim());
-      need(clock.exit_code === 0 && ticksPerSecond > 0, 'Cannot establish Linux CPU clock frequency');
+      need(clock.exit_code === 0 && !clock.timed_out && !clock.drain_incomplete && !clock.truncated
+        && clock.process_group_clean === true && ticksPerSecond > 0,
+        'Cannot establish Linux CPU clock frequency from a clean helper');
       const version = await captureProcess([binaryPath, '--version'], env, path.join(directory, 'cwd'),
         path.join(directory, 'version.json'), cfg.commandTimeout);
       identity.version_output = version.stdout.trim();
       need(!io.cancelled, 'Qualification interrupted by ' + io.cancelled);
-      need(version.exit_code === 0 && !version.timed_out && !version.drain_incomplete,
+      need(version.exit_code === 0 && !version.timed_out && !version.drain_incomplete && !version.truncated
+        && version.process_group_clean === true,
         'Supplied binary version command did not complete cleanly');
       const logFd = fs.openSync(path.join(directory, 'server.log'), 'wx', 0o600);
       const child = spawn(binaryPath, argv.slice(1), {env, cwd: path.join(directory, 'cwd'), detached: true, stdio: ['ignore', 'pipe', 'pipe']});
@@ -618,9 +644,10 @@ export async function makeNodeIO(binary, outputDirectory, options = {}) {
             path.join(directory, 'cwd'), filename, cfg.commandTimeout);
           const parsed = parseJson(result.stdout);
           const ok = result.exit_code === 0 && !result.timed_out && !result.truncated
+            && !result.drain_incomplete && result.process_group_clean === true
             && (kind === 'query' ? Array.isArray(parsed) : parsed?.ok === true);
           return {ok, rows: kind === 'query' && ok ? parsed : undefined,
-            error_kind: ok ? null : errorKind(result.stdout + '\n' + result.stderr), receipt: filename,
+            error_kind: ok ? null : result.process_group_clean !== true ? 'process' : errorKind(result.stdout + '\n' + result.stderr), receipt: filename,
             detail: ok ? undefined : result};
         },
         async suspend() {
