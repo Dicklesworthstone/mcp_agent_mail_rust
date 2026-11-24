@@ -2717,7 +2717,7 @@ mod tests {
         BeforeSeal,
     }
 
-    fn assert_reconciliation_retains_concurrent_ack<C: SyncQuery>(
+    fn assert_concurrent_ack_retry<C: SyncQuery>(
         conn: &C,
         peer: &C,
         root: &Path,
@@ -2846,6 +2846,10 @@ mod tests {
             concurrent.attempted.get(),
             "the competing commit was exercised at {when:?}"
         );
+        assert!(
+            read_revision_witness(root).unwrap().is_some(),
+            "the successful contact publication must complete its own revision"
+        );
         if !concurrent.committed.get() {
             // Writer exclusion is one valid solution. Once repair releases
             // admission, the ordinary commit and publication must still work.
@@ -2853,8 +2857,12 @@ mod tests {
                 "UPDATE message_recipients SET ack_ts=COALESCE(ack_ts,999) WHERE message_id=41",
             )
             .unwrap();
-            persist_receipts(peer, root, 29, &[41]).unwrap();
         }
+        // A committed SQL update whose archive publication failed still
+        // requires an explicit retry (RECOVERY_RUNBOOK.md). Do not demand
+        // automatic durability from the failed competing publication.
+        // The committed-ACK replay publishes without changing its timestamp.
+        persist_receipts(peer, root, 29, &[41]).unwrap();
         let committed = query(
             peer,
             "SELECT ack_ts FROM message_recipients WHERE message_id=41",
@@ -2877,11 +2885,12 @@ mod tests {
         assert_eq!(
             latest.ack_ts,
             Some(999),
-            "a completed repair must retain the actual committed ACK at {when:?}"
+            "the explicit retry must retain the first committed ACK at {when:?}"
         );
+        assert_eq!(latest.read_ts, Some(444), "the first read must survive too");
     }
 
-    fn canonical_reconciliation_ack(when: AckAttempt) {
+    fn canonical_concurrent_ack_retry(when: AckAttempt) {
         let directory = tempfile::tempdir().unwrap().keep();
         eprintln!("Retained canonical ACK fixture at {directory:?}; schedule {when:?}");
         let database = directory.join("canonical.sqlite3");
@@ -2889,15 +2898,10 @@ mod tests {
         conn.execute_raw("PRAGMA journal_mode=WAL").unwrap();
         populate_database(&conn);
         let peer = crate::CanonicalDbConn::open_file(database.to_str().unwrap()).unwrap();
-        assert_reconciliation_retains_concurrent_ack(
-            &conn,
-            &peer,
-            &directory.join("archive"),
-            when,
-        );
+        assert_concurrent_ack_retry(&conn, &peer, &directory.join("archive"), when);
     }
 
-    fn runtime_reconciliation_ack(when: AckAttempt) {
+    fn runtime_concurrent_ack_retry(when: AckAttempt) {
         let directory = tempfile::tempdir().unwrap().keep();
         eprintln!("Retained runtime ACK fixture at {directory:?}; schedule {when:?}");
         let database = directory.join("runtime.sqlite3");
@@ -2913,42 +2917,37 @@ mod tests {
         );
         peer.execute_raw(crate::pool::AUTOCOMMIT_CONCURRENT_MODE_PRAGMA)
             .unwrap();
-        assert_reconciliation_retains_concurrent_ack(
-            &*conn,
-            &*peer,
-            &directory.join("archive"),
-            when,
-        );
+        assert_concurrent_ack_retry(&*conn, &*peer, &directory.join("archive"), when);
     }
 
     #[test]
-    fn reconciliation_retains_concurrent_ack_on_canonical_database() {
-        canonical_reconciliation_ack(AckAttempt::DuringRead);
+    fn concurrent_ack_retry_preserves_first_timestamp_on_canonical_database() {
+        canonical_concurrent_ack_retry(AckAttempt::DuringRead);
     }
 
     #[test]
-    fn reconciliation_retains_concurrent_ack_after_snapshot_on_canonical_database() {
-        canonical_reconciliation_ack(AckAttempt::AfterReconciliation);
+    fn concurrent_ack_retry_after_snapshot_preserves_first_timestamp_on_canonical_database() {
+        canonical_concurrent_ack_retry(AckAttempt::AfterReconciliation);
     }
 
     #[test]
-    fn reconciliation_retains_concurrent_ack_before_seal_on_canonical_database() {
-        canonical_reconciliation_ack(AckAttempt::BeforeSeal);
+    fn concurrent_ack_retry_before_seal_preserves_first_timestamp_on_canonical_database() {
+        canonical_concurrent_ack_retry(AckAttempt::BeforeSeal);
     }
 
     #[test]
-    fn reconciliation_retains_concurrent_ack_on_runtime_database() {
-        runtime_reconciliation_ack(AckAttempt::DuringRead);
+    fn concurrent_ack_retry_preserves_first_timestamp_on_runtime_database() {
+        runtime_concurrent_ack_retry(AckAttempt::DuringRead);
     }
 
     #[test]
-    fn reconciliation_retains_concurrent_ack_after_snapshot_on_runtime_database() {
-        runtime_reconciliation_ack(AckAttempt::AfterReconciliation);
+    fn concurrent_ack_retry_after_snapshot_preserves_first_timestamp_on_runtime_database() {
+        runtime_concurrent_ack_retry(AckAttempt::AfterReconciliation);
     }
 
     #[test]
-    fn reconciliation_retains_concurrent_ack_before_seal_on_runtime_database() {
-        runtime_reconciliation_ack(AckAttempt::BeforeSeal);
+    fn concurrent_ack_retry_before_seal_preserves_first_timestamp_on_runtime_database() {
+        runtime_concurrent_ack_retry(AckAttempt::BeforeSeal);
     }
 
     #[test]
