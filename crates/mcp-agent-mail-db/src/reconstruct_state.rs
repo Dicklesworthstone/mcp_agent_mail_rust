@@ -429,7 +429,7 @@ pub(crate) fn restore(
     let publication_before = crate::recovery_state::read_revision_witness(storage_root)
         .ok()
         .flatten();
-    let manifest = crate::recovery_state::visit_records(storage_root, |record| {
+    let records = crate::recovery_state::visit_records_with_inventory(storage_root, |record| {
         match record {
             RecoveryRecord::Project(project) => {
                 let recovered_id = resolve_project(conn, &project)?;
@@ -464,6 +464,7 @@ pub(crate) fn restore(
         }
         Ok(())
     })?;
+    let (manifest, inventory) = records.unzip();
     if manifest.as_ref() != expected_manifest {
         return Err(error(
             "active checkpoint changed between identity discovery and state replay",
@@ -478,6 +479,17 @@ pub(crate) fn restore(
             before.matches_manifest(manifest) && publication_after.as_ref() == Some(before)
         })
     });
+    if restored.checkpoint_complete
+        && !publication_before.as_ref().is_some_and(|before| {
+            inventory
+                .as_ref()
+                .is_some_and(|inventory| before.matches_inventory(inventory))
+        })
+    {
+        return Err(error(
+            "incremental recovery records differ from the completed publication",
+        ));
+    }
     if reset_cursors {
         restored.cursor_reset_floor = reset_archive_cursors(conn, storage_root)?;
     } else {
@@ -1029,6 +1041,152 @@ mod tests {
             assert_eq!(reconstructed_receipt_state(&candidate), (2, None, None));
             std::fs::write(&revision, &complete_revision).unwrap();
         }
+    }
+
+    #[test]
+    fn sealed_archive_rejects_missing_and_stale_receipts_and_contact_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("archive");
+        archive(&root);
+        let source = directory.path().join("original.sqlite3");
+        crate::reconstruct::reconstruct_from_archive(&source, &root).unwrap();
+        let conn = CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+        conn.execute_raw(
+            "UPDATE message_recipients SET read_ts=100 WHERE message_id=4000 AND agent_id=121; \
+             INSERT INTO agent_links(a_project_id,a_agent_id,b_project_id,b_agent_id,status,reason,created_ts,updated_ts) \
+             VALUES(41,120,41,121,'approved','initial',10,20);",
+        )
+        .unwrap();
+        let manifest = crate::recovery_state::ensure_checkpoint(&conn, &root).unwrap();
+        record_issued_cursor(&root, 70_000).unwrap();
+        crate::recovery_state::persist_receipts(&conn, &root, 121, &[4000]).unwrap();
+        crate::recovery_state::persist_contact(&conn, &root, 120, 121).unwrap();
+        let generation = root
+            .join(CURSOR_DIRECTORY)
+            .join(format!("g{}", manifest.generation));
+        let record_path = |prefix: &str| {
+            std::fs::read_dir(&generation)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(prefix)
+                })
+                .unwrap()
+        };
+        let direct_path = record_path("receipt-");
+        let contact_path = record_path("contact-");
+        let stale_direct = std::fs::read(&direct_path).unwrap();
+        let stale_contact = std::fs::read(&contact_path).unwrap();
+        conn.execute_raw(
+            "UPDATE message_recipients SET ack_ts=200 WHERE message_id=4000 AND agent_id=121; \
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) VALUES(4001,121,300,400); \
+             UPDATE agent_links SET status='blocked',reason='latest block',updated_ts=15;",
+        )
+        .unwrap();
+        crate::recovery_state::persist_receipts(&conn, &root, 121, &[4000, 4001]).unwrap();
+        crate::recovery_state::persist_contact(&conn, &root, 120, 121).unwrap();
+        let shared_path = std::fs::read_dir(&generation)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path != &direct_path
+                    && path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("receipt-")
+            })
+            .unwrap();
+        let revision_path = root.join(CURSOR_DIRECTORY).join("read-revision.json");
+        let complete_revision = std::fs::read(&revision_path).unwrap();
+        drop(conn);
+        std::fs::rename(&source, directory.path().join("quarantined.sqlite3")).unwrap();
+
+        let complete = directory.path().join("complete.sqlite3");
+        let stats = crate::reconstruct::reconstruct_from_archive(&complete, &root).unwrap();
+        stats.require_recovery_state().unwrap();
+        assert!(stats.has_receipt_state());
+        assert_eq!(
+            reconstructed_receipt_state(&complete),
+            (2, Some(200), Some(400))
+        );
+        let probe = CanonicalDbConn::open_file(complete.to_str().unwrap()).unwrap();
+        let contacts = probe
+            .query_sync(
+                "SELECT status FROM agent_links WHERE a_agent_id=120 AND b_agent_id=121",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            contacts[0].get_named::<String>("status").unwrap(),
+            "blocked"
+        );
+        drop(probe);
+
+        for (label, path, stale) in [
+            ("missing-direct", &direct_path, None),
+            ("missing-shared", &shared_path, None),
+            ("missing-block", &contact_path, None),
+            ("stale-direct", &direct_path, Some(stale_direct.as_slice())),
+            (
+                "stale-approval",
+                &contact_path,
+                Some(stale_contact.as_slice()),
+            ),
+        ] {
+            let current = std::fs::read(path).unwrap();
+            std::fs::rename(
+                path,
+                directory.path().join(format!("{label}-preserved.json")),
+            )
+            .unwrap();
+            if let Some(bytes) = stale {
+                std::fs::write(path, bytes).unwrap();
+            }
+            let candidate = directory.path().join(format!("{label}.sqlite3"));
+            let failure = crate::reconstruct::reconstruct_from_archive(&candidate, &root)
+                .expect_err("a surviving completed witness cannot authorize a damaged record set");
+            assert!(
+                failure
+                    .to_string()
+                    .contains("record count or contents differ"),
+                "{label}: {failure}"
+            );
+            assert_eq!(
+                std::fs::read(&revision_path).unwrap(),
+                complete_revision,
+                "read-only reconstruction preserves the original completed evidence",
+            );
+            std::fs::write(path, current).unwrap();
+        }
+
+        // Version 1 has no inventory evidence. Its valid history is still
+        // inspectable, but it cannot authorize receipt filters or promotion.
+        let mut legacy: serde_json::Value = serde_json::from_slice(&complete_revision).unwrap();
+        let fields = legacy.as_object_mut().unwrap();
+        fields.insert("schema_version".to_string(), serde_json::json!(1));
+        fields.remove("inventory");
+        fields.remove("pending_record");
+        std::fs::write(&revision_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let legacy_candidate = directory.path().join("legacy.sqlite3");
+        let stats = crate::reconstruct::reconstruct_from_archive(&legacy_candidate, &root).unwrap();
+        assert_eq!(
+            reconstructed_receipt_state(&legacy_candidate),
+            (2, Some(200), Some(400))
+        );
+        assert!(stats.recovery_checkpoint_present);
+        assert!(!stats.recovery_checkpoint_complete);
+        assert!(!stats.has_receipt_state());
+        assert!(stats.require_recovery_state().is_err());
+        std::fs::write(&revision_path, complete_revision).unwrap();
+        let restored = directory.path().join("restored.sqlite3");
+        crate::reconstruct::reconstruct_from_archive(&restored, &root)
+            .unwrap()
+            .require_recovery_state()
+            .unwrap();
     }
 
     #[test]

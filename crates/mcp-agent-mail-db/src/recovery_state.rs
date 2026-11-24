@@ -31,6 +31,7 @@ const GIT_PENDING_FILE: &str = ".git-pending.jsonl";
 const MAX_GIT_PENDING_RECORD_BYTES: u64 = 1024;
 const MAX_GIT_PENDING_BYTES: u64 = 64 * 1024 * 1024;
 const SCHEMA_VERSION: u32 = 1;
+const READ_REVISION_VERSION: u32 = 2;
 const BATCH_ROWS: usize = 256;
 const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_READ_REVISION_BYTES: u64 = 4096;
@@ -39,6 +40,16 @@ const ERROR_PREFIX: &str = "archive recovery state ";
 
 static PENDING_ARCHIVE_PATHS: LazyLock<Mutex<BTreeMap<PathBuf, BTreeSet<String>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_RECORD_INTENT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_RECORD_REPLACE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_CHECKPOINT_ACTIVATION_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Hand completed state artifacts to the normal Git commit coalescer.
 ///
@@ -133,6 +144,7 @@ pub struct Manifest {
 pub struct RecoveryReadWitness {
     manifest: Manifest,
     revision: String,
+    inventory: IncrementalInventory,
 }
 
 impl RecoveryReadWitness {
@@ -145,6 +157,65 @@ impl RecoveryReadWitness {
     pub(crate) fn matches_manifest(&self, manifest: &Manifest) -> bool {
         &self.manifest == manifest
     }
+
+    pub(crate) fn matches_inventory(&self, inventory: &IncrementalInventory) -> bool {
+        &self.inventory == inventory
+    }
+}
+
+/// Order-independent omission/corruption checksum over the current incremental
+/// files. Each contribution is SHA-256 of its filename and exact bytes; count
+/// distinguishes an omitted record even if its contribution were all zero.
+/// This XOR accumulator is not an authenticated or collision-resistant
+/// commitment against adversarially chosen sets. It protects partial/damaged
+/// archives while keeping normal publication proportional to the changed keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IncrementalInventory {
+    generation: String,
+    count: u64,
+    xor_sha256: [u8; 32],
+}
+
+impl IncrementalInventory {
+    fn empty(generation: &str) -> Self {
+        Self {
+            generation: generation.to_string(),
+            count: 0,
+            xor_sha256: [0; 32],
+        }
+    }
+
+    fn replace(&mut self, before: Option<&[u8; 32]>, after: &[u8; 32]) -> DbResult<()> {
+        if let Some(before) = before {
+            if self.count == 0 {
+                return Err(state_error(
+                    "incremental inventory",
+                    "replacement has no recorded key",
+                ));
+            }
+            for (sum, byte) in self.xor_sha256.iter_mut().zip(before) {
+                *sum ^= *byte;
+            }
+        } else {
+            self.count = self
+                .count
+                .checked_add(1)
+                .ok_or_else(|| state_error("incremental inventory", "record count overflow"))?;
+        }
+        for (sum, byte) in self.xor_sha256.iter_mut().zip(after) {
+            *sum ^= *byte;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingRecord {
+    name: String,
+    before: Option<[u8; 32]>,
+    after: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +227,14 @@ struct ReadRevision {
     /// None invalidates old snapshots before any journal record can change.
     /// An interrupted publication stays uncacheable until a successful retry.
     manifest: Option<Manifest>,
+    /// The previous complete set, advanced only after a changed file is durable.
+    /// During a generation switch this may still belong to the prior manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inventory: Option<IncrementalInventory>,
+    /// A single write-ahead transition: on interruption the file must match its
+    /// exact before or after checksum before any later writer may complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_record: Option<PendingRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -284,6 +363,16 @@ fn read_json_bounded<T: serde::de::DeserializeOwned>(
     name: &str,
     limit: u64,
 ) -> DbResult<Option<T>> {
+    read_bytes_bounded(directory, name, limit)?
+        .map(|bytes| serde_json::from_slice(&bytes).map_err(|error| state_error("decode", error)))
+        .transpose()
+}
+
+fn read_bytes_bounded(
+    directory: &JournalDirectory,
+    name: &str,
+    limit: u64,
+) -> DbResult<Option<Vec<u8>>> {
     let mut file = match directory.open_file(name, JournalFileMode::Read) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -300,9 +389,7 @@ fn read_json_bounded<T: serde::de::DeserializeOwned>(
     directory
         .validate_file(name, &file)
         .map_err(|error| state_error("read binding", error))?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| state_error("decode", error))
+    Ok(Some(bytes))
 }
 
 fn validate_manifest(manifest: &Manifest) -> DbResult<()> {
@@ -336,8 +423,41 @@ fn read_revision(directory: &JournalDirectory) -> DbResult<Option<ReadRevision>>
     if let Some(revision) = &revision {
         generation_directory(&revision.generation)?;
         generation_directory(&revision.revision)?;
-        if revision.schema_version != SCHEMA_VERSION {
-            return Err(state_error("read revision", "unsupported schema version"));
+        match revision.schema_version {
+            1 if revision.inventory.is_none() && revision.pending_record.is_none() => {}
+            READ_REVISION_VERSION => {
+                let inventory = revision.inventory.as_ref().ok_or_else(|| {
+                    state_error("read revision", "incremental inventory is missing")
+                })?;
+                generation_directory(&inventory.generation)?;
+                if inventory.count == 0 && inventory.xor_sha256 != [0; 32] {
+                    return Err(state_error(
+                        "read revision",
+                        "empty incremental inventory has a nonempty checksum",
+                    ));
+                }
+                if let Some(pending) = &revision.pending_record {
+                    validate_incremental_name(&pending.name)?;
+                    if pending.before.as_ref() == Some(&pending.after)
+                        || (pending.before.is_some() && inventory.count == 0)
+                    {
+                        return Err(state_error(
+                            "read revision",
+                            "invalid pending record transition",
+                        ));
+                    }
+                }
+                if revision.manifest.is_some()
+                    && (inventory.generation != revision.generation
+                        || revision.pending_record.is_some())
+                {
+                    return Err(state_error(
+                        "read revision",
+                        "completed inventory differs from its generation or has pending writes",
+                    ));
+                }
+            }
+            _ => return Err(state_error("read revision", "unsupported schema version")),
         }
         if let Some(manifest) = &revision.manifest {
             validate_manifest(manifest)?;
@@ -355,9 +475,9 @@ fn read_revision(directory: &JournalDirectory) -> DbResult<Option<ReadRevision>>
 /// Read a constant-size cache witness without changing files or walking
 /// journal history.
 ///
-/// A missing revision (older archives) or pending publication
-/// returns `None`: callers may rebuild for inspection but must not reuse a
-/// cached receipt snapshot. Malformed, unreadable or mismatched metadata is an
+/// A missing or unsealed legacy revision, or pending publication, returns
+/// `None`: callers may rebuild for inspection but must not reuse a cached
+/// receipt snapshot. Malformed, unreadable or mismatched metadata is an
 /// error, never evidence that a previously cached snapshot remains current.
 pub fn read_revision_witness(root: &Path) -> DbResult<Option<RecoveryReadWitness>> {
     let directory = match JournalDirectory::open(root, DIRECTORY, false) {
@@ -368,7 +488,7 @@ pub fn read_revision_witness(root: &Path) -> DbResult<Option<RecoveryReadWitness
     let Some(before) = read_revision(&directory)? else {
         return Ok(None);
     };
-    let Some(expected_manifest) = &before.manifest else {
+    let (Some(expected_manifest), Some(inventory)) = (&before.manifest, &before.inventory) else {
         return Ok(None);
     };
     let manifest =
@@ -386,7 +506,8 @@ pub fn read_revision_witness(root: &Path) -> DbResult<Option<RecoveryReadWitness
     }
     Ok(Some(RecoveryReadWitness {
         manifest,
-        revision: before.revision,
+        revision: before.revision.clone(),
+        inventory: inventory.clone(),
     }))
 }
 
@@ -406,7 +527,7 @@ fn with_read_revision<T>(
     conn: &impl SyncQuery,
     root: &Path,
     generation: &str,
-    publish: impl FnOnce() -> DbResult<T>,
+    publish: impl FnOnce(&mut ReadRevision) -> DbResult<T>,
 ) -> DbResult<T> {
     // Validate existing authority before writing even an invalidation marker.
     // In particular, a malformed manifest must retain its original evidence.
@@ -426,30 +547,64 @@ fn with_read_revision<T>(
     let reconcile_pending = active.is_some()
         && previous_revision
             .as_ref()
-            .is_none_or(|revision| revision.manifest.is_none());
+            .is_none_or(|revision| revision.manifest.is_none() || revision.inventory.is_none());
+    let inventory = publication_inventory(
+        state,
+        active.as_ref(),
+        generation,
+        previous_revision.as_ref(),
+    )?;
     let mut revision = ReadRevision {
-        schema_version: SCHEMA_VERSION,
+        schema_version: READ_REVISION_VERSION,
         generation: generation.to_string(),
         revision: mcp_agent_mail_core::setup::generate_token()
             .map_err(|error| state_error("read revision token", error))?,
         manifest: None,
+        inventory: Some(inventory),
+        pending_record: None,
     };
     ensure_git_pending_journal(state)?;
     write_revision(state, &revision)?;
-    if reconcile_pending {
-        // A successful write to a different key must not erase evidence that
-        // an earlier receipt/contact publication stopped partway through.
-        // Reconcile all mutable state only after an interrupted or legacy
-        // publication; the healthy selected-key path remains bounded.
-        reconcile_incomplete_publication(state, conn, root, generation)?;
+    let manifest = checkpoint_locked(state, conn, root, generation)?;
+    #[cfg(test)]
+    if active
+        .as_ref()
+        .is_none_or(|active| active.generation != manifest.generation)
+    {
+        let hook = AFTER_CHECKPOINT_ACTIVATION_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
-    let result = publish()?;
+    if revision
+        .inventory
+        .as_ref()
+        .is_none_or(|inventory| inventory.generation != manifest.generation)
+    {
+        // A newly activated baseline contains all initial state. Generation
+        // validation already refused any preexisting incremental records.
+        revision.inventory = Some(IncrementalInventory::empty(&manifest.generation));
+        write_revision(state, &revision)?;
+    }
+    if reconcile_pending {
+        // The expected inventory was verified before reconciliation. A later
+        // successful write must neither hide missing old records nor forget an
+        // earlier receipt/contact publication that stopped partway through.
+        reconcile_incomplete_publication(state, conn, root, generation, &mut revision)?;
+    }
+    let result = publish(&mut revision)?;
     let manifest = read_manifest(&state.directory)?
         .ok_or_else(|| state_error("read revision", "publication has no active checkpoint"))?;
-    if manifest.generation != generation {
+    if manifest.generation != generation
+        || revision
+            .inventory
+            .as_ref()
+            .is_none_or(|inventory| inventory.generation != generation)
+        || revision.pending_record.is_some()
+    {
         return Err(state_error(
             "read revision",
-            "publication changed the active database generation",
+            "publication changed the active database generation or left a pending record",
         ));
     }
     revision.manifest = Some(manifest);
@@ -632,6 +787,137 @@ fn encode_record(generation: &str, mut record: RecoveryRecord) -> DbResult<Vec<u
         return Err(state_error("encode", "record exceeds bounded size limit"));
     }
     Ok(bytes)
+}
+
+fn validate_incremental_name(name: &str) -> DbResult<()> {
+    let digest = name
+        .strip_prefix("receipt-")
+        .or_else(|| name.strip_prefix("contact-"))
+        .and_then(|suffix| suffix.strip_suffix(".json"));
+    if !digest.is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(state_error(
+            "record identity",
+            "invalid incremental record filename",
+        ));
+    }
+    Ok(())
+}
+
+fn incremental_digest(name: &str, bytes: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"agent-mail-recovery-incremental-v1\0");
+    digest.update(name.as_bytes());
+    digest.update([0]);
+    digest.update(bytes);
+    digest.finalize().into()
+}
+
+fn read_incremental_record(
+    directory: &JournalDirectory,
+    name: &str,
+    generation: &str,
+) -> DbResult<Option<(RecordDocument, [u8; 32])>> {
+    validate_incremental_name(name)?;
+    let Some(bytes) = read_bytes_bounded(directory, name, MAX_RECORD_BYTES)? else {
+        return Ok(None);
+    };
+    let document: RecordDocument =
+        serde_json::from_slice(&bytes).map_err(|error| state_error("record decode", error))?;
+    validate_document(&document, generation)?;
+    if record_name(&document.record)? != name {
+        return Err(state_error(
+            "record identity",
+            "record does not match its filename",
+        ));
+    }
+    Ok(Some((document, incremental_digest(name, &bytes))))
+}
+
+fn verify_incremental_inventory(
+    directory: &JournalDirectory,
+    expected: &IncrementalInventory,
+) -> DbResult<()> {
+    let actual = visit_incremental_records(directory, &expected.generation, &mut |_| Ok(()))?;
+    if actual != *expected {
+        return Err(state_error(
+            "incremental inventory",
+            "record count or contents differ from the sealed publication",
+        ));
+    }
+    Ok(())
+}
+
+/// Preserve the last expected set when resuming an interrupted writer. Only its
+/// last write-ahead record can be in either state; all other keys must still
+/// match the previous seal. Reconciliation must never bless a partial copy.
+fn publication_inventory(
+    state: &LockedState,
+    active: Option<&Manifest>,
+    generation: &str,
+    previous: Option<&ReadRevision>,
+) -> DbResult<IncrementalInventory> {
+    let Some(active) = active else {
+        if previous.is_some_and(|revision| {
+            revision.pending_record.is_some()
+                || revision
+                    .inventory
+                    .as_ref()
+                    .is_some_and(|inventory| inventory.count != 0)
+        }) {
+            return Err(state_error(
+                "incremental inventory",
+                "incremental authority exists without its active checkpoint",
+            ));
+        }
+        return Ok(IncrementalInventory::empty(generation));
+    };
+    let directory = state.generation(&active.generation, false)?;
+    let Some(previous) = previous.filter(|revision| revision.inventory.is_some()) else {
+        // Version 1 recorded no per-key completeness evidence. Import its
+        // existing valid files, then reconcile the live database before sealing.
+        return visit_incremental_records(&directory, &active.generation, &mut |_| Ok(()));
+    };
+    let mut inventory = previous
+        .inventory
+        .clone()
+        .ok_or_else(|| state_error("incremental inventory", "previous seal is missing"))?;
+    if inventory.generation != active.generation {
+        // A switch can publish its new baseline before the pending revision is
+        // advanced. No incremental write is admitted until that advancement.
+        if previous.manifest.is_some()
+            || previous.pending_record.is_some()
+            || previous.generation != active.generation
+        {
+            return Err(state_error(
+                "incremental inventory",
+                "pending inventory does not cover the active generation",
+            ));
+        }
+        inventory = IncrementalInventory::empty(&active.generation);
+        verify_incremental_inventory(&directory, &inventory)?;
+        return Ok(inventory);
+    }
+    if let Some(pending) = &previous.pending_record {
+        let current = read_incremental_record(&directory, &pending.name, &inventory.generation)?
+            .map(|(_, digest)| digest);
+        if current.as_ref() == Some(&pending.after) {
+            inventory.replace(pending.before.as_ref(), &pending.after)?;
+        } else if current != pending.before {
+            return Err(state_error(
+                "incremental inventory",
+                "interrupted record matches neither its before nor after contents",
+            ));
+        }
+    }
+    if previous.manifest.is_none() {
+        verify_incremental_inventory(&directory, &inventory)?;
+    }
+    Ok(inventory)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -925,17 +1211,12 @@ fn write_record(
     root: &Path,
     directory: &JournalDirectory,
     generation: &str,
+    revision: &mut ReadRevision,
     mut record: RecoveryRecord,
 ) -> DbResult<()> {
     let name = record_name(&record)?;
-    if let Some(previous) = read_json::<RecordDocument>(directory, &name)? {
-        validate_document(&previous, generation)?;
-        if record_name(&previous.record)? != name {
-            return Err(state_error(
-                "record",
-                "stored identity does not match its filename",
-            ));
-        }
+    let previous = read_incremental_record(directory, &name, generation)?;
+    if let Some((previous, _)) = &previous {
         if let (RecoveryRecord::Receipt(current), RecoveryRecord::Receipt(old)) =
             (&mut record, &previous.record)
         {
@@ -947,11 +1228,52 @@ fn write_record(
         }
     }
     let bytes = encode_record(generation, record)?;
+    let before = previous.as_ref().map(|(_, digest)| *digest);
+    let after = incremental_digest(&name, &bytes);
+    let mut inventory = revision
+        .inventory
+        .clone()
+        .ok_or_else(|| state_error("record publication", "incremental inventory is missing"))?;
+    if inventory.generation != generation
+        || revision.manifest.is_some()
+        || revision.pending_record.is_some()
+    {
+        return Err(state_error(
+            "record publication",
+            "record does not belong to an admitted pending publication",
+        ));
+    }
+    inventory.replace(before.as_ref(), &after)?;
     let relative = format!("{DIRECTORY}/{}/{name}", generation_directory(generation)?);
     append_git_pending_path(state, &relative)?;
+    // Preserve the old seal plus one exact before/after transition before
+    // replacing the file. A crash can leave either version, but never permits
+    // silently recomputing a seal from whatever subset happened to survive.
+    revision.pending_record = Some(PendingRecord {
+        name: name.clone(),
+        before,
+        after,
+    });
+    write_revision(state, revision)?;
+    #[cfg(test)]
+    {
+        let hook = AFTER_RECORD_INTENT_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
     directory
         .atomic_write(&name, |file| file.write_all(&bytes))
         .map_err(|error| state_error("record publication", error))?;
+    #[cfg(test)]
+    {
+        let hook = AFTER_RECORD_REPLACE_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    revision.inventory = Some(inventory);
+    revision.pending_record = None;
     note_pending_archive_paths(root, [relative]);
     Ok(())
 }
@@ -1290,19 +1612,20 @@ fn reconcile_incomplete_publication(
     conn: &impl SyncQuery,
     root: &Path,
     generation: &str,
+    revision: &mut ReadRevision,
 ) -> DbResult<()> {
     checkpoint_locked(state, conn, root, generation)?;
     let directory = state.generation(generation, false)?;
     crate::sync::with_read_snapshot(conn, || {
         let mut receipts = 0u64;
         visit_current_receipts(conn, &mut |record| {
-            write_record(state, root, &directory, generation, record)?;
+            write_record(state, root, &directory, generation, revision, record)?;
             receipts += 1;
             Ok(())
         })?;
         let mut contacts = 0u64;
         visit_current_contacts(conn, &mut |record| {
-            write_record(state, root, &directory, generation, record)?;
+            write_record(state, root, &directory, generation, revision, record)?;
             contacts += 1;
             Ok(())
         })?;
@@ -1320,14 +1643,20 @@ fn reconcile_incomplete_publication(
 pub fn ensure_checkpoint(conn: &impl SyncQuery, root: &Path) -> DbResult<Manifest> {
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    with_read_revision(&state, conn, root, &generation, || {
+    with_read_revision(&state, conn, root, &generation, |revision| {
         let manifest = checkpoint_locked(&state, conn, root, &generation)?;
-        // Startup verifies pre-existing metadata too. Incremental publishers call
-        // checkpoint_locked directly and never rescan history on the hot path.
-        if visit_records(root, |_| Ok(()))?.as_ref() != Some(&manifest) {
+        // Startup verifies the existing seal too. Healthy selected-key writers
+        // carry the expected inventory without rescanning mailbox history.
+        let Some((observed, inventory)) = visit_records_with_inventory(root, |_| Ok(()))? else {
             return Err(state_error(
                 "startup checkpoint",
                 "completed generation disappeared during validation",
+            ));
+        };
+        if observed != manifest || revision.inventory.as_ref() != Some(&inventory) {
+            return Err(state_error(
+                "startup checkpoint",
+                "incremental inventory or checkpoint differs from the sealed publication",
             ));
         }
         queue_superseded_generations(&state, root)?;
@@ -1521,7 +1850,7 @@ pub fn persist_receipts(
     }
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    with_read_revision(&state, conn, root, &generation, || {
+    with_read_revision(&state, conn, root, &generation, |revision| {
         checkpoint_locked(&state, conn, root, &generation)?;
         let directory = state.generation(&generation, true)?;
         crate::sync::with_read_snapshot(conn, || {
@@ -1543,6 +1872,7 @@ pub fn persist_receipts(
                             root,
                             &directory,
                             &generation,
+                            revision,
                             RecoveryRecord::Receipt(receipt(&row, shared)?),
                         )?;
                     }
@@ -1568,7 +1898,7 @@ pub fn persist_project_receipts(
 ) -> DbResult<()> {
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    with_read_revision(&state, conn, root, &generation, || {
+    with_read_revision(&state, conn, root, &generation, |revision| {
         checkpoint_locked(&state, conn, root, &generation)?;
         let directory = state.generation(&generation, true)?;
         crate::sync::with_read_snapshot(conn, || {
@@ -1601,6 +1931,7 @@ pub fn persist_project_receipts(
                             root,
                             &directory,
                             &generation,
+                            revision,
                             RecoveryRecord::Receipt(receipt),
                         )?;
                     }
@@ -1624,7 +1955,7 @@ pub fn persist_contact(
 ) -> DbResult<()> {
     let state = LockedState::open(root, true)?;
     let generation = ensure_generation(conn)?;
-    with_read_revision(&state, conn, root, &generation, || {
+    with_read_revision(&state, conn, root, &generation, |revision| {
         checkpoint_locked(&state, conn, root, &generation)?;
         let directory = state.generation(&generation, true)?;
         crate::sync::with_read_snapshot(conn, || {
@@ -1645,6 +1976,7 @@ pub fn persist_contact(
                     root,
                     &directory,
                     &generation,
+                    revision,
                     RecoveryRecord::Contact(contact(row)?),
                 )?;
             }
@@ -1737,11 +2069,12 @@ fn visit_baseline(
 }
 
 fn visit_incremental_records(
-    generation: &JournalDirectory,
-    manifest: &Manifest,
+    directory: &JournalDirectory,
+    generation: &str,
     visit: &mut impl FnMut(RecoveryRecord) -> DbResult<()>,
-) -> DbResult<()> {
-    for entry in std::fs::read_dir(generation.directory_path())
+) -> DbResult<IncrementalInventory> {
+    let mut inventory = IncrementalInventory::empty(generation);
+    for entry in std::fs::read_dir(directory.directory_path())
         .map_err(|error| state_error("record inventory", error))?
     {
         let entry = entry.map_err(|error| state_error("record inventory", error))?;
@@ -1755,22 +2088,17 @@ fn visit_incremental_records(
         if !name.starts_with("receipt-") && !name.starts_with("contact-") {
             continue;
         }
-        let document: RecordDocument = read_json(generation, name)?.ok_or_else(|| {
-            state_error(
-                "record inventory",
-                "recovery record disappeared during inspection",
-            )
-        })?;
-        validate_document(&document, &manifest.generation)?;
-        if record_name(&document.record)? != name {
-            return Err(state_error(
-                "record identity",
-                "record does not match its filename",
-            ));
-        }
+        let (document, digest) =
+            read_incremental_record(directory, name, generation)?.ok_or_else(|| {
+                state_error(
+                    "record inventory",
+                    "recovery record disappeared during inspection",
+                )
+            })?;
+        inventory.replace(None, &digest)?;
         visit(document.record)?;
     }
-    Ok(())
+    Ok(inventory)
 }
 
 /// Visit the checked baseline first, followed by per-key updates from its one
@@ -1780,8 +2108,16 @@ fn visit_incremental_records(
 /// metadata is an error and must never be promoted as a successful recovery.
 pub fn visit_records(
     root: &Path,
-    mut visit: impl FnMut(RecoveryRecord) -> DbResult<()>,
+    visit: impl FnMut(RecoveryRecord) -> DbResult<()>,
 ) -> DbResult<Option<Manifest>> {
+    visit_records_with_inventory(root, visit).map(|records| records.map(|(manifest, _)| manifest))
+}
+
+pub(crate) fn visit_records_with_inventory(
+    root: &Path,
+    mut visit: impl FnMut(RecoveryRecord) -> DbResult<()>,
+) -> DbResult<Option<(Manifest, IncrementalInventory)>> {
+    let publication_before = read_revision_witness(root).ok().flatten();
     let directory = match JournalDirectory::open(root, DIRECTORY, false) {
         Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1809,14 +2145,25 @@ pub fn visit_records(
     )
     .map_err(|error| state_error("generation directory", error))?;
     visit_baseline(&generation, &manifest, &mut visit)?;
-    visit_incremental_records(&generation, &manifest, &mut visit)?;
+    let inventory = visit_incremental_records(&generation, &manifest.generation, &mut visit)?;
     if read_manifest(&directory)?.as_ref() != Some(&manifest) {
         return Err(state_error(
             "manifest",
             "active generation changed while reading recovery state",
         ));
     }
-    Ok(Some(manifest))
+    let publication_after = read_revision_witness(root).ok().flatten();
+    if let Some(before) = publication_before
+        && publication_after.as_ref() == Some(&before)
+        && before.matches_manifest(&manifest)
+        && !before.matches_inventory(&inventory)
+    {
+        return Err(state_error(
+            "incremental inventory",
+            "record count or contents differ from the sealed publication",
+        ));
+    }
+    Ok(Some((manifest, inventory)))
 }
 
 #[cfg(test)]
@@ -1852,6 +2199,314 @@ mod tests {
         .unwrap()
         .unwrap();
         (manifest, records)
+    }
+
+    fn assert_sealed_inventory(root: &Path) -> IncrementalInventory {
+        let witness = read_revision_witness(root).unwrap().unwrap();
+        let (manifest, inventory) = visit_records_with_inventory(root, |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(witness.matches_manifest(&manifest));
+        assert!(witness.matches_inventory(&inventory));
+        inventory
+    }
+
+    fn direct_receipt_filename(conn: &crate::CanonicalDbConn) -> String {
+        let rows = query(
+            conn,
+            &format!(
+                "{} WHERE r.message_id = 41 AND r.agent_id = 29",
+                receipt_select(false)
+            ),
+            &[],
+        )
+        .unwrap();
+        record_name(&RecoveryRecord::Receipt(receipt(&rows[0], false).unwrap())).unwrap()
+    }
+
+    #[test]
+    fn incremental_seal_resumes_interrupted_record_creation_and_replacement() {
+        for existing in [false, true] {
+            for after_replace in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let conn = database();
+                let manifest = ensure_checkpoint(&conn, root.path()).unwrap();
+                if existing {
+                    persist_receipts(&conn, root.path(), 29, &[41]).unwrap();
+                }
+                let generation = root
+                    .path()
+                    .join(DIRECTORY)
+                    .join(generation_directory(&manifest.generation).unwrap());
+                let path = generation.join(direct_receipt_filename(&conn));
+                let before = std::fs::read(&path).ok();
+                conn.execute_raw(
+                    "UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41; \
+                     UPDATE agent_links SET status = 'blocked', updated_ts = 7 WHERE id = 93;",
+                )
+                .unwrap();
+                if after_replace {
+                    AFTER_RECORD_REPLACE_TEST_HOOK.with(|hook| {
+                        *hook.borrow_mut() =
+                            Some(Box::new(|| panic!("stop after record replacement")));
+                    });
+                } else {
+                    AFTER_RECORD_INTENT_TEST_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(|| panic!("stop after record intent")));
+                    });
+                }
+                let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    persist_receipts(&conn, root.path(), 29, &[41])
+                }));
+                assert!(interrupted.is_err());
+                assert!(read_revision_witness(root.path()).unwrap().is_none());
+                let actual = std::fs::read(&path).ok();
+                if after_replace {
+                    assert_ne!(actual, before, "the real record replacement completed");
+                    let document: RecordDocument = serde_json::from_slice(
+                        actual.as_ref().expect("replacement published the record"),
+                    )
+                    .unwrap();
+                    assert!(matches!(document.record, RecoveryRecord::Receipt(receipt)
+                        if receipt.ack_ts == Some(444)));
+                } else {
+                    assert_eq!(actual, before, "only the durable intent was published");
+                }
+
+                // A different operation must finish all committed receipt debt
+                // after validating the exact interrupted before/after state.
+                persist_contact(&conn, root.path(), 17, 29).unwrap();
+                assert_sealed_inventory(root.path());
+                let recovered = records(root.path()).1;
+                assert!(recovered.iter().any(|record| matches!(record,
+                    RecoveryRecord::Receipt(receipt)
+                        if receipt.message_id == 41 && receipt.ack_ts == Some(444)
+                )));
+                assert!(recovered.iter().any(|record| matches!(record,
+                    RecoveryRecord::Contact(contact) if contact.status == "blocked"
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_seal_refuses_changed_current_or_missing_untouched_records() {
+        for missing_untouched in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let conn = database();
+            let manifest = ensure_checkpoint(&conn, root.path()).unwrap();
+            persist_receipts(&conn, root.path(), 29, &[41]).unwrap();
+            persist_contact(&conn, root.path(), 17, 29).unwrap();
+            conn.execute_raw("UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41")
+                .unwrap();
+            AFTER_RECORD_REPLACE_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| panic!("stop before completing seal")));
+            });
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    persist_receipts(&conn, root.path(), 29, &[41])
+                }))
+                .is_err()
+            );
+            let directory = JournalDirectory::open(root.path(), DIRECTORY, false).unwrap();
+            let pending =
+                std::fs::read(root.path().join(DIRECTORY).join(READ_REVISION_FILE)).unwrap();
+            let generation = JournalDirectory::open(
+                &directory.directory_path(),
+                &generation_directory(&manifest.generation).unwrap(),
+                false,
+            )
+            .unwrap();
+            let receipt_name = direct_receipt_filename(&conn);
+            let (mut document, _) =
+                read_incremental_record(&generation, &receipt_name, &manifest.generation)
+                    .unwrap()
+                    .unwrap();
+            let (damaged_path, preserved) = if missing_untouched {
+                let contact_name = std::fs::read_dir(generation.directory_path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .find(|name| name.starts_with("contact-"))
+                    .unwrap();
+                let path = generation.directory_path().join(contact_name);
+                let preserved = std::fs::read(&path).unwrap();
+                std::fs::rename(&path, root.path().join("held-contact.json")).unwrap();
+                (path, preserved)
+            } else {
+                let path = generation.directory_path().join(&receipt_name);
+                let preserved = std::fs::read(&path).unwrap();
+                let RecoveryRecord::Receipt(receipt) = &mut document.record else {
+                    panic!("fixture must contain a direct receipt");
+                };
+                receipt.ack_ts = Some(999);
+                std::fs::write(
+                    &path,
+                    encode_record(&manifest.generation, document.record).unwrap(),
+                )
+                .unwrap();
+                (path, preserved)
+            };
+            let failure = persist_contact(&conn, root.path(), 17, 29)
+                .expect_err("reconciliation must preserve the earlier expected set");
+            let expected = if missing_untouched {
+                "record count or contents differ"
+            } else {
+                "neither its before nor after"
+            };
+            assert!(failure.to_string().contains(expected), "{failure}");
+            assert_eq!(
+                std::fs::read(root.path().join(DIRECTORY).join(READ_REVISION_FILE)).unwrap(),
+                pending,
+                "a failed resume must not replace its original recovery evidence",
+            );
+            assert!(read_revision_witness(root.path()).unwrap().is_none());
+            std::fs::write(&damaged_path, preserved).unwrap();
+            persist_contact(&conn, root.path(), 17, 29).unwrap();
+            assert_sealed_inventory(root.path());
+        }
+    }
+
+    #[test]
+    fn incremental_seal_preserves_old_generation_until_activation_and_resumes_new_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let old = database();
+        let initial = ensure_checkpoint(&old, root.path()).unwrap();
+        old.execute_raw("UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41")
+            .unwrap();
+        persist_receipts(&old, root.path(), 29, &[41]).unwrap();
+        let original = assert_sealed_inventory(root.path());
+        assert_eq!(original.count, 1);
+
+        let broken = database();
+        broken.execute_raw("DROP TABLE agents").unwrap();
+        ensure_checkpoint(&broken, root.path()).expect_err("the new baseline cannot complete");
+        let directory = JournalDirectory::open(root.path(), DIRECTORY, false).unwrap();
+        let interrupted = read_revision(&directory).unwrap().unwrap();
+        assert!(interrupted.manifest.is_none());
+        assert_eq!(interrupted.inventory.as_ref(), Some(&original));
+        assert_eq!(read_manifest(&directory).unwrap().unwrap(), initial);
+        persist_receipts(&old, root.path(), 29, &[41]).unwrap();
+        assert_sealed_inventory(root.path());
+
+        let replacement = database();
+        AFTER_CHECKPOINT_ACTIVATION_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| panic!("stop after generation activation")));
+        });
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ensure_checkpoint(&replacement, root.path())
+            }))
+            .is_err()
+        );
+        let active = read_manifest(&directory).unwrap().unwrap();
+        assert_ne!(active.generation, initial.generation);
+        let interrupted = read_revision(&directory).unwrap().unwrap();
+        assert!(interrupted.manifest.is_none());
+        assert_eq!(interrupted.generation, active.generation);
+        assert_eq!(
+            interrupted.inventory.as_ref().unwrap().generation,
+            initial.generation,
+            "the pending marker still carries the prior generation's expected set",
+        );
+        persist_contact(&replacement, root.path(), 17, 29).unwrap();
+        let restored = assert_sealed_inventory(root.path());
+        assert_eq!(restored.generation, active.generation);
+        assert_eq!(
+            read_revision_witness(root.path())
+                .unwrap()
+                .unwrap()
+                .generation(),
+            active.generation
+        );
+        assert!(
+            ensure_checkpoint(&old, root.path()).is_err(),
+            "superseded authority stays retired"
+        );
+    }
+
+    #[test]
+    fn legacy_revision_is_unsealed_until_live_reconciliation_migrates_its_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        conn.execute_raw("UPDATE project_mailbox_receipts SET read_ts = NULL, ack_ts = NULL")
+            .unwrap();
+        let manifest = ensure_checkpoint(&conn, root.path()).unwrap();
+        persist_receipts(&conn, root.path(), 29, &[41]).unwrap();
+        let directory = JournalDirectory::open(root.path(), DIRECTORY, false).unwrap();
+        let mut legacy = read_revision(&directory).unwrap().unwrap();
+        legacy.schema_version = 1;
+        legacy.inventory = None;
+        legacy.pending_record = None;
+        write_revision(&LockedState::open(root.path(), false).unwrap(), &legacy).unwrap();
+        assert!(read_revision_witness(root.path()).unwrap().is_none());
+        assert_eq!(
+            records(root.path()).0,
+            manifest,
+            "legacy history remains inspectable"
+        );
+
+        conn.execute_raw(
+            "UPDATE project_mailbox_receipts SET read_ts = 222, ack_ts = 555; \
+             UPDATE agent_links SET status = 'blocked', updated_ts = 7 WHERE id = 93;",
+        )
+        .unwrap();
+        persist_receipts(&conn, root.path(), 29, &[41]).unwrap();
+        let complete = read_revision(&directory).unwrap().unwrap();
+        assert_eq!(complete.schema_version, READ_REVISION_VERSION);
+        assert!(complete.pending_record.is_none());
+        assert_sealed_inventory(root.path());
+        let recovered = records(root.path()).1;
+        assert!(recovered.iter().any(|record| matches!(record,
+            RecoveryRecord::Receipt(receipt) if receipt.shared && receipt.ack_ts == Some(555)
+        )));
+        assert!(recovered.iter().any(|record| matches!(record,
+            RecoveryRecord::Contact(contact) if contact.status == "blocked"
+        )));
+    }
+
+    #[test]
+    fn healthy_selected_write_keeps_missing_unrelated_record_in_the_expected_seal() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        let manifest = ensure_checkpoint(&conn, root.path()).unwrap();
+        persist_receipts(&conn, root.path(), 29, &[41]).unwrap();
+        persist_contact(&conn, root.path(), 17, 29).unwrap();
+        let before = assert_sealed_inventory(root.path());
+        let generation = root
+            .path()
+            .join(DIRECTORY)
+            .join(generation_directory(&manifest.generation).unwrap());
+        let contact = std::fs::read_dir(&generation)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("contact-")
+            })
+            .unwrap();
+        std::fs::rename(&contact, root.path().join("held-contact.json")).unwrap();
+        conn.execute_raw("UPDATE message_recipients SET ack_ts = 444 WHERE message_id = 41")
+            .unwrap();
+        persist_receipts(&conn, root.path(), 29, &[41]).unwrap();
+        let witness = read_revision_witness(root.path()).unwrap().unwrap();
+        assert_eq!(
+            witness.inventory.count, before.count,
+            "untouched keys remain expected"
+        );
+        let failure = visit_records(root.path(), |_| Ok(()))
+            .expect_err("a selected-key update cannot reseal a damaged subset");
+        assert!(
+            failure
+                .to_string()
+                .contains("record count or contents differ"),
+            "{failure}"
+        );
+        assert!(
+            ensure_checkpoint(&conn, root.path()).is_err(),
+            "startup also refuses the subset"
+        );
     }
 
     #[test]
