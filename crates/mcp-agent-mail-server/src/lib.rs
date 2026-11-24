@@ -12268,6 +12268,28 @@ struct JwksCacheEntry {
     jwks: Arc<JwkSet>,
 }
 
+/// Owns the refresh flag across every exit, including cancellation while the
+/// network future is pending. A concurrent forced/bootstrap fetch that did not
+/// acquire the flag must never release another request's refresh.
+struct JwksRefreshGuard<'a> {
+    refreshing: &'a AtomicBool,
+}
+
+impl<'a> JwksRefreshGuard<'a> {
+    fn try_acquire(refreshing: &'a AtomicBool) -> Option<Self> {
+        refreshing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self { refreshing })
+    }
+}
+
+impl Drop for JwksRefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.refreshing.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Debug)]
 enum RateLimitRedisState {
     Disabled,
@@ -13744,14 +13766,30 @@ to skip auth for local requests.</p>
     }
 
     async fn fetch_jwks_with_cx(&self, cx: &Cx, url: &str, force: bool) -> Result<Arc<JwkSet>, ()> {
+        self.fetch_jwks_with_body(force, async {
+            if let Some(body) = fetch_plain_http_body_blocking(url, JWKS_FETCH_TIMEOUT)? {
+                return Ok(body);
+            }
+            let fut = Box::pin(self.jwks_http_client.send_get(cx, url));
+            let Ok(Ok(resp)) = timeout(wall_now(), JWKS_FETCH_TIMEOUT, fut).await else {
+                return Err(());
+            };
+            if resp.status != 200 {
+                return Err(());
+            }
+            Ok(resp.body)
+        })
+        .await
+    }
+
+    async fn fetch_jwks_with_body(
+        &self,
+        force: bool,
+        fetch_body: impl std::future::Future<Output = Result<Vec<u8>, ()>>,
+    ) -> Result<Arc<JwkSet>, ()> {
         // Fast path: return cached value if still fresh.
-        if force {
-            let _ = self.jwks_refreshing.compare_exchange(
-                false,
-                true,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            );
+        let refresh_guard = if force {
+            JwksRefreshGuard::try_acquire(&self.jwks_refreshing)
         } else {
             let cached = self
                 .jwks_cache
@@ -13764,39 +13802,19 @@ to skip auth for local requests.</p>
                 }
                 // Stale-while-revalidate: if another task is already refreshing,
                 // serve the stale cached value instead of stampeding.
-                if self
-                    .jwks_refreshing
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_err()
-                {
+                let guard = JwksRefreshGuard::try_acquire(&self.jwks_refreshing);
+                if guard.is_none() {
                     return Ok(entry.jwks);
                 }
-                // We won the CAS — proceed to refresh below.
+                guard
             } else {
-                // No cached entry at all — acquire the refresh lock.
-                let _ = self.jwks_refreshing.compare_exchange(
-                    false,
-                    true,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                );
+                // Cold starts still fetch even when another bootstrap is pending.
+                JwksRefreshGuard::try_acquire(&self.jwks_refreshing)
             }
-        }
+        };
 
         let result = async {
-            let body = if let Some(body) = fetch_plain_http_body_blocking(url, JWKS_FETCH_TIMEOUT)?
-            {
-                body
-            } else {
-                let fut = Box::pin(self.jwks_http_client.send_get(cx, url));
-                let Ok(Ok(resp)) = timeout(wall_now(), JWKS_FETCH_TIMEOUT, fut).await else {
-                    return Err(());
-                };
-                if resp.status != 200 {
-                    return Err(());
-                }
-                resp.body
-            };
+            let body = fetch_body.await?;
             let jwks: JwkSet = serde_json::from_slice(&body).map_err(|_| ())?;
             let jwks = Arc::new(jwks);
 
@@ -13814,8 +13832,9 @@ to skip auth for local requests.</p>
         }
         .await;
 
-        // Always release the refresh lock.
-        self.jwks_refreshing.store(false, Ordering::Release);
+        // Drop releases only a flag acquired by this request. The same guard
+        // also releases it if this future is dropped at the network await.
+        drop(refresh_guard);
 
         // GH#221 stale-on-error: a failed refresh must serve the stale cached
         // key set (when one exists) rather than surfacing `Err`. Returning
@@ -33213,6 +33232,97 @@ first body
             state.jwks_refreshing.load(Ordering::Acquire),
             "guard must remain set when another task holds it"
         );
+    }
+
+    #[test]
+    fn jwks_cancelled_refresh_releases_guard_and_allows_retry() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for force in [false, true] {
+            for with_stale_cache in [false, true] {
+                let state = build_jwt_state_with_url("https://unused.invalid/jwks");
+                if with_stale_cache {
+                    *state.jwks_cache.lock().unwrap() = Some(JwksCacheEntry {
+                        fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
+                        jwks: make_test_jwks_set(),
+                    });
+                }
+                let mut refresh =
+                    Box::pin(state.fetch_jwks_with_body(force, std::future::pending()));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(std::future::Future::poll(refresh.as_mut(), &mut context).is_pending());
+                assert!(state.jwks_refreshing.load(Ordering::Acquire));
+
+                // Cancel the real cache/refresh path while its body fetch is pending.
+                drop(refresh);
+                assert!(
+                    !state.jwks_refreshing.load(Ordering::Acquire),
+                    "cancellation must release the refresh owner"
+                );
+                let result =
+                    runtime.block_on(state.fetch_jwks_with_body(
+                        false,
+                        std::future::ready(Ok(make_test_jwks_bytes())),
+                    ));
+                assert!(result.is_ok(), "the next request must be able to refresh");
+                assert!(!state.jwks_refreshing.load(Ordering::Acquire));
+                assert!(
+                    state
+                        .jwks_cache
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .fetched_at
+                        .elapsed()
+                        < JWKS_CACHE_TTL,
+                    "the retry must publish a fresh cache entry"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jwks_concurrent_fetch_does_not_release_refresh_owner() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for force in [false, true] {
+            for succeeds in [false, true] {
+                let state = build_jwt_state_with_url("https://unused.invalid/jwks");
+                if force {
+                    *state.jwks_cache.lock().unwrap() = Some(JwksCacheEntry {
+                        fetched_at: Instant::now().checked_sub(Duration::from_mins(2)).unwrap(),
+                        jwks: make_test_jwks_set(),
+                    });
+                }
+                let mut owner = Box::pin(state.fetch_jwks_with_body(false, std::future::pending()));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(std::future::Future::poll(owner.as_mut(), &mut context).is_pending());
+
+                // Force refresh and cold bootstrap may fetch concurrently, but
+                // neither owns the flag already held by the first request.
+                let mut follower =
+                    Box::pin(state.fetch_jwks_with_body(force, std::future::pending()));
+                assert!(std::future::Future::poll(follower.as_mut(), &mut context).is_pending());
+                drop(follower);
+                assert!(
+                    state.jwks_refreshing.load(Ordering::Acquire),
+                    "cancelling a follower must not release the owner"
+                );
+                let body = if succeeds {
+                    Ok(make_test_jwks_bytes())
+                } else {
+                    Err(())
+                };
+                let result =
+                    runtime.block_on(state.fetch_jwks_with_body(force, std::future::ready(body)));
+                assert_eq!(result.is_ok(), succeeds);
+                assert!(
+                    state.jwks_refreshing.load(Ordering::Acquire),
+                    "a completed follower must not release the owner"
+                );
+                drop(owner);
+                assert!(!state.jwks_refreshing.load(Ordering::Acquire));
+            }
+        }
     }
 
     #[test]

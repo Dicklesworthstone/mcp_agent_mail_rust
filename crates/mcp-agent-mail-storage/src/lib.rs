@@ -32105,11 +32105,7 @@ mod tests {
         let coalescer = get_commit_coalescer();
         drop(fence);
         let path = archive.repo_root.join("retry.txt");
-        fs::write(
-            &path,
-            b"archive remains writable after startup refusal\n",
-        )
-        .unwrap();
+        fs::write(&path, b"archive remains writable after startup refusal\n").unwrap();
         coalescer.enqueue(
             archive.repo_root.clone(),
             &config,
