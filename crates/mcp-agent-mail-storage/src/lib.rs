@@ -11820,6 +11820,7 @@ fn canonical_id_cache_for(messages_root: &Path) -> Arc<Mutex<CanonicalIdCache>> 
     Arc::clone(caches.entry(messages_root.to_path_buf()).or_default())
 }
 
+#[cfg(test)]
 fn current_path_stamp(path: &Path) -> Option<MessageFileStamp> {
     fs::symlink_metadata(path)
         .ok()
@@ -22144,8 +22145,14 @@ mod tests {
                 })
                 .unwrap();
             }
-            let root_stamp = current_path_stamp(&messages_root).unwrap();
-            let target_stamp = current_path_stamp(&messages_root.join("2026/01")).unwrap();
+            let root_stamp = current_path_stamp(&messages_root);
+            let target_stamp = current_path_stamp(&messages_root.join("2026/01"));
+            #[cfg(unix)]
+            assert!(root_stamp.is_some() && target_stamp.is_some());
+            // Non-Unix deliberately supplies no cache stamp. The former
+            // fallback still compared None == None and reused stale proof.
+            #[cfg(not(unix))]
+            assert!(root_stamp.is_none() && target_stamp.is_none());
             let spawn_foreign = || {
                 let mut child = Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", NAME, "--nocapture"])
@@ -22218,8 +22225,8 @@ mod tests {
             drop(start);
             let output = child.wait_with_output().unwrap();
             let diagnostic = drain.join().unwrap();
-            let after_root = current_path_stamp(&messages_root).unwrap();
-            let after_target = current_path_stamp(&messages_root.join("2026/01")).unwrap();
+            let after_root = current_path_stamp(&messages_root);
+            let after_target = current_path_stamp(&messages_root.join("2026/01"));
             drop(fence);
             let _ = resume_tx.send(());
             let result = writer.join().unwrap();

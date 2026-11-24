@@ -1,5 +1,41 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## Second review of strict build routing (`br-u9bhg`, PR #410)
+
+The initial numeric-only routing fix at `ea4ba71f` was incomplete for RCH's
+case-insensitive truthy values. Its sixteen-case evidence remains historical.
+
+- [x] Read RCH's actual flag parsers and reproduce twenty-four failures among
+  46 routing cases plus eight failures among ten artifact-fallback cases.
+  The retained baseline reports 13/15 helper scenarios passed.
+- [x] Use one runtime predicate for both remote settings at every build,
+  missing-RCH, SQLite-helper and binary-fallback boundary. Preserve false
+  settings, command errors and original response/build timeout defaults.
+- [x] Pass all 46 routing controls, ten artifact controls and 15 helper
+  scenarios. Recording commands never invoke a compiler or stale executable.
+- [x] Update the existing Rust fixture to source the complete embedded helper
+  and test both settings with five truthy spellings. Its shell dependencies
+  are covered above; the Rust test itself still requires native execution.
+- [x] Complete the original main `462914b7` all-targets check: exit 0, build
+  30097323753221799 on vmi1227854. All 3,948 receipt files match local SHA-256,
+  size and executable mode; receipt root
+  `36ca6dbb5835984d0a4105ceeedbfde4a42fe7fbe2e1b46edc48c1e7560c2e8f`.
+  This qualifies that older snapshot's compiler graph, not this follow-up.
+- [x] Fix its unused-helper warning by retaining the stamp utility only for
+  its existing unit-test callers. Preserve the Unix nonempty-stamp check and
+  foreign-message conflict checks; non-Unix's deliberately absent stamp no
+  longer causes an unconditional unwrap panic. Windows runtime is untested.
+- [x] Pass workspace formatting and Bash syntax after these repairs; complete
+  normal scans of both edited Rust files and both shell files with zero new
+  critical findings, retaining all warnings.
+- [ ] Integrate the known main changes once, freeze the final candidate, and
+  run all three mandatory compiler/Clippy graphs on its exact source.
+- [ ] Obtain ordinary native admission and execute the recovery and helper
+  regressions with nonzero counts and unchanged limits. Recent censuses still
+  show insufficient unreserved native disk despite apparent free worker slots.
+- [ ] Publish the follow-up and exact outcomes; keep original acceptance open
+  until all required native lanes have executed successfully.
+
 ## Fresh review after PR #409 merge (`br-u9bhg`, `br-1w2z0`)
 
 Review base: main `462914b7`. The first native request used preserved clean

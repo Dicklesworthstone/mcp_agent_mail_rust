@@ -315,7 +315,18 @@ cases.extend([
     ("remote-error-preserved", {"E2E_CARGO_REQUIRE_RCH": "1", "ROUTING_RCH_EXIT": "120"},
      120, "rch", True, False),
 ])
-assert len(cases) == 16
+for required in ("E2E_CARGO_REQUIRE_RCH", "RCH_REQUIRE_REMOTE"):
+    for value in ("true", "YES", "On", " enabled "):
+        cases.extend([
+            (f"{required}-{value}-remote", {required: value}, 0, "rch", True, False),
+            (f"{required}-{value}-force-local", {required: value, "E2E_CARGO_FORCE_LOCAL": "1"},
+             64, None, False, False),
+            (f"{required}-{value}-missing-rch", {required: value, "ROUTING_NO_RCH": "1"},
+             127, None, False, False),
+        ])
+    for value in ("false", "OFF", "disabled"):
+        cases.append((f"{required}-{value}-optional", {required: value}, 0, "rch", False, False))
+assert len(cases) == 46
 failures = []
 for index, (name, overrides, expected_exit, program, strict, mock) in enumerate(cases):
     case = work / f"routing-{index}"
@@ -360,7 +371,60 @@ e2e_run_cargo check --locked
         failures.append(name)
 if failures:
     raise SystemExit("incorrect build routing: " + ", ".join(failures))
-print("16 routing controls passed; recording commands never invoke a compiler")
+print("46 routing controls passed; recording commands never invoke a compiler")
+PY
+
+assert_cmd "s11_remote_artifact_guards" "truthy remote requirements reject stale binaries and local helper builds" \
+    python3 - "${SCRIPT_DIR}/../../../scripts/e2e_lib.sh" "${WORK}" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+harness = Path(sys.argv[1]).resolve()
+work = Path(sys.argv[2])
+failures = []
+cases = [(required, value) for required in ("E2E_CARGO_REQUIRE_RCH", "RCH_REQUIRE_REMOTE")
+         for value in ("1", "true", "YES", "On", " enabled ")]
+assert len(cases) == 10
+for index, (required, value) in enumerate(cases):
+    case = work / f"artifact-guard-{index}"
+    stale = case / "target/debug/am"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stale.chmod(0o700)
+    result = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+E2E_PROJECT_ROOT="$2"
+_e2e_build_binary() { printf '%s\\n' "$E2E_CARGO_FORCE_LOCAL" >> build_modes; }
+cargo() { printf unexpected-local-build >> forbidden; return 99; }
+type() { return 1; }
+ensure_status=0
+compat_status=0
+if e2e_ensure_binary am; then ensure_status=10; fi
+if e2e_sqlite3_compat_bin; then compat_status=11; fi
+test "$ensure_status" = 0
+test "$compat_status" = 0
+test ! -e forbidden
+test "$(cat build_modes)" = 0
+''', "artifact-guard-self-test", str(harness), str(case)],
+        cwd=case,
+        env={**os.environ, "AM_E2E_KEEP_TMP": "1", "CARGO_TARGET_DIR": str(case / "expected-target"),
+             "E2E_CARGO_REQUIRE_RCH": "0", "RCH_REQUIRE_REMOTE": "0",
+             "E2E_CARGO_FORCE_LOCAL": "0", "E2E_FORCE_BUILD": "0", required: value},
+        capture_output=True, text=True, timeout=15,
+    )
+    (case / "stdout.log").write_text(result.stdout, encoding="utf-8")
+    (case / "stderr.log").write_text(result.stderr, encoding="utf-8")
+    ok = result.returncode == 0 and result.stderr.count("remote-required") == 2
+    print(f"{required}={value!r}: exit={result.returncode} stale/local attempts refused={ok}")
+    if not ok:
+        failures.append((required, value))
+if failures:
+    raise SystemExit("incorrect artifact guards: " + json.dumps(failures))
+print("10 artifact controls passed; no compiler or stale executable was run")
 PY
 
 log_summary "lib_self_test" "${TOTAL}" "${PASS}" "${FAIL}" "${WORK}" "bash tests/e2e/lib/lib_self_test.sh"
