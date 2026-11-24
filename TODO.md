@@ -1,5 +1,43 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## ACK reconciliation schedule review (`br-u9bhg`)
+
+- [x] Trace both real read-snapshot releases through reconciliation and
+  selected-contact publication to the completed revision seal. The original
+  competing-ACK controls exercised only the open reconciliation snapshot.
+- [x] Add six independent engine/schedule controls: canonical and runtime
+  databases, each during the read, after reconciliation, and before sealing.
+  Forward actual SQL before attempting the competing commit; retain the
+  committed SQL ACK versus recovered-artifact comparison and mandatory retry
+  after legitimate writer exclusion. Production code is unchanged.
+- [x] Retain each private database/archive fixture and print its path. These
+  controls have not executed; no concurrency defect is yet demonstrated.
+- [x] Pass formatting and diff checks. Complete the normal single-file scan:
+  zero critical, 497 warnings, 124 informational findings, no module failures.
+  Review edited-line findings: test assertions, unwraps and fixture-path
+  diagnostics; retain them without suppression. Candidate source SHA-256
+  `40540f9617ffae7dc308b5a96b2833eb74b25bad8a3f5afe114f39a528880bb1`;
+  report `ack-schedule-gaps-v1-ubs.summary.json` SHA-256
+  `5e5bc4034aac4618e0362c4c647113c0c1bb4c9c77847052b92eb8edf17b3dd3`.
+- [x] Recover the previous exact E9 DB compiler request. It actually timed out
+  after 1,800 seconds: Cargo test --no-run uses RCH's test-command cap, so the
+  build-timeout setting alone did not supply the intended compiler envelope.
+  Wrapper `rchw-3938324a-4768-42f9-8dc5-d502ec21076c` is terminal and
+  acknowledged, delivery exit 120. Recovery CLI exit 0 is not a compile pass.
+- [x] Verify the supported per-invocation `RCH_TEST_TIMEOUT_SEC=3600` setting
+  for literal compiler-only --no-run. Actual native test executions retain
+  1,800 seconds, existing Nextest per-test limits and normal 30+10 GiB admission.
+- [ ] Compile this six-case candidate remotely, then execute all six controls
+  with nonzero counts. Preserve failures before any production repair.
+- [ ] Fix any reproduced defect and rerun the decisive controls plus original
+  DB/storage/tools/CLI acceptance. Respect caller-owned transactions and error
+  recovery if database admission needs changing.
+- [ ] Qualify the final source with both workspace compiler graphs, strict
+  Clippy, formatting and updated scanner bindings. E9's passes below qualify
+  that earlier source only; these new test changes are still uncompiled.
+- [ ] Publish exact source and executed evidence; keep original Bead
+  acceptance open until every required native lane has passed.
+
 ## Second review of strict build routing (`br-u9bhg`, PR #410)
 
 The initial numeric-only routing fix at `ea4ba71f` was incomplete for RCH's
@@ -30,14 +68,109 @@ case-insensitive truthy values. Its sixteen-case evidence remains historical.
   critical findings, retaining all warnings.
 - [x] Integrate pinned main `42acb599` once and review its Rust changes, keeping
   the current peer updates and all original test assertions.
-- [ ] Freeze this integrated candidate and run all three mandatory compiler/
-  Clippy graphs on its exact source. Keep results on the original Bead while
-  the source checkout is frozen.
+- [x] Publish the follow-up through `e9fad95a` on draft PR #410. GitHub confirms
+  that exact head is open, unmerged and conflict-free against pinned main.
+  Rewrite the PR description around the final truthy-value repair and actual
+  validation limits, preserving the earlier failed controls as history.
+- [x] Exercise this final helper against signed v0.3.41: five correlated
+  replies, 45 tools, intended message 2/body, unchanged first ACK and persisted
+  delivery receipt. Client SHA-256
+  `bbe7c299e83c20167a6082a7a640bfcc2f0729035654bc2df415ebb77953254e`.
+  This is final shell-client evidence, not current Rust server qualification.
+  An initial invocation used the wrong artifact variable and failed before
+  server launch; preserve that failed log alongside the corrected run.
+- [x] Run the integrated readiness harness tests: 28/28 pass, no skips.
+  These validate the harness model and do not qualify native readiness.
+- [x] Complete the three-file JavaScript scanner run and review its one
+  critical token-comparison finding in the loopback harness surrogate.
+  Retain that finding, all 23 warnings and all 292 informational findings.
+- [x] Complete the updated 48-file Rust scanner scope. The grouped run timed
+  out after 300 seconds and is partial. Individual storage and mail UI scans
+  completed; the individual CLI scan also exceeded 300 seconds. Its unchanged
+  rules completed in 794 seconds with a 1,200-second scanner envelope. Verify
+  all 44 reused source/report hashes and per-file counts; four refreshed files
+  complete the scope. Retain 55 critical, 59,335 warning and 21,181 informational
+  source findings. The three added criticals compare public JSON-RPC versions
+  and request IDs; all 52 previous critical identities remain. No suppression.
+  Final report `final-review-v3-ubs-final-report.json` SHA-256
+  `fc53c67670401e24b66b22b5e5bc0a0ec3a5a2332054f471cdf975f3bf18d40e`.
+  The guard could not evaluate the original combined report script, which did
+  not run. Separate read-only checks and an explicit artifact patch completed
+  the report without changing guard policy or touching code files.
+- [x] Pass the final locked production graph (`--workspace --lib --bins -j1`)
+  on frozen `e9fad95a`: hz3 build `30097323753221872`, exit 0, Cargo 26m54s.
+  Verify all 3,952 receipt entries with zero hash/length/executable-mode drift;
+  receipt root `fa7d4371a069a35be44a6d9da64809e8764c9d487c26b98379bfdf3616da3845`.
+  No project warning remains; retain the third-party future-incompatibility
+  notice for `proc-macro-error2 v2.0.1`. This is compiler evidence, not runtime.
+  Final production request on vmi1153651 was refused at disk admission (exit
+  120, Cargo not started). I submitted it before inspecting a refreshed census
+  that already showed insufficient capacity; no pass is claimed.
+  A later positive static-budget census on hz3 preceded a new strict request;
+  that request supplied the successful result above and is terminal.
+- [x] Pass final locked workspace `--all-targets` on this exact source; the
+  older main462 result does not satisfy this item. The warm vmi1227854 request
+  timed out in queue: exit 103, Cargo not started, wrapper
+  `rchw-ee78ac40-7c61-4a38-915c-0b056016b1ce` terminal and acknowledged.
+  A fresh static-budget census and free-slot check permit submitting the
+  unchanged strict gate to vmi1153651. Actual Cargo compilation began there;
+  build `30097323753221882`, wrapper
+  `rchw-9c631dbd-0853-471f-8a3c-b23dbca635c5`. It hit the 3,600-second
+  compiler deadline before completion, with no compiler diagnostic reported.
+  Wrapper exit 1 retained ownership; exact-job recovery later acknowledged
+  the actual delivery exit 120 (daemon previously recorded 130). Recovery's
+  own exit 0 means reconciliation succeeded, not that compilation passed.
+  Retain all logs; recheck ordinary capacity before any retry or next gate.
+  A fresh positive static census admitted the unchanged cached retry:
+  vmi1153651 build `30097323753221887`, exit 0, Cargo 13m37s, wrapper
+  `rchw-461a2f93-018d-4370-8c7b-4e5ae10b022b` terminal and acknowledged.
+  All 3,952 file hashes/lengths/modes match local source and the successful
+  production map exactly. Receipt root
+  `6ef91bf62bfc18d510c25ca7eaf2ea5f639b409cfe35c7be2162d5b32a895e56`.
+  The source is still `e9fad95a`; no project warnings were reported. Preserve
+  the third-party future-incompatibility notice separately.
+- [ ] Pass final locked workspace Clippy `--all-targets -- -D warnings` on
+  this exact source. Preserve the current source checkout between requests.
+- [x] Observe both workers' compiler identity: Rust 1.100.0-nightly,
+  commit `90850177249efe0321573c569aec5d12b257f8d6`, LLVM 23.1.0;
+  identical rustc SHA-256
+  `49f9fa06f3e2b93aba85273433fef67b984ddb4cacb4500de56e85f70ec2e339`
+  and Cargo SHA-256
+  `19008157a0089896bc835c5ceb0b5bfbe26e70cdd5579c32bd09538fb68c0b76`.
+  Source Cargo.lock SHA-256
+  `98b26497fb52c79582497c745654e6a7433a7a8b9178e5965650c1e37e751938`.
+  Observation is after production completion and during all-targets execution;
+  retain this limit with the full source receipts.
 - [ ] Obtain ordinary native admission and execute the recovery and helper
   regressions with nonzero counts and unchanged limits. Recent censuses still
   show insufficient unreserved native disk despite apparent free worker slots.
-- [ ] Publish the follow-up and exact outcomes; keep original acceptance open
-  until all required native lanes have executed successfully.
+  Include the modified tests explicitly:
+  `e2e_remote_required_helpers_reject_missing_artifacts_without_local_build`
+  and `deferred_message_identity_rechecks_a_foreign_historical_month`, as
+  well as every original DB/storage/tools/CLI acceptance lane. A successful
+  compiler check does not execute these tests.
+  The final DB compiler-only request on hz3 was also refused before Cargo:
+  exit 120, normal 30 GiB growth plus 10 GiB floor. A fresh earlier census had
+  room, but admission found competing reservations. Native assertions remain
+  zero. All requests preceding the next compiler gate are terminal. Fresh
+  hz3/vmi1227854/vmi1152480
+  censuses after the production pass still fail the ordinary native budget.
+  Later, after the all-targets pass, a fresh vmi1227854 census shows enough
+  normal native capacity (110,274,899,968 free; 59,055,800,320 active budgets;
+  102,005,473,280 required including native growth and floor) plus free slots.
+  The DB lib `cargo test --no-run -j1` request actually entered compilation:
+  wrapper `rchw-3938324a-4768-42f9-8dc5-d502ec21076c`. It timed out after
+  1,800 seconds because --no-run uses the test-command cap, despite the
+  requested 3,600-second build setting. Recovery acknowledged delivery exit
+  120; no test ran. See the schedule review above for the corrected literal
+  compiler-only setting. Actual native test limits remain unchanged.
+- [x] Verify the real worker runner before test dispatch: Nextest 0.9.143 at
+  `/root/.cargo/bin/cargo-nextest` is present on RCH's actual process PATH.
+  Use the documented `--build-jobs 1`, `--test-threads 1`, `--no-tests fail`
+  and `--no-fail-fast` flags. Preserve the existing Nextest configuration and
+  original test envelope; runner-help verification executes no tests.
+- [ ] Publish final scoped scanner and gate outcomes, retaining the original
+  Bead acceptance until all required native lanes execute successfully.
 
 ## Fresh review after PR #409 merge (`br-u9bhg`, `br-1w2z0`)
 
@@ -94,7 +227,9 @@ until the current owned RCH request reaches a terminal state.
   This validates the client, not current Rust source or live build routing.
   Client SHA-256 `aebf956df94c280fe3f95b33f1f03aa3148ca98a08aae88bab44c916861aceff`;
   self-test SHA-256 `37a7b5b117a1668e91122c107ec2bbf1539532c6703b2021b4c119737fa8c3ff`.
-- [ ] Observe the current compiler result and verify the exact source receipt.
+- [x] Observe the main462 compiler result and verify its exact source receipt;
+  see the completed all-targets item above. That result is historical after
+  the truthy-policy, fixture and integration changes.
 - [ ] Execute the native probes with nonzero selected test counts; verify
   their exact source receipts and preserve every failure.
 - [ ] Fix any actual compiler or behavioral failures from that run and repeat

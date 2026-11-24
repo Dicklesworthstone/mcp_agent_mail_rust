@@ -2710,13 +2710,60 @@ mod tests {
         }
     }
 
-    fn assert_reconciliation_retains_concurrent_ack<C: SyncQuery>(conn: &C, peer: &C, root: &Path) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum AckAttempt {
+        DuringRead,
+        AfterReconciliation,
+        BeforeSeal,
+    }
+
+    fn assert_reconciliation_retains_concurrent_ack<C: SyncQuery>(
+        conn: &C,
+        peer: &C,
+        root: &Path,
+        when: AckAttempt,
+    ) {
         struct ConcurrentAck<'a, C> {
             source: &'a C,
             peer: &'a C,
             root: &'a Path,
+            when: AckAttempt,
+            reconciliation_seen: std::cell::Cell<bool>,
+            snapshots_released: std::cell::Cell<u8>,
             attempted: std::cell::Cell<bool>,
             committed: std::cell::Cell<bool>,
+        }
+
+        impl<C: SyncQuery> ConcurrentAck<'_, C> {
+            fn attempt_ack(&self) {
+                if self.attempted.replace(true) {
+                    return;
+                }
+                let before = query(
+                    self.peer,
+                    "SELECT ack_ts FROM message_recipients WHERE message_id=41",
+                    &[],
+                )
+                .unwrap();
+                assert_eq!(before[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+                match self.peer.execute_raw(
+                    "UPDATE message_recipients SET ack_ts=COALESCE(ack_ts,999) WHERE message_id=41",
+                ) {
+                    Ok(()) => {
+                        self.committed.set(true);
+                        let error = persist_receipts(self.peer, self.root, 29, &[41])
+                            .expect_err("the repair still owns the archive state lock");
+                        assert!(error.to_string().contains("lock acquisition"), "{error}");
+                    }
+                    Err(error) => {
+                        let detail = error.to_string().to_ascii_lowercase();
+                        assert!(
+                            detail.contains("locked") || detail.contains("busy"),
+                            "unexpected competing commit failure: {error}"
+                        );
+                    }
+                }
+            }
         }
 
         impl<C: SyncQuery> SyncQuery for ConcurrentAck<'_, C> {
@@ -2726,45 +2773,35 @@ mod tests {
                 params: &[Value],
             ) -> Result<Vec<Row>, sqlmodel_core::Error> {
                 let rows = self.source.query_sync(sql, params)?;
-                if sql.contains("ORDER BY r.agent_id, r.message_id LIMIT")
-                    && !self.attempted.replace(true)
-                {
-                    // The repair has read the old receipt. Attempt a real
-                    // commit through an independent connection before it
-                    // publishes those rows and a completed revision.
-                    let before = query(
-                        self.peer,
-                        "SELECT ack_ts FROM message_recipients WHERE message_id=41",
-                        &[],
-                    )
-                    .unwrap();
-                    assert_eq!(before[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
-                    match self
-                        .peer
-                        .execute_raw(
-                            "UPDATE message_recipients SET ack_ts=COALESCE(ack_ts,999) WHERE message_id=41",
-                        )
-                    {
-                        Ok(()) => {
-                            self.committed.set(true);
-                            let error = persist_receipts(self.peer, self.root, 29, &[41])
-                                .expect_err("the repair still owns the archive state lock");
-                            assert!(error.to_string().contains("lock acquisition"), "{error}");
-                        }
-                        Err(error) => {
-                            let detail = error.to_string().to_ascii_lowercase();
-                            assert!(
-                                detail.contains("locked") || detail.contains("busy"),
-                                "unexpected competing commit failure: {error}"
-                            );
-                        }
+                if sql.contains("ORDER BY r.agent_id, r.message_id LIMIT") {
+                    self.reconciliation_seen.set(true);
+                    if self.when == AckAttempt::DuringRead {
+                        // Attempt a real first ACK after the repair reads the
+                        // old receipt, while its snapshot is still open.
+                        self.attempt_ack();
                     }
                 }
                 Ok(rows)
             }
 
             fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
-                self.source.execute_raw(sql)
+                self.source.execute_raw(sql)?;
+                if self.reconciliation_seen.get() && sql == "RELEASE SAVEPOINT am_inbox_read" {
+                    let released = self.snapshots_released.get() + 1;
+                    self.snapshots_released.set(released);
+                    // Exercise both gaps: after the full reconciliation
+                    // snapshot, and after the selected contact publication's
+                    // snapshot but before the completed revision is sealed.
+                    // Forward the real RELEASE before attempting the commit;
+                    // a lingering read transaction must not mask either gap.
+                    if matches!(
+                        (self.when, released),
+                        (AckAttempt::AfterReconciliation, 1) | (AckAttempt::BeforeSeal, 2)
+                    ) {
+                        self.attempt_ack();
+                    }
+                }
+                Ok(())
             }
         }
 
@@ -2798,13 +2835,16 @@ mod tests {
             source: conn,
             peer,
             root,
+            when,
+            reconciliation_seen: std::cell::Cell::new(false),
+            snapshots_released: std::cell::Cell::new(0),
             attempted: std::cell::Cell::new(false),
             committed: std::cell::Cell::new(false),
         };
         persist_contact(&concurrent, root, 17, 29).unwrap();
         assert!(
             concurrent.attempted.get(),
-            "the competing commit was exercised"
+            "the competing commit was exercised at {when:?}"
         );
         if !concurrent.committed.get() {
             // Writer exclusion is one valid solution. Once repair releases
@@ -2837,14 +2877,14 @@ mod tests {
         assert_eq!(
             latest.ack_ts,
             Some(999),
-            "a completed repair must retain the actual committed ACK"
+            "a completed repair must retain the actual committed ACK at {when:?}"
         );
     }
 
-    #[test]
-    fn reconciliation_retains_concurrent_ack_on_canonical_database() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("canonical.sqlite3");
+    fn canonical_reconciliation_ack(when: AckAttempt) {
+        let directory = tempfile::tempdir().unwrap().keep();
+        eprintln!("Retained canonical ACK fixture at {directory:?}; schedule {when:?}");
+        let database = directory.join("canonical.sqlite3");
         let conn = crate::CanonicalDbConn::open_file(database.to_str().unwrap()).unwrap();
         conn.execute_raw("PRAGMA journal_mode=WAL").unwrap();
         populate_database(&conn);
@@ -2852,14 +2892,15 @@ mod tests {
         assert_reconciliation_retains_concurrent_ack(
             &conn,
             &peer,
-            &directory.path().join("archive"),
+            &directory.join("archive"),
+            when,
         );
     }
 
-    #[test]
-    fn reconciliation_retains_concurrent_ack_on_runtime_database() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("runtime.sqlite3");
+    fn runtime_reconciliation_ack(when: AckAttempt) {
+        let directory = tempfile::tempdir().unwrap().keep();
+        eprintln!("Retained runtime ACK fixture at {directory:?}; schedule {when:?}");
+        let database = directory.join("runtime.sqlite3");
         let conn = crate::guard_db_conn(
             crate::DbConn::open_file(database.to_str().unwrap()).unwrap(),
             "concurrent ACK repair source",
@@ -2875,8 +2916,39 @@ mod tests {
         assert_reconciliation_retains_concurrent_ack(
             &*conn,
             &*peer,
-            &directory.path().join("archive"),
+            &directory.join("archive"),
+            when,
         );
+    }
+
+    #[test]
+    fn reconciliation_retains_concurrent_ack_on_canonical_database() {
+        canonical_reconciliation_ack(AckAttempt::DuringRead);
+    }
+
+    #[test]
+    fn reconciliation_retains_concurrent_ack_after_snapshot_on_canonical_database() {
+        canonical_reconciliation_ack(AckAttempt::AfterReconciliation);
+    }
+
+    #[test]
+    fn reconciliation_retains_concurrent_ack_before_seal_on_canonical_database() {
+        canonical_reconciliation_ack(AckAttempt::BeforeSeal);
+    }
+
+    #[test]
+    fn reconciliation_retains_concurrent_ack_on_runtime_database() {
+        runtime_reconciliation_ack(AckAttempt::DuringRead);
+    }
+
+    #[test]
+    fn reconciliation_retains_concurrent_ack_after_snapshot_on_runtime_database() {
+        runtime_reconciliation_ack(AckAttempt::AfterReconciliation);
+    }
+
+    #[test]
+    fn reconciliation_retains_concurrent_ack_before_seal_on_runtime_database() {
+        runtime_reconciliation_ack(AckAttempt::BeforeSeal);
     }
 
     #[test]
