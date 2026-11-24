@@ -1057,31 +1057,7 @@ fn verify_prepared_without_mutation(
     if !committed.same_head(&archive)? {
         return Err(changed());
     }
-    let paths = crate::message_paths_for_bundle(
-        &archive,
-        &prepared.message,
-        &prepared.sender,
-        &prepared.recipients,
-    )?
-    .0;
-    let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
-    let expected = committed.file_identity(&archive, &paths.canonical)?.0;
-    let mut budget = super::CanonicalScanBudget {
-        control,
-        ..Default::default()
-    };
-    if !super::identity::preflight(
-        &committed.repo,
-        &archive,
-        prepared.message["id"]
-            .as_i64()
-            .filter(|id| *id > 0)
-            .ok_or_else(|| super::invalid("message has no positive archive identity"))?,
-        &canonical,
-        expected,
-        false,
-        &mut budget,
-    )? {
+    if !canonical_identity_matches(&archive, prepared, &committed, control)? {
         return Ok(false);
     }
     super::checkpoint(control)?;
@@ -1094,6 +1070,40 @@ fn verify_prepared_without_mutation(
         return Err(changed());
     }
     Ok(true)
+}
+
+/// Check the committed canonical object and the current staged identities.
+fn canonical_identity_matches(
+    archive: &ProjectArchive,
+    prepared: &PreparedMessage,
+    committed: &CommittedMessages,
+    control: Option<RepairControl<'_>>,
+) -> Result<bool, ReconcileFailure> {
+    let paths = crate::message_paths_for_bundle(
+        archive,
+        &prepared.message,
+        &prepared.sender,
+        &prepared.recipients,
+    )?
+    .0;
+    let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
+    let expected = committed.file_identity(archive, &paths.canonical)?.0;
+    let mut budget = super::CanonicalScanBudget {
+        control,
+        ..Default::default()
+    };
+    Ok(super::identity::preflight(
+        &committed.repo,
+        archive,
+        prepared.message["id"]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| super::invalid("message has no positive archive identity"))?,
+        &canonical,
+        expected,
+        false,
+        &mut budget,
+    )?)
 }
 
 /// Immutable Git observation for all surviving copies of one message.
@@ -1566,13 +1576,38 @@ fn reconcile_message_batch_with_clock(
 /// tree, then check that those exact objects remain in HEAD and on disk. Git
 /// staging or working-tree files alone cannot authorize deleting the DB source.
 /// `None` means the complete bundle fits a fresh pass but not its remaining budget.
+#[cfg(test)]
 fn verify_retention_archive(
     archive: &ProjectArchive,
     prepared: &PreparedMessage,
     admitted_bytes: &mut usize,
 ) -> Result<Option<usize>, String> {
+    verify_retention_candidate(archive, prepared, admitted_bytes, None)
+}
+
+fn verify_retention_candidate(
+    archive: &ProjectArchive,
+    prepared: &PreparedMessage,
+    admitted_bytes: &mut usize,
+    control: Option<RepairControl<'_>>,
+) -> Result<Option<usize>, String> {
     let committed = CommittedMessages::open(archive)?;
-    verify_retention_archive_at(archive, prepared, admitted_bytes, &committed, None)
+    let Some(bytes) =
+        verify_retention_archive_at(archive, prepared, admitted_bytes, &committed, control)?
+    else {
+        return Ok(None);
+    };
+    // Retention relinquishes the live source. Even when all expected bytes
+    // match on disk and in HEAD, a conflicting canonical identity may still
+    // be staged for the next commit. Apply the same check as archive repair.
+    if !committed.same_head(archive)?
+        || !canonical_identity_matches(archive, prepared, &committed, control)
+            .map_err(|error| error.detail)?
+        || !committed.same_head(archive)?
+    {
+        return Err("retention canonical identity changed during verification".into());
+    }
+    Ok(Some(bytes))
 }
 
 fn verify_retention_archive_at(
@@ -1733,9 +1768,14 @@ fn prune_retention_candidate(
                 if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
                     return Ok(PruneAttempt::Interrupted);
                 }
-                if verify_retention_archive(&archive, &prepared, &mut report.archive_bytes)
-                    .map_err(super::invalid)?
-                    .is_none()
+                if verify_retention_candidate(
+                    &archive,
+                    &prepared,
+                    &mut report.archive_bytes,
+                    Some(control),
+                )
+                .map_err(super::invalid)?
+                .is_none()
                 {
                     return Ok(PruneAttempt::NextBatch);
                 }
@@ -3171,6 +3211,60 @@ mod tests {
             assert_eq!(complete.pruned.deleted_messages, 1);
             assert_eq!(complete.pruned.deleted_recipients, 2);
             assert_eq!(complete.deferred, 0);
+        });
+    }
+
+    #[test]
+    fn retention_preserves_db_source_while_conflicting_canonical_payload_is_staged() {
+        retention_fixture(2, |cx, pool, config| {
+            let prepared = prepare_message(cx, pool, 901).unwrap();
+            reconcile_prepared(config, &prepared).unwrap();
+            reconcile_prepared(config, &prepare_message(cx, pool, 902).unwrap()).unwrap();
+            crate::flush_async_commits();
+
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &prepared.message,
+                &prepared.sender,
+                &prepared.recipients,
+            )
+            .unwrap()
+            .0;
+            let repo = git2::Repository::open(&archive.repo_root).unwrap();
+            let relative =
+                crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+            let canonical = std::path::Path::new(&relative);
+            let original = std::fs::read(&paths.canonical).unwrap();
+            std::fs::write(
+                &paths.canonical,
+                crate::render_message_bundle_content(&prepared.message, "different staged body")
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(canonical).unwrap();
+            index.write().unwrap();
+            std::fs::write(&paths.canonical, &original).unwrap();
+            let staged = std::fs::read(repo.path().join("index")).unwrap();
+
+            let mut cursor = ArchivePruneCursor::default();
+            let stop = AtomicBool::new(false);
+            let refused =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop)
+                    .unwrap();
+            assert_eq!((refused.deferred, refused.pruned.deleted_messages), (1, 1));
+            assert_eq!(retained_message_ids(cx, pool), [901]);
+            assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), staged);
+            assert_eq!(std::fs::read(&paths.canonical).unwrap(), original);
+
+            index.add_path(canonical).unwrap();
+            index.write().unwrap();
+            let cleared =
+                prune_archived_message_batch(cx, pool, config, 3_000_000, &mut cursor, &stop)
+                    .unwrap();
+            assert_eq!((cleared.deferred, cleared.pruned.deleted_messages), (0, 1));
+            assert!(retained_message_ids(cx, pool).is_empty());
         });
     }
 
