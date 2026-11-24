@@ -1076,6 +1076,31 @@ pub(crate) fn plan_legacy_message_search(query: &SearchQuery) -> crate::DbResult
     }
 }
 
+/// Apply the same allowlist before LIMIT for every searchable document kind.
+fn push_project_set_filter(
+    scope: &ScopePolicy,
+    project_column: &str,
+    where_clauses: &mut Vec<String>,
+    params: &mut Vec<PlanParam>,
+    facets_applied: &mut Vec<String>,
+) -> bool {
+    let ScopePolicy::ProjectSet {
+        allowed_project_ids,
+    } = scope
+    else {
+        return false;
+    };
+    if allowed_project_ids.is_empty() {
+        where_clauses.push("0".to_string());
+    } else {
+        let placeholders = vec!["?"; allowed_project_ids.len()].join(", ");
+        where_clauses.push(format!("{project_column} IN ({placeholders})"));
+        params.extend(allowed_project_ids.iter().copied().map(PlanParam::Int));
+    }
+    facets_applied.push("scope_project_set".to_string());
+    true
+}
+
 #[allow(clippy::too_many_lines)]
 fn plan_message_search(
     query: &SearchQuery,
@@ -1167,32 +1192,27 @@ fn plan_message_search(
     };
 
     // ── Scope filters ──────────────────────────────────────────────
-    let mut scope_enforced = false;
     if let Some(pid) = query.project_id {
         where_clauses.push("m.project_id = ?".to_string());
         params.push(PlanParam::Int(pid));
         facets_applied.push("project_id".to_string());
-    } else if let Some(prod_id) = query.product_id {
+    }
+    // Product membership is live. An explicit project or a project: hint
+    // narrows this set and must not replace the membership predicate.
+    if let Some(prod_id) = query.product_id {
         from_clause.push_str(" JOIN product_project_links ppl ON ppl.project_id = m.project_id");
         where_clauses.push("ppl.product_id = ?".to_string());
         params.push(PlanParam::Int(prod_id));
         facets_applied.push("product_id".to_string());
     }
 
-    // ── Visibility scope enforcement ──────────────────────────────
-    if let ScopePolicy::ProjectSet {
-        ref allowed_project_ids,
-    } = query.scope
-        && !allowed_project_ids.is_empty()
-    {
-        let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
-        where_clauses.push(format!("m.project_id IN ({})", placeholders.join(", ")));
-        for &pid in allowed_project_ids {
-            params.push(PlanParam::Int(pid));
-        }
-        facets_applied.push("scope_project_set".to_string());
-        scope_enforced = true;
-    }
+    let scope_enforced = push_project_set_filter(
+        &query.scope,
+        "m.project_id",
+        &mut where_clauses,
+        &mut params,
+        &mut facets_applied,
+    );
 
     // ── Facet filters ──────────────────────────────────────────────
     if !query.importance.is_empty() {
@@ -1362,7 +1382,6 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     let mut params: Vec<PlanParam> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
     let mut facets_applied: Vec<String> = Vec::new();
-    let mut scope_enforced = false;
 
     let (select_cols, from_clause, order_clause) = {
         let mut like_parts = Vec::new();
@@ -1392,20 +1411,13 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
         facets_applied.push("project_id".to_string());
     }
 
-    // Scope enforcement for ProjectSet
-    if let ScopePolicy::ProjectSet {
-        ref allowed_project_ids,
-    } = query.scope
-        && !allowed_project_ids.is_empty()
-    {
-        let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
-        where_clauses.push(format!("a.project_id IN ({})", placeholders.join(", ")));
-        for &pid in allowed_project_ids {
-            params.push(PlanParam::Int(pid));
-        }
-        facets_applied.push("scope_project_set".to_string());
-        scope_enforced = true;
-    }
+    let scope_enforced = push_project_set_filter(
+        &query.scope,
+        "a.project_id",
+        &mut where_clauses,
+        &mut params,
+        &mut facets_applied,
+    );
 
     let where_str = if where_clauses.is_empty() {
         String::new()
@@ -1448,7 +1460,6 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
     let mut params: Vec<PlanParam> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
     let mut facets_applied: Vec<String> = Vec::new();
-    let mut scope_enforced = false;
 
     let (select_cols, from_clause, order_clause) = {
         let mut like_parts = Vec::new();
@@ -1471,20 +1482,13 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
         )
     };
 
-    // Scope enforcement for ProjectSet
-    if let ScopePolicy::ProjectSet {
-        ref allowed_project_ids,
-    } = query.scope
-        && !allowed_project_ids.is_empty()
-    {
-        let placeholders: Vec<&str> = allowed_project_ids.iter().map(|_| "?").collect();
-        where_clauses.push(format!("p.id IN ({})", placeholders.join(", ")));
-        for &pid in allowed_project_ids {
-            params.push(PlanParam::Int(pid));
-        }
-        facets_applied.push("scope_project_set".to_string());
-        scope_enforced = true;
-    }
+    let scope_enforced = push_project_set_filter(
+        &query.scope,
+        "p.id",
+        &mut where_clauses,
+        &mut params,
+        &mut facets_applied,
+    );
 
     let where_str = if where_clauses.is_empty() {
         String::new()

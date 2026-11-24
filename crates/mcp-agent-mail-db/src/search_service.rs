@@ -339,8 +339,8 @@ fn query_assistance_payload(query: &SearchQuery) -> Option<QueryAssistance> {
 
 /// Apply the `field:value` hints `parse_query_assistance` recognises as the
 /// filters they name, with the hints taken out of the text: `from:` (sender),
-/// `thread:`, `importance:`, `after:`, `before:`, and `project:` (by slug, on
-/// an unscoped search only). An explicit facet wins over a hint. Only hints
+/// `thread:`, `importance:`, `after:`, `before:`, and `project:` (by slug,
+/// within the supplied product if any). An explicit facet wins over a hint. Only hints
 /// that took effect are reported in the assistance payload.
 /// Invalid or unresolved active filters fail the query: removing a filter
 /// must never silently broaden a search to other dates, priorities or projects.
@@ -411,7 +411,7 @@ async fn apply_query_hints(
                 }
                 true
             }
-            "project" if hinted.project_id.is_none() && hinted.product_id.is_none() => {
+            "project" if hinted.project_id.is_none() => {
                 match crate::queries::get_project_by_slug(cx, pool, &hint.value).await {
                     Outcome::Ok(project) => {
                         let Some(id) = project.id else {
@@ -620,15 +620,6 @@ fn importance_filter_requires_sql_plan(query: &SearchQuery) -> bool {
     !(exactly_urgent || high_or_urgent || exactly_normal || exactly_low)
 }
 
-fn scoped_project_set_requires_sql_plan(query: &SearchQuery) -> bool {
-    matches!(
-        query.scope,
-        ScopePolicy::ProjectSet {
-            ref allowed_project_ids,
-        } if !allowed_project_ids.is_empty()
-    )
-}
-
 /// Use the SQL planner when correctness depends on filters or ordering that
 /// the Tantivy index cannot enforce before candidate truncation.
 fn message_query_requires_sql_plan(query: &SearchQuery) -> bool {
@@ -642,7 +633,7 @@ fn message_query_requires_sql_plan(query: &SearchQuery) -> bool {
         || query.ack_required.is_some()
         || query_needs_recipient_filter(query)
         || importance_filter_requires_sql_plan(query)
-        || scoped_project_set_requires_sql_plan(query)
+        || matches!(query.scope, ScopePolicy::ProjectSet { .. })
         // A numeric thread id includes its root message, which the index's
         // thread_id field does not carry.
         || query
@@ -11399,6 +11390,97 @@ mod tests {
                 .unwrap();
             assert_eq!(filtered.results.len(), 1);
             assert_eq!(filtered.results[0].result.id, 3);
+        });
+    }
+
+    #[test]
+    fn product_search_intersects_live_membership_with_project_hints_and_facets() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let (_root, pool, alpha) = query_hint_mailbox(&cx).await;
+            let beta = crate::queries::get_project_by_human_key(&cx, &pool, "/query-hint-beta")
+                .await
+                .into_result()
+                .unwrap();
+            let product_id = crate::queries::ensure_product(&cx, &pool, Some("hint-product"), None)
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            crate::queries::link_product_to_projects(&cx, &pool, product_id, &[alpha.id.unwrap()])
+                .await
+                .into_result()
+                .unwrap();
+
+            // The selected project exists and has messages, but the product
+            // does not include it. Neither spelling may return those messages
+            // or substitute all mail from the product's other project.
+            let hinted =
+                SearchQuery::product_messages(format!("project:{}", beta.slug), product_id);
+            let explicit = SearchQuery {
+                project_id: beta.id,
+                ..SearchQuery::product_messages("", product_id)
+            };
+            for linked in [false, true] {
+                if linked {
+                    crate::queries::link_product_to_projects(
+                        &cx,
+                        &pool,
+                        product_id,
+                        &[beta.id.unwrap()],
+                    )
+                    .await
+                    .into_result()
+                    .unwrap();
+                }
+                for query in [&hinted, &explicit] {
+                    let response = execute_search(&cx, &pool, query, &SearchOptions::default())
+                        .await
+                        .into_result()
+                        .unwrap();
+                    let ids: Vec<_> = response.results.iter().map(|row| row.result.id).collect();
+                    assert_eq!(ids.as_slice(), if linked { &[4][..] } else { &[][..] });
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn empty_project_allowlist_denies_every_document_kind() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let (_root, pool, alpha) = query_hint_mailbox(&cx).await;
+            for (doc_kind, text) in [
+                (DocKind::Message, "commonmail"),
+                (DocKind::Thread, "commonmail"),
+                (DocKind::Agent, "BlueLake"),
+                (DocKind::Project, "alpha"),
+            ] {
+                for allowed_project_ids in [vec![alpha.id.unwrap()], Vec::new()] {
+                    let allowed = !allowed_project_ids.is_empty();
+                    let query = SearchQuery {
+                        doc_kind,
+                        text: text.to_string(),
+                        scope: ScopePolicy::ProjectSet {
+                            allowed_project_ids,
+                        },
+                        ..Default::default()
+                    };
+                    let response = execute_search(&cx, &pool, &query, &SearchOptions::default())
+                        .await
+                        .into_result()
+                        .unwrap();
+                    assert_eq!(!response.results.is_empty(), allowed, "{doc_kind:?}");
+                    assert_eq!(response.sql_row_count > 0, allowed, "{doc_kind:?}");
+                }
+            }
         });
     }
 
