@@ -24,6 +24,9 @@ production Rust, dependency manifests, and Beads status unchanged.
 | `scripts/qualify_health_idle.mjs` | Linux black-box runner using Node built-ins; no package installation or native source hooks. |
 | `tests/test_qualify_health_idle.mjs` | Adversarial model tests of the runner's exact orchestration and verdict logic. |
 | `tests/fixtures/gh407_agent_mail_surrogate.mjs` | Clearly labelled process/HTTP/system-SQLite surrogate for testing the runner's real adapter. |
+| `scripts/ci/qualify_issue407.py` | Exact-source native qualification driver with owned process cleanup and retained failure receipts. |
+| `tests/ci/test_qualify_issue407.py` | Adversarial source, artifact, verdict, and real process-ownership controls for the native driver. |
+| `.github/workflows/issue407-native.yml` | Runs controller controls before the native regressions and same-build binary qualification. |
 | `docs/GH407_READINESS_QUALIFICATION.md` | Reproduction, evidence interpretation, source findings, and remaining qualification work. |
 
 The harness requires Linux `/proc`, Node 20 or newer, and `getconf`. The optional
@@ -257,6 +260,94 @@ receipt. User-configurable idle and soak lengths cannot be shortened below
 their qualification minima through the CLI.
 
 ## Compile and qualify an exact native build
+
+The automated entry point is `scripts/ci/qualify_issue407.py`. On an authorized
+Linux host with Python 3.11 or newer, Node 22 or newer, the source-pinned Rust
+toolchain, and sufficient build capacity, run from a clean committed checkout:
+
+```bash
+python3 scripts/ci/qualify_issue407.py \
+  --expected-source "$(git rev-parse HEAD)" \
+  --evidence /absolute/new/gh407-native-evidence
+```
+
+The driver records and rechecks the actual committed source bytes and executable
+modes, the compiler, lockfile, resolved dependency identities, and Cargo-emitted
+executables. Hidden tracked edits, untracked Cargo configuration, compiler-wrapper
+overrides, stale binaries, and reports with mismatched identities are refused.
+Targets stay outside the evidence upload directory; an existing
+`CARGO_TARGET_DIR` can be reused when its ownership and permissions are suitable.
+
+It builds the existing server tests with the original default features, then
+runs each of these exact regressions with a separate 180-second runtime bound:
+
+- `tests::health_readiness_supervisor_refreshes_without_client_polls`
+- `tests::health_readiness_fails_closed_on_pending_pool_acquisition`
+- `tests::health_readiness_invalidates_another_pool_generation`
+
+Each must report exactly one passing, zero failing, zero ignored test. The
+legitimate child-and-parent output is accepted; zero selected tests and a
+successful compilation alone do not pass. A separately bounded release `am`
+build supplies its actual emitted executable and hash to the independent
+black-box harness. The production branch can still run after an incomplete test
+build when resources permit; overall qualification requires every native test,
+the black-box run, and the final source/binary check to pass.
+
+The driver retains raw logs and structured receipts for failure, interruption,
+resource refusal, and success. It owns detached descendants through a Linux
+subreaper and applies bounded cleanup. It reserves 2 GiB of free space on relevant
+filesystems and 1 GiB of available memory, uses one compilation job, and reduces
+debug information without changing features or assertions. Its 128 MiB log cap
+also applies to a command that exits before the next resource sample.
+
+`.github/workflows/issue407-native.yml` runs on relevant `main` pushes and manual
+dispatch. Controller controls run first in a separately labelled job. The native
+job checks out the triggering SHA, installs its pinned compiler, and retains
+failed and incomplete receipts. A workflow definition or passing controller job
+is not native Agent Mail evidence.
+
+The recovered final controller sources passed **24/24 tests in 3.756 seconds**
+on November 24, 2026, including real timeout, interruption, and detached-child
+cleanup controls. The unchanged JavaScript model suite also passed **28/28**.
+Python syntax, workflow YAML structure/action pins, and embedded shell syntax
+checks passed. These results supersede the earlier unexecuted-controller state;
+they still execute zero Agent Mail native regression bodies.
+
+```bash
+python3 -m unittest discover -s tests/ci -p test_qualify_issue407.py -v
+node --test tests/test_qualify_health_idle.mjs
+```
+
+For a compiler provisioned without rustup, set PATH and RUSTC to the verified
+source-pinned tools and add
+`--toolchain-manifest /absolute/channel-rust-nightly.toml`. Retain authenticated
+distribution and component-checksum receipts: the driver checks the supplied
+manifest's date and compiler identities but does not authenticate that manifest.
+Cargo's normal cache integrity remains a trusted build input; the driver checks
+resolved identities rather than hashing every cached transitive source byte.
+
+### Recorded native build limitation
+
+An earlier attempt provisioned the exact pinned compiler and fetched all locked
+dependencies successfully in 160.233 seconds with `Cargo.lock` unchanged. Its
+default-feature server test build on clean source `bc407d6b` stopped at the
+declared available-memory reserve after **256.764 seconds**. It had emitted 226
+dependency artifacts, with no compiler diagnostic identifying a source defect,
+but had not completed Asupersync or produced the server test executable. Peak
+owned build-process-group RSS was 4,552,830,976 bytes; available host memory fell
+to 969,211,904 bytes. Cargo exited on SIGTERM, without forced SIGKILL. Native
+regression bodies executed: **zero**.
+
+A lower-memory diagnostic was not launched: shared workspace free space then
+fell below 400 MB while the measured task-owned target/cache allocations stayed
+unchanged, and the executor disconnected. Original receipts were saved before
+the outage but could not be exported afterward. These observed results are a
+resource-limited incomplete qualification, not a native pass. A separate pinned
+format check also reported existing differences in
+`crates/mcp-agent-mail-server/src/retention/pending/journal_scan.rs`; no
+workspace-wide formatting pass is claimed.
+
+### Individual build and qualification commands
 
 Use an authorized build host with the repository's pinned compiler and enough
 disk. Keep `Cargo.lock`, dependency revisions, default features, and native

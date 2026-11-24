@@ -1,0 +1,115 @@
+name: Issue 407 idle readiness qualification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/issue407-native.yml'
+      - 'scripts/ci/qualify_issue407.py'
+      - 'scripts/qualify_health_idle.mjs'
+      - 'tests/ci/test_qualify_issue407.py'
+      - 'tests/test_qualify_health_idle.mjs'
+      - 'tests/fixtures/gh407_agent_mail_surrogate.mjs'
+      - 'crates/**'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue407-native-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  harness-controls:
+    name: Qualification controller controls (not native evidence)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Exercise adversarial verdict and process controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests/ci -p test_qualify_issue407.py -v
+          node --test tests/test_qualify_health_idle.mjs
+
+  native:
+    name: Exact-source native regression and binary qualification
+    needs: harness-controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_TEST_THREADS: '1'
+      RUST_BACKTRACE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Record the requested source before toolchain setup
+        env:
+          EXPECTED_SOURCE: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gh407-bootstrap"
+          python3 - <<'PY' > "$RUNNER_TEMP/gh407-bootstrap/request.json"
+          import json, os
+          print(json.dumps({
+              "source": os.environ["EXPECTED_SOURCE"],
+              "status": "INCOMPLETE",
+              "reason": "Requested native qualification; setup alone is not a native pass. Inspect the driver summary for the final verdict.",
+          }, indent=2))
+          PY
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Install the source-pinned compiler
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy \
+            2>&1 | tee "$RUNNER_TEMP/gh407-bootstrap/toolchain-install.log"
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "$toolchain" >> "$GITHUB_ENV"
+      - name: Execute original regressions and the same-build black-box harness
+        timeout-minutes: 210
+        env:
+          EXPECTED_SOURCE: ${{ github.sha }}
+          EVIDENCE_DIR: ${{ runner.temp }}/gh407-native
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/qualify_issue407.py \
+            --expected-source "$EXPECTED_SOURCE" \
+            --evidence "$EVIDENCE_DIR"
+      - name: Retain success, failure, and incomplete receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: issue407-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/gh407-bootstrap/
+            ${{ runner.temp }}/gh407-native/
+          if-no-files-found: error
+          retention-days: 14
