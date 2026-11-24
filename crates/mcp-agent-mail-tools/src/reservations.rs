@@ -9687,7 +9687,10 @@ mod tests {
                     .get_named::<i64>("n")
                     .unwrap();
                 assert_eq!(after, before, "a closeout cannot recreate a project");
-                assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                assert_eq!(
+                    read_queued_release_intents(&config).unwrap(),
+                    [] as [crate::degraded_intents::QueuedReleaseIntentView; 0]
+                );
             });
         });
     }
@@ -9784,7 +9787,10 @@ mod tests {
                         "{row:?}"
                     );
                 }
-                assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                assert_eq!(
+                    read_queued_release_intents(&config).unwrap(),
+                    [] as [crate::degraded_intents::QueuedReleaseIntentView; 0]
+                );
             });
         });
     }
@@ -9870,7 +9876,10 @@ mod tests {
                 assert_eq!(active.len(), 1, "the old sibling must be released");
                 assert_eq!(active[0].reason, "future sibling");
                 assert!(active[0].created_ts > intent.created_ts);
-                assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                assert_eq!(
+                    read_queued_release_intents(&config).unwrap(),
+                    [] as [crate::degraded_intents::QueuedReleaseIntentView; 0]
+                );
                 replay_queued_release_intents(&ctx, &pool, &config).await;
                 let remaining = queries::get_active_reservations(&cx, &pool, project_id)
                     .await

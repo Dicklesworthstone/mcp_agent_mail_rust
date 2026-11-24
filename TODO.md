@@ -1,5 +1,85 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## Resumed fresh review (2026-11-24 15:12 UTC, `br-u9bhg`)
+
+- [x] Verify the former hz3 request is now terminal and acknowledged, exit 120,
+  with its source pair released. Retain the prior failed recovery receipts.
+- [x] Refresh registration/inbox, preserve shared-checkout peer edits, review
+  Beads triage and the CASS hit. Continue the existing recovery qualification
+  before opening another lane. Bead status and acceptance remain unchanged.
+- [x] Check actual Git ancestry: shared local main is an older ancestor, not
+  new removals. Fetch remote main and integrate its two search-scope commits
+  once as `00b35dde`; governing docs and pinned dependency graph are unchanged.
+- [x] Reread the published helper/stamp/type-inference diff and pass formatting.
+- [x] Rerun the existing helper suite: 15/15 scenarios, 46/46 routing controls,
+  ten artifact controls and ten initialize-metadata controls passed. Retain
+  `/data/tmp/am-e2e-lib-self-test.20261124T152313Z.1303962` and the full log;
+  recording commands execute no compiler or stale binary.
+- [x] Complete both integrated search-file scans and verify the prior 48
+  source/report/count bindings. All 50 Rust paths are covered, retaining
+  55 critical, 60,992 warning and 21,515 informational source findings without
+  suppression. Report: `resumed-review-v1-ubs-final-report.json`.
+- [x] Observe the actual in-flight Rust/Cargo executable hashes on the worker;
+  they match the earlier pinned nightly identities. Preserve observation time
+  and process IDs in `resumed-review-v1-compiler-identity.json`.
+- [x] Find and correct an unsupported assumption in my ACK probes. The recovery
+  runbook and `is_publication_error` explicitly require retry after an archive
+  publication error, even if SQL committed. Prepare an unconditional publication
+  retry after contention, preserving ACK 999 and first read 444. Add a check that
+  the contact publisher completes its own revision before that retry, so the
+  retry cannot mask its failure. The same six engine/schedule cases remain;
+  their new filter is `test(concurrent_ack_retry)`. No production change.
+  Preserve original `00b35dde` in the separate frozen compiler/native checkout.
+  Its original filter is `test(reconciliation_retains_concurrent_ack)`; any
+  failure of that unsupported automatic-durability assertion is not by itself
+  a production race. The corrected candidate is still uncompiled/unexecuted.
+  Corrected source SHA-256:
+  `68c1dadfcf793ef075e7b072790d009275bbac2cb4fffbc35b578716220b9f01`.
+  Formatting passes after manually collapsing two renamed helper calls; the
+  initial formatter failure is retained. Fresh final-file normal UBS completed
+  with zero critical, 499 warning and 124 informational findings. The two added
+  assertion warnings are intentional test checks and remain unsuppressed.
+  Report: `ack-retry-contract-v2-ubs.summary.json`, SHA-256
+  `2f0d372160245379633fc2c5b9d5b60fd74cfc574c9a10a4b6cdbfe6f7eee1a5`.
+  The earlier pre-format v1 scan is retained as superseded, not current evidence.
+- [ ] Complete strict Clippy on this integrated source, then both compiler
+  graphs; preserve every actual failure and repair concrete diagnostics.
+  Baseline `00b35dde` Clippy completed with exit 101 on vmi1153651, build
+  `30097323753221956`, wrapper `rchw-3bb6af03-6284-488b-b83a-58c5ade916f4`.
+  Three `assert_is_empty` errors in reservation tests require values on failure.
+  Replace those assertions with equality to a typed empty array, preserving
+  the empty-queue condition and improving diagnostics without suppression.
+  All 3,952 source entries match; receipt root
+  `9d3bada7d82e2dcbda434d40f1d6cf272e65dbe68dd96cc06ffffe32be8bbc73`.
+  Wrapper is terminal and acknowledged. The assertion repair passes formatting
+  and normal UBS: zero critical, 1,465 warning and 584 informational findings.
+  Current reservation source SHA-256
+  `9c2b091704697d8bff733ba256a78599ef6eb2c68b58e40c5745bc3d7106a125`.
+  Preserve the failed gate and rerun it on both corrections together.
+- [ ] Obtain ordinary native admission and capture the old six-case baseline,
+  then execute the corrected six retry controls with retained fixtures. Require
+  actual native results plus the documented contract before any production
+  repair. These probes do not justify imposing new writer exclusion. If a
+  separate valid failure requires it, any guard must outlive the archive lock
+  and preserve caller transactions and generation initialization.
+  Native compiler-only request `30097323753221988`, wrapper
+  `rchw-ffa526a1-a585-4b3e-b039-b23fea25ec8a`, was refused before Cargo at
+  ordinary disk admission, exit 120, terminal and acknowledged. The preceding
+  census had 129,221,058,560 bytes free versus 128,849,018,880 required; admission
+  later saw 127,688,105,984 free. No budget or policy changed. Native assertions
+  remain zero. Preserve original baseline commit `00b35dde`; finish corrected
+  static gates while awaiting a native window, and execute both six-case forms
+  when ordinary capacity permits. Runtime test limits remain 1,800 seconds;
+  the 3,600-second setting applies only to literal compiler-only --no-run.
+- [ ] Execute original DB/storage/tools/CLI regression acceptance plus the
+  modified helper and foreign-writer tests under unchanged runtime limits.
+  Include the three modified reservation cases:
+  `replay_release_intent_does_not_recreate_a_missing_project`,
+  `replay_release_intent_rejects_ambiguous_terminal_selectors`, and
+  `replay_release_intent_finishes_old_siblings_after_partial_apply`.
+- [ ] Recheck final diffs/static bindings, publish scoped evidence and update
+  the existing Bead according to actual execution, without replacing acceptance.
+
 ## ACK reconciliation schedule review (`br-u9bhg`)
 
 - [x] Trace both real read-snapshot releases through reconciliation and
