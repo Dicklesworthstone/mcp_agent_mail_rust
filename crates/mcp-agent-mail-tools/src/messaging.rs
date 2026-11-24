@@ -3855,15 +3855,22 @@ effective_free_bytes={free}"
         .collect();
     #[cfg(test)]
     tests::run_before_message_admission_hook();
-    // Both fresh and keyed sends share the same transaction-bound admission.
-    // The earlier cross-project contact check supplies helpful errors, but its
-    // result cannot authorize a send after attachment processing or pool waits.
-    let cross_project =
-        foreign_project
-            .as_ref()
-            .map(|_| mcp_agent_mail_db::queries::CrossProjectMessageScope {
-                sender_project_id: project_id,
-            });
+    // Preflight supplies helpful errors and auto-handshake behavior. Explicit
+    // local policies and cross-project consent are re-read on the transaction
+    // snapshot after attachment work and pool/serializer waits.
+    let contacts = if foreign_project.is_some() {
+        Some(
+            mcp_agent_mail_db::queries::MessageContactScope::CrossProject(
+                mcp_agent_mail_db::queries::CrossProjectMessageScope {
+                    sender_project_id: project_id,
+                },
+            ),
+        )
+    } else {
+        config
+            .contact_enforcement_enabled
+            .then_some(mcp_agent_mail_db::queries::MessageContactScope::SameProject)
+    };
     let claim = idempotency_fingerprint.as_deref().map(|fingerprint| {
         // The claim is keyed by the sender's project (where a retry looks it
         // up), even when the message itself is stored in another project.
@@ -3877,7 +3884,7 @@ effective_free_bytes={free}"
     // A replay returns before checking current contact permission and skips
     // indexing, notification and archive side effects below: no new mail is sent.
     let (message, idempotent_replay) = match db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::create_message_with_recipients_guarded(
+        mcp_agent_mail_db::queries::create_message_with_recipients_authorized(
             ctx.cx(),
             &pool,
             delivery_id,
@@ -3892,7 +3899,7 @@ effective_free_bytes={free}"
             &attachments_json,
             &recipient_refs,
             project_mailbox.as_ref().map(|mailbox| mailbox.kind),
-            cross_project,
+            contacts,
             sender_credential_proof(&sender, sender_token.as_deref()),
             claim,
         )
@@ -4850,7 +4857,7 @@ effective_free_bytes={free}"
     // cross-project replies. A cached preflight verdict cannot outlive a
     // credential rotation while attachment processing or pool waits run.
     let (reply, idempotent_replay) = match db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::create_message_with_recipients_guarded(
+        mcp_agent_mail_db::queries::create_message_with_recipients_authorized(
             ctx.cx(),
             &pool,
             project_id,
@@ -4865,7 +4872,9 @@ effective_free_bytes={free}"
             &attachments_json,
             &recipient_refs,
             None,
-            None,
+            config
+                .contact_enforcement_enabled
+                .then_some(mcp_agent_mail_db::queries::MessageContactScope::SameProject),
             sender_credential_proof(&sender, sender_token.as_deref()),
             claim,
         )
@@ -8697,6 +8706,338 @@ mod tests {
                 });
             },
         );
+    }
+
+    async fn local_policy_probe(
+        ctx: &McpContext,
+        project: &ProjectRow,
+        sender: &AgentRow,
+        recipient: &AgentRow,
+        parent_id: i64,
+        mode: &str,
+        key: Option<String>,
+    ) -> McpResult<String> {
+        if mode == "reply" {
+            reply_message(
+                ctx,
+                project.human_key.clone(),
+                parent_id,
+                sender.name.clone(),
+                "local policy probe".to_string(),
+                Some(vec![]),
+                None,
+                Some(vec![recipient.name.clone()]),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                key,
+            )
+            .await
+        } else {
+            let (to, cc) = if mode == "keyed_send" {
+                (vec![], Some(vec![recipient.name.clone()]))
+            } else {
+                (vec![recipient.name.clone()], None)
+            };
+            send_message(
+                ctx,
+                project.human_key.clone(),
+                sender.name.clone(),
+                to,
+                "local policy probe".to_string(),
+                "body".to_string(),
+                cc,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                key,
+            )
+            .await
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn local_send_and_reply_recheck_strict_contact_policy_after_preflight() {
+        with_messaging_mailbox(
+            &[
+                ("CONTACT_ENFORCEMENT_ENABLED", "1"),
+                ("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "0"),
+                ("MESSAGING_SESSION_IDENTITY", "false"),
+            ],
+            |mailbox| {
+                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let pool = get_db_pool().expect("private test mailbox");
+                    let project = ensure_project_row(&cx, &pool, "/data/projects/local-contact-admission").await;
+                    let project_id = project.id.unwrap();
+                    let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                    let recipient = register_agent_row(&cx, &pool, project_id, "RedFox").await;
+                    let from = sender.id.unwrap();
+                    let to = recipient.id.unwrap();
+                    let original = queries::create_message_with_recipients(
+                        &cx, &pool, project_id, to, "Parent", "Reply to this message",
+                        None, "normal", true, "[]", &[(from, "to")],
+                    ).await.into_result().expect("parent and recent-contact evidence");
+                    let parent_id = original.id.unwrap();
+                    // A reverse approval is deliberately present: unlike a
+                    // cross-project link, it cannot satisfy local contacts_only.
+                    queries::request_contact(
+                        &cx, &pool, project_id, to, project_id, from, "reverse", 3600,
+                    ).await.into_result().expect("reverse request");
+                    queries::respond_contact(
+                        &cx, &pool, project_id, to, project_id, from, true, 3600,
+                    ).await.into_result().expect("reverse approval");
+
+                    for mode in ["send", "keyed_send", "reply"] {
+                        for change in ["block_all", "contacts_only", "revoked", "expired", "deleted"] {
+                            let policy = match change {
+                                "block_all" => "open",
+                                "contacts_only" => "auto",
+                                _ => "contacts_only",
+                            };
+                            queries::set_agent_contact_policy_by_name(
+                                &cx, &pool, project_id, &recipient.name, policy,
+                            ).await.into_result().expect("restore preflight policy");
+                            queries::request_contact(
+                                &cx, &pool, project_id, from, project_id, to, "forward", 3600,
+                            ).await.into_result().expect("forward request");
+                            queries::respond_contact(
+                                &cx, &pool, project_id, from, project_id, to, true, 3600,
+                            ).await.into_result().expect("forward approval");
+                            let control_key = format!("local-policy-control-{mode}-{change}");
+                            let control: Value = serde_json::from_str(
+                                &local_policy_probe(
+                                    &ctx, &project, &sender, &recipient, parent_id,
+                                    mode, Some(control_key.clone()),
+                                ).await.expect("unchanged approval permits delivery"),
+                            ).expect("control receipt");
+
+                            if change == "contacts_only" {
+                                // auto legitimately passes preflight using
+                                // recent/thread evidence, with no forward approval.
+                                queries::respond_contact(
+                                    &cx, &pool, project_id, from, project_id, to, false, 0,
+                                ).await.into_result().expect("remove forward approval");
+                            }
+                            let before = bearer_admission_counts(&cx, &pool).await;
+                            let writer = mcp_agent_mail_db::DbConn::open_file(
+                                mailbox.database_path.to_str().expect("database path"),
+                            ).expect("independent policy writer");
+                            let sequence_before = writer.query_sync(
+                                "SELECT COALESCE(MAX(seq), 0) FROM sqlite_sequence WHERE name = 'messages'", &[],
+                            ).expect("message sequence before admission")[0].get_as::<i64>(0).unwrap();
+                            let called = std::rc::Rc::new(std::cell::Cell::new(false));
+                            let observed = std::rc::Rc::clone(&called);
+                            let _hook_guard = MessageAdmissionHookGuard;
+                            BEFORE_MESSAGE_ADMISSION.with(|slot| {
+                                assert!(slot.borrow().is_none());
+                                *slot.borrow_mut() = Some(Box::new(move || {
+                                    use sqlmodel_core::Value as SqlValue;
+                                    match change {
+                                        "block_all" | "contacts_only" => {
+                                            writer.execute_sync(
+                                                "UPDATE agents SET contact_policy = ? WHERE id = ?",
+                                                &[SqlValue::Text(change.to_string()), SqlValue::BigInt(to)],
+                                            ).expect("commit policy change after preflight");
+                                        }
+                                        "revoked" => {
+                                            writer.execute_sync(
+                                                "UPDATE agent_links SET status = 'blocked' WHERE a_agent_id = ? AND b_agent_id = ?",
+                                                &[SqlValue::BigInt(from), SqlValue::BigInt(to)],
+                                            ).expect("commit revocation after preflight");
+                                        }
+                                        "expired" => {
+                                            writer.execute_sync(
+                                                "UPDATE agent_links SET expires_ts = ? WHERE a_agent_id = ? AND b_agent_id = ?",
+                                                &[SqlValue::BigInt(mcp_agent_mail_db::now_micros()), SqlValue::BigInt(from), SqlValue::BigInt(to)],
+                                            ).expect("expire approval after preflight");
+                                        }
+                                        "deleted" => {
+                                            writer.execute_sync(
+                                                "DELETE FROM agent_links WHERE a_agent_id = ? AND b_agent_id = ?",
+                                                &[SqlValue::BigInt(from), SqlValue::BigInt(to)],
+                                            ).expect("remove approval after preflight");
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                    observed.set(true);
+                                    mcp_agent_mail_db::close_db_conn(writer, "local contact-admission test writer");
+                                }));
+                            });
+                            let key = (mode != "send").then(|| format!("local-policy-race-{mode}-{change}"));
+                            let error = local_policy_probe(
+                                &ctx, &project, &sender, &recipient, parent_id, mode, key,
+                            ).await.expect_err("strict policy change must prevent new mail");
+                            assert!(called.get(), "{mode}/{change} must pass preflight before the independent write");
+                            assert_eq!(
+                                crate::tool_util::tool_error_code(&error),
+                                Some(if change == "block_all" { "CONTACT_BLOCKED" } else { "CONTACT_REQUIRED" }),
+                                "{mode}/{change}: {error:?}",
+                            );
+                            assert_eq!(error.data.as_ref().unwrap()["error"]["data"]["phase"], "message_admission");
+                            assert_eq!(bearer_admission_counts(&cx, &pool).await, before,
+                                "{mode}/{change} must not publish mail, events or an idempotency claim");
+                            {
+                                let conn = pool.acquire(&cx).await.into_result().expect("sequence verifier");
+                                let sequence_after = conn.query_sync(
+                                    "SELECT COALESCE(MAX(seq), 0) FROM sqlite_sequence WHERE name = 'messages'", &[],
+                                ).expect("message sequence after refusal")[0].get_as::<i64>(0).unwrap();
+                                assert_eq!(sequence_after, sequence_before, "refused mail cannot consume a message id");
+                            }
+                            let replay: Value = serde_json::from_str(
+                                &local_policy_probe(
+                                    &ctx, &project, &sender, &recipient, parent_id,
+                                    mode, Some(control_key),
+                                ).await.expect("a committed replay creates no new mail"),
+                            ).expect("replay receipt");
+                            assert_eq!(replay["idempotent_replay"], true);
+                            let id = if mode == "reply" {
+                                &replay["id"]
+                            } else {
+                                &replay["deliveries"][0]["payload"]["id"]
+                            };
+                            let control_id = if mode == "reply" {
+                                &control["id"]
+                            } else {
+                                &control["deliveries"][0]["payload"]["id"]
+                            };
+                            assert_eq!(id, control_id);
+                            assert_eq!(bearer_admission_counts(&cx, &pool).await, before);
+                        }
+                    }
+                });
+            },
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn local_contact_admission_preserves_auto_self_and_disabled_enforcement() {
+        for enabled in ["0", "1"] {
+            with_messaging_mailbox(
+                &[
+                    ("CONTACT_ENFORCEMENT_ENABLED", enabled),
+                    ("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "0"),
+                    ("MESSAGING_SESSION_IDENTITY", "false"),
+                ],
+                |_| {
+                    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                    rt.block_on(async {
+                        let cx = Cx::current().expect("runtime context");
+                        let ctx = McpContext::new(cx.clone(), 1);
+                        let pool = get_db_pool().expect("private test mailbox");
+                        let project = ensure_project_row(
+                            &cx,
+                            &pool,
+                            "/data/projects/local-contact-compatibility",
+                        )
+                        .await;
+                        let project_id = project.id.unwrap();
+                        let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                        let recipient = register_agent_row(&cx, &pool, project_id, "RedFox").await;
+                        let original = queries::create_message_with_recipients(
+                            &cx,
+                            &pool,
+                            project_id,
+                            recipient.id.unwrap(),
+                            "Parent",
+                            "Recent exchange",
+                            None,
+                            "normal",
+                            false,
+                            "[]",
+                            &[(sender.id.unwrap(), "to")],
+                        )
+                        .await
+                        .into_result()
+                        .expect("recent-contact evidence");
+                        queries::request_contact(
+                            &cx,
+                            &pool,
+                            project_id,
+                            sender.id.unwrap(),
+                            project_id,
+                            recipient.id.unwrap(),
+                            "denied link",
+                            3600,
+                        )
+                        .await
+                        .into_result()
+                        .expect("contact request");
+                        queries::respond_contact(
+                            &cx,
+                            &pool,
+                            project_id,
+                            sender.id.unwrap(),
+                            project_id,
+                            recipient.id.unwrap(),
+                            false,
+                            0,
+                        )
+                        .await
+                        .into_result()
+                        .expect("denied contact");
+                        queries::set_agent_contact_policy_by_name(
+                            &cx,
+                            &pool,
+                            project_id,
+                            &recipient.name,
+                            if enabled == "1" { "auto" } else { "block_all" },
+                        )
+                        .await
+                        .into_result()
+                        .expect("recipient policy");
+                        local_policy_probe(
+                            &ctx,
+                            &project,
+                            &sender,
+                            &recipient,
+                            original.id.unwrap(),
+                            "send",
+                            None,
+                        )
+                        .await
+                        .expect(
+                            "auto recent evidence and disabled enforcement retain their behavior",
+                        );
+                        queries::set_agent_contact_policy_by_name(
+                            &cx,
+                            &pool,
+                            project_id,
+                            &sender.name,
+                            "block_all",
+                        )
+                        .await
+                        .into_result()
+                        .expect("self opt-out policy");
+                        local_policy_probe(
+                            &ctx,
+                            &project,
+                            &sender,
+                            &sender,
+                            original.id.unwrap(),
+                            "send",
+                            None,
+                        )
+                        .await
+                        .expect("self messages bypass contact policies");
+                    });
+                },
+            );
+        }
     }
 
     /// br-xhfoz: requesting contact again with an already-approved peer (what a

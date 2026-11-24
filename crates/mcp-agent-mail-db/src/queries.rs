@@ -9527,17 +9527,70 @@ pub struct CrossProjectMessageScope {
     pub sender_project_id: i64,
 }
 
+/// Contact constraints checked on the message transaction's snapshot.
+#[derive(Debug, Clone, Copy)]
+pub enum MessageContactScope {
+    /// Enforce explicit local opt-outs and directed `contacts_only` consent.
+    /// The `auto` policy keeps its advisory tool-layer evidence and fail-open
+    /// behavior; it is not promoted to the stricter cross-project contract.
+    SameProject,
+    CrossProject(CrossProjectMessageScope),
+}
+
+/// Compatibility entry point for bearer checks and cross-project consent.
+/// Internal contact-request notices leave `cross_project` unset because their
+/// purpose is to request approval that does not yet exist.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_message_with_recipients_guarded(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    topic: Option<&str>,
+    reply_to: Option<i64>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    recipients: &[(i64, &str)],
+    project_mailbox: Option<&str>,
+    cross_project: Option<CrossProjectMessageScope>,
+    credential: Option<AgentCredentialProof<'_>>,
+    idempotency: Option<IdempotencyClaim<'_>>,
+) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    create_message_with_recipients_authorized(
+        cx,
+        pool,
+        project_id,
+        sender_id,
+        subject,
+        body_md,
+        thread_id,
+        topic,
+        reply_to,
+        importance,
+        ack_required,
+        attachments,
+        recipients,
+        project_mailbox,
+        cross_project.map(MessageContactScope::CrossProject),
+        credential,
+        idempotency,
+    )
+    .await
+}
+
 /// Create a message with transaction-bound bearer and contact authorization.
 ///
 /// User-facing sends and replies pass their supplied `credential`, if any.
 /// Bearer authority is checked before both fresh writes and idempotent replays.
-/// Qualified sends additionally pass `cross_project`. Internal contact-request
-/// notices use the ordinary creation functions because their purpose is to
-/// request approval that does not yet exist. Same-project contact policy stays
-/// with its existing tool-layer rules. An existing idempotency result is returned
+/// Local sends use `SameProject` when contact enforcement is enabled; qualified
+/// sends always use `CrossProject`. An existing idempotency result is returned
 /// before checking current contact permission: replay creates no mail.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub async fn create_message_with_recipients_guarded(
+pub async fn create_message_with_recipients_authorized(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,
@@ -9552,11 +9605,11 @@ pub async fn create_message_with_recipients_guarded(
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
     project_mailbox: Option<&str>,
-    cross_project: Option<CrossProjectMessageScope>,
+    contacts: Option<MessageContactScope>,
     credential: Option<AgentCredentialProof<'_>>,
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
-    if let Some(scope) = cross_project
+    if let Some(MessageContactScope::CrossProject(scope)) = contacts
         && (scope.sender_project_id == project_id
             || recipients.is_empty()
             || project_mailbox.is_some())
@@ -9689,7 +9742,7 @@ pub async fn create_message_with_recipients_guarded(
                     attachments,
                     recipients,
                     project_mailbox,
-                    cross_project,
+                    contacts,
                     credential,
                     now,
                     archive_seed,
@@ -9912,6 +9965,104 @@ async fn ensure_message_participants_active_in_tx(
     // Cross-project messages may have a sender in a different project from
     // their recipients. Their routing is validated separately.
     ensure_agents_active_in_tx(cx, tracked, &participant_ids, None).await
+}
+
+/// Re-read strict local policies after preflight, attachment work and admission
+/// waits. In particular, a switch from `auto`/`open` to `contacts_only` must not
+/// inherit the earlier advisory decision, and a revoked/expired approval must
+/// not authorize a new message. `auto` keeps its existing tool-layer heuristics.
+/// Self messages and the opt-in shared project mailbox retain their semantics.
+async fn ensure_local_message_contacts_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    project_id: i64,
+    sender_id: i64,
+    recipients: &[(i64, &str)],
+) -> Outcome<(), DbError> {
+    let admitted_at = now_micros();
+    let mut needs_approval = Vec::new();
+    for chunk in recipients.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let sql = format!(
+            "SELECT id, contact_policy FROM agents WHERE project_id = ? AND id IN ({})",
+            placeholders(chunk.len())
+        );
+        let mut params = vec![Value::BigInt(project_id)];
+        params.extend(chunk.iter().map(|(id, _)| Value::BigInt(*id)));
+        let rows = match map_sql_outcome(traw_query(cx, tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        if rows.len() != chunk.len() {
+            return Outcome::Err(DbError::invalid(
+                "project_key",
+                "recipient project changed before message admission",
+            ));
+        }
+        for row in rows {
+            let decode = || -> std::result::Result<_, SqlError> {
+                Ok((row.get_as::<i64>(0)?, row.get_as::<String>(1)?))
+            };
+            let (recipient_id, policy) = match decode() {
+                Ok(recipient) => recipient,
+                Err(error) => return Outcome::Err(map_sql_error(&error)),
+            };
+            if recipient_id == sender_id {
+                continue;
+            }
+            if policy.eq_ignore_ascii_case("block_all") {
+                return Outcome::Err(DbError::invalid(
+                    "local_contact_blocked",
+                    "Recipient is not accepting messages.",
+                ));
+            }
+            if policy.eq_ignore_ascii_case("contacts_only") {
+                needs_approval.push(recipient_id);
+            }
+        }
+    }
+    if needs_approval.is_empty() {
+        return Outcome::Ok(());
+    }
+
+    // Match the existing local contract: only sender -> recipient approval
+    // satisfies contacts_only, and contact-evidence lookup failures fail open.
+    // Scan all policies first so a later block_all cannot be bypassed by a
+    // missing approval or a failed lookup for an earlier recipient.
+    match list_approved_contact_ids_on_connection(
+        cx,
+        tracked,
+        project_id,
+        sender_id,
+        &needs_approval,
+        admitted_at,
+    )
+    .await
+    {
+        Outcome::Ok(approved) => {
+            let approved: HashSet<i64> = approved.into_iter().collect();
+            if needs_approval.iter().any(|id| !approved.contains(id)) {
+                return Outcome::Err(DbError::invalid(
+                    "local_contact_required",
+                    "Contact approval is no longer valid. Obtain an approved, unexpired contact link before retrying; nothing was sent.",
+                ));
+            }
+            Outcome::Ok(())
+        }
+        Outcome::Err(error) => {
+            tracing::warn!(
+                "contact enforcement: admission approval lookup failed (fail-open): {error}"
+            );
+            mcp_agent_mail_core::global_metrics()
+                .tools
+                .contact_enforcement_bypass_total
+                .inc();
+            Outcome::Ok(())
+        }
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
 }
 
 /// Re-read cross-project consent on the same snapshot that creates the mail.
@@ -10148,7 +10299,7 @@ async fn create_message_with_recipients_tx(
     attachments: &str,
     recipients: &[(i64, &str)],
     project_mailbox: Option<&str>,
-    cross_project: Option<CrossProjectMessageScope>,
+    contacts: Option<MessageContactScope>,
     credential: Option<AgentCredentialProof<'_>>,
     now: i64,
     archive_seed: Option<i64>,
@@ -10225,15 +10376,28 @@ async fn create_message_with_recipients_tx(
         tracked,
         ensure_message_participants_active_in_tx(cx, tracked, sender_id, recipients).await
     );
-    if let Some(scope) = cross_project {
-        try_in_tx!(
-            cx,
-            tracked,
-            ensure_cross_project_message_contacts_in_tx(
-                cx, tracked, scope, project_id, sender_id, recipients,
-            )
-            .await
-        );
+    match contacts {
+        Some(MessageContactScope::CrossProject(scope)) => {
+            try_in_tx!(
+                cx,
+                tracked,
+                ensure_cross_project_message_contacts_in_tx(
+                    cx, tracked, scope, project_id, sender_id, recipients,
+                )
+                .await
+            );
+        }
+        Some(MessageContactScope::SameProject) => {
+            try_in_tx!(
+                cx,
+                tracked,
+                ensure_local_message_contacts_in_tx(
+                    cx, tracked, project_id, sender_id, recipients,
+                )
+                .await
+            );
+        }
+        None => {}
     }
 
     // Elect the canonical id durably inside this transaction, AFTER the
@@ -19652,11 +19816,28 @@ pub async fn list_approved_contact_ids(
     };
 
     let tracked = tracked(&*conn);
+    list_approved_contact_ids_on_connection(
+        cx,
+        &tracked,
+        project_id,
+        sender_id,
+        candidate_ids,
+        now_micros(),
+    )
+    .await
+}
 
+async fn list_approved_contact_ids_on_connection(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    project_id: i64,
+    sender_id: i64,
+    candidate_ids: &[i64],
+    now: i64,
+) -> Outcome<Vec<i64>, DbError> {
     let mut out: Vec<i64> = Vec::with_capacity(candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS));
     for chunk in candidate_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
         let sql = approved_contact_sql(chunk.len());
-        let now = now_micros();
         let mut params: Vec<Value> = Vec::with_capacity(chunk.len() + 4);
         params.push(Value::BigInt(project_id));
         params.push(Value::BigInt(sender_id));
@@ -19666,7 +19847,7 @@ pub async fn list_approved_contact_ids(
             params.push(Value::BigInt(*id));
         }
 
-        let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
+        let rows_out = map_sql_outcome(traw_query(cx, tracked, sql, &params).await);
         match rows_out {
             Outcome::Ok(rows) => {
                 for row in rows {

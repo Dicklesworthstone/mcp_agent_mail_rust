@@ -903,10 +903,17 @@ pub mod tool_util {
                 ),
             ),
             DbError::InvalidArgument {
-                field: field @ ("cross_project_contact_blocked" | "cross_project_contact_required"),
+                field:
+                    field @ ("cross_project_contact_blocked"
+                    | "cross_project_contact_required"
+                    | "local_contact_blocked"
+                    | "local_contact_required"),
                 message,
             } => legacy_tool_error(
-                if field == "cross_project_contact_blocked" {
+                if matches!(
+                    field,
+                    "cross_project_contact_blocked" | "local_contact_blocked"
+                ) {
                     "CONTACT_BLOCKED"
                 } else {
                     "CONTACT_REQUIRED"
