@@ -3541,13 +3541,12 @@ pub struct ArchiveLagSnapshot {
     /// Ops waiting in the write-behind queue channel (not yet dequeued).
     #[serde(default)]
     pub wbq_depth: u64,
-    /// Age (microseconds) of the oldest op in the batch the WBQ drain is
-    /// executing right now, 0 when no batch is in flight. The queue is FIFO, so
-    /// while a batch is in flight this is the oldest unmaterialized WBQ write.
+    /// Age (microseconds) of the oldest op in the current WBQ publication
+    /// group, 0 when idle. Completed groups from the same dequeue are excluded.
     #[serde(default)]
     pub wbq_inflight_oldest_age_us: u64,
-    /// How long (microseconds) the drain has been executing its current batch,
-    /// 0 when idle. A value that keeps growing means the drain is stuck.
+    /// How long (microseconds) the drain has spent on its current publication
+    /// group, including admission waits, 0 when idle.
     #[serde(default)]
     pub wbq_inflight_execution_us: u64,
     /// How long (microseconds) queued WBQ work has waited without the drain
@@ -3585,7 +3584,7 @@ fn archive_lag_lock<'a, T>(
     }
 }
 
-/// Wall-clock µs at which the WBQ drain dequeued the batch it is executing
+/// Wall-clock µs at which the WBQ drain started the group it is executing
 /// now; 0 when no batch is in flight (br-kp1in.23).
 static WBQ_INFLIGHT_SINCE_US: AtomicU64 = AtomicU64::new(0);
 /// Wall-clock µs at which the oldest op of the in-flight WBQ batch was
@@ -4629,14 +4628,14 @@ fn wbq_drain_loop(
             metrics.storage.wbq_over_80_since_us.set(0);
         }
 
-        if !batch.is_empty() {
-            wbq_mark_batch_in_flight(&batch);
-        }
-        let mut errors = 0usize;
         let mut idx = 0usize;
         while idx < batch.len() {
             let end = wbq_message_bundle_batch_end(&batch, idx);
             let envelopes = &batch[idx..end];
+            wbq_mark_batch_in_flight(envelopes);
+            if idx != 0 {
+                wbq_yield_between_groups();
+            }
             let result = wbq_execute_envelopes(envelopes);
             let group_failed = result.is_err();
             let reservation_version_refused = matches!(
@@ -4665,6 +4664,7 @@ fn wbq_drain_loop(
                     .storage
                     .wbq_unrecoverable_errors_total
                     .add(unrecoverable);
+                metrics.storage.wbq_errors_total.add(unrecoverable);
                 recovery::message_reconcile::database::durability::record_failures(
                     envelopes.iter().map(|envelope| envelope.op.as_ref()),
                 );
@@ -4673,12 +4673,10 @@ fn wbq_drain_loop(
                         "[wbq-drain] batched message-bundle run failed after retries ({} ops): {error} — durability degraded, refusing further writes until operator intervention",
                         envelopes.len()
                     );
-                    errors += envelopes.len();
                 } else {
                     tracing::error!(
                         "[wbq-drain] op failed after retries: {error} — durability degraded, refusing further writes until operator intervention"
                     );
-                    errors += 1;
                 }
             }
             // Feed the per-archive circuit breaker. A run of non-retryable
@@ -4691,19 +4689,17 @@ fn wbq_drain_loop(
             if !reservation_version_refused {
                 note_archive_write_outcome(envelopes[0].op.as_ref(), group_failed);
             }
+            // One dequeue can contain many independently published groups.
+            // A slow later group must not hide earlier progress from health.
+            metrics
+                .storage
+                .wbq_drained_total
+                .add(u64::try_from(envelopes.len()).unwrap_or(u64::MAX));
+            wbq_note_drain_progress(op_depth.load(Ordering::Relaxed));
             idx = end;
-            if idx < batch.len() {
-                wbq_yield_between_groups();
-            }
         }
 
-        metrics.storage.wbq_drained_total.add(drained_u64);
         wbq_clear_batch_in_flight();
-        wbq_note_drain_progress(op_depth.load(Ordering::Relaxed));
-        metrics
-            .storage
-            .wbq_errors_total
-            .add(u64::try_from(errors).unwrap_or(u64::MAX));
 
         if let Some(waiter) = flush_waiter {
             let _ = waiter.try_send(wbq_persistence_status());
@@ -28333,6 +28329,8 @@ mod tests {
             let observed_hook = Arc::clone(&observed);
             let observed_archive = archive.clone();
             let reservation_config = config.clone();
+            let before = wbq_stats();
+            let drained_before = before.drained;
             WBQ_BETWEEN_GROUPS_TEST_HOOK.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move || {
                     let index = observed_hook.fetch_add(1, Ordering::Relaxed);
@@ -28340,6 +28338,11 @@ mod tests {
                         .get(index)
                         .expect("unexpected extra window");
                     assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+                    assert_eq!(
+                        wbq_stats().drained - drained_before,
+                        u64::try_from(expected).unwrap(),
+                        "health must see completed groups before this dequeue finishes"
+                    );
                     let threads = observed_archive.root.join("messages/threads");
                     let canonical_count =
                         list_message_files(&observed_archive.root.join("messages"))
@@ -28383,7 +28386,6 @@ mod tests {
             let capacity = ops.len() + 1;
             let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
             let depth = Arc::new(AtomicU64::new(0));
-            let before = wbq_stats();
             for op in &ops {
                 assert_eq!(
                     wbq_enqueue_with_sender(&tx, &depth, op.clone()),

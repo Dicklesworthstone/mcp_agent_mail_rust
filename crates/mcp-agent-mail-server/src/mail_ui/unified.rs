@@ -25,7 +25,7 @@ const SAVEPOINT: &str = "SAVEPOINT am_unified_inbox_read";
 const RELEASE: &str = "RELEASE SAVEPOINT am_unified_inbox_read";
 // Both ordering terms let the runtime use a reverse timestamp-index range seek.
 // The first page's inclusive bound retains even the largest valid timestamp.
-const FIRST_HEADERS: &str = "SELECT id, project_id, sender_id, created_ts, importance FROM messages WHERE created_ts <= 9223372036854775807 ORDER BY created_ts DESC, id DESC LIMIT 256";
+const FIRST_HEADERS: &str = "SELECT id, project_id, sender_id, created_ts, importance FROM messages WHERE created_ts <= 9223372036854775807 ORDER BY created_ts DESC, id DESC LIMIT ?";
 const NEXT_HEADERS: &str = "SELECT id, project_id, sender_id, created_ts, importance FROM messages WHERE created_ts <= ? ORDER BY created_ts DESC, id DESC LIMIT 256 OFFSET ?";
 
 type Roster = BTreeMap<i64, BTreeSet<i64>>;
@@ -651,22 +651,33 @@ fn read_with_viewers(
     let mut skip_at_ceiling = 0_i64;
     let mut last_key = None;
     loop {
-        let (sql, params) = ceiling.map_or_else(
-            || (FIRST_HEADERS, Vec::new()),
+        // A small page of visible recent mail can be answered without loading
+        // receipts and entire project rosters for older, discarded headers.
+        // If the first page is sparse, resume with the full scan batch size.
+        let first_size = limit.min(PAGE_SIZE);
+        let (sql, params, page_size) = ceiling.map_or_else(
+            || {
+                (
+                    FIRST_HEADERS,
+                    vec![Value::BigInt(i64::try_from(first_size).unwrap())],
+                    first_size,
+                )
+            },
             |created| {
                 (
                     NEXT_HEADERS,
                     vec![Value::BigInt(created), Value::BigInt(skip_at_ceiling)],
+                    PAGE_SIZE,
                 )
             },
         );
         let rows = conn.query_sync(sql, &params).map_err(database_error)?;
-        if rows.len() > PAGE_SIZE {
+        if rows.len() > page_size {
             return Err(DbError::Internal(
                 "unified inbox header page exceeded its bound".into(),
             ));
         }
-        let finished = rows.len() < PAGE_SIZE;
+        let finished = rows.len() < page_size;
         let mut candidates = BTreeMap::new();
         let mut last_ts = ceiling;
         let mut trailing_count = skip_at_ceiling;
@@ -1132,7 +1143,13 @@ mod tests {
         for id in 100..700 {
             conn.execute_raw(&format!("INSERT INTO messages(id,project_id,sender_id,created_ts,importance) VALUES({id},1,10,{id}+100000,'normal'); INSERT INTO message_recipients VALUES({id},11,'to',NULL,NULL)")).unwrap();
         }
-        conn.execute_raw("COMMIT; PRAGMA query_only=ON").unwrap();
+        // Place an unrelated project immediately below the requested page,
+        // inside the old fixed 256-header read. Opening that entire roster
+        // both wastes work and makes unrelated legacy data break this page.
+        conn.execute_raw(
+            "UPDATE messages SET project_id=3 WHERE id=679; COMMIT; PRAGMA query_only=ON",
+        )
+        .unwrap();
         let traced = Traced {
             conn: &conn,
             statements: RefCell::new(Vec::new()),
@@ -1153,6 +1170,12 @@ mod tests {
             .collect();
         assert_eq!(rosters.len(), 1);
         assert!(matches!(rosters[0].1.as_slice(), [Value::BigInt(1)]));
+        let direct_reads: Vec<_> = statements
+            .iter()
+            .filter(|(sql, _)| sql.contains("FROM message_recipients WHERE message_id IN"))
+            .collect();
+        assert_eq!(direct_reads.len(), 1);
+        assert_eq!(direct_reads[0].1.len(), 20);
         let labels: Vec<_> = statements
             .iter()
             .filter(|(sql, _)| sql.contains("FROM projects"))
@@ -1816,7 +1839,7 @@ mod tests {
     fn newest_header_pages_seek_the_timestamp_index_and_stop_at_the_visible_limit() {
         let (_dir, conn) = fixture();
         for (sql, params) in [
-            (FIRST_HEADERS, Vec::new()),
+            (FIRST_HEADERS, vec![Value::BigInt(7)]),
             (
                 NEXT_HEADERS,
                 vec![Value::BigInt(i64::MAX), Value::BigInt(0)],
@@ -1945,7 +1968,7 @@ mod tests {
                 .iter()
                 .filter(|(sql, _)| sql == FIRST_HEADERS || sql == NEXT_HEADERS)
                 .count(),
-            4,
+            5,
             "foreign projects, undelivered mail and unselected recipients must all advance the cursor"
         );
         let body_reads: Vec<_> = statements

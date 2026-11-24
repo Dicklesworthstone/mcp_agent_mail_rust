@@ -28,8 +28,11 @@ case-insensitive truthy values. Its sixteen-case evidence remains historical.
 - [x] Pass workspace formatting and Bash syntax after these repairs; complete
   normal scans of both edited Rust files and both shell files with zero new
   critical findings, retaining all warnings.
-- [ ] Integrate the known main changes once, freeze the final candidate, and
-  run all three mandatory compiler/Clippy graphs on its exact source.
+- [x] Integrate pinned main `42acb599` once and review its Rust changes, keeping
+  the current peer updates and all original test assertions.
+- [ ] Freeze this integrated candidate and run all three mandatory compiler/
+  Clippy graphs on its exact source. Keep results on the original Bead while
+  the source checkout is frozen.
 - [ ] Obtain ordinary native admission and execute the recovery and helper
   regressions with nonzero counts and unchanged limits. Recent censuses still
   show insufficient unreserved native disk despite apparent free worker slots.
