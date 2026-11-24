@@ -41,6 +41,28 @@
   receipt root `55cfb8476b3e25c13369d5dacbaa90f22ca29200fd5b3b85d7cfd9e3e1a63083`.
   Preserve this failure. Remove only the redundant annotation, letting Rust
   infer the same return type, and rerun the unchanged strict gate.
+  Annotation-only repair is commit `b8974575`. Formatting passes. The full
+  48-file static scope is rebound with two fresh reports and 46 verified
+  unchanged source/report/count bindings: 55 critical, 59,335 warning and
+  21,183 informational source findings, retained without suppression.
+  `ack-schedule-v2-ubs-final-report.json` SHA-256
+  `c6498e3a377533feb83ff31c7c8f22b63d8a6a987522988b50fb96cbe848b6d3`.
+  A preliminary reuse check assumed relative report paths and failed; the
+  corrected check accepts the same exact repository path under original
+  checkout roots and verifies every count. No finding was dropped.
+- [ ] Resolve exact RCH recovery before any additional compiler request.
+  Strict Clippy retry on `b8974575`, hz3 build `30097323753221899`, wrapper
+  `rchw-2d0f74cc-881e-48ef-8580-13713dd3adb4`, was refused before Cargo by
+  `monitor_unavailable`. Wrapper exit 1 retained ownership. Both supported
+  recovery attempts failed with RCH-E504: cannot verify source-pair release
+  receipt, status 73. Recipe records command exit 120, sources released and
+  tree retired, but pair release remains false and terminal acknowledgment
+  remains false. Preserve the frozen compiler checkout and both recoveries.
+  Read-only capability probes find hz3's deployed rch-wkr 2.1.37 (550f62e7f4d9)
+  rejects `source-pair`; the current local CLI also reports 2.1.37 while the
+  daemon reports 2.1.36. These are current observations, not reconstructed
+  past executable identities. No global binary, daemon, lock, reservation or
+  ledger was changed. Agent Mail message 329 requests peer coordination.
 - [ ] Publish exact source and executed evidence; keep original Bead
   acceptance open until every required native lane has passed.
 
