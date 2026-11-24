@@ -8040,23 +8040,34 @@ fn coalescer_restore_spilled_work(rq: &RepoQueue, work: CoalescerSpilledWork) {
     rq.depth.fetch_add(work.pending_requests, Ordering::Relaxed);
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static COALESCER_DEPTH_BEFORE_STORE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Recompute and store the true per-repo queue depth.
 fn coalescer_reconcile_repo_depth(rq: &RepoQueue) -> u64 {
-    let queue_depth = {
-        let queue = rq
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        u64::try_from(queue.len()).unwrap_or(u64::MAX)
-    };
-    let spill_depth = {
-        let spill = rq
-            .spill
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        spill.inner.as_ref().map_or(0, |repo| repo.pending_requests)
-    };
+    // Match the lag reader's queue -> spill order. Producers publish the entry
+    // and increment depth under the corresponding lock. Keep both guards
+    // through the store so a stale zero cannot hide accepted work from workers.
+    let queue = rq
+        .queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spill = rq
+        .spill
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let queue_depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+    let spill_depth = spill.inner.as_ref().map_or(0, |repo| repo.pending_requests);
     let actual = queue_depth.saturating_add(spill_depth);
+    #[cfg(test)]
+    COALESCER_DEPTH_BEFORE_STORE.with(|hook| {
+        if let Some(hook) = hook.take() {
+            hook();
+        }
+    });
     rq.depth.store(actual, Ordering::Relaxed);
     actual
 }
@@ -18637,6 +18648,47 @@ mod tests {
 
     fn test_repo_queue() -> RepoQueue {
         RepoQueue::default()
+    }
+
+    #[test]
+    fn coalescer_depth_repair_keeps_racing_queue_admission_visible() {
+        let rq = test_repo_queue();
+        let (sampled, sample_ready) = std::sync::mpsc::channel();
+        let (attempted, attempt_done) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let rq = &rq;
+            scope.spawn(move || {
+                sample_ready.recv().unwrap();
+                let request = coalescer_group_test_request("mail".into(), vec!["mail.md".into()]);
+                match rq.queue.try_lock() {
+                    Ok(mut queue) => {
+                        // The old sampler released the queue before publishing
+                        // its zero. Complete admission before it can resume.
+                        queue.push_back(request);
+                        rq.depth.fetch_add(1, Ordering::Relaxed);
+                        attempted.send(()).unwrap();
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        attempted.send(()).unwrap();
+                        coalescer_requeue_requests(rq, vec![request]);
+                    }
+                    Err(error) => panic!("unexpected queue error: {error}"),
+                }
+            });
+            COALESCER_DEPTH_BEFORE_STORE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    sampled.send(()).unwrap();
+                    attempt_done.recv().unwrap();
+                }));
+            });
+            coalescer_reconcile_repo_depth(rq);
+        });
+        assert_eq!(rq.queue.lock().unwrap().len(), 1);
+        assert_eq!(rq.depth.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            coalescer_repo_readiness(&rq, 1, Duration::ZERO, true),
+            CoalescerRepoReadiness::Ready
+        );
     }
 
     #[test]
