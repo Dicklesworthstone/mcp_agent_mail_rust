@@ -48,6 +48,15 @@ E2E_RCH_TIMEOUT_SECONDS="${E2E_RCH_TIMEOUT_SECONDS:-900}"
 E2E_RCH_MOCK_CIRCUIT_OPEN="${E2E_RCH_MOCK_CIRCUIT_OPEN:-0}"
 
 e2e_run_cargo() {
+    local -a rch_args=(exec)
+    if [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ] || [ "${RCH_REQUIRE_REMOTE:-0}" = "1" ]; then
+        if [ "${E2E_CARGO_FORCE_LOCAL}" = "1" ]; then
+            e2e_log "ERROR: E2E_CARGO_FORCE_LOCAL=1 conflicts with required remote execution."
+            return 64
+        fi
+        rch_args+=(--require-remote)
+    fi
+
     if [ "${E2E_CARGO_FORCE_LOCAL}" = "1" ]; then
         cargo "$@"
         return $?
@@ -57,16 +66,16 @@ e2e_run_cargo() {
         if command -v timeout >/dev/null 2>&1; then
             if [ "${E2E_RCH_MOCK_CIRCUIT_OPEN}" = "1" ]; then
                 timeout "${E2E_RCH_TIMEOUT_SECONDS}" \
-                    env RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
+                    env RCH_MOCK_CIRCUIT_OPEN=1 rch "${rch_args[@]}" -- env -u CARGO_TARGET_DIR cargo "$@"
             else
                 timeout "${E2E_RCH_TIMEOUT_SECONDS}" \
-                    rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
+                    rch "${rch_args[@]}" -- env -u CARGO_TARGET_DIR cargo "$@"
             fi
         else
             if [ "${E2E_RCH_MOCK_CIRCUIT_OPEN}" = "1" ]; then
-                env RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
+                env RCH_MOCK_CIRCUIT_OPEN=1 rch "${rch_args[@]}" -- env -u CARGO_TARGET_DIR cargo "$@"
             else
-                rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
+                rch "${rch_args[@]}" -- env -u CARGO_TARGET_DIR cargo "$@"
             fi
         fi
         return $?

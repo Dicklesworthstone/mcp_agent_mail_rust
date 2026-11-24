@@ -1,5 +1,78 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## Fresh review after PR #409 merge (`br-u9bhg`, `br-1w2z0`)
+
+Review base: main `462914b7`. The first native request used preserved clean
+`a025434e`; its recovery source matches this main exactly. After that terminal
+refusal, the compiler checkout fast-forwarded to `462914b7` and stays frozen
+until the current owned RCH request reaches a terminal state.
+
+- [x] Verify PR #409 merged, the shared checkout's peer edits are preserved,
+  governing project docs are unchanged, and there is no unread coordination.
+- [x] Reread every stdio metadata-validation and self-test hunk, then trace
+  initialization, queued writes, response correlation and EOF cleanup again.
+  No additional defect has been established in those changes.
+- [x] Refresh Beads/BV and CASS history; retain existing owners and original
+  acceptance rather than claim an unrelated task while recovery is active.
+- [x] Run required read-only mailbox health. It reports leaked-pages-only and
+  a proactive backup 389 hours old; no live repair or vacuum was performed.
+- [x] Check ordinary disk reservations before a new native request. The
+  vmi1152480 census showed room for normal 30 GiB growth plus 10 GiB floor;
+  that disk observation did not guarantee a worker slot or actual admission.
+- [x] Submit one strict remote DB nextest request with one build job, one
+  test thread, unchanged 1800-second native envelope and per-test limits.
+- [x] Observe the terminal result of wrapper
+  `rchw-3d39869d-55a3-4339-9f94-17fc530c4a3b`: queue timeout, exit 103,
+  Cargo not started, native assertions zero. Preserve its refusal log.
+- [x] Start actual all-targets Cargo compilation of main `462914b7` on
+  vmi1227854 through ordinary strict RCH admission, with one build job.
+- [x] Scan both changed shell files with normal Bash UBS rules: zero critical,
+  14 retained warnings, each an explicitly guarded post-increment.
+- [x] Reproduce six formatting failures in the newly merged journal scanner,
+  manually apply the reported whitespace changes in this isolated checkout,
+  and pass the full workspace formatting check without changing Rust tokens.
+- [x] Complete normal-rule static UBS over the 46-path merged scope: eight
+  refreshed paths (journal scanner refreshed after formatting) and 38 identical
+  source/report reuses. Retain all 52 critical, 58,430 warning and 20,973
+  informational source findings; critical identities match the prior report.
+  Report `fresh-review-v1-ubs-final-report.json` SHA-256:
+  `added5433d974465c821dc5e856640278ce999da1ccf2ecc7a27e8a37075c0cd`.
+- [x] Inspect the surrounding build helper and reproduce both strict-routing
+  defects with recording executables: missing `--require-remote` on every
+  RCH branch, and force-local taking precedence over either requirement.
+  The baseline failed 11 of 16 declared routing controls (13/14 scenarios).
+- [x] Propagate the strict RCH option through timeout and mock/non-mock paths;
+  reject contradictory local/remote options with exit 64 before any command.
+  Preserve optional routing, missing-RCH exit 127 and remote failure status.
+- [x] Pass all 16 routing controls and all 14 helper scenarios, including the
+  original ten initialization controls. Recording commands invoke no compiler;
+  these controls do not qualify the Rust server or replace live RCH evidence.
+- [x] Pass Bash syntax and diff whitespace checks after the routing repair.
+- [x] Complete the final normal Bash scan (zero critical, 14 retained guarded
+  post-increment warnings), syntax checks and real stdio regression with the
+  changed helper. Five correlated replies from signed v0.3.41 verified the
+  45-tool catalog, actual message 2/body, unchanged ACK and delivery receipt.
+  This validates the client, not current Rust source or live build routing.
+  Client SHA-256 `aebf956df94c280fe3f95b33f1f03aa3148ca98a08aae88bab44c916861aceff`;
+  self-test SHA-256 `37a7b5b117a1668e91122c107ec2bbf1539532c6703b2021b4c119737fa8c3ff`.
+- [ ] Observe the current compiler result and verify the exact source receipt.
+- [ ] Execute the native probes with nonzero selected test counts; verify
+  their exact source receipts and preserve every failure.
+- [ ] Fix any actual compiler or behavioral failures from that run and repeat
+  the affected real-dependency controls without relaxing assertions.
+- [ ] Complete current-source workspace compiler/Clippy and original native
+  acceptance lanes from `br-u9bhg`; an admission or older-source result does
+  not close this task.
+- [x] Compare the installed and signed v0.3.41 read-only doctor diagnoses.
+  The signed CLI reports 264 backup images against a limit of 6, clear staging
+  (0/3), a live owner and one leaked page. No retained guard failure log is
+  available, so its exact failure chain remains unattributed. Preserve the
+  diagnosis without removing data, changing limits or repairing a live owner.
+- [x] Record scoped evidence in Bead comments 4794/4795 and inspect the full
+  final diff again. Package the routing repair, regression controls and manual
+  formatter repairs together; Git and Agent Mail record publication identity.
+  Preserve all unfinished compiler and native acceptance above.
+
 ## Shared stdio client initialization (`br-1w2z0`, scoped contribution)
 
 This shell-client change started on main `615f4b2f` and integrates `6eb6264d`.

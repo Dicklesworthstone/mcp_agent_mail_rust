@@ -268,6 +268,101 @@ if failures:
 print("10 initialization controls passed; malformed peers are negative controls only")
 PY
 
+assert_cmd "s10_remote_build_routing" "remote requirements reach RCH and reject forced local builds" \
+    python3 - "${SCRIPT_DIR}/../../../scripts/e2e_lib.sh" "${WORK}" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+harness = Path(sys.argv[1]).resolve()
+work = Path(sys.argv[2])
+binary_dir = work / "routing-bin"
+binary_dir.mkdir()
+for name in ("cargo", "rch"):
+    with (binary_dir / name).open("x", encoding="utf-8") as script:
+        script.write('''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+name = Path(sys.argv[0]).name
+with Path(os.environ["ROUTING_SEEN"]).open("a", encoding="utf-8") as seen:
+    seen.write(json.dumps({"program": name, "args": sys.argv[1:],
+                           "mock": os.environ.get("RCH_MOCK_CIRCUIT_OPEN")}) + "\\n")
+sys.exit(int(os.environ["ROUTING_RCH_EXIT"]) if name == "rch" else 0)
+''')
+    (binary_dir / name).chmod(0o755)
+
+cases = []
+for required in ("E2E_CARGO_REQUIRE_RCH", "RCH_REQUIRE_REMOTE"):
+    for timeout in (True, False):
+        for mock in (False, True):
+            cases.append((f"{required}-timeout-{timeout}-mock-{mock}",
+                          {required: "1", "ROUTING_NO_TIMEOUT": "0" if timeout else "1",
+                           "E2E_RCH_MOCK_CIRCUIT_OPEN": "1" if mock else "0"},
+                          0, "rch", True, mock))
+    cases.append((required + "-force-local", {required: "1", "E2E_CARGO_FORCE_LOCAL": "1"},
+                  64, None, False, False))
+    cases.append((required + "-missing-rch", {required: "1", "ROUTING_NO_RCH": "1"},
+                  127, None, False, False))
+cases.extend([
+    ("optional-rch", {}, 0, "rch", False, False),
+    ("optional-force-local", {"E2E_CARGO_FORCE_LOCAL": "1"}, 0, "cargo", False, False),
+    ("optional-missing-rch", {"ROUTING_NO_RCH": "1"}, 0, "cargo", False, False),
+    ("remote-error-preserved", {"E2E_CARGO_REQUIRE_RCH": "1", "ROUTING_RCH_EXIT": "120"},
+     120, "rch", True, False),
+])
+assert len(cases) == 16
+failures = []
+for index, (name, overrides, expected_exit, program, strict, mock) in enumerate(cases):
+    case = work / f"routing-{index}"
+    case.mkdir()
+    seen = case / "seen.jsonl"
+    result = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+command() {
+    if [ "$1" = "-v" ]; then
+        if [ "$2" = "rch" ] && [ "$ROUTING_NO_RCH" = "1" ]; then return 1; fi
+        if [ "$2" = "timeout" ] && [ "$ROUTING_NO_TIMEOUT" = "1" ]; then return 1; fi
+    fi
+    builtin command "$@"
+}
+e2e_run_cargo check --locked
+''', "remote-routing-self-test", str(harness)],
+        env={**os.environ, "PATH": str(binary_dir) + os.pathsep + os.environ["PATH"],
+             "AM_E2E_KEEP_TMP": "1", "E2E_CARGO_REQUIRE_RCH": "0", "RCH_REQUIRE_REMOTE": "0",
+             "E2E_CARGO_FORCE_LOCAL": "0", "E2E_RCH_MOCK_CIRCUIT_OPEN": "0",
+             "ROUTING_NO_RCH": "0", "ROUTING_NO_TIMEOUT": "0", "ROUTING_RCH_EXIT": "0",
+             "ROUTING_SEEN": str(seen), "RCH_MOCK_CIRCUIT_OPEN": "0", **overrides},
+        capture_output=True, text=True, timeout=15,
+    )
+    (case / "stdout.log").write_text(result.stdout, encoding="utf-8")
+    (case / "stderr.log").write_text(result.stderr, encoding="utf-8")
+    calls = [json.loads(line) for line in seen.read_text().splitlines()] if seen.exists() else []
+    expected = []
+    if program is not None:
+        args = ["check", "--locked"] if program == "cargo" else (
+            ["exec"] + (["--require-remote"] if strict else [])
+            + ["--", "env", "-u", "CARGO_TARGET_DIR", "cargo", "check", "--locked"]
+        )
+        expected = [{"program": program, "args": args, "mock": "1" if mock else "0"}]
+    ok = result.returncode == expected_exit and calls == expected
+    if expected_exit == 64:
+        ok = ok and "conflicts with required remote execution" in result.stderr
+    if expected_exit == 127:
+        ok = ok and "rch is required but not available" in result.stderr
+    print(f"{name}: exit={result.returncode} programs={[call['program'] for call in calls]}")
+    if not ok:
+        failures.append(name)
+if failures:
+    raise SystemExit("incorrect build routing: " + ", ".join(failures))
+print("16 routing controls passed; recording commands never invoke a compiler")
+PY
+
 log_summary "lib_self_test" "${TOTAL}" "${PASS}" "${FAIL}" "${WORK}" "bash tests/e2e/lib/lib_self_test.sh"
 if [ "${FAIL}" -ne 0 ]; then
     exit 1
