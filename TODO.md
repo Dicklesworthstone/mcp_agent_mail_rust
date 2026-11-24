@@ -43,8 +43,8 @@
   Report: `ack-retry-contract-v2-ubs.summary.json`, SHA-256
   `2f0d372160245379633fc2c5b9d5b60fd74cfc574c9a10a4b6cdbfe6f7eee1a5`.
   The earlier pre-format v1 scan is retained as superseded, not current evidence.
-- [ ] Complete strict Clippy on this integrated source, then both compiler
-  graphs; preserve every actual failure and repair concrete diagnostics.
+- [x] Complete strict Clippy on the repaired candidate; preserve every actual
+  failure and repair concrete diagnostics.
   Baseline `00b35dde` Clippy completed with exit 101 on vmi1153651, build
   `30097323753221956`, wrapper `rchw-3bb6af03-6284-488b-b83a-58c5ade916f4`.
   Three `assert_is_empty` errors in reservation tests require values on failure.
@@ -59,8 +59,8 @@
   Preserve the failed gate and rerun it on both corrections together.
   The corrected `a4860459` retry also completed with exit 101: build
   `30097323753221990`, wrapper `rchw-33f5d91c-fd00-47c3-b613-19ac584d4c72`.
-  Its three reservation assertions passed; two server retention assertions
-  have the same denied lint. Preserve their empty-queue conditions using typed
+  The next reported failures are two server retention assertions with the same
+  denied lint. Preserve their empty-queue conditions using typed
   empty arrays and keep all surrounding identity, terminal-state and timestamp
   checks. The failed run's 3,952 source entries match, with receipt root
   `dca772815787d57763559a25fd3c15983f5ffd6a625836d66a8b9202a08194e9`;
@@ -71,6 +71,65 @@
   `46e29adac0de2b39f51626dba9acb1a659afdbe662af2fef5d9c6f35eab6d3d0`.
   The focused queued-intent assertion search has no remaining matches.
   Rerun the same strict workspace gate after this second concrete repair.
+  That unchanged retry passed on `a6472714`: build `30097323753222008`, wrapper
+  `rchw-a6e2d95b-db50-4bf7-81c0-6d7855ffe4b9`, Cargo 10m24s, exit zero,
+  terminal and acknowledged. All 3,952 source hashes, sizes and executable modes
+  match; receipt root
+  `6e0854c0103d2d71a8969922fea3f3f685e54b621282f796c7d9df28321edac5`.
+  Preserve the third-party future-incompatibility notice for
+  `proc-macro-error2 v2.0.1`. This is compiler/lint evidence, not native execution.
+- [x] Integrate the externally merged main `71ffa099` into both isolated
+  checkouts. Its Rust sources, lockfile, toolchain and Cargo/Nextest settings
+  match `a6472714` exactly; three CI files are added and the readiness
+  qualification document is updated.
+  The shared checkout and its peer changes remain untouched.
+- [x] Complete the production compiler graph on merged main
+  `71ffa099`. The preceding `a6472714` production request timed out in queue,
+  exit 103, before worker allocation or Cargo; no active owned lease remains.
+  The first merged-main request on vmi1153651 also timed out in queue, exit
+  103 before allocation/Cargo. A fresh positive ordinary static census on hz4
+  admitted the replacement, build `30097323753222020`, wrapper
+  `rchw-2affdbd5-b313-42cb-9942-d04ba7d657ac`. It passed: Cargo 23m59s, exit zero,
+  terminal and acknowledged. All 3,955 source hashes, lengths and executable
+  modes match; receipt root
+  `ae5f8d8ced81060dfad1287f82e43df0cda1e952192cd39d8d175aab3ee2347a`.
+  The difference from the 3,952-entry Clippy receipt is precisely three added
+  CI files and the changed readiness document, with no removed entry.
+  Log: `merged-main-v2-production.log`; retain both preceding queue failures
+  and the third-party future-incompatibility notice.
+  The actual in-flight Cargo and rustc were observed at 17:21 UTC on hz4:
+  nightly 2026-08-31, rustc 1.100.0-nightly / LLVM 23.1.0, matching the earlier
+  executable hashes, with main `71ffa099` in rustc's build-source environment.
+  `merged-main-v2-live-compiler-tree.json`, SHA-256
+  `eba8baf2ad266c2108bdd54084d5de53b738fced007a8fd02b523c7c3f0bef6f`.
+  Earlier empty/Cargo-only observations are retained and do not prove a rustc
+  identity. These observations establish no compiler pass or native result.
+- [x] Complete strict Clippy on merged main `71ffa099`: vmi1153651 build
+  `30097323753222065`, wrapper `rchw-764cf573-f43e-4f0a-9044-8bc0e58110fa`,
+  Cargo 6.92s, exit zero, terminal and acknowledged. All 3,955 file hashes,
+  lengths and executable modes match; receipt root
+  `deb75704455b18567037d24b75db3b65c620e7bc6e3cb614ccf6f522f9c667c9`.
+  Log: `merged-main-v1-clippy.log`. Retain the third-party future notice.
+- [x] Complete the all-targets compiler graph on merged main `71ffa099`:
+  vmi1153651 build `30097323753222067`, wrapper
+  `rchw-d7d6fb2c-4680-4c02-b77f-54aa8f40c6ab`, Cargo 15m58s, exit zero,
+  terminal and acknowledged. All 3,955 hashes, lengths and executable modes
+  match; receipt root
+  `08cc8b794522aa1167b3777cae940d9b7eff1475a91c9bbaeae52ed9de5775c4`.
+  Log: `merged-main-v1-all-targets.log`. The three main compiler receipt file
+  maps are identical. Native acceptance remains independently open.
+- [x] Rebind the existing normal-rule static gate to merged main: 50 Rust
+  files, 22 complete raw reports, 55 critical / 60,994 warning / 21,515 scoped
+  informational findings. Four updated source/report/count bindings replace
+  stale ones; all 46 reused bindings and every report hash/count are verified.
+  No findings or rules are suppressed. Final report
+  `resumed-review-v2-ubs-final-report.json`, SHA-256
+  `cb5d9ca8e32d06bf24553adb8465a08b4761b70d9755c6425b0090d1bbcc8ad8`.
+  This is static self-review, without native or release qualification.
+- [x] Trace the caller-visible consuming-read publication error: it already
+  returns affected message IDs, `read_may_have_committed` and explicit retry
+  guidance. Preserve the existing wiring; its native test remains in the
+  original tools acceptance below.
 - [ ] Obtain ordinary native admission and capture the old six-case baseline,
   then execute the corrected six retry controls with retained fixtures. Require
   actual native results plus the documented contract before any production
@@ -86,6 +145,39 @@
   static gates while awaiting a native window, and execute both six-case forms
   when ordinary capacity permits. Runtime test limits remain 1,800 seconds;
   the 3,600-second setting applies only to literal compiler-only --no-run.
+  RCH's supported clean-baseline mode was refused before Cargo by its namespace
+  guard: CLI exit 103, lease exit 1, build `30097323753222032`, wrapper
+  `rchw-38a858b7-3ea9-4d9e-9b52-c2f2933a997a`; terminal, acknowledged and all
+  source ownership released. No guard or budget was changed. Preserve that
+  failure. The safe replacement is a dedicated read-only baseline worktree,
+  `/data/projects/am-mossytern-native-20261124`, pinned to original `00b35dde`.
+  Its normal RCH compiler-only request is actually compiling on vmi1149989:
+  build `30097323753222033`, wrapper
+  `rchw-5e59dc16-451c-4ef6-8f48-d88c9caa09f3`, log
+  `retained-base-v3-db-compile.log`. Freeze that worktree until terminal.
+  Nextest 0.9.143 (60fa45f638ffc3f35e74afa65737f45fcd32db2a) is present there.
+  That compiler-only request hit its actual 3,600-second deadline before
+  producing a test binary. CLI exit 1 retained ownership; exact supported
+  recovery returned zero and acknowledged actual command exit 120 with all
+  sources/pair/tree released. Preserve both `retained-base-v3-db-compile.log`
+  and `retained-base-v3-db-recovery.log`. Recovery is not a compile pass.
+  Actual baseline compiler identities are retained in
+  `native-baseline-v3-live-compiler-tree.json`, SHA-256
+  `3ed6390d4d20e468a35887001181397c4468acc24d254ee5d8afa8b7db49236f`.
+  The native worktree remains at `00b35dde`, with completed dependency work
+  retained in its worker cache. RCH temporarily quarantined vmi1149989 after
+  timeout; normal health checks later reported it healthy. No quarantine,
+  guard, profile, dependency, budget or timeout policy was overridden.
+  Use a fresh ordinary admission check before its cached compiler retry.
+  At 19:07 UTC the healthy warm worker had 163,974,504,448 bytes free versus
+  195,421,011,968 required, including all live reservations. Its ledger has
+  no reservation attributable to the terminated native request. Do not edit
+  the ledger, discount live groups or change the admission policy.
+  Native runs retain 1,800 seconds and existing Nextest limits; Nextest is also
+  verified on the original Cargo process's PATH.
+  No native assertions have executed. After old-case execution, this worktree
+  can advance to `71ffa099`, preserving the worker cache without deleting
+  checked-out files; verify the source transition before advancing it.
 - [ ] Execute original DB/storage/tools/CLI regression acceptance plus the
   modified helper and foreign-writer tests under unchanged runtime limits.
   Include the three modified reservation cases:
@@ -95,11 +187,27 @@
   Also include the two repaired server cases:
   `ack_replay_refuses_post_intent_messages_and_replacement_agents` and
   `explicit_id_replay_rejects_newer_foreign_and_terminal_selectors`.
-- [ ] Recheck final diffs/static bindings, publish scoped evidence and update
+  The DB filter must also include `delivery_event_snapshot` cases and
+  `durable_cursor_schema_refuses_legacy_fallback_after_all_events_are_pruned`;
+  they do not all carry a `gh404` prefix. Keep the named sync-admission case
+  `gh404_sync_receipts_refuse_promotion_before_opening_the_live_database`.
+  Include storage's modified
+  `deferred_message_identity_rechecks_a_foreign_historical_month`, and CLI's
+  `e2e_remote_required_helpers_reject_missing_artifacts_without_local_build`
+  plus its original project-metadata preservation cases.
+- [x] Recheck final diffs/static bindings, publish scoped evidence and update
   the existing Bead according to actual execution, without replacing acceptance.
   GitHub reports PR #410 merged externally at 15:51 UTC as `00b35dde` in
-  merge commit `ab252a31`. Corrections after that head are separately reviewable
-  on draft PR #411; that publication is not native or final gate evidence.
+  merge commit `ab252a31`, then PR #411 at 16:43 UTC as `a6472714` in
+  `71ffa099`. Publication is not native or final gate evidence.
+  Final formatting and diff checks pass; the full 50-file static binding
+  verifier passes again. Beads has no dependency cycles. Only this TODO and
+  the claimed Bead's evidence comments are included in the handoff commit.
+  Remote main advanced to `ace116df` during qualification, changing 13 paths,
+  including production DB/storage/server code. The compiler and static
+  results above qualify pinned `71ffa099`; they do not qualify that newer
+  source. Preserve the native baseline and warm cache rather than replacing
+  them with another unexecuted candidate. Native acceptance remains open.
 
 ## ACK reconciliation schedule review (`br-u9bhg`)
 
