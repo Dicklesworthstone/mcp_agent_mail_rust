@@ -299,8 +299,8 @@ impl Snapshot {
                 }
                 continue;
             }
-            let remaining = usize::try_from(self.initial_bytes - self.position)
-                .unwrap_or(usize::MAX);
+            let remaining =
+                usize::try_from(self.initial_bytes - self.position).unwrap_or(usize::MAX);
             let available = self.reader.fill_buf()?;
             if available.is_empty() {
                 return Err(io::Error::new(
@@ -357,7 +357,11 @@ impl Snapshot {
                     ));
                 }
                 if self.candidates.len() >= self.limits.candidate_identities
-                    || bytes > self.limits.candidate_bytes.saturating_sub(self.candidate_bytes)
+                    || bytes
+                        > self
+                            .limits
+                            .candidate_bytes
+                            .saturating_sub(self.candidate_bytes)
                 {
                     // This complete record belongs to the next window. Resume
                     // at its start, never after an intent that was not retained.
@@ -975,8 +979,7 @@ mod tests {
                         .unwrap();
                 }
                 let mut scanner = Scanner::new(kind);
-                scanner.limits.candidate_bytes =
-                    first_payload.len().max(second_payload.len()) + 1;
+                scanner.limits.candidate_bytes = first_payload.len().max(second_payload.len()) + 1;
                 scanner.limits.candidate_identities = 64;
                 let first_bytes = first_payload.len() + 1;
                 assert!(
@@ -1004,7 +1007,10 @@ mod tests {
                 assert_eq!(snapshot.candidates.len(), 1);
                 let pending = finish(&mut scanner, &config).unwrap();
                 assert_eq!(
-                    pending.iter().map(|intent| intent.key().0).collect::<Vec<_>>(),
+                    pending
+                        .iter()
+                        .map(|intent| intent.key().0)
+                        .collect::<Vec<_>>(),
                     [
                         first["intent_id"].as_str().unwrap(),
                         second["intent_id"].as_str().unwrap(),
@@ -1055,12 +1061,7 @@ mod tests {
         for _ in 0..2 {
             assert!(
                 scanner
-                    .poll_bounded(
-                        &config,
-                        &stop,
-                        usize::try_from(file_bytes).unwrap(),
-                        10,
-                    )
+                    .poll_bounded(&config, &stop, usize::try_from(file_bytes).unwrap(), 10,)
                     .unwrap()
                     .is_none()
             );
@@ -1108,7 +1109,10 @@ mod tests {
             append(&config, kind, &later);
             let pinned = finish(&mut scanner, &config).unwrap();
             assert_eq!(
-                pinned.iter().map(|intent| intent.key().0).collect::<Vec<_>>(),
+                pinned
+                    .iter()
+                    .map(|intent| intent.key().0)
+                    .collect::<Vec<_>>(),
                 [
                     first["intent_id"].as_str().unwrap(),
                     second["intent_id"].as_str().unwrap(),

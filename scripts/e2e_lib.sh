@@ -47,7 +47,30 @@ E2E_CARGO_REQUIRE_RCH="${E2E_CARGO_REQUIRE_RCH:-0}"
 E2E_RCH_TIMEOUT_SECONDS="${E2E_RCH_TIMEOUT_SECONDS:-900}"
 E2E_RCH_MOCK_CIRCUIT_OPEN="${E2E_RCH_MOCK_CIRCUIT_OPEN:-0}"
 
+_e2e_requires_remote() {
+    local value
+    for value in "${E2E_CARGO_REQUIRE_RCH:-0}" "${RCH_REQUIRE_REMOTE:-0}"; do
+        # Match RCH's case-insensitive truthy policy, including surrounding
+        # whitespace, at every build and artifact-fallback boundary.
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        case "$value" in
+            1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|[Ee][Nn][Aa][Bb][Ll][Ee][Dd]) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 e2e_run_cargo() {
+    local -a rch_args=(exec)
+    if _e2e_requires_remote; then
+        if [ "${E2E_CARGO_FORCE_LOCAL}" = "1" ]; then
+            e2e_log "ERROR: E2E_CARGO_FORCE_LOCAL=1 conflicts with required remote execution."
+            return 64
+        fi
+        rch_args+=(--require-remote)
+    fi
+
     if [ "${E2E_CARGO_FORCE_LOCAL}" = "1" ]; then
         cargo "$@"
         return $?
@@ -57,22 +80,22 @@ e2e_run_cargo() {
         if command -v timeout >/dev/null 2>&1; then
             if [ "${E2E_RCH_MOCK_CIRCUIT_OPEN}" = "1" ]; then
                 timeout "${E2E_RCH_TIMEOUT_SECONDS}" \
-                    env RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
+                    env RCH_MOCK_CIRCUIT_OPEN=1 rch "${rch_args[@]}" -- env -u CARGO_TARGET_DIR cargo "$@"
             else
                 timeout "${E2E_RCH_TIMEOUT_SECONDS}" \
-                    rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
+                    rch "${rch_args[@]}" -- env -u CARGO_TARGET_DIR cargo "$@"
             fi
         else
             if [ "${E2E_RCH_MOCK_CIRCUIT_OPEN}" = "1" ]; then
-                env RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
+                env RCH_MOCK_CIRCUIT_OPEN=1 rch "${rch_args[@]}" -- env -u CARGO_TARGET_DIR cargo "$@"
             else
-                rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
+                rch "${rch_args[@]}" -- env -u CARGO_TARGET_DIR cargo "$@"
             fi
         fi
         return $?
     fi
 
-    if [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ] || [ "${RCH_REQUIRE_REMOTE:-0}" = "1" ]; then
+    if _e2e_requires_remote; then
         e2e_log "ERROR: rch is required but not available in PATH."
         return 127
     fi
@@ -95,7 +118,7 @@ e2e_sqlite3_compat_bin() {
         return 0
     fi
 
-    if [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ] || [ "${RCH_REQUIRE_REMOTE:-0}" = "1" ]; then
+    if _e2e_requires_remote; then
         e2e_log "ERROR: sqlite3 and the prepared test_db binary are unavailable; remote-required mode forbids a local helper build."
         return 127
     fi
@@ -2851,7 +2874,7 @@ e2e_ensure_binary() {
         _e2e_build_binary "${bin_name}"
     fi
 
-    if [ ! -x "$bin_path" ] && { [ "${E2E_CARGO_REQUIRE_RCH}" = "1" ] || [ "${RCH_REQUIRE_REMOTE:-0}" = "1" ]; }; then
+    if [ ! -x "$bin_path" ] && _e2e_requires_remote; then
         e2e_log "ERROR: remote build did not provide ${bin_name} at ${bin_path}; remote-required mode forbids a fallback binary or local retry."
         return 1
     fi

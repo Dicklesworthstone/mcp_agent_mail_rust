@@ -3062,63 +3062,53 @@ echo 'Pass: 1  Fail: 0  Skip: 0'
         use std::os::unix::fs::PermissionsExt as _;
         let root = TempDir::new().unwrap().keep();
         let source = include_str!("../../../scripts/e2e_lib.sh");
-        let ensure = source
-            .split_once("e2e_ensure_binary() {\n")
-            .unwrap()
-            .1
-            .split_once("\n}\n")
-            .unwrap()
-            .0;
-        let compat = source
-            .split_once("e2e_sqlite3_compat_bin() {\n")
-            .unwrap()
-            .1
-            .split_once("\n}\n")
-            .unwrap()
-            .0;
+        let harness = root.join("e2e_lib.sh");
+        fs::write(&harness, source).unwrap();
         let stale = root.join("target/debug");
         fs::create_dir_all(&stale).unwrap();
         fs::write(stale.join("am"), "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(stale.join("am"), fs::Permissions::from_mode(0o700)).unwrap();
         for required in ["E2E_CARGO_REQUIRE_RCH", "RCH_REQUIRE_REMOTE"] {
-            let script = format!(
-                r#"set -eu
-e2e_log() {{ echo "$*" >&2; }}
-_e2e_build_binary() {{ printf '%s\n' "$E2E_CARGO_FORCE_LOCAL" >> build_modes; }}
-cargo() {{ printf unexpected-local-build >> forbidden; return 99; }}
-type() {{ return 1; }}
-e2e_ensure_binary() {{
-{ensure}
-}}
-e2e_sqlite3_compat_bin() {{
-{compat}
-}}
+            for (index, value) in ["1", "true", "YES", "On", " enabled "]
+                .into_iter()
+                .enumerate()
+            {
+                let script = r#"set -eu
+source "$1"
+E2E_PROJECT_ROOT="$2"
+_e2e_build_binary() { printf '%s\n' "$E2E_CARGO_FORCE_LOCAL" >> build_modes; }
+cargo() { printf unexpected-local-build >> forbidden; return 99; }
+type() { return 1; }
 if e2e_ensure_binary am; then exit 10; fi
 if e2e_sqlite3_compat_bin; then exit 11; fi
 test ! -e forbidden
 test "$(tail -n 1 build_modes)" = 0
-"#,
-            );
-            let script_path = root.join(format!("{required}.sh"));
-            fs::write(&script_path, script).unwrap();
-            let output = Command::new("bash")
-                .arg(script_path)
-                .current_dir(&root)
-                .env("E2E_PROJECT_ROOT", &root)
-                .env("CARGO_TARGET_DIR", root.join("expected-target"))
-                .env("E2E_CARGO_REQUIRE_RCH", "0")
-                .env("RCH_REQUIRE_REMOTE", "0")
-                .env("E2E_CARGO_FORCE_LOCAL", "0")
-                .env("E2E_FORCE_BUILD", "0")
-                .env(required, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(String::from_utf8_lossy(&output.stderr).contains("remote-required"));
+"#;
+                let script_path = root.join(format!("{required}-{index}.sh"));
+                fs::write(&script_path, script).unwrap();
+                let output = Command::new("bash")
+                    .arg(script_path)
+                    .arg(&harness)
+                    .arg(&root)
+                    .current_dir(&root)
+                    .env("E2E_PROJECT_ROOT", &root)
+                    .env("CARGO_TARGET_DIR", root.join("expected-target"))
+                    .env("TMPDIR", &root)
+                    .env("AM_E2E_KEEP_TMP", "1")
+                    .env("E2E_CARGO_REQUIRE_RCH", "0")
+                    .env("RCH_REQUIRE_REMOTE", "0")
+                    .env("E2E_CARGO_FORCE_LOCAL", "0")
+                    .env("E2E_FORCE_BUILD", "0")
+                    .env(required, value)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{required}={value:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stderr).contains("remote-required"));
+            }
         }
     }
 
