@@ -1,5 +1,59 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## Fresh review of concurrent recovery publication (`br-u9bhg`)
+
+This separate checkout starts at draft PR #408's `2155e7f5`. Its new tests
+are uncompiled baseline probes, not a production repair or runtime proof.
+The published candidate and its three successful static receipts remain
+unchanged in the other checkout.
+
+- [x] Reread every published Rust hunk, the storage flush/clone regression,
+  durable Git debt, state-lock ordering and incomplete-publication repair.
+- [x] Refresh Beads/BV, git and peer activity; keep the original qualification
+  task in progress rather than taking a second unfinished soak task.
+- [x] Verify live disk reservations before the normal native request.
+- [x] Preserve the first DB request's terminal queue-timeout refusal: strict
+  RCH on `vmi1149989`, exit 103, no Cargo execution or native assertions.
+- [x] Preserve the new probes' unavailable-worker refusal (exit 103) and
+  subsequent selected-worker disk-admission refusal (exit 120, RCH-E330).
+  Both happened before Cargo; native assertions remain zero.
+- [x] Isolate a new baseline probe from the published checkout's source freeze.
+- [x] Reuse the real database setup for file-backed canonical and runtime
+  connections, with concurrent autocommit enabled on the runtime peer.
+- [x] Exercise a real interrupted receipt write before reconciliation; require
+  archived ACK 444 and an incomplete witness before attempting the new commit.
+- [x] Attempt peer ACK 999 after the repair reads old rows; confirm its actual
+  SQL value and require the completed recovery state to contain ACK 999.
+- [x] Permit writer exclusion only with a subsequent successful real commit
+  and publication after repair releases admission.
+- [x] Pass formatting and whitespace checks for the baseline probes.
+- [x] Complete the final normal-rule scan for this exact baseline test source:
+  one file, zero critical findings, 375 warnings and 94 informational findings;
+  the 36 findings in the new tests are their explicit failure assertions.
+- [ ] Compile and execute both new baseline probes through ordinary strict
+  RCH admission; distinguish a target failure from an invalid control.
+- [ ] If the target fails, implement the smallest production repair supported
+  by that failure, preserving cancellation and caller-owned transactions.
+- [ ] Execute both probes again, retain the original failure, and require
+  successful peer commit/publication after the repaired operation.
+- [ ] Pass all three required locked workspace compiler/Clippy graphs on the
+  exact final source and complete its changed-file scanner review.
+- [ ] Execute the original DB, storage, tools and CLI acceptance lanes; keep
+  their nonzero counts separate from compile, scanner and admission results.
+- [x] Update the original bead with scoped evidence, flush only intended graph
+  records, confirm zero cycles, and hand off the exact source and limitations.
+  Bead comment 4792 and Agent Mail message 310 retain the actual results.
+
+Probe source SHA-256:
+`617c462a2874e101ee0934662997a3838657f944ba871f5748d656216d906e80`.
+Evidence remains under `/data/tmp/am-mossytern-20261123/`: the
+`concurrent-ack-v2-baseline-test.patch`, frozen-input hashes, complete
+normal-rule UBS report, and both native admission logs. The published PR's
+three older static passes do not qualify these added tests. A fresh live
+reservation census after the last refusal also lacked the normal static
+budget plus protected floor. No gate, disk reservation, worker drain or
+peer job was changed. Production repair awaits an executed baseline failure.
+
 ## Active recovery qualification (`br-u9bhg`, MossyTern)
 
 Current base: `c5672259`. Its durable Git outbox is upstream work, reviewed
