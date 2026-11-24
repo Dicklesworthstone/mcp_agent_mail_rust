@@ -1670,17 +1670,17 @@ where
             deadline,
             &mut first_unit_admitted_at,
             &mut report,
-            |admitted_at| {
+            |_| {
                 if early_snapshot_guard.is_none() {
                     let parent = parent_admission
                         .as_ref()
                         .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
-                    early_snapshot_guard = Some(acquire_snapshot_retention(
-                        snapshot_primary,
-                        parent.directory(),
-                        deadline,
-                        admitted_at,
-                    )?);
+                    early_snapshot_guard = Some(
+                        mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire_for_directory_cleanup(
+                            snapshot_primary,
+                            parent.directory(),
+                        )?,
+                    );
                 }
                 early_snapshot_guard
                     .as_ref()
@@ -1912,7 +1912,7 @@ where
                         pin_admitted_at,
                     )
                 },
-                Ok,
+                |guard| guard.verify_replacement(deadline, pin_admitted_at),
             )
             .map(|guard| (parent, guard))
     });
@@ -3220,6 +3220,58 @@ mod tests {
             1
         );
         guard.revalidate().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_directory_cleanup_preserves_a_busy_pin_and_verifies_before_payload_eviction() {
+        use std::os::fd::AsRawFd as _;
+
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let backup = mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary);
+        let original = fs::read(&backup).unwrap();
+        let empty = tmp
+            .path()
+            .join("doctor/reclaimable/rotation-20000101T000000Z");
+        create_fixture_directory(&empty);
+        let reader = fs::File::open(&backup).unwrap();
+        let lock = nix::libc::flock {
+            l_type: i16::try_from(nix::libc::F_RDLCK).unwrap(),
+            l_whence: i16::try_from(nix::libc::SEEK_SET).unwrap(),
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(&reader, nix::fcntl::FcntlArg::F_SETLK(&lock)).unwrap();
+        let fdinfo = format!("/proc/thread-self/fdinfo/{}", reader.as_raw_fd());
+        assert!(fs::read_to_string(&fdinfo).unwrap().contains("POSIX"));
+
+        let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert!(!report.admission_refused);
+        assert_eq!(report.empty_directories_deleted, 1);
+        assert_eq!(report.deleted, 0);
+        assert!(!empty.exists());
+        // No new open/close of the pinned inode may release this reader's lock.
+        assert!(fs::read_to_string(&fdinfo).unwrap().contains("POSIX"));
+        drop(reader);
+
+        create_fixture_directory(&empty);
+        for day in 1..=4 {
+            fs::copy(
+                &primary,
+                tmp.path()
+                    .join(format!("storage.sqlite3.bak.2000010{day}_000000")),
+            )
+            .unwrap();
+        }
+        let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert!(!report.admission_refused);
+        assert_eq!(report.empty_directories_deleted, 1);
+        assert_eq!(report.deleted, 2);
+        assert_eq!(fs::read(&backup).unwrap(), original);
     }
 
     #[cfg(unix)]

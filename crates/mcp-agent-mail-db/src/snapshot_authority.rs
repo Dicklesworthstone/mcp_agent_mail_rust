@@ -371,11 +371,53 @@ impl SnapshotRetentionGuard {
         )
     }
 
+    /// Retain recovery and publication coordination while removing empty
+    /// rotation directories. Empty directories contain no snapshot payload,
+    /// so this admission does not hash or verify any backup image.
+    ///
+    /// Payload eviction still requires [`Self::verify_replacement`]. Until
+    /// then this guard has no selected snapshot or completed-search evidence.
+    ///
+    /// # Errors
+    /// Refuses concurrent owners, changed parents and pending recovery state.
+    pub fn acquire_for_directory_cleanup(
+        primary: &Path,
+        expected_parent: &File,
+    ) -> io::Result<Self> {
+        let guard = Self::acquire_controls(primary, Some(expected_parent))?;
+        guard.revalidate()?;
+        Ok(guard)
+    }
+
+    /// Select and verify the replacement before payload eviction, retaining
+    /// the recovery election and snapshot lock acquired for directory cleanup.
+    ///
+    /// # Errors
+    /// Preserves the deadline, candidate and byte limits of ordinary retention
+    /// admission, and refuses any authority change since acquisition.
+    pub fn verify_replacement(
+        self,
+        deadline: Option<Instant>,
+        first_unit_admitted_at: Option<Instant>,
+    ) -> io::Result<Self> {
+        let budget = deadline.map(|deadline| {
+            first_unit_admitted_at.map_or_else(
+                || RetentionSearchBudget::new(deadline),
+                |admitted_at| RetentionSearchBudget::finishing_admitted_turn(admitted_at, deadline),
+            )
+        });
+        self.select_snapshot(budget)
+    }
+
     fn acquire_with_parent(
         primary: &Path,
         expected_parent: Option<&File>,
-        mut budget: Option<RetentionSearchBudget>,
+        budget: Option<RetentionSearchBudget>,
     ) -> io::Result<Self> {
+        Self::acquire_controls(primary, expected_parent)?.select_snapshot(budget)
+    }
+
+    fn acquire_controls(primary: &Path, expected_parent: Option<&File>) -> io::Result<Self> {
         let primary = super::normalized_snapshot_primary(primary).map_err(io::Error::other)?;
         let expected_parent = expected_parent.map(File::try_clone).transpose()?;
         // Recovery owns this election before selecting a snapshot. Use the
@@ -386,10 +428,26 @@ impl SnapshotRetentionGuard {
         ensure_no_recovery_references(&primary)?;
         let metadata_path = super::snapshot_meta_path(&primary);
         let metadata = retention_metadata(&metadata_path);
+        Ok(Self {
+            authority,
+            expected_parent,
+            primary,
+            metadata_path,
+            metadata,
+            selected: None,
+            selected_identity: None,
+            completed_search_without_pin: false,
+            recovery,
+        })
+    }
+
+    fn select_snapshot(mut self, mut budget: Option<RetentionSearchBudget>) -> io::Result<Self> {
+        self.revalidate()?;
+        let primary = self.primary.clone();
         let reader_refusal = std::cell::RefCell::<Option<io::Error>>::new(None);
         let bounded = budget.is_some();
         let mut completed_search_without_pin = false;
-        let selected = if let RetentionMetadata::Bytes(metadata_bytes) = &metadata {
+        let selected = if let RetentionMetadata::Bytes(metadata_bytes) = &self.metadata {
             let hint = budget.as_ref().and_then(|_| {
                 retention_search_hints()
                     .lock()
@@ -574,19 +632,11 @@ impl SnapshotRetentionGuard {
             .as_ref()
             .map(|selected| selected.source.metadata())
             .transpose()?;
-        let guard = Self {
-            authority,
-            expected_parent,
-            primary,
-            metadata_path,
-            metadata,
-            selected,
-            selected_identity,
-            completed_search_without_pin,
-            recovery,
-        };
-        guard.revalidate()?;
-        Ok(guard)
+        self.selected = selected;
+        self.selected_identity = selected_identity;
+        self.completed_search_without_pin = completed_search_without_pin;
+        self.revalidate()?;
+        Ok(self)
     }
 }
 
@@ -1921,6 +1971,62 @@ mod tests {
         *different.last_mut().unwrap() ^= 0xff;
         std::fs::write(backup, different).unwrap();
         (primary, pin, original)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_cleanup_defers_backup_reads_and_retains_both_locks() {
+        use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (primary, pin, original) = retention_search_fixture(&root);
+        let current = super::super::snapshot_bak_path(&primary);
+        let parent = File::open(&root).unwrap();
+        let observer = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
+        for path in [&current, &pin] {
+            inotify::add_watch(&observer, path, WatchFlags::OPEN).unwrap();
+        }
+        let observe = || rustix::io::read(&observer, &mut [0_u8; 4096]);
+
+        // The previous admission path performs real reads on the same files.
+        let original_guard = SnapshotRetentionGuard::acquire_for_parent(&primary, &parent).unwrap();
+        assert_eq!(original_guard.verified_source_path(), Some(pin.as_path()));
+        assert!(observe().unwrap() > 0);
+        assert_eq!(observe(), Err(rustix::io::Errno::WOULDBLOCK));
+        drop(original_guard);
+
+        let guard =
+            SnapshotRetentionGuard::acquire_for_directory_cleanup(&primary, &parent).unwrap();
+        assert!(guard.verified_source_path().is_none());
+        assert!(!guard.completed_search_without_pin());
+        assert!(SnapshotAuthority::acquire(&primary, false).is_err());
+        assert!(SnapshotAuthority::acquire(&primary, true).is_err());
+        assert!(crate::recovery_breaker::try_acquire_file_lock(&primary).is_err());
+        let authority_inode = guard.authority.file.metadata().unwrap().ino();
+        assert!(
+            guard
+                .delete_superseded_generation(&primary, &pin, &std::fs::metadata(&pin).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("no verified replacement")
+        );
+        assert_eq!(observe(), Err(rustix::io::Errno::WOULDBLOCK));
+
+        let guard = guard.verify_replacement(None, None).unwrap();
+        assert_eq!(
+            guard.authority.file.metadata().unwrap().ino(),
+            authority_inode
+        );
+        assert_eq!(guard.verified_source_path(), Some(pin.as_path()));
+        assert!(observe().unwrap() > 0);
+        assert!(SnapshotAuthority::acquire(&primary, true).is_err());
+        assert!(crate::recovery_breaker::try_acquire_file_lock(&primary).is_err());
+        guard.revalidate().unwrap();
+        drop(guard);
+        SnapshotAuthority::acquire(&primary, true).unwrap();
+        crate::recovery_breaker::try_acquire_file_lock(&primary).unwrap();
+        assert_eq!(std::fs::read(pin).unwrap(), original);
     }
 
     #[test]
