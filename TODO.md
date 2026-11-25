@@ -1,5 +1,44 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## Qualification completed (2026-11-25, `br-u9bhg`)
+
+- [x] Close the original Bead acceptance on canonical main
+  `0e0d5334da9be1e417b3916e17bb122ca5968baf`, after the three required compiler
+  gates, formatting, complete normal static coverage and all named native
+  regressions finish. Bead closed at 14:21:50 UTC with cited evidence.
+- [x] Verify all four compiler source maps (including native preparation):
+  3,957 identical hashes, sizes and executable modes. Exact receipt-command
+  digests match the dispatch commands including `CARGO_INCREMENTAL=0` and
+  Clippy's `--keep-going`; logged worker argv preserves every strict gate
+  argument. All actual exits are zero, terminal acknowledged and released.
+- [x] Verify all nine non-compilation runtime jobs: original 240-second
+  process-group deadline, serial runner, prepared executable hashes checked
+  before/after, complete returned results and released ownership.
+
+| Component | Distinct targeted native tests passed |
+|-----------|---------------------------------------|
+| DB | 228 |
+| Storage | 15 |
+| Tools | 12 |
+| Server | 2 |
+| CLI | 20 |
+| **Total** | **277** |
+
+There are 283 outer test invocations including the separate six-case ACK run;
+those repeated cases and nested child summaries add no distinct-test credit.
+Both real database drivers pass all three explicit-publication-retry schedules.
+All six ACK SQL/archive fixtures are retained. Normal static coverage remains
+complete on 55 Rust files / 35 reports with every finding retained.
+
+Full commands, source receipts, exact IDs/wrappers, executable hashes, test
+names/counts and coverage audit:
+`/data/tmp/am-mossytern-20261123/main-0e0d-native-final-report.json`, SHA-256
+`ef98228bca6fc8caaa4388f5b4847609ce7794b364253a18fa19e8eba5857159`.
+Coverage is the specified GH#404 regression set; broader workspace runtime,
+release, live-mailbox and performance qualification remain separate. Earlier
+checklists retain historical failures, unexecuted probes and independent work.
+The additional bespoke-resolver investigation below remains guard-blocked.
+
 ## Fresh review resumed (2026-11-25 03:13 UTC, `br-u9bhg`)
 
 - [x] Refresh Agent Mail identity/inbox, Beads/BV and CASS; preserve the dirty
@@ -48,7 +87,7 @@
 - [x] Check the live stale-backup finding: full integrity failures persist;
   the existing `br-lqz87` fix already improves its diagnosis. No live repair,
   daemon replacement or unrelated backup-policy change is attempted here.
-- [ ] Build the current review candidate's native DB tests, then execute the
+- [x] Build the current review candidate's native DB tests, then execute the
   corrected six retry cases and original DB recovery/cursor/admission suites.
   The warm native worker `vmi1149989` lacks ordinary headroom. A fresh normal
   census on `vmi1153651` admits native work: 137,080,143,872 bytes free versus
@@ -98,7 +137,7 @@
   calling either a native pass. No assertions executed. Logs:
   `fresh-nov25-v2-native-ack-wrapper-cancel.log` and
   `fresh-nov25-v2-native-ack-recovery.log`.
-- [ ] Prepare all five required component library test packages together
+- [x] Prepare all five required component library test packages together
   through direct Cargo in the retained RCH source/pool. Then keep that same
   package/feature graph for focused runtime batches with a 240-second RCH
   process-group deadline, bounding every test at least as strictly as the
@@ -110,33 +149,66 @@
   Recovery acknowledges failed exit 1 and source/pair release; no test ran.
   Later peer reservations make ordinary admission on `vmi1153651` negative:
   121,901,449,216 bytes free versus 150,323,855,360 required for native.
-- [ ] Run the six corrected canonical/runtime ACK controls with actual test
+- [x] Run the six corrected canonical/runtime ACK controls with actual test
   counts and retained SQL/archive fixtures; zero-test runs cannot qualify them.
-- [ ] Run DB `recovery_state`, `reconstruct_state`, `reconstruct`, GH404 cursor
+  Exact-main prepared DB ELF SHA-256
+  `1576d7d176540e7ff8305595d35ed7f7be308448446f21dee1da5ea28199a5a0`:
+  6/6 pass in 14.16s, zero failed/ignored, build `30097323753222566`, wrapper
+  `rchw-3e34f2b6-3183-4335-88a0-1f99dc111c8f`. Runtime envelope confirms
+  remote exit zero; executable hashes match before/after, terminal acknowledged
+  and source/pair released. All six SQL/archive fixture directories returned in
+  `target/native-regression-results/ack-six-v1`. Runtime is bound to the native
+  compiler receipt, not a separate runtime source-content receipt.
+- [x] Run all 32 `recovery_state::` tests: zero failed/ignored, 18.86s,
+  build `30097323753222571`, wrapper
+  `rchw-80be73d0-f17d-4ee2-b4ae-9d0d21f159ee`, same DB ELF/hash binding.
+  Both hash checks, native counts, result retrieval and terminal release verify.
+- [x] Run all 15 `reconstruct_state::` tests, seven `delivery_event_snapshot`
+  cases, the pruned-cursor boundary and both named promotion-admission cases:
+  25/25 pass, zero failed/ignored; build `30097323753222573`, wrapper
+  `rchw-5572febd-17ef-4c98-916b-6ef4ed19ff08`. Same verified executable,
+  complete result retrieval and terminal release. Original 240-second deadline.
+- [x] Run DB `recovery_state`, `reconstruct_state`, `reconstruct`, GH404 cursor
   and sync-admission cases, all seven `delivery_event_snapshot` cases, and
   `durable_cursor_schema_refuses_legacy_fallback_after_all_events_are_pruned`.
-- [ ] Run storage GH404 flush/envelope/exited-producer/backlog cases and
+  All 228 distinct required DB tests pass on `0e0d5334` (234 invocations
+  including the independent six-case ACK run). `reconstruct::` passes 171/171
+  in 19.38s, build `30097323753222575`, wrapper
+  `rchw-7252b19e-74f3-499f-a071-1f27e65da382`; hashes, delivery and terminal
+  release verify. No failed/ignored cases or altered runtime thresholds.
+- [x] Correct the private result checker after its first-summary search
+  selected a one-case child summary instead of the real 171-case outer result.
+  Validate the final nonempty line, retaining the exact positive count and
+  zero failed/ignored requirements. The real nested log and plain valid output
+  are accepted; failed/zero/wrong-count/ignored/trailing-error controls remain
+  rejected. These are parser controls, not extra native assertion evidence.
+- [x] Run storage GH404 flush/envelope/exited-producer/backlog cases and
   `deferred_message_identity_rechecks_a_foreign_historical_month`.
-- [ ] Run tools failed-publication auto-read, consuming-inbox admission and
+- [x] Include the existing storage envelope/order and foreign-generation
+  controls explicitly: `prepared_envelope_uses_the_shared_archive_key_order`,
+  `foreign_generation_and_conflicting_identity_remain_byte_identical`, and
+  `rejects_foreign_generations_roots_replacements_and_invalid_debt`.
+  The GH404 flush case itself verifies a real Git clone and recovered witness.
+- [x] Run tools failed-publication auto-read, consuming-inbox admission and
   committed-ACK replay cases, plus all three modified release-intent cases.
-- [ ] Run both modified server ACK/explicit-ID retention cases.
-- [ ] Run CLI missing-project-metadata repair, missing/malformed-project JSON
+- [x] Run both modified server ACK/explicit-ID retention cases.
+- [x] Run CLI missing-project-metadata repair, missing/malformed-project JSON
   detector/fixer cases, archive-count status, and the remote-required helper
   artifact case. Keep their actual dependencies and original assertions.
 - [x] Verify publication: all three repair commits through `292a2f43` pushed.
   PR #412 was merged externally at 04:51:22 UTC as `4b938d1b`; I had left
   it draft pending qualification. Merge is not completion evidence. The
   original Bead acceptance and all pending native/compiler gates remain open.
-- [ ] Execute original storage/tools/CLI acceptance and all five modified
+- [x] Execute original storage/tools/CLI acceptance and all five modified
   queue cases. Preserve actual failures; fix only demonstrated defects.
-- [ ] Qualify any subsequent integrated source separately, publish actual
+- [x] Qualify any subsequent integrated source separately, publish actual
   outcomes and keep the Bead open until its complete acceptance passes.
-  The isolated compiler checkout now holds exact main `4b938d1b`; its tracked
-  tree equals the reviewed `292a2f43` tree. A separate required production
-  `cargo check --locked --workspace --lib --bins -j1` is submitted through
+  At the first main transition, the isolated checkout held `4b938d1b`; its
+  tracked tree equalled reviewed `292a2f43`. The required production
+  `cargo check --locked --workspace --lib --bins -j1` was submitted through
   strict RCH on `hz4` with its ordinary 10 GiB growth/10 GiB floor admission.
-  Preserve `fresh-nov25-v4-production.log`. Current-source all-targets and
-  strict Clippy remain pending independently of that production verdict.
+  Preserve `fresh-nov25-v4-production.log`. All-targets and strict Clippy were
+  then pending independently; the completed exact-main results appear above.
 - [x] Complete the required production-only graph on main `4b938d1b`:
   `cargo check --locked --workspace --lib --bins -j1` passed through strict
   RCH on `hz4`, build `30097323753222359`, wrapper
@@ -369,7 +441,8 @@
   Retain `fixed-main-v6-native-{compile,recovery}.log`. The clean compiler
   checkout remains at `3803dd85`; preserve all completed cache outputs and
   resume the same five-package/default graph only after ordinary admission.
-- [ ] Finish admitted native preparation v7, build `30097323753222507`, wrapper
+- [x] Follow admitted native preparation v7 through its terminal timeout,
+  build `30097323753222507`, wrapper
   `rchw-8ca78609-a11d-4ba0-a37d-5dc4f3417f8e`, still frozen at `3803dd85` on
   the original worker/root/pool. Ordinary census: 125,733,163,008 bytes free
   versus 64,424,509,440 required. Original command, graph, profiles and timeout
@@ -381,7 +454,7 @@
   `debug/build/<package>/<variant>/fingerprint` layout. Check a warm native
   request before concluding whether materialization forces recompilation;
   source timestamps and cache/tool configuration are left unchanged.
-- [ ] After native preparation succeeds and is acknowledged/released, capture
+- [x] After native preparation succeeds and is acknowledged/released, capture
   the actual test-executable paths and hashes from that completed build. Use
   RCH's documented `--job` mode for already-built test shards, with both
   supported build/test timeouts set to 240 seconds, package working directory
@@ -396,16 +469,79 @@
   recovery confirms delivery exit 120, terminal acknowledgement and source/pair
   release. Retain `fixed-main-v7-native-{compile,recovery}.log`; do not count
   recovery CLI zero as compiler/test success.
-- [ ] Land the two-line compile repair whose source passed all three compiler
+- [x] Land the two-line compile repair whose source passed all three compiler
   gates, then pin canonical main and repeat those gates on that exact source.
   Native execution and original Bead acceptance remain pending throughout.
-- [ ] Allow up to 7,200 seconds for compiler-only native preparation on main,
+- [x] Land PR #414 normally at main `0e0d5334da9be1e417b3916e17bb122ca5968baf`,
+  using the expected reviewed head `a57ca105`. The head's additional commit is
+  tracking metadata only. The connected GitHub API corrected the PR body after
+  the CLI's deprecated Projects field prevented its edit. No check/admin
+  bypass or branch-deletion request was used. Native acceptance remains open.
+- [x] Verify canonical main against the published review through the GitHub
+  comparison API: no file differences from `a57ca105`; only TODO and two Bead
+  metadata files differ from compiler-qualified `3803dd85`. An optional generic
+  Python Git wrapper was blocked for unverified argument spreading; it was not
+  executed or retried. The structured read-only API supplied the comparison.
+  Fast-forward only the two clean private worktrees, import JSONL, and verify
+  both main and the legacy mirror point to `0e0d5334`. Shared checkout preserved.
+- [x] Main formatting passes. Rebind all 55 identical source/report hashes to
+  main without rescanning unchanged code: 35 complete normal reports with all
+  findings retained. Report `main-0e0d-ubs-final-report.json`, SHA-256
+  `2e69230d97fd253530b46b0f945a779ac6e50abc71b1a7f65021d114d922249b`.
+  This is non-partial static coverage, not a clean verdict or native proof.
+- [x] Complete exact-main Clippy, production-only check and all-target check.
+  Keep original compiler flags and full source-content receipts. The earlier
+  `3803dd85` passes remain scoped to that candidate; exact-main results follow.
+- [x] Complete exact-main strict Clippy on `0e0d5334`: build
+  `30097323753222531`, wrapper `rchw-1a01085d-68ad-4710-945f-538101b62783`,
+  actual exit zero after Cargo 10m05s. All 3,957 source hashes, sizes and
+  executable modes verify; receipt root
+  `19984950e394d044de86c79bc908aec5f84ffbafd96c71f4f7e9b11bdf55a70b`.
+  Terminal acknowledged and source/pair ownership released. The production
+  check is separately running on `hz4`; all-targets and native remain pending.
+- [x] Complete the exact-main production-only workspace check on `hz4`:
+  `cargo check --locked --workspace --lib --bins -j1`, build
+  `30097323753222535`, wrapper `rchw-9fd5ce01-c1e3-48fb-ae37-ea7d0b6ca133`,
+  actual exit zero after Cargo 20m40s. All 3,957 source hashes, sizes and modes
+  verify and match the Clippy map; receipt root
+  `aec88c4baf0cf8ba5ba4598d4239d43617aa4fe52614ff6ef0c10b102f333ec9`.
+  Terminal acknowledged with source/pair released. Actual Cargo/rustc hashes
+  match the pinned nightly in `main-0e0d-hz4-compiler-identity-v3.json`.
+- [x] Complete `main-0e0d-v3-all-targets.log`, separately submitted after the
+  production request released: Cargo 8m16s, actual exit zero, build
+  `30097323753222543`, wrapper `rchw-8db2578e-c100-4bde-a318-337bfa7f715b`.
+  All 3,957 source hashes, sizes and modes verify against `0e0d5334` and match
+  both prior compiler maps; receipt root
+  `4f9c87de34801a62e7cefc10f2a5c2ab9237fc253dda4c41420cf57812a4a81d`.
+  Terminal acknowledged with source/pair released; no native claim follows.
+- [x] Allow up to 7,200 seconds for compiler-only native preparation on main,
   using `--lib --no-run -j1` with the same five packages/default graph. Repeated
   one-hour attempts reached CLI test code generation without completing the
   workspace test executables. This revises the chosen compiler preparation
   budget; actual test-execution jobs keep their original 240-second deadline.
   Retain ordinary disk/slot admission, original profiles/dependencies/features
   and every required assertion and probe.
+- [x] Complete `main-0e0d-v4-native-compile.log` on exact main `0e0d5334`,
+  build `30097323753222545`, wrapper
+  `rchw-a4793b80-8875-426b-895f-0b6e6e92fba7`, submitted at 12:13 UTC on the
+  original native worker/root/pool. Fresh normal
+  census admits native preparation: 171,870,392,320 bytes free versus
+  64,424,509,440 required including all live growth reservations and the floor.
+  This prepares all five library test packages without executing assertions;
+  the source checkout remains frozen until terminal acknowledgement/release.
+  Actual CLI test compilation was observed with the pinned Cargo/rustc/lock
+  hashes and original opt-level 1, debug info 2 and debug assertions. Identity
+  report `main-0e0d-v4-native-compiler-identity.json`, SHA-256
+  `42fd3b0f533c587be1a4ba3edcd41c87aadbc5ab388a9d733564e22de6909e63`.
+  Remote compilation finished with exit zero at 13:33:42 UTC after 80m05s,
+  producing all five test executables. All 3,957 source hashes, sizes and modes
+  verify and match the three compiler gate maps; receipt root
+  `117964d9bdd48328848c5b9e907a0ad5ac344ddb36e64832120d512c6a79b7b5`.
+  RCH reports artifact delivery of 21 files / 2,058,977,324 transferred bytes,
+  with a selected-file budget of 14,178,520,940 bytes. Preserve both figures;
+  they describe different transfer measurements.
+  Client exit zero, terminal acknowledged and source/pair released by 13:44:39.
+  Native assertions remain separate, pending work below.
 - [x] Push `3803dd85` and create draft PR #414 after all three compiler gates
   pass; verify its head, base `main`, open state and draft flag. Its Rust/build
   diff against main checkpoint `733ff1c7` is exactly two one-line test repairs.
@@ -437,11 +573,15 @@
   `fixed-main-v3-ubs-final-report.json`, SHA-256
   `275e3844eaa13994dc89e0057a8b137710ccb73d489bacbe115cddd8a6cc40c5`.
   This completes source coverage, not a clean verdict or native qualification.
-- [ ] Execute both repaired native controls:
+- [x] Execute both repaired native controls:
   `shutdown_during_project_contention_retains_the_candidate_for_resume` and
   `retention_admission_shutdown_during_project_wait_preserves_unconsumed_work`,
   in addition to the original acceptance and four archive-cache cases. Their
-  compile failure is observed; no native result is yet available.
+  compile failure was observed before the two-line repair. Both now pass on
+  `0e0d5334` in 2.75s / 2.71s, and all four cache cases pass in 0.02s.
+  Build `30097323753222577`, wrapper
+  `rchw-a703eb18-933e-4b9d-8057-3bbc8f390572`: hashes, remote zero exit,
+  result retrieval, terminal acknowledgement and ownership release verify.
 
 ## Resumed fresh review (2026-11-24 15:12 UTC, `br-u9bhg`)
 
