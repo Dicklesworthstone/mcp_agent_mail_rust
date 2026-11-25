@@ -48,14 +48,37 @@
 - [x] Check the live stale-backup finding: full integrity failures persist;
   the existing `br-lqz87` fix already improves its diagnosis. No live repair,
   daemon replacement or unrelated backup-policy change is attempted here.
-- [ ] Build native DB tests on pinned `71ffa099`, then execute the corrected
-  six retry cases and the original DB recovery/cursor/admission suites.
+- [ ] Build the current review candidate's native DB tests, then execute the
+  corrected six retry cases and original DB recovery/cursor/admission suites.
   The warm native worker `vmi1149989` lacks ordinary headroom. A fresh normal
   census on `vmi1153651` admits native work: 137,080,143,872 bytes free versus
   96,636,764,160 required. Reuse the existing compiler checkout/cache there.
   Preserve the `00b35dde` baseline and cache; its known unsupported automatic
   durability expectation is supplementary investigation, not a replacement
   for the original acceptance. No original acceptance is removed or weakened.
+- [x] Preserve the first `71ffa099` compiler-only preparation failure:
+  `fresh-nov25-v1-db-compile.log`, build `30097323753222311`, wrapper
+  `rchw-0ad00334-da21-489e-89c7-7a4c8fa05954`. It timed out at 3,600 seconds
+  before a DB test binary or assertion. Recovery CLI zero acknowledges actual
+  command exit 120 with source/pair ownership released; log
+  `fresh-nov25-v1-db-recovery.log`. Completed dependencies remain in the same
+  worker cache. The actual compiler/lock identity is retained in
+  `fresh-nov25-v1-db-live-compiler-tree.json` (SHA-256
+  `b2a87b89a1de979df89202c9271e0a76b1c91e8b0910dd9c935104f324bae64b`).
+  After release, ordinary admission still fits on the healthy worker:
+  123,228,721,152 bytes free versus 107,374,182,400 required. Preserve every
+  live reservation and all original profiles, dependencies and runtime limits.
+- [x] Observe the integrated formatter failure in `mailbox_verdict.rs` and
+  storage `lib.rs`; apply only its reported line wrapping manually. Preserve
+  `fresh-nov25-current-fmt-red.log`; workspace formatting now passes in
+  `fresh-nov25-current-fmt-green.log`. No Rust behavior or assertion changed.
+- [ ] Refresh the existing normal Rust static gate for the current candidate:
+  39 of the original 50 source hashes still match; 11 need fresh scans.
+  Retain completed pre-format storage output as historical, rescan that file,
+  and include the newly touched `mailbox_verdict.rs` (51 total Rust paths).
+  No rules, findings or modules may be suppressed; static work is not native
+  proof. The source transition changes no manifest, lockfile, toolchain or
+  Cargo/Nextest settings, and removes no checked-out file.
 - [ ] Execute original storage/tools/CLI acceptance and all five modified
   queue cases. Preserve actual failures; fix only demonstrated defects.
 - [ ] Qualify any subsequent integrated source separately, publish actual
