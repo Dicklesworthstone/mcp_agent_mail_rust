@@ -1,5 +1,89 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## Fresh review resumed (2026-11-25 03:13 UTC, `br-u9bhg`)
+
+- [x] Refresh Agent Mail identity/inbox, Beads/BV and CASS; preserve the dirty
+  shared checkout. Fast-forward only the clean review checkout to `5922131d`.
+  Governing README/AGENTS content is unchanged from the full earlier reading.
+- [x] Reread all five repaired queue assertions and the complete ACK helper
+  against the actual publication-retry contract. No further observed defect.
+- [x] Reproduce a further bug in my E2E helper: a rejected forced rebuild
+  returns success with an existing executable when called in a conditional.
+  The real remote/local policy refuses with 64, but the helper returns 0.
+  The new regression fails all ten forced-build cases on the unchanged
+  helper; its ten prepared-artifact controls and the other 15 scenarios pass.
+  Retain `fresh-nov25-force-build-baseline.log` and
+  `fresh-nov25-forced-build-red.log` with their private fixtures.
+- [x] Propagate the actual build failure at both helper build call sites.
+  Preserve prepared-artifact behavior and existing fallback policy.
+- [x] Complete the full helper suite: 16/16 scenarios pass, including ten
+  rejected forced rebuilds and ten accepted prepared-artifact controls.
+  Existing 46 routing, ten artifact and ten initialization controls pass.
+  Bash syntax and fresh diff checks pass. Normal UBS completed both Bash
+  files: zero critical, 14 retained warnings on unchanged counters explicitly
+  guarded with `|| true`, no failed modules. Report
+  `fresh-nov25-forced-build-ubs.json`, SHA-256
+  `886b8c4a4c4aaf49c40cf04f6350e1d7bf8f8b9d4b0130cf5b76c4c7bc94a67d`.
+  Green log: `fresh-nov25-forced-build-green.log`; retained fixtures
+  `/data/tmp/am-e2e-lib-self-test.20261125T032225Z.3845055`.
+  These controls execute no compiler or stale executable; native proof is
+  separate. Publish the helper repair after final scoped review/checks below.
+- [x] Trace real callers and reproduce stdout contamination after a successful
+  forced build: scripts capture the helper output as one executable path, but
+  the helper also prints build logs there. Preserve the first direct control
+  and the failing 16/17 full suite in `fresh-nov25-build-stdout-baseline.log`
+  and `fresh-nov25-build-stdout-red.log`. The I/O control uses an explicitly
+  recording Cargo function and never compiles or executes an application.
+- [x] Send build diagnostics to stderr at both checked call sites and document
+  the path-only stdout contract; correct two stale caller comments. Full suite
+  now passes 17/17, retaining all previous controls. Bash syntax and diff checks
+  pass. Normal UBS completes all four changed Bash files: zero critical,
+  15 retained preexisting warnings (14 guarded counters and one clock capture).
+  Report `fresh-nov25-build-stdout-ubs.json`, SHA-256
+  `8289069646f09c0b6635368af09f6ff539424a69e06477c12a6d649c00ba7cb0`.
+  Green fixtures: `/data/tmp/am-e2e-lib-self-test.20261125T035220Z.190273`.
+- [x] Publish the first helper correction as draft PR #412, `a9c5baf7`.
+  Add the stdout correction to that same review; workspace/native
+  qualifications remain separate, pending work below.
+- [x] Check the live stale-backup finding: full integrity failures persist;
+  the existing `br-lqz87` fix already improves its diagnosis. No live repair,
+  daemon replacement or unrelated backup-policy change is attempted here.
+- [ ] Build the current review candidate's native DB tests, then execute the
+  corrected six retry cases and original DB recovery/cursor/admission suites.
+  The warm native worker `vmi1149989` lacks ordinary headroom. A fresh normal
+  census on `vmi1153651` admits native work: 137,080,143,872 bytes free versus
+  96,636,764,160 required. Reuse the existing compiler checkout/cache there.
+  Preserve the `00b35dde` baseline and cache; its known unsupported automatic
+  durability expectation is supplementary investigation, not a replacement
+  for the original acceptance. No original acceptance is removed or weakened.
+- [x] Preserve the first `71ffa099` compiler-only preparation failure:
+  `fresh-nov25-v1-db-compile.log`, build `30097323753222311`, wrapper
+  `rchw-0ad00334-da21-489e-89c7-7a4c8fa05954`. It timed out at 3,600 seconds
+  before a DB test binary or assertion. Recovery CLI zero acknowledges actual
+  command exit 120 with source/pair ownership released; log
+  `fresh-nov25-v1-db-recovery.log`. Completed dependencies remain in the same
+  worker cache. The actual compiler/lock identity is retained in
+  `fresh-nov25-v1-db-live-compiler-tree.json` (SHA-256
+  `b2a87b89a1de979df89202c9271e0a76b1c91e8b0910dd9c935104f324bae64b`).
+  After release, ordinary admission still fits on the healthy worker:
+  123,228,721,152 bytes free versus 107,374,182,400 required. Preserve every
+  live reservation and all original profiles, dependencies and runtime limits.
+- [x] Observe the integrated formatter failure in `mailbox_verdict.rs` and
+  storage `lib.rs`; apply only its reported line wrapping manually. Preserve
+  `fresh-nov25-current-fmt-red.log`; workspace formatting now passes in
+  `fresh-nov25-current-fmt-green.log`. No Rust behavior or assertion changed.
+- [ ] Refresh the existing normal Rust static gate for the current candidate:
+  39 of the original 50 source hashes still match; 11 need fresh scans.
+  Retain completed pre-format storage output as historical, rescan that file,
+  and include the newly touched `mailbox_verdict.rs` (51 total Rust paths).
+  No rules, findings or modules may be suppressed; static work is not native
+  proof. The source transition changes no manifest, lockfile, toolchain or
+  Cargo/Nextest settings, and removes no checked-out file.
+- [ ] Execute original storage/tools/CLI acceptance and all five modified
+  queue cases. Preserve actual failures; fix only demonstrated defects.
+- [ ] Qualify any subsequent integrated source separately, publish actual
+  outcomes and keep the Bead open until its complete acceptance passes.
+
 ## Resumed fresh review (2026-11-24 15:12 UTC, `br-u9bhg`)
 
 - [x] Verify the former hz3 request is now terminal and acknowledged, exit 120,

@@ -2394,8 +2394,14 @@ mod tests {
             .find(|probe| probe.name == "archive_writable")
             .expect("real writable probe");
         assert!(writable.passed, "{writable:?}");
-        assert_eq!(std::fs::read(&sentinel).expect("preserved sentinel"), original);
-        assert!(!database.exists(), "health must not initialize the database");
+        assert_eq!(
+            std::fs::read(&sentinel).expect("preserved sentinel"),
+            original
+        );
+        assert!(
+            !database.exists(),
+            "health must not initialize the database"
+        );
         let entries: Vec<_> = std::fs::read_dir(&archive)
             .expect("archive entries")
             .map(|entry| entry.expect("archive entry").file_name())
@@ -2427,7 +2433,9 @@ mod tests {
                 assert_eq!(std::fs::read(&outside).expect("outside sentinel"), original);
             }
             assert_eq!(
-                std::fs::read_dir(&archive).expect("archive entries").count(),
+                std::fs::read_dir(&archive)
+                    .expect("archive entries")
+                    .count(),
                 1,
                 "the owned probe must not leave another archive entry"
             );
@@ -2455,7 +2463,10 @@ mod tests {
             }
         });
 
-        assert_eq!(std::fs::read(&sentinel).expect("preserved sentinel"), original);
+        assert_eq!(
+            std::fs::read(&sentinel).expect("preserved sentinel"),
+            original
+        );
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .expect("archive entries")
             .map(|entry| entry.expect("archive entry").file_name())
@@ -2470,7 +2481,10 @@ mod tests {
         let probe = probe_archive_writable(&missing);
         assert!(!probe.passed);
         assert_eq!(probe.severity, ProbeSeverity::Warning);
-        assert!(!missing.exists(), "a writable probe must not create its root");
+        assert!(
+            !missing.exists(),
+            "a writable probe must not create its root"
+        );
 
         let file = dir.path().join("ordinary-file");
         std::fs::write(&file, b"keep").expect("non-directory fixture");

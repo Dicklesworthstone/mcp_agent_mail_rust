@@ -10124,7 +10124,10 @@ fn cached_directory_is_usable(dir: &Path) -> std::io::Result<bool> {
     if path_existing_prefix_has_symlink(dir)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("refusing to use symlinked directory path: {}", dir.display()),
+            format!(
+                "refusing to use symlinked directory path: {}",
+                dir.display()
+            ),
         ));
     }
     match fs::symlink_metadata(dir) {
@@ -19153,27 +19156,27 @@ mod tests {
     #[test]
     fn archive_init_cache_recreates_moved_parent_before_publishing() {
         let tmp = TempDir::new().unwrap();
-        let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
-            &tmp.path().canonicalize().unwrap(),
-        );
+        let root =
+            mcp_agent_mail_core::disk::simplify_verbatim_path(&tmp.path().canonicalize().unwrap());
         let config = test_config(&root);
         ensure_repo(&root, &config).unwrap();
         let parent = root.join("messages");
         let retained = root.join("preserved-messages");
         write_text(&parent.join("first.md"), "retained first message", true).unwrap();
-        commit_paths_with_retry(&root, &config, "first message", &["messages/first.md"])
-            .unwrap();
+        commit_paths_with_retry(&root, &config, "first message", &["messages/first.md"]).unwrap();
         fs::rename(&parent, &retained).unwrap();
 
         write_text(&parent.join("second.md"), "second message", true)
             .expect("an old directory hint must not prevent recreating a missing parent");
-        commit_paths_with_retry(&root, &config, "second message", &["messages/second.md"])
-            .unwrap();
+        commit_paths_with_retry(&root, &config, "second message", &["messages/second.md"]).unwrap();
         assert_eq!(
             fs::read(retained.join("first.md")).unwrap(),
             b"retained first message",
         );
-        assert_eq!(fs::read(parent.join("second.md")).unwrap(), b"second message");
+        assert_eq!(
+            fs::read(parent.join("second.md")).unwrap(),
+            b"second message"
+        );
         let repo = Repository::open(&root).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
         let entry = tree.get_path(Path::new("messages/second.md")).unwrap();
@@ -19213,9 +19216,8 @@ mod tests {
     #[test]
     fn archive_init_cache_revalidates_reservation_preparation() {
         let tmp = TempDir::new().unwrap();
-        let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
-            &tmp.path().canonicalize().unwrap(),
-        );
+        let root =
+            mcp_agent_mail_core::disk::simplify_verbatim_path(&tmp.path().canonicalize().unwrap());
         let config = test_config(&root);
         let slug = "prepared-revalidation";
         let archive = ensure_archive(&config, slug).unwrap();
@@ -19233,9 +19235,8 @@ mod tests {
     #[test]
     fn archive_init_cache_reopens_missing_or_invalid_git_metadata() {
         let tmp = TempDir::new().unwrap();
-        let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
-            &tmp.path().canonicalize().unwrap(),
-        );
+        let root =
+            mcp_agent_mail_core::disk::simplify_verbatim_path(&tmp.path().canonicalize().unwrap());
         let config = test_config(&root);
         ensure_repo(&root, &config).unwrap();
         let original_tip = Repository::open(&root)
@@ -19283,9 +19284,8 @@ mod tests {
     #[test]
     fn archive_init_cache_repairs_valid_unborn_repository_replacement() {
         let tmp = TempDir::new().unwrap();
-        let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
-            &tmp.path().canonicalize().unwrap(),
-        );
+        let root =
+            mcp_agent_mail_core::disk::simplify_verbatim_path(&tmp.path().canonicalize().unwrap());
         let config = test_config(&root);
         ensure_repo(&root, &config).unwrap();
         let original_tip = Repository::open(&root)
@@ -19421,9 +19421,8 @@ mod tests {
     #[test]
     fn signal_io_and_cached_dirs_do_not_wait_for_a_held_fence() {
         let tmp = TempDir::new().unwrap();
-        let root = mcp_agent_mail_core::disk::simplify_verbatim_path(
-            &tmp.path().canonicalize().unwrap(),
-        );
+        let root =
+            mcp_agent_mail_core::disk::simplify_verbatim_path(&tmp.path().canonicalize().unwrap());
         let cached_dir = root.join("cached");
         ensure_dir(&cached_dir).expect("create and cache the directory");
         let mut config = test_config(&root);
@@ -21714,11 +21713,17 @@ mod tests {
                 panic!("{case}: changed setup waited for the held fence: {error}")
             });
             assert!(
-                matches!(&result, DirectArchiveWrite::Failed(StorageError::LockContention { .. })),
+                matches!(
+                    &result,
+                    DirectArchiveWrite::Failed(StorageError::LockContention { .. })
+                ),
                 "{case}: {result:?}"
             );
             assert_eq!(checks, move_at, "{case}: refusal must happen at setup");
-            assert!(missing_while_held, "{case}: setup must not recreate the path");
+            assert!(
+                missing_while_held,
+                "{case}: setup must not recreate the path"
+            );
             assert_eq!(
                 retained_while_held.as_deref(),
                 Some(b"preserve existing bytes".as_slice()),
@@ -21737,7 +21742,10 @@ mod tests {
             // the bounded slow path once the real fence owner has released it.
             let retry = write_op_sync_direct(&op);
             flush_async_commits();
-            assert!(matches!(&retry, DirectArchiveWrite::Written), "{case}: {retry:?}");
+            assert!(
+                matches!(&retry, DirectArchiveWrite::Written),
+                "{case}: {retry:?}"
+            );
             let published: serde_json::Value =
                 serde_json::from_slice(&fs::read(reservation_dir.join("id-91.json")).unwrap())
                     .unwrap();
