@@ -2772,7 +2772,7 @@ mod tests {
                 // Latch the real project-lock lookup after mutation admission.
                 // Its window then stays observable until shutdown is requested,
                 // even when a fenced repair only tries the busy project once.
-                let lookup = crate::ARCHIVE_LOCK_MAP.get().unwrap().write();
+                let lookup = crate::ARCHIVE_LOCK_MAP.get().unwrap().locks.write();
                 ready_tx.send(()).unwrap();
                 // Observe the actual repair mutation window, not a timed guess
                 // about when the worker will reach the held project mutex.

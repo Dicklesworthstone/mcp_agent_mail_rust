@@ -284,6 +284,57 @@
   integrated source, refresh affected static bindings and complete the original
   native acceptance plus the four existing archive-cache cases. Keep this
   checkpoint stable through the next validation run rather than chasing heads.
+- [x] Prepare integrated source `2b050817` containing checkpoint `733ff1c7`:
+  its Rust sources and build inputs match main's checkpoint exactly; only own
+  TODO/Bead evidence differs. All three worktrees advance without removed files;
+  original manifests, lockfile, toolchain and Cargo/Nextest settings remain.
+  Formatting passes in `fixed-main-v1-fmt.log`.
+- [x] Refresh affected normal static coverage on `2b050817`: 53 Rust paths,
+  50 verified unchanged bindings, two fresh replacements and the added products
+  scan. All 34 bound reports are complete, retaining 55 critical, 62,544 warning,
+  21,905 scoped informational and 136 unscoped diagnostics without suppression.
+  Fresh critical flags are unchanged synthetic tokens in messaging tests. Report
+  `fixed-main-v1-ubs-final-report.json`, SHA-256
+  `8e4f45599545f1790d74abe543c33d152f6cc3047cb7a0e7e0f28597265ed29c`.
+  This is static completion, not a clean verdict or compiler/native result.
+- [ ] Complete the three integrated-source compiler gates. Ordinary `hz4`
+  headroom is negative; the subsequent `vmi1153651` request ended with 103
+  before admission, no remote build ID or source hold. Wrapper
+  `rchw-4aac9dfb-0e8a-4b46-ab0a-ee188c20d5b5` is terminal acknowledged;
+  preserve its empty `fixed-main-v1-clippy.log` and local admission journal.
+  The unchanged strict Clippy command is admitted on `vmi1149989`, build
+  `30097323753222438`, wrapper `rchw-a20ee77c-99c2-44bb-8362-773663e523be`,
+  frozen source `2b050817`, log `fixed-main-v2-clippy.log`. Its ordinary census
+  fits static work; no limit, bypass, quarantine, namespace or profile changed.
+  The separate production/all-target graphs and all original native cases
+  remain mandatory. The `434c798d` passes do not qualify this new source.
+
+- [x] Preserve the integrated-source Clippy failure on `2b050817`: actual
+  101, build `30097323753222438`, wrapper
+  `rchw-a20ee77c-99c2-44bb-8362-773663e523be`, terminal acknowledged and
+  source/pair released. All 3,957 hashes, sizes and executable modes verify;
+  receipt `f28a5e74ddeebc11e33aa32d4313352640ea265d4dc0ec7f97353df79ec6a516`.
+  Log `fixed-main-v2-clippy.log` reports two E0599 errors: the archive-lock
+  cache refactor left two shutdown/admission tests using the old map type.
+- [x] Read the cache implementation and both complete contention controls;
+  search every `ARCHIVE_LOCK_MAP` use. Under narrow leases, update the two
+  stale `.write()` calls to `.locks.write()` in active-reservation and message
+  retention tests. Preserve their real registry latch, project mutex owner,
+  shutdown/admission observation, resume and SQL/archive assertions. Formatting
+  and diff checks pass; no production behavior or assertion changes.
+- [ ] Complete the normal static refresh for both changed test files, retain
+  prior findings, and requalify the repaired source through all three required
+  compiler gates on the retained worker pool with unchanged flags/policies.
+- [x] Both changed test files complete the normal scan with zero critical,
+  1,242 warning and 131 informational diagnostics, no failed modules and no
+  suppressions. Report `fixed-main-v3-ubs-lock-tests.json`, SHA-256
+  `77b54b45c1496ac57bd48df31a9562c95c1574bead7a9a2a7c59b9ec9ce2842b`.
+  This is static evidence only; native behavior remains unexecuted.
+- [ ] Execute both repaired native controls:
+  `shutdown_during_project_contention_retains_the_candidate_for_resume` and
+  `retention_admission_shutdown_during_project_wait_preserves_unconsumed_work`,
+  in addition to the original acceptance and four archive-cache cases. Their
+  compile failure is observed; no native result is yet available.
 
 ## Resumed fresh review (2026-11-24 15:12 UTC, `br-u9bhg`)
 

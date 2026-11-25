@@ -2193,7 +2193,7 @@ fn retention_admission_shutdown_during_project_wait_preserves_unconsumed_work() 
             // Retention reaches this real registry only after taking the
             // publication fence. Latch that boundary until stop is set, so
             // try-only project admission cannot end the observed window early.
-            let lookup = crate::ARCHIVE_LOCK_MAP.get().unwrap().write();
+            let lookup = crate::ARCHIVE_LOCK_MAP.get().unwrap().locks.write();
             ready_tx.send(()).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while crate::archive_mutations_active() == 0 && std::time::Instant::now() < deadline {
