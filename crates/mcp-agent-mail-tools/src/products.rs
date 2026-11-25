@@ -110,17 +110,22 @@ fn parse_fetch_inbox_product_limit(limit: Option<i32>) -> McpResult<usize> {
     })
 }
 
-fn parse_product_since_ts(since_ts: Option<&str>) -> Option<i64> {
-    since_ts.and_then(|raw| {
-        let parsed = mcp_agent_mail_db::iso_to_micros(raw);
-        if parsed.is_none() {
-            tracing::debug!(
-                since_ts = raw,
-                "ignoring invalid fetch_inbox_product since_ts to preserve Python parity"
-            );
-        }
-        parsed
-    })
+fn parse_product_since_ts(since_ts: Option<&str>) -> McpResult<Option<i64>> {
+    since_ts
+        .map(|timestamp| {
+            mcp_agent_mail_db::iso_to_micros(timestamp).ok_or_else(|| {
+                legacy_tool_error(
+                    "INVALID_TIMESTAMP",
+                    format!("Invalid since_ts format: {timestamp:?}. Expected ISO-8601."),
+                    true,
+                    serde_json::json!({
+                        "provided": timestamp,
+                        "expected_format": "YYYY-MM-DDTHH:MM:SS+HH:MM",
+                    }),
+                )
+            })
+        })
+        .transpose()
 }
 
 fn validate_product_inbox_agent_name(agent_name: &str) -> McpResult<()> {
@@ -845,6 +850,16 @@ pub async fn fetch_inbox_product(
         return Err(worktrees_required());
     }
 
+    // Validate the caller's scope before any mailbox admission or lookup. An
+    // invalid incremental timestamp must never turn into an unfiltered inbox.
+    let max_messages = parse_fetch_inbox_product_limit(limit)?;
+    let urgent = urgent_only.unwrap_or(false);
+    let with_bodies = include_bodies.unwrap_or(false);
+    phase.set_include_bodies(with_bodies);
+    let since_micros = parse_product_since_ts(since_ts.as_deref())?;
+    validate_product_inbox_agent_name(&agent_name)?;
+    phase.mark("argument_validation");
+
     let pool = get_read_db_pool(ctx.cx()).await?;
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
@@ -864,14 +879,6 @@ pub async fn fetch_inbox_product(
     )?;
     let partial_failures = product_partial_failures_for_projects(&product_projects);
     phase.mark("product_project_scope_resolution");
-
-    let max_messages = parse_fetch_inbox_product_limit(limit)?;
-    let urgent = urgent_only.unwrap_or(false);
-    let with_bodies = include_bodies.unwrap_or(false);
-    phase.set_include_bodies(with_bodies);
-    let since_micros = parse_product_since_ts(since_ts.as_deref());
-    validate_product_inbox_agent_name(&agent_name)?;
-    phase.mark("argument_validation");
 
     // Resolve canonical viewers once, before returning any project data.
     // Pin the fan-in to those exact IDs so concurrent link/registration
@@ -1537,6 +1544,25 @@ mod tests {
                     assert_eq!(urgent.iter().map(|row|row["id"].as_i64().unwrap()).collect::<Vec<_>>(),vec![110,100]);
                     let since: Vec<serde_json::Value> = serde_json::from_str(&invoke(false,false,Some(micros_to_iso(110)),10).await.unwrap()).unwrap();
                     assert_eq!(since.iter().map(|row|row["id"].as_i64().unwrap()).collect::<Vec<_>>(),vec![111]);
+                    let offset_since: Vec<serde_json::Value> = serde_json::from_str(
+                        &invoke(false, false, Some("1970-01-01T01:00:00.000110+01:00".into()), 10)
+                            .await.unwrap(),
+                    ).unwrap();
+                    assert_eq!(offset_since, since, "equivalent instants preserve the strict lower bound");
+                    for invalid in ["", " ", "2026/03/09 12:00:00", "2026-02-30T00:00:00Z"] {
+                        tracker.reset();
+                        let error = invoke(true, false, Some(invalid.into()), 10)
+                            .await.expect_err("invalid scope must not return linked-project messages");
+                        let payload = error.data.expect("structured timestamp error");
+                        assert_eq!(payload["error"]["type"], "INVALID_TIMESTAMP");
+                        assert_eq!(payload["error"]["recoverable"], true);
+                        assert_eq!(payload["error"]["data"]["provided"], invalid);
+                        assert_eq!(tracker.snapshot().total, 0, "invalid scope must fail before product lookup");
+                    }
+                    let unfiltered: Vec<serde_json::Value> = serde_json::from_str(
+                        &invoke(false, false, None, 10).await.unwrap(),
+                    ).unwrap();
+                    assert_eq!(unfiltered.iter().map(|row| row["id"].as_i64().unwrap()).collect::<Vec<_>>(), vec![111, 110, 101, 100]);
                     let conn=pool.acquire(&cx).await.into_result().unwrap();
                     let activity=conn.query_sync("SELECT last_active_ts FROM agents WHERE name='BlueLake'",&[]).unwrap();
                     assert!(activity.iter().all(|row|row.get_named::<i64>("last_active_ts").unwrap()==7));
@@ -2526,8 +2552,77 @@ mod tests {
     }
 
     #[test]
-    fn fetch_inbox_product_invalid_since_ts_is_ignored() {
-        assert_eq!(parse_product_since_ts(Some("2026/03/09 12:00:00")), None);
+    fn fetch_inbox_product_since_ts_preserves_valid_instants_and_rejects_invalid_filters() {
+        assert_eq!(parse_product_since_ts(None).unwrap(), None);
+        for valid in [
+            "1970-01-01T00:00:00.000110Z",
+            "1970-01-01T01:00:00.000110+01:00",
+        ] {
+            assert_eq!(parse_product_since_ts(Some(valid)).unwrap(), Some(110));
+        }
+        for invalid in ["", " ", "2026/03/09 12:00:00", "2026-02-30T00:00:00Z"] {
+            let error = parse_product_since_ts(Some(invalid))
+                .expect_err("a supplied malformed timestamp cannot remove the time filter");
+            let payload = error.data.expect("structured timestamp error");
+            assert_eq!(payload["error"]["type"], "INVALID_TIMESTAMP");
+            assert_eq!(payload["error"]["recoverable"], true);
+            assert_eq!(payload["error"]["data"]["provided"], invalid);
+        }
+    }
+
+    #[test]
+    fn fetch_inbox_product_rejects_invalid_scope_before_missing_mailbox_admission() {
+        let temp = tempfile::tempdir().expect("private test root");
+        let database = temp.path().join("uncreated-db").join("mail.sqlite3");
+        let archive = temp.path().join("uncreated-archive");
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", database.display())),
+                ("STORAGE_ROOT", &archive.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async {
+                        let ctx = McpContext::new(Cx::current().expect("runtime context"), 1);
+                        for invalid in ["", "2026/03/09 12:00:00"] {
+                            let error = fetch_inbox_product(
+                                &ctx,
+                                "missing-product".into(),
+                                "BlueLake".into(),
+                                Some(10),
+                                Some(false),
+                                Some(true),
+                                Some(invalid.into()),
+                            )
+                            .await
+                            .expect_err("invalid scope must win over missing mailbox and product");
+                            let payload = error.data.expect("structured timestamp error");
+                            assert_eq!(payload["error"]["type"], "INVALID_TIMESTAMP");
+                            assert_eq!(payload["error"]["data"]["provided"], invalid);
+                        }
+                    });
+                Config::reset_cached();
+            },
+        );
+        assert!(
+            !database.exists(),
+            "invalid input must not bootstrap a database"
+        );
+        assert!(
+            !archive.exists(),
+            "invalid input must not initialize an archive"
+        );
+        assert!(
+            std::fs::read_dir(temp.path())
+                .expect("private test root")
+                .next()
+                .is_none(),
+            "invalid input must leave no mailbox directories or recovery artifacts"
+        );
     }
 
     #[test]

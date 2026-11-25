@@ -5156,39 +5156,215 @@ fn wbq_execute_op_inner(op: &WriteOp) -> Result<()> {
 /// for intra-process contention (the dominant case under load).
 ///
 /// The outer `RwLock` is read-locked for lookup (hot path, concurrent) and
-/// write-locked only when creating a new project entry (cold path, once).
+/// write-locked when creating a project entry or pruning idle entries.
 type ArchiveProcessLockKey = PathBuf;
 
-static ARCHIVE_LOCK_MAP: OnceLock<OrderedRwLock<HashMap<ArchiveProcessLockKey, Arc<Mutex<()>>>>> =
-    OnceLock::new();
+const ARCHIVE_PROCESS_LOCK_CACHE_TARGET: usize = 1024;
+const ARCHIVE_PROCESS_LOCK_PRUNE_INTERVAL: usize = 128;
 
-fn archive_process_lock_for_root(root: PathBuf) -> Arc<Mutex<()>> {
-    let map = ARCHIVE_LOCK_MAP
-        .get_or_init(|| OrderedRwLock::new(LockLevel::StorageArchiveLockMap, HashMap::new()));
-    let key = root;
+/// Idle project locks are optional memoization, not lifetime-owned state. Keep
+/// hot locks reusable, but periodically retire map-only entries after the cache
+/// reaches its target. External `Arc`s include both holders and waiters: none
+/// may be evicted, even when active concurrency exceeds the target.
+struct ArchiveProcessLockCache {
+    locks: OrderedRwLock<HashMap<ArchiveProcessLockKey, Arc<Mutex<()>>>>,
+    saturated_lookups: AtomicUsize,
+}
 
-    // Fast path: read lock for existing entry.
-    {
-        let guard = map.read();
-        if let Some(lock) = guard.get(&key) {
-            return Arc::clone(lock);
+impl Default for ArchiveProcessLockCache {
+    fn default() -> Self {
+        Self {
+            locks: OrderedRwLock::new(LockLevel::StorageArchiveLockMap, HashMap::new()),
+            saturated_lookups: AtomicUsize::new(0),
         }
     }
+}
 
-    // Slow path: write lock to insert.
-    let mut guard = map.write();
-    if let Some(lock) = guard.get(&key) {
-        return Arc::clone(lock);
+impl ArchiveProcessLockCache {
+    fn get(&self, key: ArchiveProcessLockKey) -> Arc<Mutex<()>> {
+        let (existing, prune) = {
+            let guard = self.locks.read();
+            // Ordinary hot-project lookups below the target need no atomic
+            // update or exclusive map lock. Above it, count hits as well as
+            // misses so a completed concurrency burst can shed idle locks
+            // even when subsequent requests reuse one existing project.
+            let prune = guard.len() >= ARCHIVE_PROCESS_LOCK_CACHE_TARGET
+                && self
+                    .saturated_lookups
+                    .fetch_add(1, Ordering::Relaxed)
+                    .is_multiple_of(ARCHIVE_PROCESS_LOCK_PRUNE_INTERVAL);
+            (guard.get(&key).cloned(), prune)
+        };
+        if let Some(lock) = existing {
+            if prune {
+                Self::prune_idle(&mut self.locks.write());
+            }
+            return lock;
+        }
+
+        // Recheck under exclusive ownership: a peer may have inserted the
+        // same project after our read. Clone before pruning so this caller's
+        // future acquisition already protects the selected mutex identity.
+        let mut guard = self.locks.write();
+        let lock = Arc::clone(guard.entry(key).or_default());
+        if prune {
+            Self::prune_idle(&mut guard);
+        }
+        lock
     }
-    let lock = Arc::new(Mutex::new(()));
-    guard.insert(key, Arc::clone(&lock));
-    lock
+
+    fn prune_idle(locks: &mut HashMap<ArchiveProcessLockKey, Arc<Mutex<()>>>) {
+        // The exclusive map lock prevents a new lookup from cloning an entry
+        // between this count and removal. A holder/waiter always owns an Arc;
+        // its last reference can disappear concurrently, but cannot appear
+        // from a map-only entry while this guard is retained.
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        let retained_capacity = ARCHIVE_PROCESS_LOCK_CACHE_TARGET.max(locks.len());
+        if locks.capacity() > retained_capacity.saturating_mul(2) {
+            locks.shrink_to(retained_capacity);
+        }
+        // FILE_LOCK_GENERATIONS and canonical-ID caches are independent
+        // authority witnesses. Never reset them when retiring an idle mutex.
+    }
+}
+
+static ARCHIVE_LOCK_MAP: OnceLock<ArchiveProcessLockCache> = OnceLock::new();
+
+fn archive_process_lock_for_root(root: PathBuf) -> Arc<Mutex<()>> {
+    ARCHIVE_LOCK_MAP
+        .get_or_init(ArchiveProcessLockCache::default)
+        .get(root)
 }
 
 fn archive_process_lock(archive: &ProjectArchive) -> Result<Arc<Mutex<()>>> {
     Ok(archive_process_lock_for_root(
         archive_project_root_canonical_checked(archive)?,
     ))
+}
+
+#[cfg(test)]
+mod archive_process_lock_cache_tests {
+    use super::*;
+
+    fn churn(cache: &ArchiveProcessLockCache) {
+        for index in 0..(ARCHIVE_PROCESS_LOCK_CACHE_TARGET * 3) {
+            drop(cache.get(PathBuf::from(format!("archive-cache-churn-{index}"))));
+        }
+    }
+
+    #[test]
+    fn archive_process_lock_cache_reuses_idle_hot_locks_and_bounds_churn() {
+        let cache = ArchiveProcessLockCache::default();
+        let key = PathBuf::from("hot-project");
+        let first = cache.get(key.clone());
+        let previous = Arc::downgrade(&first);
+        drop(first);
+        let reused = cache.get(key);
+        assert!(Arc::ptr_eq(&previous.upgrade().unwrap(), &reused));
+        drop(reused);
+
+        churn(&cache);
+
+        assert!(previous.upgrade().is_none(), "idle locks must retire");
+        assert!(
+            cache.locks.read().len()
+                < ARCHIVE_PROCESS_LOCK_CACHE_TARGET + ARCHIVE_PROCESS_LOCK_PRUNE_INTERVAL,
+            "sequential project churn must not grow lifetime retention"
+        );
+    }
+
+    #[test]
+    fn archive_process_lock_cache_preserves_active_entries_and_reclaims_on_hits() {
+        let cache = ArchiveProcessLockCache::default();
+        let count = ARCHIVE_PROCESS_LOCK_CACHE_TARGET * 3;
+        let held = (0..count)
+            .map(|index| cache.get(PathBuf::from(format!("active-project-{index}"))))
+            .collect::<Vec<_>>();
+        for (index, original) in held.iter().enumerate() {
+            let same = cache.get(PathBuf::from(format!("active-project-{index}")));
+            assert!(Arc::ptr_eq(original, &same));
+        }
+        let retired = Arc::downgrade(&held[1]);
+        let active = Arc::clone(&held[0]);
+        drop(held);
+
+        for _ in 0..ARCHIVE_PROCESS_LOCK_PRUNE_INTERVAL {
+            let same = cache.get(PathBuf::from("active-project-0"));
+            assert!(Arc::ptr_eq(&active, &same));
+        }
+
+        assert!(retired.upgrade().is_none());
+        let locks = cache.locks.read();
+        assert_eq!(locks.len(), 1);
+        assert!(locks.capacity() <= ARCHIVE_PROCESS_LOCK_CACHE_TARGET * 2);
+    }
+
+    #[test]
+    fn archive_process_lock_cache_keeps_holders_and_waiters_on_one_mutex() {
+        let cache = ArchiveProcessLockCache::default();
+        let key = PathBuf::from("contended-project");
+        std::thread::scope(|scope| {
+            let holder = cache.get(key.clone());
+            let guard = holder.lock().unwrap();
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let expected = Arc::clone(&holder);
+            let waiter_key = key.clone();
+            let waiter_cache = &cache;
+            let waiter = scope.spawn(move || {
+                let lock = waiter_cache.get(waiter_key);
+                assert!(Arc::ptr_eq(&expected, &lock));
+                assert!(matches!(
+                    lock.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                ready_tx.send(()).unwrap();
+                let guard = lock.lock().unwrap();
+                drop(guard);
+                lock
+            });
+            let ready = ready_rx.recv_timeout(Duration::from_secs(5));
+            if ready.is_ok() {
+                churn(&cache);
+            }
+            let peer = cache.get(key.clone());
+            let same_mutex = Arc::ptr_eq(&holder, &peer);
+            let still_held = matches!(peer.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+            // Release before reporting a failed rendezvous, so a delayed
+            // waiter can never keep scope teardown behind the held mutex.
+            drop(guard);
+            let joined = waiter.join();
+
+            ready.expect("waiter reached the held mutex");
+            let waiter_lock = joined.unwrap();
+            assert!(same_mutex);
+            assert!(still_held);
+            assert!(Arc::ptr_eq(&peer, &waiter_lock));
+        });
+    }
+
+    #[test]
+    fn archive_process_lock_cache_eviction_preserves_file_lock_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = ArchiveProcessLockCache::default();
+        let root = directory.path().to_path_buf();
+        let cached = cache.get(root.clone());
+        let retired = Arc::downgrade(&cached);
+        let path = root.join(".archive.lock");
+        let mut first = FileLock::new(path.clone());
+        first.acquire_existing_parent().unwrap();
+        let first_generation = first.acquired_generation.unwrap();
+        first.release().unwrap();
+        drop(cached);
+
+        churn(&cache);
+        assert!(retired.upgrade().is_none());
+        let replacement = cache.get(root);
+        let _guard = replacement.lock().unwrap();
+        let mut second = FileLock::new(path);
+        second.acquire_existing_parent().unwrap();
+        assert_eq!(second.acquired_generation, Some(first_generation + 1));
+        second.release().unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
