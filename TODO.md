@@ -322,14 +322,121 @@
   retention tests. Preserve their real registry latch, project mutex owner,
   shutdown/admission observation, resume and SQL/archive assertions. Formatting
   and diff checks pass; no production behavior or assertion changes.
-- [ ] Complete the normal static refresh for both changed test files, retain
-  prior findings, and requalify the repaired source through all three required
-  compiler gates on the retained worker pool with unchanged flags/policies.
+- [x] Requalify repaired source `3803dd85` through all three required compiler
+  gates on the retained worker pool with unchanged flags/policies. Full strict
+  Clippy was admitted as build `30097323753222469`, wrapper
+  `rchw-858b45e7-df21-4761-b270-518541bc8dfc`; source stayed frozen.
+- [x] All three repaired-source compiler gates pass on `3803dd85`:
+  strict Clippy (8m19s), build `30097323753222469`, wrapper
+  `rchw-858b45e7-df21-4761-b270-518541bc8dfc`, receipt
+  `512a240d5b89aff7b68417afe5d0cdfb3f5787607f2ef20d96bc49cf53cb3363`;
+  production-only check (15m24s), build `30097323753222474`, wrapper
+  `rchw-67684f3e-76b4-4104-93f2-7090a31f046c`, receipt
+  `bb6270cc83db34e99944757089afa2a4ff0eaa678a7dbe6c6ca2e9aaf4b55c37`;
+  all-target check (11m17s), build `30097323753222477`, wrapper
+  `rchw-872ccc09-b591-4759-a3db-5f8897a6d6d8`, receipt
+  `3b5d363ff1af36a3a230ed3ba41d5e41e76093026e534fdd5ace10d55498157f`.
+  Every command exits zero, is terminal acknowledged with source/pair released,
+  and verifies the same 3,957 file hashes, sizes and executable modes. Logs
+  `fixed-main-v3-clippy.log`, `fixed-main-v4-production.log` and
+  `fixed-main-v5-all-targets.log` retain the third-party future-incompatibility
+  warning. This qualifies the repaired candidate, not native execution or any
+  later main commit. The original exact-main acceptance remains mandatory.
+- [ ] Finish the same five-library native preparation on `vmi1149989`:
+  build `30097323753222482`, wrapper
+  `rchw-0b3b1dda-16aa-4615-bff2-1a3d33c0479b`, frozen `3803dd85`, log
+  `fixed-main-v6-native-compile.log`. Ordinary admission fits again after peer
+  reservations finish: 109,564,952,576 bytes free versus 64,424,509,440 required.
+  Retain the existing source/pool and default graph; compiler-only timeout stays
+  3,600 seconds. All native assertions remain unexecuted; runtime batches will
+  keep the original 240-second process-group deadline and five-package graph.
+- [x] Observe the actual current-source native compiler at 09:42 UTC:
+  FrankenSQLite core emits `dep-info,metadata,link` with `opt-level=1`,
+  `debuginfo=2` and debug assertions enabled. Actual Cargo/rustc executable
+  hashes match the earlier pinned nightly identities and the original lock
+  hash remains `98b26497fb52c79582497c745654e6a7433a7a8b9178e5965650c1e37e751938`.
+  Report `fixed-main-v6-compiler-identity.json`, SHA-256
+  `31e3f1ee5bfa0db5912b726c13a657855a61dce59ddcb785ca451757e114eed6`.
+  Tensor CPU/API and other completed dependencies have advanced into the real
+  engine core; this is compiler progress, not native assertion evidence.
+- [x] Preserve native preparation v6's 3,600-second timeout at 09:59:42 UTC:
+  tensor CPU/API and FrankenSQLite core compiled, and the log reached Agent
+  Mail core before later dependencies. Core completion before timeout was not
+  independently established. No source diagnostic or
+  native assertion was reported. RCH verified its process group dead and
+  refused local fallback. Supported recovery confirms delivery exit 120,
+  terminal acknowledgement and source/pair release; recovery CLI exits zero.
+  Retain `fixed-main-v6-native-{compile,recovery}.log`. The clean compiler
+  checkout remains at `3803dd85`; preserve all completed cache outputs and
+  resume the same five-package/default graph only after ordinary admission.
+- [ ] Finish admitted native preparation v7, build `30097323753222507`, wrapper
+  `rchw-8ca78609-a11d-4ba0-a37d-5dc4f3417f8e`, still frozen at `3803dd85` on
+  the original worker/root/pool. Ordinary census: 125,733,163,008 bytes free
+  versus 64,424,509,440 required. Original command, graph, profiles and timeout
+  are unchanged; log `fixed-main-v7-native-compile.log`. Heavy engine/tensor
+  outputs are reused. Core has no build script; the initially guessed path was
+  absent. Remote source mtimes reset during materialization, but no cache defect
+  is claimed without checking Cargo's real fingerprints and warm execution.
+  Cargo's actual current core fingerprint uses `mtime` freshness in the newer
+  `debug/build/<package>/<variant>/fingerprint` layout. Check a warm native
+  request before concluding whether materialization forces recompilation;
+  source timestamps and cache/tool configuration are left unchanged.
+- [ ] After native preparation succeeds and is acknowledged/released, capture
+  the actual test-executable paths and hashes from that completed build. Use
+  RCH's documented `--job` mode for already-built test shards, with both
+  supported build/test timeouts set to 240 seconds, package working directory
+  and private fixture/result directories. No compiler runs inside runtime
+  jobs. Keep the original five-package compile graph, profiles, dependencies
+  and every assertion. Bind runtime hashes to the compiler's source receipt;
+  `--job` conflicts with source-content-receipt mode, so do not claim a runtime
+  source-content receipt. Require six actual ACK passes and retain their real
+  fixtures; then execute all original, repaired-shutdown and cache cases.
+- [x] Preserve v7's one-hour timeout at 11:02:42 UTC during CLI unit-test
+  code generation. No assertion ran; group termination was verified. Supported
+  recovery confirms delivery exit 120, terminal acknowledgement and source/pair
+  release. Retain `fixed-main-v7-native-{compile,recovery}.log`; do not count
+  recovery CLI zero as compiler/test success.
+- [ ] Land the two-line compile repair whose source passed all three compiler
+  gates, then pin canonical main and repeat those gates on that exact source.
+  Native execution and original Bead acceptance remain pending throughout.
+- [ ] Allow up to 7,200 seconds for compiler-only native preparation on main,
+  using `--lib --no-run -j1` with the same five packages/default graph. Repeated
+  one-hour attempts reached CLI test code generation without completing the
+  workspace test executables. This revises the chosen compiler preparation
+  budget; actual test-execution jobs keep their original 240-second deadline.
+  Retain ordinary disk/slot admission, original profiles/dependencies/features
+  and every required assertion and probe.
+- [x] Push `3803dd85` and create draft PR #414 after all three compiler gates
+  pass; verify its head, base `main`, open state and draft flag. Its Rust/build
+  diff against main checkpoint `733ff1c7` is exactly two one-line test repairs.
+  Keep native and exact-main acceptance pending in the review. Notify the peer
+  of the single admitted compiler and release code leases 4179/4180; retain the
+  TODO lease. The shared dirty checkout and peer Beads remain untouched.
+- [x] Reread the common Bash builder, resolver and server-launcher call paths.
+  The server launcher explicitly checks build status and selects the last
+  output line; no additional observed defect there. Three bespoke suite
+  resolvers prefer installed/historical candidates before the common helper.
+- [ ] Investigate that possible remote-required fallback gap in
+  `test_search_quality_integration.sh`, `test_tools_search.sh` and
+  `test_product_isolation.sh`, preserving their explicit override contracts.
+  No file in this review is changed and no dynamic failure is claimed. The
+  proposed real-definition comparison was rejected before execution by DCG
+  rule `heredoc.python:subprocess_run.argv_unverified` because its Python
+  subprocess argument count could not be statically verified. Retain
+  `fresh-resolver-dcg-explain.log`; do not reshape/retry the blocked probe or
+  weaken the guard. Continue original native acceptance independently.
 - [x] Both changed test files complete the normal scan with zero critical,
   1,242 warning and 131 informational diagnostics, no failed modules and no
   suppressions. Report `fixed-main-v3-ubs-lock-tests.json`, SHA-256
   `77b54b45c1496ac57bd48df31a9562c95c1574bead7a9a2a7c59b9ec9ce2842b`.
   This is static evidence only; native behavior remains unexecuted.
+- [x] Verify the full updated static scope: these two files add to all 53
+  unchanged bindings, giving 55 Rust paths and 35 complete bound reports.
+  Retain 55 critical, 63,786 warning, 22,032 scoped informational and 140
+  unscoped diagnostics without suppression. Report
+  `fixed-main-v3-ubs-final-report.json`, SHA-256
+  `275e3844eaa13994dc89e0057a8b137710ccb73d489bacbe115cddd8a6cc40c5`.
+  This completes source coverage, not a clean verdict or native qualification.
 - [ ] Execute both repaired native controls:
   `shutdown_during_project_contention_retains_the_candidate_for_resume` and
   `retention_admission_shutdown_during_project_wait_preserves_unconsumed_work`,
