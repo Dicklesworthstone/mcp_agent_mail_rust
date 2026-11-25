@@ -163,7 +163,7 @@
   exactly; receipt root
   `26e08a03400deaafc079566f35e4fe6646eabfb65477cbda978cc43a55a3443f`.
   The existing third-party future-incompatibility warning remains retained.
-- [ ] Complete `cargo clippy --locked --workspace --all-targets -j1 -- -D warnings`
+- [x] Complete `cargo clippy --locked --workspace --all-targets -j1 -- -D warnings`
   on that same candidate, preserving and repairing actual diagnostics.
   Strict RCH `hz4` submitted after the all-targets lease was acknowledged and
   released; retain `fresh-nov25-v6-clippy.log`.
@@ -176,7 +176,7 @@
   `pool_impl` module, public registry glob and its internal retention caller;
   change only this helper to `pub(super)`, preserving the parent DB crate
   boundary and function body. No suppression, dependency or assertion change.
-- [ ] Qualify that visibility correction with the same strict Clippy gate,
+- [x] Qualify that visibility correction with the same strict Clippy gate,
   then repeat both required compiler graphs on the repaired source. Refresh
   only the pool file's static binding (`fresh-nov25-rust-14-pool-visibility`).
   No new test is needed for this visibility-only edit; original native cases
@@ -207,6 +207,83 @@
   Formatting passes; scan the newly touched acceptance file with normal rules
   (`fresh-nov25-rust-16-idempotency-clones`). Original native acceptance stays
   mandatory; these mechanical test-input copies add no new runtime behavior.
+- [x] Qualify the repaired `434c798d` compiler source through strict RCH `hz4`:
+  Clippy with `--keep-going` and unchanged `-D warnings` passed (Cargo 3m35s),
+  build `30097323753222392`, wrapper
+  `rchw-ff3baa60-13ef-4f75-b7a6-fc92f4d697ff`, receipt root
+  `c58cddd37ce14ca9a1de516ff0b85bfd6ce63aa2d9e4f8fe6ddc33472eccbf76`.
+  The production-only graph passed separately (1m14s), build
+  `30097323753222394`, wrapper `rchw-0dd7ef9c-df69-4b8d-b580-2665fcbae9a7`,
+  receipt `42c5429477098b80755978cd7c63a5e0291e02e88f8143382c6bb81fe80e0b61`.
+  The all-targets graph passed separately (3m56s), build
+  `30097323753222395`, wrapper `rchw-29708474-b1f7-473b-af96-38e84c46b1d9`,
+  receipt `6a0fbc5f26728ef90810dc315ad459a3257049ce728bfdb9529afd48c6a20668`.
+  Every command exited zero, is acknowledged with ownership released, and
+  verifies the same 3,957 file hashes/sizes/executable modes. Retain all failed
+  attempts and the existing third-party future-incompatibility warning.
+- [x] Complete the final normal static refresh on `434c798d`: 52 Rust paths,
+  50 exact reused bindings plus the fresh pool replacement and acceptance-file
+  addition, all matching the accepted Clippy source map. All 33 bound reports
+  are complete with no failed modules. Retain 55 critical, 61,898 warning,
+  21,790 scoped informational and 132 unscoped diagnostics without suppression.
+  New pool/acceptance scans have zero critical flags. Report
+  `fresh-nov25-final-ubs-report.json`, SHA-256
+  `f6aac1edd9609b8798fab00f419956e61bd6aacb7b33811e9fce2cd7fb182d33`.
+  Earlier `pub(super)` coverage remains historical, not current evidence.
+- [x] Preserve the unsupported `00b35dde` baseline as a separate clean detached
+  checkout at `/data/projects/am-mossytern-00b35dde-preserved-20261125`.
+  Its former native request `30097323753222033` is acknowledged with actual
+  120 and source/pair released. After verifying no removed files and identical
+  manifests/lock/toolchain/Cargo/Nextest settings, fast-forward only my clean
+  compiler working copy `/data/projects/am-mossytern-native-20261124` to
+  `434c798d`. Reuse its existing `vmi1149989` direct-Cargo source/pool `76f74c28`;
+  no cache copy, namespace override, peer cleanup or policy change.
+- [ ] Finish the five-library compiler-only native preparation on that worker.
+  A fresh normal census admits native work: 125,234,085,888 bytes free versus
+  99,857,989,632 required, including every live reservation and protected floor.
+  Submit `cargo test --locked` for DB/storage/tools/server/CLI with
+  `--lib --no-run -j1`, strict RCH/source receipt and the original default
+  graph, 3,600-second compiler-only envelope. Retain
+  `fresh-nov25-v12-native-compile.log`. Then execute the corrected six and
+  original acceptance above under the unchanged 240-second runtime envelopes.
+  The `vmi1153651` cache remains preserved; new peer reservations there again
+  prevent ordinary native admission. No native assertion has passed yet.
+- [x] Publish the compiler corrections as draft PR #413 at `434c798d` after
+  all three compiler gates passed. The first create attempt raced the pending
+  branch push and failed without creating a PR; wait for push exit zero and
+  retry successfully. Original native acceptance remains pending; no merge or
+  Bead closure requested. The pending local TODO/Bead evidence update does
+  not change the tested Rust source.
+- [x] Observe the actual native compiler process on `vmi1149989`: pinned
+  Cargo/rustc executable hashes match, default `opt-level=1`, `debuginfo=2`
+  and debug assertions remain enabled. Report
+  `fresh-nov25-v12-compiler-identity.json`, SHA-256
+  `98e5187d94b83441118b8fac1ee140120bdc39996df8451e943a5e5d53d83e2c`.
+  Active compiler-only build `30097323753222397`, wrapper
+  `rchw-1b00eb90-171b-4e4b-8f84-f9c1705831aa`, retains frozen `434c798d`.
+- [ ] At the current command boundary, integrate main's separate `126f8544`
+  archive process-lock change once, qualify its source and run the four
+  existing `archive_process_lock_cache` cases, including the previously
+  unexecuted real filesystem-generation case. Its changed code and tests have
+  been reread; no further concrete defect found. Retain the original GH404
+  suites and do not close peer Bead `br-navqh`. Current `434c798d` receipts
+  do not qualify that later main source or demonstrate those four tests.
+- [x] Preserve the compiler-only preparation deadline failure: build
+  `30097323753222397` timed out at 3,600 seconds in the tensor CPU dependency,
+  after progressing through Asupersync and other real default dependencies.
+  RCH killed and verified the remote group. Supported recovery acknowledges
+  delivery exit 120 versus the daemon's earlier 130; retain both, source/pair
+  released. Logs `fresh-nov25-v12-native-{compile,recovery}.log`. No native
+  assertion executed and no source error was reported. Retain the dependency
+  outputs; resume with the same five-package graph and original envelope.
+- [ ] Integrate fixed main checkpoint `733ff1c7` at this released-command
+  boundary. PR #413 was merged externally as `82dd2922`; later upstream
+  messaging/product changes are included in that checkpoint. Compiler results
+  above still qualify `434c798d` only. Manifests, lockfile, toolchain and Cargo/
+  Nextest settings are unchanged and no tracked file is removed. Requalify the
+  integrated source, refresh affected static bindings and complete the original
+  native acceptance plus the four existing archive-cache cases. Keep this
+  checkpoint stable through the next validation run rather than chasing heads.
 
 ## Resumed fresh review (2026-11-24 15:12 UTC, `br-u9bhg`)
 
