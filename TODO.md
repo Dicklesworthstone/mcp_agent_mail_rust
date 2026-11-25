@@ -72,17 +72,141 @@
   storage `lib.rs`; apply only its reported line wrapping manually. Preserve
   `fresh-nov25-current-fmt-red.log`; workspace formatting now passes in
   `fresh-nov25-current-fmt-green.log`. No Rust behavior or assertion changed.
-- [ ] Refresh the existing normal Rust static gate for the current candidate:
+- [x] Refresh the existing normal Rust static gate for the current candidate:
   39 of the original 50 source hashes still match; 11 need fresh scans.
   Retain completed pre-format storage output as historical, rescan that file,
   and include the newly touched `mailbox_verdict.rs` (51 total Rust paths).
   No rules, findings or modules may be suppressed; static work is not native
   proof. The source transition changes no manifest, lockfile, toolchain or
   Cargo/Nextest settings, and removes no checked-out file.
+  All 51 source/report/count bindings verify on `292a2f43`: 39 unchanged
+  paths reuse their exact reports; 11 replacements and one added path use
+  fresh normal scans. The final report retains 55 critical, 61,697 warning
+  and 21,717 scoped informational findings, plus 128 unscoped diagnostics;
+  no failed modules. Fresh critical flags concern unchanged fixture/cache/time
+  source lines, verified against `71ffa099`. This is completed static coverage,
+  not a clean scanner verdict or native proof. Report
+  `fresh-nov25-ubs-final-report.json`, SHA-256
+  `c5db7ac9d50c831b87b23588b37d9c3a21badee08311bcede6a2a2ed2e91996b`.
+- [x] Correct the runner/cache assumption. RCH uses a separate disposable
+  source/pool for external `cargo nextest`; it did not reuse the prepared
+  direct-Cargo dependencies. Stop only my own cold request via wrapper-scoped
+  cancellation and recovery. Build `30097323753222348`, wrapper
+  `rchw-d6599047-e4b4-4e69-ba0a-becc74d6280d`, has terminal acknowledgement
+  and released source/pair ownership. Recovery reports delivery exit 120
+  versus the daemon's earlier cancellation exit 130; preserve both without
+  calling either a native pass. No assertions executed. Logs:
+  `fresh-nov25-v2-native-ack-wrapper-cancel.log` and
+  `fresh-nov25-v2-native-ack-recovery.log`.
+- [ ] Prepare all five required component library test packages together
+  through direct Cargo in the retained RCH source/pool. Then keep that same
+  package/feature graph for focused runtime batches with a 240-second RCH
+  process-group deadline, bounding every test at least as strictly as the
+  default four-minute Nextest limit. No test case, profile or assertion is
+  removed. The first request, build `30097323753222357`, wrapper
+  `rchw-470a2842-666e-4676-a771-bd7146102443`, hit an SSH reset before confirmed
+  execution; recover ownership before retrying. Preserve
+  `fresh-nov25-v3-native-compile.log` and its recovery log.
+  Recovery acknowledges failed exit 1 and source/pair release; no test ran.
+  Later peer reservations make ordinary admission on `vmi1153651` negative:
+  121,901,449,216 bytes free versus 150,323,855,360 required for native.
+- [ ] Run the six corrected canonical/runtime ACK controls with actual test
+  counts and retained SQL/archive fixtures; zero-test runs cannot qualify them.
+- [ ] Run DB `recovery_state`, `reconstruct_state`, `reconstruct`, GH404 cursor
+  and sync-admission cases, all seven `delivery_event_snapshot` cases, and
+  `durable_cursor_schema_refuses_legacy_fallback_after_all_events_are_pruned`.
+- [ ] Run storage GH404 flush/envelope/exited-producer/backlog cases and
+  `deferred_message_identity_rechecks_a_foreign_historical_month`.
+- [ ] Run tools failed-publication auto-read, consuming-inbox admission and
+  committed-ACK replay cases, plus all three modified release-intent cases.
+- [ ] Run both modified server ACK/explicit-ID retention cases.
+- [ ] Run CLI missing-project-metadata repair, missing/malformed-project JSON
+  detector/fixer cases, archive-count status, and the remote-required helper
+  artifact case. Keep their actual dependencies and original assertions.
+- [x] Verify publication: all three repair commits through `292a2f43` pushed.
+  PR #412 was merged externally at 04:51:22 UTC as `4b938d1b`; I had left
+  it draft pending qualification. Merge is not completion evidence. The
+  original Bead acceptance and all pending native/compiler gates remain open.
 - [ ] Execute original storage/tools/CLI acceptance and all five modified
   queue cases. Preserve actual failures; fix only demonstrated defects.
 - [ ] Qualify any subsequent integrated source separately, publish actual
   outcomes and keep the Bead open until its complete acceptance passes.
+  The isolated compiler checkout now holds exact main `4b938d1b`; its tracked
+  tree equals the reviewed `292a2f43` tree. A separate required production
+  `cargo check --locked --workspace --lib --bins -j1` is submitted through
+  strict RCH on `hz4` with its ordinary 10 GiB growth/10 GiB floor admission.
+  Preserve `fresh-nov25-v4-production.log`. Current-source all-targets and
+  strict Clippy remain pending independently of that production verdict.
+- [x] Complete the required production-only graph on main `4b938d1b`:
+  `cargo check --locked --workspace --lib --bins -j1` passed through strict
+  RCH on `hz4`, build `30097323753222359`, wrapper
+  `rchw-4e52d4e3-e601-43bd-83f5-9f031ec82ac9`. Cargo finished in 21m46s;
+  command exit zero, terminal acknowledged, source/pair ownership released.
+  All 3,957 source hashes, sizes and executable modes verify against the
+  frozen checkout; receipt root
+  `fefc7d21899fe73afcbd27cac4a7a15826500c24d02caddfe321f5e3a49e0e59`.
+  The existing third-party `proc-macro-error2` future-incompatibility warning
+  remains retained. Actual live Cargo/rustc executable hashes match the pinned
+  nightly; `fresh-nov25-v4-cargo-identity.json`, SHA-256
+  `c6cc6e1201129b41a26af98d73746efab96329f48b5896ec0270c1dbcd5e7257`.
+  The earlier identity probe matched no process because it missed RCH's real
+  Cargo executable name; retain its empty observation without using it as
+  compiler attestation. No native or release claim follows from this check.
+- [x] Complete the separate all-targets graph on the same frozen main source:
+  `cargo check --locked --workspace --all-targets -j1`, strict RCH `hz4`;
+  retain `fresh-nov25-v5-all-targets.log`. Reuse the production worker's pool
+  without changing profiles, features, dependencies or admission policy.
+  Build `30097323753222377`, wrapper
+  `rchw-b3565573-c01e-49bc-86f7-1ef5b19fa9b0`, passed in Cargo 8m18s,
+  actual exit zero, terminal acknowledged and source/pair released. All 3,957
+  source hashes/sizes/executable modes verify and match the production map
+  exactly; receipt root
+  `26e08a03400deaafc079566f35e4fe6646eabfb65477cbda978cc43a55a3443f`.
+  The existing third-party future-incompatibility warning remains retained.
+- [ ] Complete `cargo clippy --locked --workspace --all-targets -j1 -- -D warnings`
+  on that same candidate, preserving and repairing actual diagnostics.
+  Strict RCH `hz4` submitted after the all-targets lease was acknowledged and
+  released; retain `fresh-nov25-v6-clippy.log`.
+  That gate failed with actual 101 on `4b938d1b`, build
+  `30097323753222384`, wrapper `rchw-45f0f3f4-473a-4dbc-bc51-ad3ec1814551`:
+  `clippy::redundant_pub_crate` at `pool.rs:18596`. All 3,957 source hashes,
+  sizes and executable modes match; receipt root
+  `a8e8b141c5e0a0227e229f98688baa692f719ef4c38431787efd081510e04698`.
+  Terminal acknowledged with source/pair released. Trace the private
+  `pool_impl` module, public registry glob and its internal retention caller;
+  change only this helper to `pub(super)`, preserving the parent DB crate
+  boundary and function body. No suppression, dependency or assertion change.
+- [ ] Qualify that visibility correction with the same strict Clippy gate,
+  then repeat both required compiler graphs on the repaired source. Refresh
+  only the pool file's static binding (`fresh-nov25-rust-14-pool-visibility`).
+  No new test is needed for this visibility-only edit; original native cases
+  remain mandatory. Retain every failed gate and all earlier static reports.
+  The `pub(super)` attempt `d348267a` also failed the same lint: Clippy resolves
+  that restriction to the parent crate here. Preserve build
+  `30097323753222386`, wrapper `rchw-f033b6ae-3e99-4d32-80a2-8275cb922789`,
+  actual 101, terminal acknowledged and source/pair released, all 3,957 inputs
+  verified; receipt root
+  `b8d080376779a06737cfc18c8016d6e6c2cfbcff5d60f51339a3d962c07caf39`.
+  Log: `fresh-nov25-v7-clippy.log`. Its completed pool scan/51-file aggregate
+  are historical coverage only, not qualification of the next candidate.
+  Follow the module's existing public recovery-helper convention instead:
+  make the unchanged suffix iterator public with its purpose documented.
+  The registry will expose this read-only helper alongside the existing
+  recovery helpers. No runtime implementation, assertion or lint policy changes.
+  Formatting passes; the replacement normal scan is
+  `fresh-nov25-rust-15-pool-public.json`. Rerun the original strict command.
+  Candidate `05463de2` passes the helper's DB lint but fails later on three
+  `implicit_clone` diagnostics in `idempotency_tool_acceptance.rs:809/816/818`.
+  Preserve `fresh-nov25-v8-clippy.log`, build `30097323753222388`, wrapper
+  `rchw-5e848950-8a1a-416f-964f-877b4c442b8c`, actual 101, acknowledged and
+  released; all 3,957 inputs verify, receipt root
+  `e419c1f00487791b23806943a486dcc91846f4a3e76d2467781e09f342d5d39b`.
+  Replace only these known `Vec` copies with explicit `clone()` calls.
+  Preserve attachment reordering, duplicate requests, conflict refusal and
+  all SQL/archive/inbox/source-byte assertions. No lint suppression or new test.
+  Formatting passes; scan the newly touched acceptance file with normal rules
+  (`fresh-nov25-rust-16-idempotency-clones`). Original native acceptance stays
+  mandatory; these mechanical test-input copies add no new runtime behavior.
 
 ## Resumed fresh review (2026-11-24 15:12 UTC, `br-u9bhg`)
 

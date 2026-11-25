@@ -806,16 +806,16 @@ async fn attachment_list_boundaries_case(cx: Cx, storage_root: String, is_reply:
         let files = snapshot_delivery_files(&storage_root);
         let inbox = inbox_snapshot(&ctx, &project_key).await;
 
-        let mut reordered = original.to_vec();
+        let mut reordered = original.clone();
         reordered.reverse();
         let replay = attachment_list_request(&ctx, &project_key, parent, &reordered, key)
             .await
             .expect("reordering the same list must replay exactly");
         assert_exact_replay(&fresh, &replay);
 
-        let mut duplicated = original.to_vec();
+        let mut duplicated = original.clone();
         duplicated.push(original[0].clone());
-        for changed_paths in [changed.to_vec(), duplicated] {
+        for changed_paths in [changed.clone(), duplicated] {
             let error = attachment_list_request(&ctx, &project_key, parent, &changed_paths, key)
                 .await
                 .expect_err("a changed attachment list must not replay an accepted result");

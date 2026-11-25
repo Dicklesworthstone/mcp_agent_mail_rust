@@ -18593,7 +18593,8 @@ pub fn sqlite_recovery_candidate_is_standalone(path: &Path) -> bool {
         .any(|suffix| path_is_occupied(&sqlite_sidecar_path(path, suffix)))
 }
 
-pub(crate) fn sqlite_recovery_companion_suffixes() -> impl Iterator<Item = &'static str> {
+/// Iterate the SQLite and FrankenSQLite sidecar suffixes checked during recovery.
+pub fn sqlite_recovery_companion_suffixes() -> impl Iterator<Item = &'static str> {
     SQLITE_RECOVERY_SIDECAR_SUFFIXES
         .into_iter()
         .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES)
