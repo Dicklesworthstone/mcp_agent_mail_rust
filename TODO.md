@@ -181,6 +181,20 @@
   only the pool file's static binding (`fresh-nov25-rust-14-pool-visibility`).
   No new test is needed for this visibility-only edit; original native cases
   remain mandatory. Retain every failed gate and all earlier static reports.
+  The `pub(super)` attempt `d348267a` also failed the same lint: Clippy resolves
+  that restriction to the parent crate here. Preserve build
+  `30097323753222386`, wrapper `rchw-f033b6ae-3e99-4d32-80a2-8275cb922789`,
+  actual 101, terminal acknowledged and source/pair released, all 3,957 inputs
+  verified; receipt root
+  `b8d080376779a06737cfc18c8016d6e6c2cfbcff5d60f51339a3d962c07caf39`.
+  Log: `fresh-nov25-v7-clippy.log`. Its completed pool scan/51-file aggregate
+  are historical coverage only, not qualification of the next candidate.
+  Follow the module's existing public recovery-helper convention instead:
+  make the unchanged suffix iterator public with its purpose documented.
+  The registry will expose this read-only helper alongside the existing
+  recovery helpers. No runtime implementation, assertion or lint policy changes.
+  Formatting passes; the replacement normal scan is
+  `fresh-nov25-rust-15-pool-public.json`. Rerun the original strict command.
 
 ## Resumed fresh review (2026-11-24 15:12 UTC, `br-u9bhg`)
 
