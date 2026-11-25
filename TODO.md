@@ -195,6 +195,18 @@
   recovery helpers. No runtime implementation, assertion or lint policy changes.
   Formatting passes; the replacement normal scan is
   `fresh-nov25-rust-15-pool-public.json`. Rerun the original strict command.
+  Candidate `05463de2` passes the helper's DB lint but fails later on three
+  `implicit_clone` diagnostics in `idempotency_tool_acceptance.rs:809/816/818`.
+  Preserve `fresh-nov25-v8-clippy.log`, build `30097323753222388`, wrapper
+  `rchw-5e848950-8a1a-416f-964f-877b4c442b8c`, actual 101, acknowledged and
+  released; all 3,957 inputs verify, receipt root
+  `e419c1f00487791b23806943a486dcc91846f4a3e76d2467781e09f342d5d39b`.
+  Replace only these known `Vec` copies with explicit `clone()` calls.
+  Preserve attachment reordering, duplicate requests, conflict refusal and
+  all SQL/archive/inbox/source-byte assertions. No lint suppression or new test.
+  Formatting passes; scan the newly touched acceptance file with normal rules
+  (`fresh-nov25-rust-16-idempotency-clones`). Original native acceptance stays
+  mandatory; these mechanical test-input copies add no new runtime behavior.
 
 ## Resumed fresh review (2026-11-24 15:12 UTC, `br-u9bhg`)
 
