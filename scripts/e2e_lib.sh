@@ -2871,7 +2871,7 @@ e2e_ensure_binary() {
     local workspace_fallback="${E2E_PROJECT_ROOT}/target/debug/${bin_name}"
     if [ ! -x "$bin_path" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
         e2e_log "Building ${bin_name}..."
-        _e2e_build_binary "${bin_name}"
+        _e2e_build_binary "${bin_name}" || return $?
     fi
 
     if [ ! -x "$bin_path" ] && _e2e_requires_remote; then
@@ -2885,7 +2885,7 @@ e2e_ensure_binary() {
     fi
     if [ ! -x "$bin_path" ] && [ "${E2E_CARGO_FORCE_LOCAL}" != "1" ]; then
         e2e_log "Remote build left no local ${bin_name}; retrying build locally"
-        E2E_CARGO_FORCE_LOCAL=1 _e2e_build_binary "${bin_name}"
+        E2E_CARGO_FORCE_LOCAL=1 _e2e_build_binary "${bin_name}" || return $?
         if [ ! -x "$bin_path" ] && [ -x "$workspace_fallback" ]; then
             bin_path="$workspace_fallback"
         fi

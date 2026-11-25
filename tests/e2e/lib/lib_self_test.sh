@@ -427,6 +427,54 @@ if failures:
 print("10 artifact controls passed; no compiler or stale executable was run")
 PY
 
+assert_cmd "s12_forced_build_preserves_failure" "a failed forced rebuild cannot reuse an existing executable" \
+    python3 - "${SCRIPT_DIR}/../../../scripts/e2e_lib.sh" "${WORK}" <<'PY'
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+harness = Path(sys.argv[1]).resolve()
+work = Path(sys.argv[2])
+cases = [(required, value) for required in ("E2E_CARGO_REQUIRE_RCH", "RCH_REQUIRE_REMOTE")
+         for value in ("1", "true", "YES", "On", " enabled ")]
+failures = []
+for index, (required, value) in enumerate(cases):
+    case = work / f"forced-build-{index}"
+    stale = case / "target/debug/am"
+    stale.parent.mkdir(parents=True)
+    original = b"#!/bin/sh\nprintf unexpected-execution > executed\n"
+    stale.write_bytes(original)
+    stale.chmod(0o700)
+    for force in ("0", "1"):
+        result = subprocess.run(
+            ["bash", "-c", '''
+source "$1"
+if e2e_ensure_binary am; then exit 0; else exit $?; fi
+''', "forced-build-self-test", str(harness)],
+            cwd=case,
+            env={**os.environ, "AM_E2E_KEEP_TMP": "1", "CARGO_TARGET_DIR": str(case / "target"),
+                 "E2E_CARGO_REQUIRE_RCH": "0", "RCH_REQUIRE_REMOTE": "0",
+                 "E2E_CARGO_FORCE_LOCAL": "1", "E2E_FORCE_BUILD": force, required: value},
+            capture_output=True, text=True, timeout=15,
+        )
+        (case / f"force-{force}.stdout.log").write_text(result.stdout, encoding="utf-8")
+        (case / f"force-{force}.stderr.log").write_text(result.stderr, encoding="utf-8")
+        expected_exit = 64 if force == "1" else 0
+        ok = (result.returncode == expected_exit and stale.read_bytes() == original
+              and not (case / "executed").exists())
+        if force == "1":
+            ok = ok and "conflicts with required remote execution" in result.stdout + result.stderr
+        else:
+            ok = ok and result.stdout.strip() == str(stale)
+        print(f"{required}={value!r}, force={force}: exit={result.returncode}, expected={expected_exit}")
+        if not ok:
+            failures.append((required, value, force))
+if failures:
+    raise SystemExit("forced-build status lost: " + repr(failures))
+print("10 failed forced rebuilds rejected; 10 prepared-artifact controls accepted; no compiler or stale executable ran")
+PY
+
 log_summary "lib_self_test" "${TOTAL}" "${PASS}" "${FAIL}" "${WORK}" "bash tests/e2e/lib/lib_self_test.sh"
 if [ "${FAIL}" -ne 0 ]; then
     exit 1

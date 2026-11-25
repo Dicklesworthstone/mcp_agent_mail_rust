@@ -1,5 +1,49 @@
 # MCP Agent Mail Rust Port — TODO (Granular)
 
+## Fresh review resumed (2026-11-25 03:13 UTC, `br-u9bhg`)
+
+- [x] Refresh Agent Mail identity/inbox, Beads/BV and CASS; preserve the dirty
+  shared checkout. Fast-forward only the clean review checkout to `5922131d`.
+  Governing README/AGENTS content is unchanged from the full earlier reading.
+- [x] Reread all five repaired queue assertions and the complete ACK helper
+  against the actual publication-retry contract. No further observed defect.
+- [x] Reproduce a further bug in my E2E helper: a rejected forced rebuild
+  returns success with an existing executable when called in a conditional.
+  The real remote/local policy refuses with 64, but the helper returns 0.
+  The new regression fails all ten forced-build cases on the unchanged
+  helper; its ten prepared-artifact controls and the other 15 scenarios pass.
+  Retain `fresh-nov25-force-build-baseline.log` and
+  `fresh-nov25-forced-build-red.log` with their private fixtures.
+- [x] Propagate the actual build failure at both helper build call sites.
+  Preserve prepared-artifact behavior and existing fallback policy.
+- [x] Complete the full helper suite: 16/16 scenarios pass, including ten
+  rejected forced rebuilds and ten accepted prepared-artifact controls.
+  Existing 46 routing, ten artifact and ten initialization controls pass.
+  Bash syntax and fresh diff checks pass. Normal UBS completed both Bash
+  files: zero critical, 14 retained warnings on unchanged counters explicitly
+  guarded with `|| true`, no failed modules. Report
+  `fresh-nov25-forced-build-ubs.json`, SHA-256
+  `886b8c4a4c4aaf49c40cf04f6350e1d7bf8f8b9d4b0130cf5b76c4c7bc94a67d`.
+  Green log: `fresh-nov25-forced-build-green.log`; retained fixtures
+  `/data/tmp/am-e2e-lib-self-test.20261125T032225Z.3845055`.
+  These controls execute no compiler or stale executable; native proof is
+  separate. Publish the helper repair after final scoped review/checks below.
+- [x] Check the live stale-backup finding: full integrity failures persist;
+  the existing `br-lqz87` fix already improves its diagnosis. No live repair,
+  daemon replacement or unrelated backup-policy change is attempted here.
+- [ ] Build native DB tests on pinned `71ffa099`, then execute the corrected
+  six retry cases and the original DB recovery/cursor/admission suites.
+  The warm native worker `vmi1149989` lacks ordinary headroom. A fresh normal
+  census on `vmi1153651` admits native work: 137,080,143,872 bytes free versus
+  96,636,764,160 required. Reuse the existing compiler checkout/cache there.
+  Preserve the `00b35dde` baseline and cache; its known unsupported automatic
+  durability expectation is supplementary investigation, not a replacement
+  for the original acceptance. No original acceptance is removed or weakened.
+- [ ] Execute original storage/tools/CLI acceptance and all five modified
+  queue cases. Preserve actual failures; fix only demonstrated defects.
+- [ ] Qualify any subsequent integrated source separately, publish actual
+  outcomes and keep the Bead open until its complete acceptance passes.
+
 ## Resumed fresh review (2026-11-24 15:12 UTC, `br-u9bhg`)
 
 - [x] Verify the former hz3 request is now terminal and acknowledged, exit 120,
