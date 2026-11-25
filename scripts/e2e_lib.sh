@@ -2865,13 +2865,14 @@ _e2e_build_binary() {
     printf '%s\n' "$build_output" | tail -5
 }
 
+# Return the executable path on stdout and build diagnostics on stderr.
 e2e_ensure_binary() {
     local bin_name="${1:-mcp-agent-mail}"
     local bin_path="${CARGO_TARGET_DIR}/debug/${bin_name}"
     local workspace_fallback="${E2E_PROJECT_ROOT}/target/debug/${bin_name}"
     if [ ! -x "$bin_path" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
         e2e_log "Building ${bin_name}..."
-        _e2e_build_binary "${bin_name}" || return $?
+        _e2e_build_binary "${bin_name}" >&2 || return $?
     fi
 
     if [ ! -x "$bin_path" ] && _e2e_requires_remote; then
@@ -2885,7 +2886,7 @@ e2e_ensure_binary() {
     fi
     if [ ! -x "$bin_path" ] && [ "${E2E_CARGO_FORCE_LOCAL}" != "1" ]; then
         e2e_log "Remote build left no local ${bin_name}; retrying build locally"
-        E2E_CARGO_FORCE_LOCAL=1 _e2e_build_binary "${bin_name}" || return $?
+        E2E_CARGO_FORCE_LOCAL=1 _e2e_build_binary "${bin_name}" >&2 || return $?
         if [ ! -x "$bin_path" ] && [ -x "$workspace_fallback" ]; then
             bin_path="$workspace_fallback"
         fi

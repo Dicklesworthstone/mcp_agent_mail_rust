@@ -603,7 +603,7 @@ run_subsuite() {
 # Build binary (once)
 # ---------------------------------------------------------------------------
 
-# e2e_ensure_binary is verbose (logs to stdout); take the last line as the path.
+# Keep the resolved binary path.
 BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 AM_BIN="$(e2e_ensure_binary "am" | tail -n 1)"
 

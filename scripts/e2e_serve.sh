@@ -170,7 +170,7 @@ run_am_server_command_capture() {
     run_command_capture "${case_id}" "${cmd[@]}"
 }
 
-# e2e_ensure_binary logs progress to stdout; keep final line (binary path).
+# Keep the resolved binary path.
 AM_BIN="$(e2e_ensure_binary "am" | tail -n 1)"
 e2e_assert_file_exists "am binary exists" "${AM_BIN}"
 

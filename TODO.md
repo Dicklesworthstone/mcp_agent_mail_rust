@@ -28,6 +28,23 @@
   `/data/tmp/am-e2e-lib-self-test.20261125T032225Z.3845055`.
   These controls execute no compiler or stale executable; native proof is
   separate. Publish the helper repair after final scoped review/checks below.
+- [x] Trace real callers and reproduce stdout contamination after a successful
+  forced build: scripts capture the helper output as one executable path, but
+  the helper also prints build logs there. Preserve the first direct control
+  and the failing 16/17 full suite in `fresh-nov25-build-stdout-baseline.log`
+  and `fresh-nov25-build-stdout-red.log`. The I/O control uses an explicitly
+  recording Cargo function and never compiles or executes an application.
+- [x] Send build diagnostics to stderr at both checked call sites and document
+  the path-only stdout contract; correct two stale caller comments. Full suite
+  now passes 17/17, retaining all previous controls. Bash syntax and diff checks
+  pass. Normal UBS completes all four changed Bash files: zero critical,
+  15 retained preexisting warnings (14 guarded counters and one clock capture).
+  Report `fresh-nov25-build-stdout-ubs.json`, SHA-256
+  `8289069646f09c0b6635368af09f6ff539424a69e06477c12a6d649c00ba7cb0`.
+  Green fixtures: `/data/tmp/am-e2e-lib-self-test.20261125T035220Z.190273`.
+- [x] Publish the first helper correction as draft PR #412, `a9c5baf7`.
+  Add the stdout correction to that same review; workspace/native
+  qualifications remain separate, pending work below.
 - [x] Check the live stale-backup finding: full integrity failures persist;
   the existing `br-lqz87` fix already improves its diagnosis. No live repair,
   daemon replacement or unrelated backup-policy change is attempted here.

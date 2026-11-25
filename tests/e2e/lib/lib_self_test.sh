@@ -475,6 +475,43 @@ if failures:
 print("10 failed forced rebuilds rejected; 10 prepared-artifact controls accepted; no compiler or stale executable ran")
 PY
 
+assert_cmd "s13_build_output_keeps_binary_path_clean" "successful build diagnostics stay off the binary-path stream" \
+    python3 - "${SCRIPT_DIR}/../../../scripts/e2e_lib.sh" "${WORK}" <<'PY'
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+harness = Path(sys.argv[1]).resolve()
+case = Path(sys.argv[2]) / "build-stdout"
+binary = case / "target/debug/am"
+binary.parent.mkdir(parents=True)
+original = b"#!/bin/sh\nprintf unexpected-execution > executed\n"
+binary.write_bytes(original)
+binary.chmod(0o700)
+result = subprocess.run(
+    ["bash", "-c", '''
+source "$1"
+# Exercise the real helper and build-output capture with a recording producer.
+# No compiler or application executable runs in this I/O control.
+cargo() { printf 'recorded build progress\\n'; }
+e2e_ensure_binary am
+''', "build-stdout-self-test", str(harness)],
+    cwd=case,
+    env={**os.environ, "AM_E2E_KEEP_TMP": "1", "CARGO_TARGET_DIR": str(case / "target"),
+         "E2E_CARGO_REQUIRE_RCH": "0", "RCH_REQUIRE_REMOTE": "0",
+         "E2E_CARGO_FORCE_LOCAL": "1", "E2E_FORCE_BUILD": "1"},
+    capture_output=True, text=True, timeout=15,
+)
+(case / "stdout.log").write_text(result.stdout, encoding="utf-8")
+(case / "stderr.log").write_text(result.stderr, encoding="utf-8")
+assert result.returncode == 0, (result.returncode, result.stderr)
+assert result.stdout.strip() == str(binary), result.stdout
+assert "recorded build progress" in result.stderr, result.stderr
+assert binary.read_bytes() == original and not (case / "executed").exists()
+print("binary path stays on stdout; recorded build diagnostics stay on stderr")
+PY
+
 log_summary "lib_self_test" "${TOTAL}" "${PASS}" "${FAIL}" "${WORK}" "bash tests/e2e/lib/lib_self_test.sh"
 if [ "${FAIL}" -ne 0 ]; then
     exit 1
