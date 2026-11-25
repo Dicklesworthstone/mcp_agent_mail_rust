@@ -1062,12 +1062,13 @@ fn probe_archive_accessible(archive_root: &Path) -> ProbeResult {
 
 /// Probe: Archive directory is writable.
 fn probe_archive_writable(archive_root: &Path) -> ProbeResult {
-    let test_file = archive_root.join(".write_probe");
-    match std::fs::write(&test_file, b"probe") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&test_file);
-            ProbeResult::ok("archive_writable", "Archive directory is writable")
-        }
+    // A health probe must never truncate or unlink an existing archive entry.
+    // Each probe owns an anonymous file, so concurrent probes also cannot
+    // overwrite or clean up one another's work through a shared pathname.
+    match tempfile::tempfile_in(archive_root)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, b"probe"))
+    {
+        Ok(()) => ProbeResult::ok("archive_writable", "Archive directory is writable"),
         Err(e) => ProbeResult::warn(
             "archive_writable",
             format!("Archive directory not writable: {e}"),
@@ -2370,6 +2371,113 @@ mod tests {
         )];
         let verdict = verdict_from_probes(probes, true);
         assert_eq!(verdict.state, MailboxState::Broken);
+    }
+
+    #[test]
+    fn fast_verdict_write_probe_preserves_existing_archive_entry() {
+        let dir = tempfile::tempdir().expect("private mailbox");
+        let archive = dir.path().join("archive");
+        std::fs::create_dir(&archive).expect("archive directory");
+        let sentinel = archive.join(".write_probe");
+        let original = b"existing archive evidence must survive a health request";
+        std::fs::write(&sentinel, original).expect("archive sentinel");
+        let database = dir.path().join("missing.sqlite3");
+
+        let verdict = compute_mailbox_verdict(
+            &format!("sqlite:///{}", database.display()),
+            &archive,
+            &VerdictOptions::fast(),
+        );
+        let writable = verdict
+            .probes
+            .iter()
+            .find(|probe| probe.name == "archive_writable")
+            .expect("real writable probe");
+        assert!(writable.passed, "{writable:?}");
+        assert_eq!(std::fs::read(&sentinel).expect("preserved sentinel"), original);
+        assert!(!database.exists(), "health must not initialize the database");
+        let entries: Vec<_> = std::fs::read_dir(&archive)
+            .expect("archive entries")
+            .map(|entry| entry.expect("archive entry").file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from(".write_probe")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_write_probe_preserves_symlinks_and_their_targets() {
+        for dangling in [false, true] {
+            let dir = tempfile::tempdir().expect("private mailbox");
+            let archive = dir.path().join("archive");
+            std::fs::create_dir(&archive).expect("archive directory");
+            let outside = dir.path().join("outside-evidence");
+            let original = b"outside data must not be overwritten";
+            if !dangling {
+                std::fs::write(&outside, original).expect("outside sentinel");
+            }
+            let link = archive.join(".write_probe");
+            std::os::unix::fs::symlink(&outside, &link).expect("probe-name symlink");
+
+            let probe = probe_archive_writable(&archive);
+            assert!(probe.passed, "{probe:?}");
+            assert_eq!(std::fs::read_link(&link).expect("preserved link"), outside);
+            if dangling {
+                assert!(!outside.exists(), "health must not create a symlink target");
+            } else {
+                assert_eq!(std::fs::read(&outside).expect("outside sentinel"), original);
+            }
+            assert_eq!(
+                std::fs::read_dir(&archive).expect("archive entries").count(),
+                1,
+                "the owned probe must not leave another archive entry"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_archive_write_probes_preserve_existing_evidence() {
+        let dir = tempfile::tempdir().expect("private archive");
+        let sentinel = dir.path().join(".write_probe");
+        let original = b"retained while concurrent diagnostics run";
+        std::fs::write(&sentinel, original).expect("archive sentinel");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let barrier = &barrier;
+                let archive = dir.path();
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..16 {
+                        let probe = probe_archive_writable(archive);
+                        assert!(probe.passed, "{probe:?}");
+                    }
+                });
+            }
+        });
+
+        assert_eq!(std::fs::read(&sentinel).expect("preserved sentinel"), original);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("archive entries")
+            .map(|entry| entry.expect("archive entry").file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from(".write_probe")]);
+    }
+
+    #[test]
+    fn archive_write_probe_reports_missing_and_non_directory_roots() {
+        let dir = tempfile::tempdir().expect("private archive parent");
+        let missing = dir.path().join("missing");
+        let probe = probe_archive_writable(&missing);
+        assert!(!probe.passed);
+        assert_eq!(probe.severity, ProbeSeverity::Warning);
+        assert!(!missing.exists(), "a writable probe must not create its root");
+
+        let file = dir.path().join("ordinary-file");
+        std::fs::write(&file, b"keep").expect("non-directory fixture");
+        let probe = probe_archive_writable(&file);
+        assert!(!probe.passed);
+        assert_eq!(probe.severity, ProbeSeverity::Warning);
+        assert_eq!(std::fs::read(&file).expect("preserved file"), b"keep");
     }
 
     #[test]
