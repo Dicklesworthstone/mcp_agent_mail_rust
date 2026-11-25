@@ -5723,7 +5723,7 @@ fn inbox_delivery_cursor_number(message: &str, key: &str) -> Option<i64> {
 /// Look up message-ID-bound delivery facts without reading mutable signal files
 /// or exposing message content.
 #[tool(
-    description = "Return durable delivery receipt facts for one message ID. The response distinguishes persisted, signaled, and acknowledged per recipient. `signaled` is true only when a message-ID-bound signal receipt was appended after a successful signal write; a debounced or failed signal remains persisted but not signaled."
+    description = "Return durable delivery receipt facts for one message ID. The response distinguishes persisted, signaled, and acknowledged for public to/cc recipients. BCC recipients and their receipt facts are omitted because this lookup does not authenticate a message sender. `signaled` is true only when a message-ID-bound signal receipt was appended after a successful signal write; a debounced or failed signal remains persisted but not signaled."
 )]
 pub async fn get_message_delivery_receipt(
     ctx: &McpContext,
@@ -5749,6 +5749,12 @@ pub async fn get_message_delivery_receipt(
     let recipients = receipt
         .recipients
         .into_iter()
+        // This tool has no authenticated viewer/sender argument. Keep the
+        // database's complete receipt for recovery and operator use, but never
+        // expose blind recipients (or unrecognized imported kinds) here.
+        .filter(|recipient| {
+            recipient.kind.eq_ignore_ascii_case("to") || recipient.kind.eq_ignore_ascii_case("cc")
+        })
         .map(|recipient| {
             let signal_receipts = recipient
                 .signal_receipts
@@ -9262,6 +9268,204 @@ mod tests {
         .expect("create acknowledgement test message")
         .id
         .expect("message ID")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn delivery_receipt_redacts_bcc_without_losing_public_or_durable_facts() {
+        with_messaging_mailbox(&[], |_mailbox| {
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            runtime.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let pool = DbPool::new(&DbPoolConfig::from_env()).expect("seed pool");
+                let project = ensure_project_row(&cx, &pool, "/delivery-receipt-privacy").await;
+                let project_id = project.id.unwrap();
+                let sender = register_agent_row(&cx, &pool, project_id, "GreenStone").await;
+                let to = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                let cc = register_agent_row(&cx, &pool, project_id, "RedFox").await;
+                let bcc = register_agent_row(&cx, &pool, project_id, "GoldHill").await;
+                register_agent_row(&cx, &pool, project_id, "SilverTree").await;
+                let message = queries::create_message_with_recipients_topic(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap(),
+                    "delivery privacy",
+                    "body",
+                    None,
+                    None,
+                    None,
+                    "normal",
+                    true,
+                    "[]",
+                    &[
+                        (to.id.unwrap(), "to"),
+                        (cc.id.unwrap(), "cc"),
+                        (bcc.id.unwrap(), "bcc"),
+                    ],
+                    Some("to"),
+                )
+                .await
+                .into_result()
+                .expect("create direct and shared delivery");
+                let message_id = message.id.unwrap();
+                let conn = pool.acquire(&cx).await.into_result().expect("seed receipts");
+                conn.execute_sync(
+                    "UPDATE message_recipients SET read_ts = 11, ack_ts = 22 \
+                     WHERE message_id = ? AND agent_id IN (?, ?)",
+                    &[
+                        sqlmodel_core::Value::BigInt(message_id),
+                        sqlmodel_core::Value::BigInt(to.id.unwrap()),
+                        sqlmodel_core::Value::BigInt(bcc.id.unwrap()),
+                    ],
+                )
+                .unwrap();
+                for (agent_id, route, digest, observed_ts) in [
+                    (to.id.unwrap(), "file", "public-file-digest", 33),
+                    (to.id.unwrap(), "tmux", "public-pane-digest", 44),
+                    (bcc.id.unwrap(), "private-route", "private-signal-digest", 55),
+                ] {
+                    mcp_agent_mail_db::sync::append_message_delivery_signal_receipt(
+                        &conn,
+                        message_id,
+                        agent_id,
+                        route,
+                        digest,
+                        observed_ts,
+                    )
+                    .expect("persist exact signal observation");
+                }
+                let before = mcp_agent_mail_db::sync::message_delivery_receipt_from_conn(
+                    &*conn,
+                    project_id,
+                    message_id,
+                )
+                .unwrap();
+                assert_eq!(before.recipients.len(), 3);
+                assert_eq!(before.recipients[2].acknowledged_ts, Some(22));
+                assert_eq!(before.recipients[2].signal_receipts.len(), 1);
+                drop(conn);
+
+                let response = get_message_delivery_receipt(
+                    &ctx,
+                    project.human_key.clone(),
+                    message_id,
+                )
+                .await
+                .expect("public receipt lookup");
+                for private_value in ["GoldHill", "bcc", "private-route", "private-signal-digest"] {
+                    assert!(!response.contains(private_value), "leaked {private_value}: {response}");
+                }
+                let receipt: Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(receipt["message_id"], message_id);
+                assert_eq!(receipt["project_id"], project_id);
+                assert_eq!(receipt["persisted"], true);
+                assert_eq!(receipt["persisted_at"], micros_to_iso(message.created_ts));
+                assert_eq!(
+                    receipt["recipients"],
+                    json!([
+                        {
+                            "recipient": "BlueLake", "kind": "to", "persisted": true,
+                            "signaled": true, "acknowledged": true,
+                            "acknowledged_at": micros_to_iso(22),
+                            "signal_receipts": [
+                                {"delivery_route": "file", "signal_path_digest": "public-file-digest", "observed_at": micros_to_iso(33)},
+                                {"delivery_route": "tmux", "signal_path_digest": "public-pane-digest", "observed_at": micros_to_iso(44)},
+                            ],
+                        },
+                        {
+                            "recipient": "RedFox", "kind": "cc", "persisted": true,
+                            "signaled": false, "acknowledged": false,
+                            "acknowledged_at": null, "signal_receipts": [],
+                        },
+                    ])
+                );
+                assert_eq!(receipt["project_mailbox"]["visible_agents"], 1);
+                assert_eq!(receipt["project_mailbox"]["read_count"], 0);
+                assert_eq!(receipt["project_mailbox"]["acknowledged_count"], 0);
+                assert_eq!(receipt["project_mailbox"]["agents"][0]["agent"], "SilverTree");
+                let after = queries::get_message_delivery_receipt(
+                    &cx, &pool, project_id, message_id,
+                )
+                .await
+                .into_result()
+                .expect("complete durable receipt remains readable");
+                assert_eq!(after, before, "public redaction must not alter stored facts");
+            });
+        });
+    }
+
+    #[test]
+    fn delivery_receipt_hides_bcc_only_and_unknown_recipient_kinds() {
+        with_messaging_mailbox(&[], |_mailbox| {
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            runtime.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let pool = DbPool::new(&DbPoolConfig::from_env()).expect("seed pool");
+                let project = ensure_project_row(&cx, &pool, "/delivery-receipt-kinds").await;
+                let project_id = project.id.unwrap();
+                let sender = register_agent_row(&cx, &pool, project_id, "GreenStone").await;
+                let recipient = register_agent_row(&cx, &pool, project_id, "GoldHill").await;
+                let message_id = create_ack_test_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap(),
+                    &[(recipient.id.unwrap(), "bcc")],
+                )
+                .await;
+                for (kind, visible) in [
+                    ("bcc", false),
+                    ("BCC", false),
+                    ("BcC", false),
+                    (" bcc ", false),
+                    ("private", false),
+                    ("", false),
+                    (" to ", false),
+                    ("TO", true),
+                    ("Cc", true),
+                ] {
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("set imported kind");
+                    conn.execute_sync(
+                        "UPDATE message_recipients SET kind = ? WHERE message_id = ?",
+                        &[
+                            sqlmodel_core::Value::Text(kind.to_string()),
+                            sqlmodel_core::Value::BigInt(message_id),
+                        ],
+                    )
+                    .unwrap();
+                    drop(conn);
+                    let response =
+                        get_message_delivery_receipt(&ctx, project.human_key.clone(), message_id)
+                            .await
+                            .expect("receipt remains available regardless of recipient visibility");
+                    let receipt: Value = serde_json::from_str(&response).unwrap();
+                    assert_eq!(receipt["persisted"], true);
+                    assert!(receipt.get("project_mailbox").is_none());
+                    let recipients = receipt["recipients"].as_array().unwrap();
+                    assert_eq!(recipients.len(), usize::from(visible), "kind={kind:?}");
+                    if visible {
+                        assert_eq!(recipients[0]["recipient"], "GoldHill");
+                        assert_eq!(recipients[0]["kind"], kind);
+                    } else {
+                        assert!(!response.contains("GoldHill"), "kind={kind:?}: {response}");
+                    }
+                    let stored =
+                        queries::get_message_delivery_receipt(&cx, &pool, project_id, message_id)
+                            .await
+                            .into_result()
+                            .unwrap();
+                    assert_eq!(stored.recipients.len(), 1);
+                    assert_eq!(stored.recipients[0].kind, kind);
+                }
+            });
+        });
     }
 
     #[test]
