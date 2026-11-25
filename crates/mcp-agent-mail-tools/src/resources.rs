@@ -4651,50 +4651,44 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
         .id
         .unwrap_or(0);
 
-    // Fetch unacked ack-required messages (over-fetch, then filter by age).
-    // Use 20x multiplier to reduce the chance of missing qualifying rows
-    // when only a small fraction of unacked messages are stale enough.
-    let unacked_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::fetch_unacked_for_agent(
-            ctx.cx(),
-            &pool,
-            project_id,
-            agent_id,
-            limit.saturating_mul(20),
-        )
-        .await,
-    )?;
-
     let now_us = mcp_agent_mail_db::now_micros();
     let ttl_us = i64::try_from(ttl_seconds)
         .unwrap_or(i64::MAX)
         .saturating_mul(1_000_000);
+    let cutoff_us = now_us.saturating_sub(ttl_us);
+
+    // Apply age and the requested oldest-first limit in the database without
+    // loading bodies that this metadata-only resource never returns.
+    let unacked_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::fetch_unacked_for_agent_metadata_before(
+            ctx.cx(),
+            &pool,
+            project_id,
+            agent_id,
+            cutoff_us,
+            limit,
+        )
+        .await,
+    )?;
 
     let mut messages = Vec::with_capacity(unacked_rows.len());
     for row in unacked_rows {
-        let age_us = now_us.saturating_sub(row.message.created_ts);
-        if age_us >= ttl_us {
-            let age_seconds = age_us / 1_000_000;
-            let msg = &row.message;
-            messages.push(StaleAckMessageEntry {
-                id: msg.id.unwrap_or(0),
-                project_id: msg.project_id,
-                sender_id: msg.sender_id,
-                thread_id: msg.thread_id.clone(),
-                topic: msg.topic.clone(),
-                subject: msg.subject.clone(),
-                importance: msg.importance.clone(),
-                ack_required: true,
-                created_ts: Some(micros_to_iso(msg.created_ts)),
-                attachments: parse_attachment_metadata(&msg.attachments),
-                kind: row.kind.clone(),
-                read_at: row.read_ts.map(mcp_agent_mail_db::micros_to_iso),
-                age_seconds,
-            });
-            if messages.len() >= limit {
-                break;
-            }
-        }
+        let msg = &row.message;
+        messages.push(StaleAckMessageEntry {
+            id: msg.id.unwrap_or(0),
+            project_id: msg.project_id,
+            sender_id: msg.sender_id,
+            thread_id: msg.thread_id.clone(),
+            topic: msg.topic.clone(),
+            subject: msg.subject.clone(),
+            importance: msg.importance.clone(),
+            ack_required: true,
+            created_ts: Some(micros_to_iso(msg.created_ts)),
+            attachments: parse_attachment_metadata(&msg.attachments),
+            kind: row.kind.clone(),
+            read_at: row.read_ts.map(mcp_agent_mail_db::micros_to_iso),
+            age_seconds: now_us.saturating_sub(msg.created_ts) / 1_000_000,
+        });
     }
 
     let count = messages.len();
@@ -4755,41 +4749,37 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
             .saturating_mul(1_000_000),
     );
 
-    // Fetch unacked ack-required messages (over-fetch, then filter by cutoff).
-    // Use 20x multiplier to reduce the chance of missing qualifying rows.
+    // Apply the cutoff before the shared/direct oldest-first limit. These
+    // views need metadata only, so large bodies never enter the result rows.
     let unacked_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::fetch_unacked_for_agent(
+        mcp_agent_mail_db::queries::fetch_unacked_for_agent_metadata_before(
             ctx.cx(),
             &pool,
             project_id,
             agent_id,
-            limit.saturating_mul(20),
+            cutoff_us,
+            limit,
         )
         .await,
     )?;
 
     let mut messages = Vec::with_capacity(unacked_rows.len());
     for row in unacked_rows {
-        if row.message.created_ts <= cutoff_us {
-            let msg = &row.message;
-            messages.push(ViewMessageEntry {
-                id: msg.id.unwrap_or(0),
-                project_id: msg.project_id,
-                sender_id: msg.sender_id,
-                thread_id: msg.thread_id.clone(),
-                topic: msg.topic.clone(),
-                subject: msg.subject.clone(),
-                importance: msg.importance.clone(),
-                ack_required: true,
-                created_ts: Some(micros_to_iso(msg.created_ts)),
-                attachments: parse_attachment_metadata(&msg.attachments),
-                from: None,
-                kind: row.kind.clone(),
-            });
-            if messages.len() >= limit {
-                break;
-            }
-        }
+        let msg = &row.message;
+        messages.push(ViewMessageEntry {
+            id: msg.id.unwrap_or(0),
+            project_id: msg.project_id,
+            sender_id: msg.sender_id,
+            thread_id: msg.thread_id.clone(),
+            topic: msg.topic.clone(),
+            subject: msg.subject.clone(),
+            importance: msg.importance.clone(),
+            ack_required: true,
+            created_ts: Some(micros_to_iso(msg.created_ts)),
+            attachments: parse_attachment_metadata(&msg.attachments),
+            from: None,
+            kind: row.kind.clone(),
+        });
     }
 
     let count = messages.len();
@@ -11589,6 +11579,181 @@ mod resource_shape_tests {
                         .unwrap(),
                     );
                     assert_eq!(overdue["count"], expected_count);
+                }
+            });
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn acknowledgement_views_project_metadata_without_decoding_bodies() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let project_key = format!("/tmp/resources-ack-metadata-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap();
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let viewer = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                let large_body = "x".repeat(192 * 1024);
+                let direct = create_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap(),
+                    viewer.id.unwrap(),
+                    "Direct acknowledgement",
+                    &large_body,
+                    "ack-metadata",
+                    true,
+                )
+                .await;
+                let shared = queries::create_message_with_recipients_topic(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap(),
+                    "Shared acknowledgement",
+                    &large_body,
+                    None,
+                    None,
+                    None,
+                    "high",
+                    true,
+                    "[]",
+                    &[],
+                    Some("to"),
+                )
+                .await
+                .into_result()
+                .unwrap();
+                let fresh = create_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap(),
+                    viewer.id.unwrap(),
+                    "Recent acknowledgement",
+                    &large_body,
+                    "ack-metadata",
+                    true,
+                )
+                .await;
+                let direct_id = direct.id.unwrap();
+                let shared_id = shared.id.unwrap();
+                let now_us = mcp_agent_mail_db::now_micros();
+                let read_us = now_us - 60_000_000;
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                conn.execute_sync(
+                    "UPDATE agents SET inception_ts = 0 WHERE project_id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id)],
+                )
+                .unwrap();
+                conn.execute_sync(
+                    "UPDATE messages SET created_ts = ? WHERE id IN (?, ?)",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(now_us - 120_000_000),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(direct_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(shared_id),
+                    ],
+                )
+                .unwrap();
+                // Keep the not-yet-due control independent of slow test hosts.
+                conn.execute_sync(
+                    "UPDATE messages SET created_ts = ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(now_us + 3_600_000_000),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(fresh.id.unwrap()),
+                    ],
+                )
+                .unwrap();
+                conn.execute_sync(
+                    "UPDATE message_recipients SET read_ts = ? WHERE message_id = ? AND agent_id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(read_us),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(direct_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(viewer.id.unwrap()),
+                    ],
+                )
+                .unwrap();
+                drop(conn);
+
+                let full = queries::fetch_unacked_for_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    viewer.id.unwrap(),
+                    10,
+                )
+                .await
+                .into_result()
+                .unwrap();
+                assert_eq!(full.len(), 3);
+                assert!(full.iter().all(|row| row.message.body_md == large_body));
+
+                // A body that cannot be decoded as text makes accidental full
+                // projection observable. Both metadata views must still read
+                // direct and shared headers; selecting then clearing bodies
+                // after decoding is not sufficient.
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                conn.execute_sync(
+                    "UPDATE messages SET body_md = X'fffe' WHERE id IN (?, ?)",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(direct_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(shared_id),
+                    ],
+                )
+                .unwrap();
+                drop(conn);
+                assert!(matches!(
+                    queries::fetch_unacked_for_agent(
+                        &cx,
+                        &pool,
+                        project_id,
+                        viewer.id.unwrap(),
+                        10,
+                    )
+                    .await,
+                    Outcome::Err(_)
+                ));
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                for limit in [1, 2, 10] {
+                    let stale = parse_json(
+                        &views_acks_stale(
+                            &ctx,
+                            format!("RedPeak?project={project_key}&ttl_seconds=60&limit={limit}"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    let overdue = parse_json(
+                        &views_ack_overdue(
+                            &ctx,
+                            format!("RedPeak?project={project_key}&ttl_minutes=1&limit={limit}"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    let expected: Vec<_> = [direct_id, shared_id].into_iter().take(limit).collect();
+                    for value in [&stale, &overdue] {
+                        let messages = value["messages"].as_array().unwrap();
+                        assert_eq!(
+                            messages
+                                .iter()
+                                .map(|message| message["id"].as_i64().unwrap())
+                                .collect::<Vec<_>>(),
+                            expected
+                        );
+                        assert!(messages.iter().all(|message| message.get("body_md").is_none()));
+                        assert!(messages.iter().all(|message| message["id"] != fresh.id.unwrap()));
+                        assert_eq!(messages[0]["kind"], "to");
+                        if messages.len() == 2 {
+                            assert_eq!(messages[1]["kind"], "project");
+                        }
+                    }
+                    assert_eq!(stale["messages"][0]["read_at"], micros_to_iso(read_us));
+                    assert!(stale["messages"][0]["age_seconds"].as_i64().unwrap() >= 120);
                 }
             });
         });

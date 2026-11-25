@@ -21163,13 +21163,61 @@ pub struct UnackedInboxRow {
 /// A direct delivery takes precedence over the same message's project delivery,
 /// including its acknowledgement state. Each row carries the viewer's own read
 /// timestamp; this read never creates shared receipts or marks messages read.
-#[allow(clippy::too_many_lines)]
 pub async fn fetch_unacked_for_agent(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,
     agent_id: i64,
     limit: usize,
+) -> Outcome<Vec<UnackedInboxRow>, DbError> {
+    fetch_unacked_for_agent_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        limit,
+        None,
+        InboxBodyPolicy::Full,
+    )
+    .await
+}
+
+/// Fetch overdue acknowledgement metadata without materializing message bodies.
+///
+/// Apply the inclusive creation-time cutoff to both direct and visible shared
+/// deliveries before their common oldest-first limit. Every returned
+/// `MessageRow::body_md` is empty; other metadata and the viewer's read receipt
+/// are preserved. Visibility and acknowledgement precedence match
+/// [`fetch_unacked_for_agent`].
+pub async fn fetch_unacked_for_agent_metadata_before(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    cutoff_us: i64,
+    limit: usize,
+) -> Outcome<Vec<UnackedInboxRow>, DbError> {
+    fetch_unacked_for_agent_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        limit,
+        Some(cutoff_us),
+        InboxBodyPolicy::MetadataOnly,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn fetch_unacked_for_agent_impl(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    limit: usize,
+    cutoff_us: Option<i64>,
+    body_policy: InboxBodyPolicy,
 ) -> Outcome<Vec<UnackedInboxRow>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -21184,8 +21232,12 @@ pub async fn fetch_unacked_for_agent(
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
 
-    let direct = format!(
-        "SELECT m.id AS id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
+    let body_select = match body_policy {
+        InboxBodyPolicy::Full => "m.body_md",
+        InboxBodyPolicy::MetadataOnly => "'' AS body_md",
+    };
+    let mut direct = format!(
+        "SELECT m.id AS id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                   m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                   m.attachments, \
                   r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts \
@@ -21196,8 +21248,8 @@ pub async fn fetch_unacked_for_agent(
              AND m.ack_required = 1 AND r.ack_ts IS NULL"
     );
     let visibility = crate::project_mailbox::visible_to_viewer_sql!();
-    let shared = format!(
-        "SELECT m.id AS id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
+    let mut shared = format!(
+        "SELECT m.id AS id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 'project' AS kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
                 pr.read_ts, pr.ack_ts \
@@ -21210,17 +21262,18 @@ pub async fn fetch_unacked_for_agent(
          WHERE d.project_id = ? AND {visibility} \
            AND m.ack_required = 1 AND pr.ack_ts IS NULL"
     );
+    let mut arm_params = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
+    if let Some(cutoff_us) = cutoff_us {
+        direct.push_str(" AND m.created_ts <= ?");
+        shared.push_str(" AND m.created_ts <= ?");
+        arm_params.push(Value::BigInt(cutoff_us));
+    }
     // One statement observes both delivery kinds and their receipts together.
     // As in the product inbox, render the validated integer limit: the pinned
     // compound-select executor does not bind LIMIT parameters.
     let sql =
         format!("{direct} UNION ALL {shared} ORDER BY created_ts ASC, id ASC LIMIT {limit_i64}");
-    let params = [
-        Value::BigInt(agent_id),
-        Value::BigInt(project_id),
-        Value::BigInt(agent_id),
-        Value::BigInt(project_id),
-    ];
+    let params = [arm_params.as_slice(), arm_params.as_slice()].concat();
     let rows = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
         Outcome::Ok(rows) => rows,
         Outcome::Err(error)
@@ -21237,11 +21290,8 @@ pub async fn fetch_unacked_for_agent(
                 return Outcome::Err(error);
             }
             let direct = format!("{direct} ORDER BY m.created_ts ASC, m.id ASC LIMIT ?");
-            let params = [
-                Value::BigInt(agent_id),
-                Value::BigInt(project_id),
-                Value::BigInt(limit_i64),
-            ];
+            let mut params = arm_params;
+            params.push(Value::BigInt(limit_i64));
             match map_sql_outcome(traw_query(cx, &tracked, &direct, &params).await) {
                 Outcome::Ok(rows) => rows,
                 Outcome::Err(error) => return Outcome::Err(error),
@@ -45145,6 +45195,12 @@ mod tests {
                         (8, 2, NULL, 91), (9, 2, 160, NULL);",
             )
             .unwrap();
+            let large_body = "acknowledgement body ".repeat(8192);
+            conn.execute_sync(
+                "UPDATE messages SET body_md = ?",
+                &[Value::Text(large_body.clone())],
+            )
+            .unwrap();
             drop(conn);
 
             let rows = fetch_unacked_for_agent(&cx, &pool, 1, 2, 100)
@@ -45164,6 +45220,43 @@ mod tests {
                     (2, "cc", Some(210)),
                 ]
             );
+            assert!(
+                rows.iter().all(|row| row.message.body_md == large_body),
+                "the existing full-message API must preserve body contents"
+            );
+            for (cutoff, limit, expected) in [
+                (99, 100, vec![]),
+                (100, 100, vec![1, 6]),
+                (150, 100, vec![1, 6, 9]),
+                (200, 2, vec![1, 6]),
+                (200, 0, vec![]),
+            ] {
+                let metadata =
+                    fetch_unacked_for_agent_metadata_before(&cx, &pool, 1, 2, cutoff, limit)
+                        .await
+                        .into_result()
+                        .unwrap();
+                assert_eq!(
+                    metadata
+                        .iter()
+                        .map(|row| row.message.id.unwrap())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "inclusive cutoff and oldest-first limit must apply to both delivery kinds"
+                );
+                for row in &metadata {
+                    assert!(row.message.body_md.is_empty());
+                    let original = rows
+                        .iter()
+                        .find(|original| original.message.id == row.message.id)
+                        .unwrap();
+                    assert_eq!(row.kind, original.kind);
+                    assert_eq!(row.read_ts, original.read_ts);
+                    assert_eq!(row.sender_name, original.sender_name);
+                    assert_eq!(row.message.attachments, original.message.attachments);
+                    assert_eq!(row.message.recipients_json, original.message.recipients_json);
+                }
+            }
             let limited = fetch_unacked_for_agent(&cx, &pool, 1, 2, 2)
                 .await
                 .into_result()
@@ -45182,6 +45275,13 @@ mod tests {
             for viewer in [4, 5, 6, 7] {
                 assert!(
                     fetch_unacked_for_agent(&cx, &pool, 1, viewer, 100)
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    fetch_unacked_for_agent_metadata_before(&cx, &pool, 1, viewer, 200, 100)
                         .await
                         .into_result()
                         .unwrap()
@@ -45270,6 +45370,20 @@ mod tests {
                 .expect("genuinely old schema retains direct obligations");
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].message.id, Some(1));
+            let metadata = fetch_unacked_for_agent_metadata_before(&cx, &pool, 1, 2, 10, 1)
+                .await
+                .into_result()
+                .expect("metadata fallback preserves the inclusive cutoff");
+            assert_eq!(metadata.len(), 1);
+            assert_eq!(metadata[0].message.id, Some(1));
+            assert!(metadata[0].message.body_md.is_empty());
+            assert!(
+                fetch_unacked_for_agent_metadata_before(&cx, &pool, 1, 2, 9, 1)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .is_empty()
+            );
 
             let conn = pool.acquire(&cx).await.into_result().unwrap();
             conn.execute_sync(
@@ -45280,6 +45394,10 @@ mod tests {
             drop(conn);
             assert!(matches!(
                 fetch_unacked_for_agent(&cx, &pool, 1, 2, 10).await,
+                Outcome::Err(_)
+            ));
+            assert!(matches!(
+                fetch_unacked_for_agent_metadata_before(&cx, &pool, 1, 2, 10, 1).await,
                 Outcome::Err(_)
             ));
         });
