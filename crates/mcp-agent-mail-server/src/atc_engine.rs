@@ -5109,7 +5109,30 @@ impl AtcEngine {
     }
 
     fn prune_agent_from_conflict_graphs(&mut self, agent_name: &str) {
-        let dirty_projects: Vec<String> = self.conflict_graphs.keys().cloned().collect();
+        let Some(project_key) = self.agent_project_key(agent_name) else {
+            // A bare name is not evidence about any project's reservations.
+            return;
+        };
+        // Names are only unique within a project. A liveness transition must
+        // not erase wait edges belonging to an unrelated namesake. Tool hints
+        // can use a slug while reservation observations retain the full path.
+        let dirty_projects: Vec<String> = self
+            .conflict_graphs
+            .keys()
+            .filter(|project| crate::atc_project_keys_match(project, &project_key))
+            .cloned()
+            .collect();
+        // A slug can match distinct absolute paths. It cannot select which
+        // namesake died, so retain every edge if the candidates disagree on
+        // their full project identity. Legitimate path/slug aliases still work.
+        let mut full_projects = dirty_projects
+            .iter()
+            .filter(|project| !crate::looks_like_project_slug(project));
+        if let Some(anchor) = full_projects.next()
+            && full_projects.any(|project| !crate::atc_project_keys_match(anchor, project))
+        {
+            return;
+        }
         let timestamp_micros = mcp_agent_mail_core::timestamps::now_micros();
         for project in dirty_projects {
             let removed = self
@@ -8075,6 +8098,203 @@ mod engine_tests {
         let remaining = engine.detect_deadlocks();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, "active-project");
+    }
+
+    #[test]
+    fn conflict_project_dead_agent_cleanup_preserves_namesake_cycles() {
+        let project_key = "/tmp/agent-mail-dead-conflicts";
+        let project_slug = mcp_agent_mail_core::compute_project_slug(project_key);
+        // Exercise both exact project routing and the supported slug alias.
+        for own_graph_key in [project_key, project_slug.as_str()] {
+            let mut engine = AtcEngine::new_for_testing();
+            engine.register_agent("ScopedConflictHolder", "claude-code", Some(project_key));
+            engine
+                .agents
+                .get_mut("ScopedConflictHolder")
+                .unwrap()
+                .rhythm = AgentRhythm::new(60.0);
+            for index in 0..10 {
+                engine.observe_activity(
+                    "ScopedConflictHolder",
+                    Some(project_key),
+                    index * 60_000_000,
+                );
+            }
+            let entry = engine.agents.get_mut("ScopedConflictHolder").unwrap();
+            for _ in 0..30 {
+                entry.core.update_posterior(&[
+                    (LivenessState::Alive, 0.01),
+                    (LivenessState::Flaky, 0.05),
+                    (LivenessState::Dead, 0.95),
+                ]);
+            }
+            let now = 9 * 60_000_000 + 600_000_000;
+            // These absolute paths collide under slugification but represent
+            // distinct projects. Neither namesake supplies the other's state.
+            let other_project = "/tmp/Agent-Mail-Dead-Conflicts";
+            assert_eq!(
+                project_slug,
+                mcp_agent_mail_core::compute_project_slug(other_project)
+            );
+            for project in [own_graph_key, other_project] {
+                note_test_conflict_cycle(
+                    &mut engine,
+                    project,
+                    "ScopedConflictHolder",
+                    "BlockedNamesake",
+                    now - 1,
+                );
+            }
+            assert_eq!(engine.detect_deadlocks().len(), 2);
+            assert_eq!(engine.deadlock_cycle_total, 2);
+            assert_eq!(engine.conflict_edge_count, 4);
+            let other_generation = engine.conflict_graphs[other_project].generation;
+
+            let evaluation = engine.evaluate_liveness(now);
+            assert!(evaluation.actions.iter().any(|(agent, action)| {
+                agent == "ScopedConflictHolder" && *action == LivenessAction::ReleaseReservations
+            }));
+            assert!(!engine.conflict_graphs.contains_key(own_graph_key));
+            assert!(!engine.deadlock_cache.contains_key(own_graph_key));
+            assert_eq!(
+                engine.conflict_graphs[other_project].generation,
+                other_generation
+            );
+            assert!(engine.deadlock_cache.contains_key(other_project));
+            assert!(engine.dirty_projects.is_empty());
+            assert_eq!(engine.deadlock_cycle_total, 1);
+            assert_eq!(engine.conflict_edge_count, 2);
+            let remaining = engine.detect_deadlocks();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].0, other_project);
+            assert!(
+                remaining[0].1[0]
+                    .iter()
+                    .any(|name| name == "ScopedConflictHolder")
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_project_dead_agent_cleanup_requires_project_scope() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("UnscopedConflictHolder", "claude-code", None);
+        engine
+            .agents
+            .get_mut("UnscopedConflictHolder")
+            .unwrap()
+            .rhythm = AgentRhythm::new(60.0);
+        for index in 0..10 {
+            engine.observe_activity("UnscopedConflictHolder", None, index * 60_000_000);
+        }
+        let entry = engine.agents.get_mut("UnscopedConflictHolder").unwrap();
+        for _ in 0..30 {
+            entry.core.update_posterior(&[
+                (LivenessState::Alive, 0.01),
+                (LivenessState::Flaky, 0.05),
+                (LivenessState::Dead, 0.95),
+            ]);
+        }
+        let now = 9 * 60_000_000 + 600_000_000;
+        for project in ["first-project", "second-project"] {
+            note_test_conflict_cycle(
+                &mut engine,
+                project,
+                "UnscopedConflictHolder",
+                "BlockedNamesake",
+                now - 1,
+            );
+        }
+        let before = engine.detect_deadlocks();
+        assert_eq!(before.len(), 2);
+        assert_eq!(engine.conflict_edge_count, 4);
+
+        let evaluation = engine.evaluate_liveness(now);
+        assert!(evaluation.actions.iter().any(|(agent, action)| {
+            agent == "UnscopedConflictHolder" && *action == LivenessAction::ReleaseReservations
+        }));
+        assert_eq!(
+            engine.agent_liveness("UnscopedConflictHolder"),
+            Some(LivenessState::Dead)
+        );
+        assert_eq!(engine.conflict_graphs.len(), 2);
+        assert_eq!(engine.deadlock_cache.len(), 2);
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.deadlock_cycle_total, 2);
+        assert_eq!(engine.conflict_edge_count, 4);
+        assert_eq!(engine.detect_deadlocks(), before);
+    }
+
+    #[test]
+    fn conflict_project_dead_agent_cleanup_preserves_ambiguous_slug_cycles() {
+        let projects = [
+            "/tmp/agent-mail-ambiguous-conflicts",
+            "/tmp/Agent-Mail-Ambiguous-Conflicts",
+        ];
+        let project_slug = mcp_agent_mail_core::compute_project_slug(projects[0]);
+        assert_eq!(
+            project_slug,
+            mcp_agent_mail_core::compute_project_slug(projects[1])
+        );
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent(
+            "AmbiguousConflictHolder",
+            "claude-code",
+            Some(&project_slug),
+        );
+        engine
+            .agents
+            .get_mut("AmbiguousConflictHolder")
+            .unwrap()
+            .rhythm = AgentRhythm::new(60.0);
+        for index in 0..10 {
+            engine.observe_activity(
+                "AmbiguousConflictHolder",
+                Some(&project_slug),
+                index * 60_000_000,
+            );
+        }
+        let entry = engine.agents.get_mut("AmbiguousConflictHolder").unwrap();
+        for _ in 0..30 {
+            entry.core.update_posterior(&[
+                (LivenessState::Alive, 0.01),
+                (LivenessState::Flaky, 0.05),
+                (LivenessState::Dead, 0.95),
+            ]);
+        }
+        let now = 9 * 60_000_000 + 600_000_000;
+        for project in projects {
+            note_test_conflict_cycle(
+                &mut engine,
+                project,
+                "AmbiguousConflictHolder",
+                "BlockedNamesake",
+                now - 1,
+            );
+        }
+        let before = engine.detect_deadlocks();
+        assert_eq!(before.len(), 2);
+        assert_eq!(engine.conflict_edge_count, 4);
+        let generations = projects.map(|project| engine.conflict_graphs[project].generation);
+
+        let evaluation = engine.evaluate_liveness(now);
+        assert!(evaluation.actions.iter().any(|(agent, action)| {
+            agent == "AmbiguousConflictHolder" && *action == LivenessAction::ReleaseReservations
+        }));
+        assert_eq!(
+            engine.agent_liveness("AmbiguousConflictHolder"),
+            Some(LivenessState::Dead)
+        );
+        assert_eq!(engine.conflict_graphs.len(), 2);
+        assert_eq!(
+            projects.map(|project| engine.conflict_graphs[project].generation),
+            generations
+        );
+        assert_eq!(engine.deadlock_cache.len(), 2);
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.deadlock_cycle_total, 2);
+        assert_eq!(engine.conflict_edge_count, 4);
+        assert_eq!(engine.detect_deadlocks(), before);
     }
 
     #[test]
