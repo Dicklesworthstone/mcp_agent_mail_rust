@@ -7607,9 +7607,14 @@ pub fn agent_touch_due(pool: &DbPool, agent_id: i64) -> bool {
 /// right after a call still has that call recorded, and a pool rebuilt between
 /// calls cannot strand a pending update under a retired pool generation.
 ///
-/// Returns `Ok(true)` when the write committed. A failed write still counts
-/// against the interval, so it is retried by the first call after the interval
-/// rather than by every call against a contended database.
+/// Lifecycle is checked by the UPDATE: a retired or deregistered identity is
+/// ignored even if it became inactive while the touch waited for a connection.
+/// Historical reads can still succeed without refreshing inactive activity.
+///
+/// Returns `Ok(true)` when the write transaction committed, including a no-op
+/// for an inactive or missing identity. A failed write still counts against the
+/// interval, so it is retried by the first call after the interval rather than
+/// by every call against a contended database.
 pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<bool, DbError> {
     let now = now_micros();
     let key = (agent_touch_throttle_key(pool), agent_id);
@@ -7637,6 +7642,8 @@ pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<bool,
             };
             let tracked = tracked(&*conn);
             try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+            // Bound the tombstone lookup to one identity. Correlated predicates
+            // can route FrankenSQLite through its slow interpreter path.
             try_in_tx!(
                 cx,
                 &tracked,
@@ -7644,8 +7651,15 @@ pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<bool,
                     traw_execute(
                         cx,
                         &tracked,
-                        "UPDATE agents SET last_active_ts = MAX(last_active_ts, ?) WHERE id = ?",
-                        &[Value::BigInt(now), Value::BigInt(agent_id)],
+                        "UPDATE agents SET last_active_ts = MAX(last_active_ts, ?) \
+                         WHERE id = ? AND retired_at IS NULL \
+                         AND id NOT IN (SELECT agent_id FROM agent_deregistrations \
+                                        WHERE agent_id = ?)",
+                        &[
+                            Value::BigInt(now),
+                            Value::BigInt(agent_id),
+                            Value::BigInt(agent_id),
+                        ],
                     )
                     .await,
                 )
@@ -7683,7 +7697,9 @@ pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<bool,
 /// Flush touches queued in the read cache's deferred-touch queue.
 ///
 /// [`touch_agent`] writes through (throttled) and no longer enqueues here;
-/// this drains only entries a caller placed on the queue directly.
+/// this drains only entries a caller placed on the queue directly. The UPDATE
+/// rechecks lifecycle and discards inactive identities' entries on success
+/// without changing their activity.
 pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbError> {
     let read_cache = crate::cache::read_cache();
     let cache_scope = cache_scope_for_pool(pool);
@@ -7712,13 +7728,17 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
 
         for chunk in entries.chunks(400) {
             let placeholders = std::iter::repeat_n("(?,?)", chunk.len()).collect::<Vec<_>>();
+            // Materialize only this batch's tombstones, without a correlated
+            // predicate that could select the backend's slow interpreter path.
             let sql = format!(
                 "WITH batch(agent_id, new_ts) AS (VALUES {}) \
                  UPDATE agents \
                  SET last_active_ts = MAX(last_active_ts, ( \
                      SELECT b.new_ts FROM batch b WHERE b.agent_id = agents.id \
                  )) \
-                 WHERE id IN (SELECT agent_id FROM batch)",
+                 WHERE id IN (SELECT agent_id FROM batch) AND retired_at IS NULL \
+                 AND id NOT IN (SELECT agent_id FROM agent_deregistrations \
+                                WHERE agent_id IN (SELECT agent_id FROM batch))",
                 placeholders.join(",")
             );
             let mut params = Vec::with_capacity(chunk.len() * 2);
@@ -47104,6 +47124,172 @@ mod tests {
                 "pool a flush should still apply its own deferred touch"
             );
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn activity_touches_recheck_lifecycle_after_waiting_for_pool_admission() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for deferred in [false, true] {
+            for deregister in [false, true] {
+                let (_cx, pool, _dir) = setup_test_pool(&format!(
+                    "activity-lifecycle-{deferred}-{deregister}.db"
+                ));
+                let lifecycle_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                    database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                    storage_root: Some(pool.storage_root().to_path_buf()),
+                    min_connections: 1,
+                    max_connections: 1,
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..Default::default()
+                })
+                .expect("independent lifecycle pool");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    let project_id = ensure_project(&cx, &pool, "/tmp/activity-lifecycle")
+                        .await
+                        .into_result()
+                        .expect("project")
+                        .id
+                        .unwrap();
+                    let agent = register_agent(
+                        &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+                    )
+                    .await
+                    .into_result()
+                    .expect("agent");
+                    let peer = register_agent(
+                        &cx, &pool, project_id, "GreenStone", "test", "test", None, None, None,
+                    )
+                    .await
+                    .into_result()
+                    .expect("active peer");
+                    let agent_id = agent.id.unwrap();
+                    let peer_id = peer.id.unwrap();
+                    set_agent_last_active_for_test(&cx, &pool, agent_id, 1).await;
+                    set_agent_last_active_for_test(&cx, &pool, peer_id, 1).await;
+                    let active = get_agent_by_id_fresh(&cx, &pool, agent_id)
+                        .await
+                        .into_result()
+                        .expect("aged active profile");
+                    let scope = cache_scope_for_pool(&pool);
+                    if deferred {
+                        for id in [agent_id, peer_id] {
+                            crate::read_cache().enqueue_touch_scoped(&scope, id, now_micros());
+                        }
+                    }
+                    drop(
+                        lifecycle_pool
+                            .acquire(&cx)
+                            .await
+                            .into_result()
+                            .expect("initialize lifecycle pool"),
+                    );
+                    let held = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("hold sole checkout");
+                    let mut waiting = std::pin::pin!(async {
+                        if deferred {
+                            flush_deferred_touches(&cx, &pool).await
+                        } else {
+                            touch_agent(&cx, &pool, agent_id).await.map(|_| ())
+                        }
+                    });
+                    {
+                        let mut context = Context::from_waker(Waker::noop());
+                        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                    }
+                    let inactive = if deregister {
+                        deregister_agent(&cx, &lifecycle_pool, agent_id, now_micros()).await
+                    } else {
+                        set_agent_retired_at(&cx, &lifecycle_pool, agent_id, Some(now_micros()))
+                            .await
+                    }
+                    .into_result()
+                    .expect("lifecycle commits before activity admission");
+                    crate::read_cache().put_agent_scoped(&scope, &active);
+                    drop(held);
+                    asupersync::time::timeout(
+                        cx.now(),
+                        std::time::Duration::from_secs(5),
+                        waiting,
+                    )
+                    .await
+                    .expect("activity admission watchdog")
+                    .into_result()
+                    .expect("inactive activity is a harmless no-op");
+                    let stored = get_agent_by_id_fresh(&cx, &pool, agent_id)
+                        .await
+                        .into_result()
+                        .expect("inactive profile");
+                    assert_eq!(
+                        serde_json::to_value(stored).unwrap(),
+                        serde_json::to_value(&inactive).unwrap(),
+                        "late activity must preserve the entire inactive profile"
+                    );
+                    if !deferred {
+                        assert!(
+                            crate::read_cache()
+                                .get_agent_by_id_scoped(&scope, agent_id)
+                                .is_none(),
+                            "write-through must evict a stale active cache entry"
+                        );
+                        touch_agent(&cx, &pool, peer_id)
+                            .await
+                            .into_result()
+                            .expect("active peer touch");
+                    }
+                    assert!(
+                        read_agent_last_active_for_test(&cx, &pool, peer_id).await > 1,
+                        "active peers must still receive activity updates"
+                    );
+                    if !deregister {
+                        set_agent_retired_at(&cx, &pool, agent_id, None)
+                            .await
+                            .into_result()
+                            .expect("explicit unretire");
+                        if deferred {
+                            crate::read_cache().enqueue_touch_scoped(
+                                &scope,
+                                agent_id,
+                                now_micros(),
+                            );
+                            flush_deferred_touches(&cx, &pool)
+                                .await
+                                .into_result()
+                                .expect("unretired deferred touch");
+                        } else {
+                            // Simulate the next interval without waiting a minute.
+                            agent_touch_throttle()
+                                .remove(&(agent_touch_throttle_key(&pool), agent_id));
+                            touch_agent(&cx, &pool, agent_id)
+                                .await
+                                .into_result()
+                                .expect("unretired direct touch");
+                        }
+                        let resumed = get_agent_by_id_fresh(&cx, &pool, agent_id)
+                            .await
+                            .into_result()
+                            .expect("resumed profile");
+                        assert!(resumed.last_active_ts > 1);
+                        let mut expected = active;
+                        expected.last_active_ts = resumed.last_active_ts;
+                        assert_eq!(
+                            serde_json::to_value(resumed).unwrap(),
+                            serde_json::to_value(expected).unwrap()
+                        );
+                    }
+                });
+            }
+        }
     }
 
     /// GH#334: `touch_agent` writes `last_active_ts` through immediately, at

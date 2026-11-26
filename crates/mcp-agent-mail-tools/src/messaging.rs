@@ -5958,6 +5958,8 @@ pub const MARK_ALL_READ_MAX_LIMIT: usize = 1000;
 
 /// Bulk mark-read for one agent's inbox in one project (GH#273).
 ///
+/// This operator cleanup preserves the target agent's last activity timestamp.
+///
 /// # Parameters
 /// - `project_key`: Project identifier (must already exist; never auto-created)
 /// - `agent_name`: Agent whose unread inbox rows transition to read
@@ -6030,7 +6032,7 @@ pub async fn mark_all_read(
     .await?;
     crate::session_identity::authorize_actor(ctx, &agent, false, "mark mail read")?;
     let agent_id = agent.id.unwrap_or(0);
-    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
+    // Operator cleanup preserves the target agent's last activity timestamp.
 
     let outcome = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::mark_messages_read_bulk(
@@ -6974,6 +6976,171 @@ mod tests {
                 "reads must not promote a rebuild"
             );
             assert_eq!(std::fs::read(&retained_source).unwrap(), source_before);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn historical_inbox_actions_and_bulk_cleanup_preserve_inactive_activity() {
+        with_messaging_mailbox(&[("MESSAGING_SESSION_IDENTITY", "true")], |_mailbox| {
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let pool = get_db_pool().expect("hot authoritative pool");
+                let project = ensure_project_row(&cx, &pool, "/historical-activity").await;
+                let project_id = project.id.unwrap();
+                for (lifecycle, action, name) in [
+                    ("active", "bulk", "BlueLake"),
+                    ("retired", "bulk", "GreenStone"),
+                    ("deregistered", "bulk", "RedFox"),
+                    ("retired", "peek", "GoldHill"),
+                    ("deregistered", "peek", "SilverPine"),
+                    ("retired", "read", "AmberHawk"),
+                    ("deregistered", "read", "PurpleBear"),
+                    ("retired", "ack", "CopperWolf"),
+                    ("deregistered", "ack", "SilverOtter"),
+                ] {
+                    let agent = register_agent_row(&cx, &pool, project_id, name).await;
+                    let agent_id = agent.id.unwrap();
+                    let message_id = create_ack_test_message(
+                        &cx,
+                        &pool,
+                        project_id,
+                        agent_id,
+                        &[(agent_id, "to")],
+                    )
+                    .await;
+                    let conn = pool.acquire(&cx).await.into_result().expect("age activity");
+                    conn.execute_sync(
+                        "UPDATE agents SET last_active_ts = 1 WHERE id = ?",
+                        &[sqlmodel_core::Value::BigInt(agent_id)],
+                    )
+                    .expect("old activity");
+                    drop(conn);
+                    match lifecycle {
+                        "retired" => {
+                            queries::set_agent_retired_at(
+                                &cx,
+                                &pool,
+                                agent_id,
+                                Some(mcp_agent_mail_db::now_micros()),
+                            )
+                            .await
+                            .into_result()
+                            .expect("retire");
+                        }
+                        "deregistered" => {
+                            queries::deregister_agent(
+                                &cx,
+                                &pool,
+                                agent_id,
+                                mcp_agent_mail_db::now_micros(),
+                            )
+                            .await
+                            .into_result()
+                            .expect("deregister");
+                        }
+                        _ => {}
+                    }
+                    let before = queries::get_agent_by_id_fresh(&cx, &pool, agent_id)
+                        .await
+                        .into_result()
+                        .expect("historical profile");
+                    assert!(queries::agent_touch_due(&pool, agent_id));
+                    let ctx =
+                        McpContext::with_state(cx.clone(), 1, fastmcp_core::SessionState::new());
+                    crate::session_identity::bind(&ctx, project_id, agent_id, name);
+                    let response = match action {
+                        "bulk" => {
+                            mark_all_read(
+                                &ctx,
+                                project.human_key.clone(),
+                                name.into(),
+                                None,
+                                None,
+                            )
+                            .await
+                        }
+                        "peek" => {
+                            fetch_inbox(
+                                &ctx,
+                                project.human_key.clone(),
+                                name.into(),
+                                None,
+                                None,
+                                Some(10),
+                                Some(true),
+                                None,
+                                None,
+                                None,
+                                Some(false),
+                            )
+                            .await
+                        }
+                        "read" => {
+                            mark_message_read(
+                                &ctx,
+                                project.human_key.clone(),
+                                name.into(),
+                                message_id,
+                            )
+                            .await
+                        }
+                        _ => {
+                            acknowledge_message(
+                                &ctx,
+                                project.human_key.clone(),
+                                name.into(),
+                                message_id,
+                                None,
+                            )
+                            .await
+                        }
+                    }
+                    .expect("historical mail remains accessible");
+                    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+                    if action == "bulk" {
+                        assert_eq!(response["marked_count"], 1);
+                        assert!(
+                            queries::agent_touch_due(&pool, agent_id),
+                            "operator cleanup must not claim the target's activity throttle"
+                        );
+                    } else if action == "peek" {
+                        assert_eq!(response.as_array().unwrap().len(), 1);
+                        assert_eq!(response[0]["id"], message_id);
+                        assert_eq!(response[0]["body_md"], "body");
+                    }
+                    let after = queries::get_agent_by_id_fresh(&cx, &pool, agent_id)
+                        .await
+                        .into_result()
+                        .expect("preserved profile");
+                    assert_eq!(
+                        serde_json::to_value(after).unwrap(),
+                        serde_json::to_value(before).unwrap(),
+                        "{lifecycle} {action} must not refresh activity or change lifecycle"
+                    );
+                    let conn = pool.acquire(&cx).await.into_result().expect("receipt");
+                    let rows = conn
+                        .query_sync(
+                            "SELECT read_ts, ack_ts FROM message_recipients \
+                             WHERE agent_id = ? AND message_id = ?",
+                            &[
+                                sqlmodel_core::Value::BigInt(agent_id),
+                                sqlmodel_core::Value::BigInt(message_id),
+                            ],
+                        )
+                        .expect("durable receipt");
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(
+                        rows[0].get_named::<Option<i64>>("read_ts").unwrap().is_some(),
+                        action != "peek"
+                    );
+                    assert_eq!(
+                        rows[0].get_named::<Option<i64>>("ack_ts").unwrap().is_some(),
+                        action == "ack"
+                    );
+                }
+            });
         });
     }
 
