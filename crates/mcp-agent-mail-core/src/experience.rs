@@ -704,7 +704,9 @@ impl ExperienceRow {
     /// Append and amendment boundaries must call this before cloning or
     /// serializing untrusted payloads. Validate the merged candidate as well
     /// as a patch, so individually valid patches cannot grow a row past the
-    /// aggregate limits. Only fixed field/category names appear in errors.
+    /// aggregate limits. Floating-point metadata must be finite so JSON and
+    /// SQLite cannot silently replace it with null. Only fixed field/category
+    /// names appear in errors.
     pub fn validate_content(&self) -> Result<(), &'static str> {
         self.validate_content_with_optional_outcome(self.outcome.as_ref())
     }
@@ -723,6 +725,10 @@ impl ExperienceRow {
         outcome: Option<&ExperienceOutcome>,
     ) -> Result<(), &'static str> {
         let mut validator = ContentValidator::default();
+        ContentValidator::finite_number(self.expected_loss)?;
+        if let Some(loss) = self.runner_up_loss {
+            ContentValidator::finite_number(loss)?;
+        }
         if self.evidence_summary.len() > 256 {
             return Err("evidence_summary exceeds 256 chars");
         }
@@ -756,7 +762,8 @@ impl ExperienceRow {
             validator.text(text, ContentField::Metadata)?;
         }
         validator.require_nodes(self.posterior.len())?;
-        for (label, _) in &self.posterior {
+        for (label, probability) in &self.posterior {
+            ContentValidator::finite_number(*probability)?;
             validator.text(label, ContentField::Metadata)?;
             validator.bytes(32)?;
         }
@@ -860,6 +867,17 @@ impl std::io::Write for ContentValidator {
 }
 
 impl ContentValidator {
+    // serde_json serializes non-finite floats as null rather than returning an
+    // error. Required fields then cannot decode, while optional losses silently
+    // disappear. Reject before any append, amendment or lifecycle write.
+    const fn finite_number(value: f64) -> Result<(), &'static str> {
+        if value.is_finite() {
+            Ok(())
+        } else {
+            Err("ATC numeric content must be finite")
+        }
+    }
+
     fn bytes(&mut self, amount: usize) -> Result<(), &'static str> {
         self.bytes_remaining = self
             .bytes_remaining
@@ -946,6 +964,9 @@ impl ContentValidator {
     }
 
     fn outcome(&mut self, outcome: &ExperienceOutcome) -> Result<(), &'static str> {
+        for value in [outcome.actual_loss, outcome.regret].into_iter().flatten() {
+            Self::finite_number(value)?;
+        }
         self.text(&outcome.label, ContentField::OutcomeLabel)?;
         if let Some(evidence) = &outcome.evidence {
             self.json(evidence, 0, ContentField::OutcomeEvidence)?;
@@ -955,16 +976,34 @@ impl ContentValidator {
 
     fn non_execution_reason(&mut self, reason: &NonExecutionReason) -> Result<(), &'static str> {
         match reason {
-            NonExecutionReason::BudgetExhausted { budget_name, .. } => {
+            NonExecutionReason::BudgetExhausted {
+                budget_name,
+                current,
+                threshold,
+            } => {
+                Self::finite_number(*current)?;
+                Self::finite_number(*threshold)?;
                 self.text(budget_name, ContentField::NonExecutionReason)
             }
-            NonExecutionReason::SafetyGate { gate_name, .. } => {
+            NonExecutionReason::SafetyGate {
+                gate_name,
+                risk_score,
+                gate_threshold,
+            } => {
+                Self::finite_number(*risk_score)?;
+                Self::finite_number(*gate_threshold)?;
                 self.text(gate_name, ContentField::NonExecutionReason)
             }
             NonExecutionReason::CalibrationFallback { reason } => {
                 self.text(reason, ContentField::NonExecutionReason)
             }
-            NonExecutionReason::DeliberateInaction { .. } => Ok(()),
+            NonExecutionReason::DeliberateInaction {
+                no_action_loss,
+                best_action_loss,
+            } => {
+                Self::finite_number(*no_action_loss)?;
+                Self::finite_number(*best_action_loss)
+            }
         }
     }
 }
@@ -2662,6 +2701,116 @@ mod tests {
             regret: Some(0.0),
             evidence: Some(evidence),
         }
+    }
+
+    fn numeric_non_execution_reasons(first: f64, second: f64) -> [NonExecutionReason; 3] {
+        [
+            NonExecutionReason::BudgetExhausted {
+                budget_name: "request_budget".to_string(),
+                current: first,
+                threshold: second,
+            },
+            NonExecutionReason::SafetyGate {
+                gate_name: "risk_gate".to_string(),
+                risk_score: first,
+                gate_threshold: second,
+            },
+            NonExecutionReason::DeliberateInaction {
+                no_action_loss: first,
+                best_action_loss: second,
+            },
+        ]
+    }
+
+    #[test]
+    fn content_validation_rejects_nonfinite_numeric_metadata_before_json_loss() {
+        const REJECTION: &str = "ATC numeric content must be finite";
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut row = sample_row();
+            row.expected_loss = value;
+            assert_eq!(row.validate_content(), Err(REJECTION));
+            let mut row = sample_row();
+            row.runner_up_loss = Some(value);
+            assert_eq!(row.validate_content(), Err(REJECTION));
+            let mut row = sample_row();
+            row.posterior[0].1 = value;
+            assert_eq!(row.validate_content(), Err(REJECTION));
+            // Encoding alone used to succeed, even though a durable posterior
+            // with null in this required f64 could never be read back.
+            let encoded = serde_json::to_string(&row).unwrap();
+            assert!(serde_json::from_str::<ExperienceRow>(&encoded).is_err());
+
+            for (actual_loss, regret) in [(Some(value), Some(0.0)), (Some(0.0), Some(value))] {
+                let mut outcome = synthetic_outcome(Value::Null);
+                outcome.actual_loss = actual_loss;
+                outcome.regret = regret;
+                assert_eq!(outcome.validate_content(), Err(REJECTION));
+                let mut row = sample_row();
+                assert_eq!(row.validate_content_with_outcome(&outcome), Err(REJECTION));
+                row.outcome = Some(outcome);
+                assert_eq!(row.validate_content(), Err(REJECTION));
+            }
+
+            for (first, second) in [(value, 0.5), (0.5, value)] {
+                for reason in numeric_non_execution_reasons(first, second) {
+                    assert_eq!(reason.validate_content(), Err(REJECTION));
+                    let mut row = sample_row();
+                    row.non_execution_reason = Some(reason);
+                    assert_eq!(row.validate_content(), Err(REJECTION));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finite_numeric_metadata_and_absent_losses_remain_valid() {
+        for value in [
+            -f64::MAX,
+            -1.5,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            0.25,
+            f64::MAX,
+        ] {
+            let mut row = sample_row();
+            row.expected_loss = value;
+            row.runner_up_loss = Some(value);
+            let mut outcome = synthetic_outcome(Value::Null);
+            outcome.actual_loss = Some(value);
+            outcome.regret = Some(value);
+            row.outcome = Some(outcome);
+            for reason in numeric_non_execution_reasons(value, value) {
+                row.non_execution_reason = Some(reason);
+                assert_eq!(row.validate_content(), Ok(()));
+            }
+        }
+
+        // Require exact JSON round-trips only for ordinary binary fractions.
+        // Extreme finite values above test acceptance, not parser precision.
+        let mut row = sample_row();
+        row.expected_loss = -1.5;
+        row.runner_up_loss = Some(0.25);
+        let mut outcome = synthetic_outcome(Value::Null);
+        outcome.actual_loss = Some(0.5);
+        outcome.regret = Some(-0.25);
+        row.outcome = Some(outcome);
+        let encoded = serde_json::to_string(&row).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ExperienceRow>(&encoded).unwrap(),
+            row
+        );
+
+        row.runner_up_loss = None;
+        let outcome = row.outcome.as_mut().unwrap();
+        outcome.actual_loss = None;
+        outcome.regret = None;
+        assert_eq!(row.validate_content(), Ok(()));
+        let encoded = serde_json::to_string(&row).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ExperienceRow>(&encoded).unwrap(),
+            row
+        );
     }
 
     #[test]

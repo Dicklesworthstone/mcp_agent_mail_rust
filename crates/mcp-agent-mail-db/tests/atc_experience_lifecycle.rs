@@ -2169,3 +2169,210 @@ fn message_outcome_rejections_preserve_sidecar() {
 fn message_outcome_rejections_preserve_memory() {
     check_message_outcome_rejections(PrivacyStorage::Memory);
 }
+
+fn check_nonfinite_numeric_persistence(storage: PrivacyStorage) {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_privacy_db(&rt, storage);
+    rt.block_on(async {
+        let planned = make_probe_experience(8000, 8001, "GreenCastle");
+        let planned_id = append_atc_experience(&cx, &pool, &planned)
+            .await
+            .into_result()
+            .expect("append planned numeric fixture")
+            .experience_id;
+        let mut dispatched = make_probe_experience(8002, 8003, "BlueLake");
+        dispatched.state = ExperienceState::Dispatched;
+        dispatched.dispatched_ts_micros = Some(1_700_000_000_100_000);
+        let dispatched_id = append_atc_experience(&cx, &pool, &dispatched)
+            .await
+            .into_result()
+            .expect("append dispatched numeric fixture")
+            .experience_id;
+        let mut outcome_ids = Vec::new();
+        for (decision_id, state) in [
+            (8004, ExperienceState::Executed),
+            (8006, ExperienceState::Open),
+            (8008, ExperienceState::Resolved),
+        ] {
+            let mut row = make_message_experience(decision_id);
+            row.state = state;
+            if state == ExperienceState::Resolved {
+                row.resolved_ts_micros = Some(1_700_000_000_500_000);
+                row.outcome = Some(message_outcome("read", 1_700_000_000_500_000));
+            }
+            outcome_ids.push(
+                append_atc_experience(&cx, &pool, &row)
+                    .await
+                    .into_result()
+                    .expect("append outcome numeric fixture")
+                    .experience_id,
+            );
+        }
+        let [executed_id, open_id, resolved_id] = outcome_ids.as_slice() else {
+            unreachable!("three lifecycle fixtures");
+        };
+        seed_privacy_rollup(&cx, &pool).await;
+        let before = privacy_snapshot(&cx, &pool).await;
+
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let clean = make_probe_experience(8100, 8101, "SilverLake");
+            let mut candidates = Vec::new();
+            let mut row = clean.clone();
+            row.expected_loss = value;
+            candidates.push(row);
+            let mut row = clean.clone();
+            row.runner_up_loss = Some(value);
+            candidates.push(row);
+            let mut row = clean.clone();
+            row.posterior[0].1 = value;
+            candidates.push(row);
+            // A duplicate key must not turn invalid metadata into a successful
+            // idempotent append, even though it would not replace the old row.
+            let mut replay = planned.clone();
+            replay.expected_loss = value;
+            candidates.push(replay);
+            for row in candidates {
+                assert_content_rejected(
+                    append_atc_experience(&cx, &pool, &row).await,
+                    "append_nonfinite_decision",
+                );
+                assert_privacy_snapshot_unchanged(&cx, &pool, &before).await;
+            }
+
+            for (first, second) in [(value, 0.5), (0.5, value)] {
+                for (state, reason) in [
+                    (
+                        ExperienceState::Throttled,
+                        NonExecutionReason::BudgetExhausted {
+                            budget_name: "request_budget".to_string(),
+                            current: first,
+                            threshold: second,
+                        },
+                    ),
+                    (
+                        ExperienceState::Suppressed,
+                        NonExecutionReason::SafetyGate {
+                            gate_name: "risk_gate".to_string(),
+                            risk_score: first,
+                            gate_threshold: second,
+                        },
+                    ),
+                    (
+                        ExperienceState::Skipped,
+                        NonExecutionReason::DeliberateInaction {
+                            no_action_loss: first,
+                            best_action_loss: second,
+                        },
+                    ),
+                ] {
+                    let mut row = clean.clone();
+                    row.state = state;
+                    row.non_execution_reason = Some(reason.clone());
+                    assert_content_rejected(
+                        append_atc_experience(&cx, &pool, &row).await,
+                        "append_nonfinite_reason",
+                    );
+                    assert_privacy_snapshot_unchanged(&cx, &pool, &before).await;
+                    reject_context_transition(
+                        &cx,
+                        &pool,
+                        dispatched_id,
+                        state,
+                        Some(&reason),
+                        None,
+                    )
+                    .await;
+                    // Check the production execution shortcut too: rejection
+                    // must not commit its implicit Planned -> Dispatched step.
+                    assert_content_rejected(
+                        record_atc_execution_outcome(
+                            &cx,
+                            &pool,
+                            planned_id,
+                            state,
+                            1_700_000_000_400_000,
+                            Some(&reason),
+                            None,
+                        )
+                        .await,
+                        "record_nonfinite_execution",
+                    );
+                    assert_privacy_snapshot_unchanged(&cx, &pool, &before).await;
+                }
+            }
+
+            for (actual_loss, regret) in [(Some(value), Some(0.0)), (Some(0.0), Some(value))] {
+                let mut outcome = message_outcome("acknowledged", 1_700_000_000_600_000);
+                outcome.actual_loss = actual_loss;
+                outcome.regret = regret;
+                let mut row = clean.clone();
+                row.state = ExperienceState::Resolved;
+                row.resolved_ts_micros = Some(outcome.observed_ts_micros);
+                row.outcome = Some(outcome.clone());
+                assert_content_rejected(
+                    append_atc_experience(&cx, &pool, &row).await,
+                    "append_nonfinite_outcome",
+                );
+                assert_privacy_snapshot_unchanged(&cx, &pool, &before).await;
+                for (id, operation) in [
+                    (*open_id, PrivacyOutcomeWrite::Resolve),
+                    (*open_id, PrivacyOutcomeWrite::Unified),
+                    (*executed_id, PrivacyOutcomeWrite::Observed),
+                    (*resolved_id, PrivacyOutcomeWrite::Amend),
+                    (*resolved_id, PrivacyOutcomeWrite::Resolve),
+                    (*resolved_id, PrivacyOutcomeWrite::Unified),
+                    (*resolved_id, PrivacyOutcomeWrite::Observed),
+                ] {
+                    reject_outcome_write(&cx, &pool, id, operation, &outcome).await;
+                }
+                for id in [*executed_id, *open_id, *resolved_id] {
+                    assert_content_rejected(
+                        resolve_atc_message_outcome(&cx, &pool, id, &outcome).await,
+                        "resolve_nonfinite_message_outcome",
+                    );
+                    assert_privacy_snapshot_unchanged(&cx, &pool, &before).await;
+                }
+            }
+        }
+
+        // Rejections leave all rows usable, including the real Executed ->
+        // Resolved path. Absent loss data and finite signed regret stay valid.
+        let mut outcome = message_outcome("acknowledged", 1_700_000_000_700_000);
+        outcome.actual_loss = None;
+        outcome.regret = Some(-0.5);
+        assert_eq!(
+            resolve_atc_message_outcome(&cx, &pool, *executed_id, &outcome)
+                .await
+                .into_result()
+                .expect("resolve valid outcome after rejected nonfinite candidates"),
+            AtcMessageOutcomeUpdate::Resolved
+        );
+        assert_stored_message_outcome(&cx, &pool, *executed_id, &outcome).await;
+
+        let mut finite = make_probe_experience(8200, 8201, "SilverLake");
+        finite.expected_loss = -2.5;
+        finite.runner_up_loss = None;
+        let stored = append_atc_experience(&cx, &pool, &finite)
+            .await
+            .into_result()
+            .expect("append finite signed loss after rejected candidates");
+        assert_eq!(stored.expected_loss, finite.expected_loss);
+        assert_eq!(stored.runner_up_loss, None);
+        assert_eq!(stored.posterior, finite.posterior);
+        let replay = append_atc_experience(&cx, &pool, &finite)
+            .await
+            .into_result()
+            .expect("valid duplicate remains idempotent");
+        assert_eq!(replay, stored);
+    });
+}
+
+#[test]
+fn nonfinite_numeric_persistence_preserves_sidecar_rows_and_rollups() {
+    check_nonfinite_numeric_persistence(PrivacyStorage::File);
+}
+
+#[test]
+fn nonfinite_numeric_persistence_preserves_memory_rows_and_rollups() {
+    check_nonfinite_numeric_persistence(PrivacyStorage::Memory);
+}
