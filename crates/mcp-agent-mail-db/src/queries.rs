@@ -7899,7 +7899,7 @@ pub async fn consume_proof_nonce(
     .await
 }
 
-/// Update agent's `contact_policy`
+/// Update an active agent's `contact_policy`.
 pub async fn set_agent_contact_policy(
     cx: &Cx,
     pool: &DbPool,
@@ -7917,19 +7917,11 @@ pub async fn set_agent_contact_policy(
     let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        if try_in_tx!(
+        try_in_tx!(
             cx,
             &tracked,
-            get_agent_deregistered_at_in_tx(cx, &tracked, agent_id).await
-        )
-        .is_some()
-        {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::invalid(
-                "agent_deregistered",
-                "deregistered agents cannot change contact policy",
-            ));
-        }
+            ensure_agents_active_in_tx(cx, &tracked, &[agent_id], None).await
+        );
 
         let now = now_micros();
         let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
@@ -8573,7 +8565,7 @@ pub async fn deregister_agent_guarded(
     Outcome::Ok(agent)
 }
 
-/// Update agent's `contact_policy` by project and name (avoids ID lookup issues)
+/// Update an active agent's `contact_policy` by project and name.
 pub async fn set_agent_contact_policy_by_name(
     cx: &Cx,
     pool: &DbPool,
@@ -8631,19 +8623,11 @@ pub async fn set_agent_contact_policy_by_name(
                 "policy update lookup returned agent without id for {project_id}:{normalized_name}"
             )));
         };
-        if try_in_tx!(
+        try_in_tx!(
             cx,
             &tracked,
-            get_agent_deregistered_at_in_tx(cx, &tracked, current_id).await
-        )
-        .is_some()
-        {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::invalid(
-                "agent_deregistered",
-                "deregistered agents cannot change contact policy",
-            ));
-        }
+            ensure_agents_active_in_tx(cx, &tracked, &[current_id], Some(project_id)).await
+        );
 
         let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
         let params = [
@@ -41611,6 +41595,159 @@ mod tests {
             assert_eq!(cached.contact_policy, "closed");
             assert_eq!(cached.attachments_policy, "inline");
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn contact_policy_rechecks_lifecycle_after_pool_wait_without_mutating_history() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for by_name in [false, true] {
+            for deregister in [false, true] {
+                let (_cx, pool, _dir) = setup_test_pool(&format!(
+                    "contact-policy-lifecycle-{by_name}-{deregister}.db"
+                ));
+                let lifecycle_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                    database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                    storage_root: Some(pool.storage_root().to_path_buf()),
+                    min_connections: 1,
+                    max_connections: 1,
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..Default::default()
+                })
+                .expect("independent lifecycle pool");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    let project_id = ensure_project(&cx, &pool, "/tmp/contact-policy-lifecycle")
+                        .await
+                        .into_result()
+                        .expect("project")
+                        .id
+                        .unwrap();
+                    let registered = register_agent(
+                        &cx,
+                        &pool,
+                        project_id,
+                        "BlueLake",
+                        "test",
+                        "test",
+                        Some("preserve task"),
+                        Some("inline"),
+                        Some(true),
+                    )
+                    .await
+                    .into_result()
+                    .expect("agent");
+                    let agent_id = registered.id.unwrap();
+                    let active = if by_name {
+                        set_agent_contact_policy_by_name(
+                            &cx, &pool, project_id, " bluelake ", "contacts_only",
+                        )
+                        .await
+                    } else {
+                        set_agent_contact_policy(&cx, &pool, agent_id, "contacts_only").await
+                    }
+                    .into_result()
+                    .expect("active identity can change policy");
+                    assert_eq!(active.contact_policy, "contacts_only");
+                    drop(
+                        lifecycle_pool
+                            .acquire(&cx)
+                            .await
+                            .into_result()
+                            .expect("initialize lifecycle pool"),
+                    );
+                    let held = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("hold sole checkout");
+                    let mut waiting = std::pin::pin!(async {
+                        if by_name {
+                            set_agent_contact_policy_by_name(
+                                &cx, &pool, project_id, " bluelake ", "open",
+                            )
+                            .await
+                        } else {
+                            set_agent_contact_policy(&cx, &pool, agent_id, "open").await
+                        }
+                    });
+                    {
+                        let mut context = Context::from_waker(Waker::noop());
+                        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                    }
+                    // Commit lifecycle while policy mutation waits, then restore
+                    // the stale active cache a different process might still hold.
+                    let inactive = if deregister {
+                        deregister_agent(&cx, &lifecycle_pool, agent_id, now_micros()).await
+                    } else {
+                        set_agent_retired_at(&cx, &lifecycle_pool, agent_id, Some(now_micros()))
+                            .await
+                    }
+                    .into_result()
+                    .expect("lifecycle transition");
+                    crate::read_cache().put_agent_scoped(&cache_scope_for_pool(&pool), &active);
+                    drop(held);
+                    let error = asupersync::time::timeout(
+                        cx.now(),
+                        std::time::Duration::from_secs(5),
+                        waiting,
+                    )
+                    .await
+                    .expect("policy admission watchdog")
+                    .into_result()
+                    .expect_err("inactive identity cannot change policy");
+                    let expected = if deregister {
+                        "agent_deregistered"
+                    } else {
+                        "agent_retired"
+                    };
+                    assert!(matches!(
+                        error,
+                        asupersync::OutcomeError::Err(DbError::InvalidArgument { field, .. })
+                            if field == expected
+                    ));
+                    let stored = get_agent_by_id_fresh(&cx, &pool, agent_id)
+                        .await
+                        .into_result()
+                        .expect("preserved historical profile");
+                    assert_eq!(
+                        serde_json::to_value(&stored).unwrap(),
+                        serde_json::to_value(&inactive).unwrap(),
+                        "rejection must not alter activity, policy, or profile"
+                    );
+                    if !deregister {
+                        set_agent_retired_at(&cx, &pool, agent_id, None)
+                            .await
+                            .into_result()
+                            .expect("explicitly unretire");
+                        let resumed = if by_name {
+                            set_agent_contact_policy_by_name(
+                                &cx, &pool, project_id, "bluelake", "open",
+                            )
+                            .await
+                        } else {
+                            set_agent_contact_policy(&cx, &pool, agent_id, "open").await
+                        }
+                        .into_result()
+                        .expect("unretired identity can change policy");
+                        assert_eq!(resumed.contact_policy, "open");
+                        let mut expected = active;
+                        expected.contact_policy = resumed.contact_policy.clone();
+                        expected.last_active_ts = resumed.last_active_ts;
+                        assert_eq!(
+                            serde_json::to_value(resumed).unwrap(),
+                            serde_json::to_value(expected).unwrap()
+                        );
+                    }
+                });
+            }
+        }
     }
 
     #[test]

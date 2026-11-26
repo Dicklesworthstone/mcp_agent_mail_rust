@@ -1045,7 +1045,7 @@ pub async fn list_contacts(
         .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
-/// Set contact policy for an agent.
+/// Set contact policy for an active agent.
 ///
 /// # Parameters
 /// - `project_key`: Project identifier
@@ -1057,7 +1057,9 @@ pub async fn list_contacts(
 ///
 /// # Conformance
 /// Python-parity.
-#[tool(description = "Set contact policy for an agent: open | auto | contacts_only | block_all.")]
+#[tool(
+    description = "Set contact policy for an active agent: open | auto | contacts_only | block_all. Retired agents must be unretired first; deregistered agents cannot change contact authorization."
+)]
 pub async fn set_contact_policy(
     ctx: &McpContext,
     project_key: String,
@@ -1083,7 +1085,9 @@ pub async fn set_contact_policy(
     )
     .await?;
     crate::session_identity::authorize_actor(ctx, &agent, false, "set contact policy")?;
+    require_active_contact_participant(&agent, "policy owner")?;
 
+    // The DB transaction rechecks lifecycle after this cached preflight.
     // Use name-based lookup to avoid ID issues with ORM row decoding
     let updated_agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::set_agent_contact_policy_by_name(
@@ -1141,6 +1145,142 @@ mod tests {
                 assert_eq!(tool_error_code(&error), Some("AGENT_DEREGISTERED"));
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn set_contact_policy_preserves_inactive_profiles_despite_stale_cache() {
+        use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
+        use mcp_agent_mail_db::queries;
+
+        let dir = tempfile::tempdir().expect("private mailbox");
+        let database_url = format!("sqlite:///{}", dir.path().join("mail.sqlite3").display());
+        let storage_root = dir.path().join("archive").display().to_string();
+        let project_key = dir.path().join("project").display().to_string();
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.as_str()),
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(async {
+                    let cx = asupersync::Cx::current().expect("runtime context");
+                    let pool = crate::tool_util::get_db_pool().expect("private pool");
+                    let project = queries::ensure_project(&cx, &pool, &project_key)
+                        .await
+                        .into_result()
+                        .expect("project");
+                    let project_id = project.id.unwrap();
+                    let agent = queries::register_agent(
+                        &cx,
+                        &pool,
+                        project_id,
+                        "BlueLake",
+                        "test",
+                        "test",
+                        Some("preserve task"),
+                        Some("inline"),
+                        Some(true),
+                    )
+                    .await
+                    .into_result()
+                    .expect("agent");
+                    let agent_id = agent.id.unwrap();
+                    let ctx =
+                        McpContext::with_state(cx.clone(), 1, fastmcp_core::SessionState::new());
+                    crate::session_identity::bind(&ctx, project_id, agent_id, &agent.name);
+                    set_contact_policy(
+                        &ctx,
+                        project_key.clone(),
+                        agent.name.clone(),
+                        "contacts_only".into(),
+                    )
+                    .await
+                    .expect("active policy update");
+                    let active = queries::get_agent_by_id_fresh(&cx, &pool, agent_id)
+                        .await
+                        .into_result()
+                        .expect("active profile");
+                    let retired = queries::set_agent_retired_at(
+                        &cx,
+                        &pool,
+                        agent_id,
+                        Some(mcp_agent_mail_db::now_micros()),
+                    )
+                    .await
+                    .into_result()
+                    .expect("retire");
+                    for cached in [&active, &retired] {
+                        mcp_agent_mail_db::read_cache()
+                            .put_agent_scoped(&pool.sqlite_identity_key(), cached);
+                        let error = set_contact_policy(
+                            &ctx,
+                            project_key.clone(),
+                            agent.name.clone(),
+                            "open".into(),
+                        )
+                        .await
+                        .expect_err("retired policy change");
+                        assert_eq!(tool_error_code(&error), Some("AGENT_RETIRED"));
+                        let stored = queries::get_agent_by_id_fresh(&cx, &pool, agent_id)
+                            .await
+                            .into_result()
+                            .expect("unchanged retired profile");
+                        assert_eq!(
+                            serde_json::to_value(stored).unwrap(),
+                            serde_json::to_value(&retired).unwrap()
+                        );
+                    }
+                    queries::set_agent_retired_at(&cx, &pool, agent_id, None)
+                        .await
+                        .into_result()
+                        .expect("unretire");
+                    set_contact_policy(
+                        &ctx,
+                        project_key.clone(),
+                        agent.name.clone(),
+                        "open".into(),
+                    )
+                    .await
+                    .expect("unretired policy update");
+                    let deregistered = queries::deregister_agent(
+                        &cx,
+                        &pool,
+                        agent_id,
+                        mcp_agent_mail_db::now_micros(),
+                    )
+                    .await
+                    .into_result()
+                    .expect("deregister");
+                    mcp_agent_mail_db::read_cache()
+                        .put_agent_scoped(&pool.sqlite_identity_key(), &active);
+                    let error = set_contact_policy(
+                        &ctx,
+                        project_key.clone(),
+                        agent.name.clone(),
+                        "open".into(),
+                    )
+                    .await
+                    .expect_err("deregistered policy change");
+                    assert_eq!(tool_error_code(&error), Some("AGENT_DEREGISTERED"));
+                    let stored = queries::get_agent_by_id_fresh(&cx, &pool, agent_id)
+                        .await
+                        .into_result()
+                        .expect("unchanged deregistered profile");
+                    assert_eq!(
+                        serde_json::to_value(stored).unwrap(),
+                        serde_json::to_value(deregistered).unwrap()
+                    );
+                });
+                Config::reset_cached();
+            },
+        );
     }
 
     // ── normalize_contact_policy ──
