@@ -35730,10 +35730,13 @@ first body
                     ),
                     mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
                 ));
-                assert!(matches!(
+                // The barrier is reached, but the write before it failed and
+                // has not been repaired, so the flush must not report Drained.
+                assert_eq!(
                     mcp_agent_mail_storage::wbq_flush_status(),
-                    mcp_agent_mail_storage::WbqFlushOutcome::Drained
-                ));
+                    mcp_agent_mail_storage::WbqFlushOutcome::PersistenceFailed,
+                    "a flush barrier must report the failed archive write before it"
+                );
                 mcp_agent_mail_storage::wbq_shutdown();
                 assert!(mcp_agent_mail_storage::durability_degraded());
                 // Re-probe reads so a slow CI filesystem cannot turn this into
