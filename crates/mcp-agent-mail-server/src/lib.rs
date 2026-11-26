@@ -14053,6 +14053,11 @@ to skip auth for local requests.</p>
                 Some(client)
             }
             Err(err) => {
+                // Cancellation belongs to this request, not the shared Redis
+                // backend. A later live request must still be able to initialize it.
+                if cx.checkpoint().is_err() {
+                    return None;
+                }
                 tracing::debug!(
                     error = %err,
                     "rate limit redis init failed; falling back to memory"
@@ -14067,39 +14072,56 @@ to skip auth for local requests.</p>
         }
     }
 
-    async fn consume_rate_limit(&self, key: &str, per_minute: u32, burst: u32) -> bool {
+    async fn consume_rate_limit_with_cx(
+        &self,
+        cx: &Cx,
+        key: &str,
+        per_minute: u32,
+        burst: u32,
+    ) -> Result<bool, ()> {
+        // Auth and admission share one request budget. Creating a new context
+        // here would restart that budget and discard cancellation from auth.
+        cx.checkpoint().map_err(|_| ())?;
         if per_minute == 0 {
-            return true;
+            return Ok(true);
         }
         // Tool names and JWT subjects are supplied by clients. Bound retained
         // keys before either backend allocates its own copy; truncating them
         // would merge unrelated clients' quotas.
         if key.len() > RATE_LIMIT_MAX_KEY_BYTES {
-            return false;
+            return Ok(false);
         }
 
         let now = rate_limit_now();
-        let budget = if self.request_timeout_secs == 0 {
-            Budget::INFINITE
-        } else {
-            // Use wall_now() + duration for a RELATIVE deadline, not an absolute epoch time.
-            let deadline = wall_now() + std::time::Duration::from_secs(self.request_timeout_secs);
-            Budget::new().with_deadline(deadline)
-        };
-        let cx = runtime_request_cx(budget);
+        let redis = self.rate_limit_redis_client(cx).await;
+        cx.checkpoint().map_err(|_| ())?;
 
-        let redis = self.rate_limit_redis_client(&cx).await;
-
-        if let Some(redis) = redis
-            && let Ok(allowed) =
-                consume_rate_limit_redis(&cx, &redis, key, per_minute, burst, now).await
-        {
-            return allowed;
+        if let Some(redis) = redis {
+            let consume = consume_rate_limit_redis(cx, &redis, key, per_minute, burst, now);
+            let started = wall_now();
+            let budget = cx.budget();
+            let result = if budget.deadline.is_some() {
+                // An elapsed deadline can also have no remaining duration;
+                // it must never select the unlimited-budget branch.
+                let remaining = budget.remaining_time(started).unwrap_or(Duration::ZERO);
+                // A silent socket need not wake to observe a Cx checkpoint.
+                // Arm a timer for only the budget left after authentication.
+                timeout(started, remaining, consume).await.map_err(|_| ())?
+            } else {
+                consume.await
+            };
+            // Request cancellation must never turn into a second admission
+            // attempt against the independent in-memory fallback quota.
+            cx.checkpoint().map_err(|_| ())?;
+            if let Ok(allowed) = result {
+                return Ok(allowed);
+            }
         }
         // A ready Redis client can keep failing commands for an entire outage.
         // Its fallback needs the same bounded retention as a memory-only server.
-        self.rate_limiter
-            .allow_memory(key, per_minute, burst, now, true)
+        Ok(self
+            .rate_limiter
+            .allow_memory(key, per_minute, burst, now, true))
     }
 
     #[cfg(test)]
@@ -14252,7 +14274,15 @@ to skip auth for local requests.</p>
             let endpoint = tool_name.as_deref().unwrap_or("*");
             let key = format!("{kind}:{endpoint}:{identity}");
 
-            let allowed = self.consume_rate_limit(&key, rpm, burst).await;
+            let Ok(allowed) = self.consume_rate_limit_with_cx(cx, &key, rpm, burst).await else {
+                return Some(self.jsonrpc_error_response(
+                    req,
+                    json_rpc,
+                    503,
+                    McpErrorCode::InternalError,
+                    "Request cancelled or timed out during rate limiting",
+                ));
+            };
             mcp_agent_mail_core::global_metrics()
                 .http
                 .record_rate_limit_check(allowed);
@@ -30868,10 +30898,9 @@ first body
             let redis_key = format!("rl:{key}");
             let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
             for &(rpm, burst, now, expected) in scenario.steps {
-                let allowed = block_on(consume_rate_limit_redis(
-                    &cx, &redis, &key, rpm, burst, now,
-                ))
-                .expect("redis eval");
+                let allowed =
+                    block_on(consume_rate_limit_redis(&cx, &redis, &key, rpm, burst, now))
+                        .expect("redis eval");
                 assert_eq!(
                     allowed, expected,
                     "redis scenario={} time={now}",
@@ -30906,7 +30935,10 @@ first body
             .expect("TTL")
             .as_integer()
             .expect("integer TTL");
-        assert!((9..=11).contains(&ttl), "clock-skew debt expired early: ttl={ttl}");
+        assert!(
+            (9..=11).contains(&ttl),
+            "clock-skew debt expired early: ttl={ttl}"
+        );
         assert!(!block_on(consume_rate_limit_redis(&cx, &redis, &key, 60, 1, 1000.0)).unwrap());
         assert!(block_on(consume_rate_limit_redis(&cx, &redis, &key, 60, 1, 1001.0)).unwrap());
         let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
@@ -30980,6 +31012,162 @@ first body
 
         // Best-effort cleanup
         let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+    }
+
+    #[test]
+    fn http_rate_limit_preserves_cancelled_and_expired_caller_contexts() {
+        for backend in [
+            mcp_agent_mail_core::RateLimitBackend::Memory,
+            mcp_agent_mail_core::RateLimitBackend::Redis,
+        ] {
+            for expired in [false, true] {
+                let config = mcp_agent_mail_core::Config {
+                    http_bearer_token: Some("budget-secret".to_string()),
+                    http_allow_localhost_unauthenticated: false,
+                    http_rate_limit_enabled: true,
+                    http_rate_limit_backend: backend,
+                    http_rate_limit_redis_url: Some("not-a-url".to_string()),
+                    http_rate_limit_tools_per_minute: 1,
+                    http_rate_limit_tools_burst: 1,
+                    ..Default::default()
+                };
+                let state = build_state(config);
+                let req = make_request_with_peer_addr(
+                    Http1Method::Post,
+                    "/api/",
+                    &[("Authorization", "Bearer budget-secret")],
+                    Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                );
+                let json_rpc = JsonRpcRequest::new("tools/list", None, 1_i64);
+                let cx = if expired {
+                    Cx::for_testing_with_budget(
+                        Budget::INFINITE.with_deadline(asupersync::Time::from_secs(0)),
+                    )
+                } else {
+                    let cx = Cx::for_testing();
+                    cx.cancel_with(asupersync::types::CancelKind::User, None);
+                    cx
+                };
+
+                let response =
+                    block_on(state.check_rbac_and_rate_limit_with_cx(&cx, &req, &json_rpc))
+                        .expect("abandoned admission must not proceed to dispatch");
+                assert_jsonrpc_error_response(
+                    &response,
+                    503,
+                    serde_json::json!(1),
+                    -32603,
+                    "Request cancelled or timed out during rate limiting",
+                );
+                assert!(cx.is_cancel_requested());
+                assert!(state.rate_limiter.buckets.lock().unwrap().is_empty());
+                if backend == mcp_agent_mail_core::RateLimitBackend::Redis {
+                    assert!(matches!(
+                        &*state.rate_limit_redis.lock().unwrap(),
+                        RateLimitRedisState::Uninitialized { .. }
+                    ));
+                }
+
+                // The aborted request consumed no quota. A healthy request
+                // still gets its first token, including Redis memory fallback.
+                assert!(block_on(state.check_rbac_and_rate_limit(&req, &json_rpc)).is_none());
+                let limited = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+                    .expect("healthy request consumed the one-token burst");
+                assert_eq!(limited.status, 429);
+            }
+        }
+    }
+
+    #[test]
+    fn rate_limit_redis_cancelled_initialization_remains_retryable() {
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_backend: mcp_agent_mail_core::RateLimitBackend::Redis,
+            http_rate_limit_redis_url: Some("redis://127.0.0.1:1/0".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let cancelled = Cx::for_testing();
+        cancelled.cancel_with(asupersync::types::CancelKind::User, None);
+
+        // Exercise RedisClient::connect's cancellation error directly, as
+        // when cancellation races the caller's admission checkpoint.
+        assert!(block_on(state.rate_limit_redis_client(&cancelled)).is_none());
+        assert!(matches!(
+            &*state.rate_limit_redis.lock().unwrap(),
+            RateLimitRedisState::Uninitialized { .. }
+        ));
+
+        // Redis initialization is lazy and opens no socket until a command.
+        let healthy = Cx::for_testing();
+        assert!(block_on(state.rate_limit_redis_client(&healthy)).is_some());
+        assert!(matches!(
+            &*state.rate_limit_redis.lock().unwrap(),
+            RateLimitRedisState::Ready(_)
+        ));
+        assert!(state.rate_limiter.buckets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn http_rate_limit_silent_redis_respects_remaining_caller_deadline() {
+        use std::io::Read;
+
+        // The kernel completes the TCP connection, but this peer never replies.
+        // No Redis process or external network service is required.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind silent peer");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("listener address");
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_backend: mcp_agent_mail_core::RateLimitBackend::Redis,
+            http_rate_limit_redis_url: Some(format!("redis://{address}/0")),
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let mut state = build_state(config);
+        state.request_timeout_secs = 60;
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[],
+            Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+        );
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1_i64);
+        let response = block_on(async {
+            let cx = runtime_request_cx(
+                Budget::INFINITE.with_timeout(wall_now(), Duration::from_secs(1)),
+            );
+            timeout(
+                wall_now(),
+                Duration::from_secs(5),
+                state.check_rbac_and_rate_limit_with_cx(&cx, &req, &json_rpc),
+            )
+            .await
+        })
+        .expect("caller deadline must complete admission before the watchdog")
+        .expect("silent Redis must abort expired admission");
+        assert_jsonrpc_error_response(
+            &response,
+            503,
+            serde_json::json!(1),
+            -32603,
+            "Request cancelled or timed out during rate limiting",
+        );
+        assert!(state.rate_limiter.buckets.lock().unwrap().is_empty());
+        assert!(matches!(
+            &*state.rate_limit_redis.lock().unwrap(),
+            RateLimitRedisState::Ready(_)
+        ));
+
+        let (mut peer, _) = listener.accept().expect("Redis opened a real connection");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("bounded peer read");
+        let mut received = [0_u8; 1];
+        assert_eq!(peer.read(&mut received).expect("Redis command bytes"), 1);
     }
 
     #[test]
