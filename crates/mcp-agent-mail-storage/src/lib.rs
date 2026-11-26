@@ -8322,7 +8322,6 @@ fn self_process_repo(
             if outcome.committed_requests > 0 {
                 rq.note_commit_progress();
                 coalescer_update_pending(pending_requests, outcome.committed_requests);
-                coalescer_note_commit_success(rq);
             }
             if !failed_requests.is_empty() {
                 had_failure = true;
@@ -8388,7 +8387,6 @@ fn self_process_repo(
                 .fetch_add(1, Ordering::Relaxed);
 
             coalescer_update_pending(pending_requests, outcome.committed_requests);
-            coalescer_note_commit_success(rq);
         }
         if outcome.committed_commits > 0 {
             rq.metrics
@@ -8396,6 +8394,16 @@ fn self_process_repo(
                 .fetch_add(outcome.committed_commits, Ordering::Relaxed);
         }
         panic_guard.inflight_spilled = None;
+    }
+
+    // Success in one ownership lane does not resolve another lane's retained
+    // failure. In particular, a healthy spill must not erase the queue's retry
+    // deadline or keep a persistent failure at its first backoff under load.
+    // Reset only after a non-empty pass succeeds in every attempted lane,
+    // while this worker still owns the repository. An empty defensive pass
+    // proves no recovery either.
+    if !had_failure && drained_count > 0 {
+        coalescer_note_commit_success(rq);
     }
 
     had_failure
@@ -19411,6 +19419,163 @@ mod tests {
             coalescer_repo_readiness(&rq, 1, Duration::ZERO, true),
             CoalescerRepoReadiness::Ready
         );
+    }
+
+    #[test]
+    fn coalescer_mixed_queue_and_spill_success_preserves_failed_work_backoff() {
+        if !isolated_coalescer_regression(
+            "tests::coalescer_mixed_queue_and_spill_success_preserves_failed_work_backoff",
+        ) {
+            return;
+        }
+
+        for (queue_fails, spill_fails) in [(true, false), (false, true), (true, true)] {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).unwrap();
+            let rq = Arc::new(RepoQueue::default());
+            let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+            let sizes = Arc::new(Mutex::new(VecDeque::new()));
+            let pending = Arc::new(AtomicU64::new(0));
+            let repos = Arc::new(Mutex::new(HashMap::from([(
+                tmp.path().to_path_buf(),
+                Arc::clone(&rq),
+            )])));
+            let work_cv = Arc::new((Mutex::new(0), std::sync::Condvar::new()));
+            let run_pass = || {
+                assert!(!rq.processing.swap(true, Ordering::Acquire));
+                self_process_repo(
+                    tmp.path(),
+                    &rq,
+                    &stats,
+                    &sizes,
+                    &pending,
+                    1,
+                    &repos,
+                    &work_cv,
+                )
+            };
+            let paths = [("queued.txt", queue_fails), ("spilled.txt", spill_fails)];
+            let failures_per_pass = u64::from(queue_fails) + u64::from(spill_fails);
+
+            for attempt in 1..=3 {
+                for (name, fails) in paths {
+                    // Retained failures retry their original request. Fresh
+                    // healthy work in the other lane must not reset its streak.
+                    if fails && attempt > 1 {
+                        continue;
+                    }
+                    let path = tmp.path().join(name);
+                    if fails {
+                        // A real non-file source fails both Git commit paths;
+                        // no mocked error or timing-dependent permission bit.
+                        fs::create_dir(&path).unwrap();
+                    } else {
+                        fs::write(&path, format!("healthy {name} pass {attempt}\n")).unwrap();
+                    }
+                    let request = coalescer_group_test_request(name.into(), vec![name.into()]);
+                    if name == "queued.txt" {
+                        coalescer_requeue_requests(&rq, vec![request]);
+                    } else {
+                        CommitCoalescer::spill_to_repo(&rq, request);
+                    }
+                    pending.fetch_add(1, Ordering::Relaxed);
+                }
+
+                let started = Instant::now();
+                assert!(run_pass(), "the obstructed Git source must actually fail");
+                assert!(!rq.processing.load(Ordering::Acquire));
+                assert_eq!(pending.load(Ordering::Relaxed), failures_per_pass);
+                assert_eq!(rq.depth.load(Ordering::Relaxed), failures_per_pass);
+                assert_eq!(
+                    rq.failure_streak.load(Ordering::Relaxed),
+                    attempt * failures_per_pass,
+                    "successful work must not reset a retained failure's streak"
+                );
+                assert!(
+                    rq.retry_after
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|retry_at| retry_at
+                            >= started + coalescer_failure_backoff(attempt * failures_per_pass)),
+                    "both lane orders must retain the installed retry deadline"
+                );
+                assert_eq!(
+                    rq.metrics.retries_total.load(Ordering::Relaxed),
+                    attempt * failures_per_pass
+                );
+                assert_eq!(
+                    rq.metrics.drained_total.load(Ordering::Relaxed),
+                    attempt * (2 - failures_per_pass)
+                );
+                assert_eq!(
+                    stats.lock().unwrap().errors as u64,
+                    attempt * failures_per_pass
+                );
+                for (name, fails) in paths {
+                    if !fails {
+                        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                        let entry = tree.get_path(Path::new(name)).unwrap();
+                        assert_eq!(
+                            repo.find_blob(entry.id()).unwrap().content(),
+                            fs::read(tmp.path().join(name)).unwrap()
+                        );
+                    }
+                }
+            }
+
+            // Remove the cause by preserving the obstructing directory under
+            // another name. The original queued/spilled requests must recover
+            // without being replaced, replayed by a client, or discarded.
+            for (name, fails) in paths {
+                if fails {
+                    fs::rename(
+                        tmp.path().join(name),
+                        tmp.path().join(format!("{name}.blocked-directory")),
+                    )
+                    .unwrap();
+                    fs::write(tmp.path().join(name), format!("recovered {name}\n")).unwrap();
+                }
+            }
+            assert!(!run_pass());
+            assert_eq!(pending.load(Ordering::Relaxed), 0);
+            assert_eq!(rq.depth.load(Ordering::Relaxed), 0);
+            assert_eq!(rq.failure_streak.load(Ordering::Relaxed), 0);
+            assert!(rq.retry_after.lock().unwrap().is_none());
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            for (name, _) in paths {
+                let entry = tree.get_path(Path::new(name)).unwrap();
+                assert_eq!(
+                    repo.find_blob(entry.id()).unwrap().content(),
+                    fs::read(tmp.path().join(name)).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coalescer_empty_pass_does_not_clear_previous_failure_backoff() {
+        let tmp = TempDir::new().unwrap();
+        let rq = Arc::new(RepoQueue::default());
+        coalescer_note_commit_failure(&rq);
+        let deadline = *rq.retry_after.lock().unwrap();
+        let repos = Arc::new(Mutex::new(HashMap::from([(
+            tmp.path().to_path_buf(),
+            Arc::clone(&rq),
+        )])));
+        rq.processing.store(true, Ordering::Release);
+        assert!(!self_process_repo(
+            tmp.path(),
+            &rq,
+            &Arc::new(Mutex::new(CommitQueueStats::default())),
+            &Arc::new(Mutex::new(VecDeque::new())),
+            &Arc::new(AtomicU64::new(0)),
+            1,
+            &repos,
+            &Arc::new((Mutex::new(0), std::sync::Condvar::new())),
+        ));
+        assert!(!rq.processing.load(Ordering::Acquire));
+        assert_eq!(rq.failure_streak.load(Ordering::Relaxed), 1);
+        assert_eq!(*rq.retry_after.lock().unwrap(), deadline);
     }
 
     #[test]
