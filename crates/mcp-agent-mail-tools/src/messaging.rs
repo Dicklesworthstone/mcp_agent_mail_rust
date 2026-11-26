@@ -5135,6 +5135,7 @@ pub async fn fetch_inbox(
     topic: Option<String>,
     mark_read: Option<bool>,
 ) -> McpResult<String> {
+    ensure_request_live(ctx)?;
     let mut phase = TailLatencyPhaseRecorder::new("fetch_inbox");
     phase.mark("queue_wait");
     let agent_name = normalize_agent_name_or_original(agent_name);
@@ -5334,6 +5335,9 @@ pub async fn fetch_inbox(
     let consumes = mark_read.unwrap_or(true);
     let live_sqlite_path = read_pool.live_sqlite_path();
     if consumes && !messages.is_empty() {
+        #[cfg(test)]
+        tests::run_before_inbox_receipts_hook();
+        ensure_request_live(ctx)?;
         let (ids, shared_ids) = unread_receipt_targets(&messages);
         // These IDs were resolved from this read pool. Keep its generation
         // authoritative until both receipt lanes and their recovery records
@@ -5362,53 +5366,69 @@ pub async fn fetch_inbox(
         if let Some(live_sqlite_path) = live_sqlite_path
             && !shared_ids.is_empty()
         {
-            match mcp_agent_mail_db::project_mailbox::mark_project_mailbox_read_batch_sync(
+            match mcp_agent_mail_db::project_mailbox::mark_project_mailbox_read_batch_sync_if_live(
+                ctx.cx(),
                 live_sqlite_path,
                 read_pool.storage_root(),
                 agent_id,
                 &shared_ids,
+                &|| ctx.ensure_live().is_ok(),
             ) {
-                Ok(Some(batch)) => {
+                Outcome::Ok(Some(batch)) => {
                     apply_auto_read_timestamp(&mut messages, &batch.message_ids, batch.read_ts);
                 }
-                Ok(None) => {}
-                Err(error) if mcp_agent_mail_db::recovery_state::is_publication_error(&error) => {
+                Outcome::Ok(None) => {}
+                Outcome::Err(error)
+                    if mcp_agent_mail_db::recovery_state::is_publication_error(&error) =>
+                {
                     return Err(auto_read_recovery_error(error, &shared_ids));
                 }
-                Err(e) => tracing::warn!(
+                Outcome::Err(e) => tracing::warn!(
                     agent_id = agent_id,
                     count = shared_ids.len(),
                     error = %e,
                     "project mailbox auto-mark-read on fetch_inbox failed"
                 ),
+                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+                Outcome::Panicked(payload) => {
+                    return db_outcome_to_mcp_result(Outcome::Panicked(payload));
+                }
             }
         }
         if let Some(live_sqlite_path) = live_sqlite_path {
-            match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
+            match mcp_agent_mail_db::sync::mark_messages_read_batch_sync_if_live(
+                ctx.cx(),
                 live_sqlite_path,
                 read_pool.storage_root(),
                 agent_id,
                 &ids,
+                &|| ctx.ensure_live().is_ok(),
             ) {
-                Ok(Some(batch)) => {
+                Outcome::Ok(Some(batch)) => {
                     apply_auto_read_timestamp(&mut messages, &batch.message_ids, batch.read_ts);
                     mcp_agent_mail_db::read_cache()
                         .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
                 }
-                Ok(None) => {
+                Outcome::Ok(None) => {
                     mcp_agent_mail_db::read_cache()
                         .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
                 }
-                Err(error) if mcp_agent_mail_db::recovery_state::is_publication_error(&error) => {
+                Outcome::Err(error)
+                    if mcp_agent_mail_db::recovery_state::is_publication_error(&error) =>
+                {
                     return Err(auto_read_recovery_error(error, &ids));
                 }
-                Err(e) => {
+                Outcome::Err(e) => {
                     tracing::warn!(
                         agent_id = agent_id,
                         count = ids.len(),
                         error = %e,
                         "batch auto-mark-read on fetch_inbox failed"
                     );
+                }
+                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+                Outcome::Panicked(payload) => {
+                    return db_outcome_to_mcp_result(Outcome::Panicked(payload));
                 }
             }
         } else {
@@ -5431,6 +5451,7 @@ pub async fn fetch_inbox(
     let config = &Config::get();
     if config.notifications_enabled
         && consumes
+        && ensure_request_live(ctx).is_ok()
         && live_sqlite_path.is_some()
         && !urgent
         && !unread
@@ -5454,7 +5475,7 @@ pub async fn fetch_inbox(
             config,
             &project.slug,
             &agent.name,
-            &can_clear,
+            &|| ensure_request_live(ctx).is_ok() && can_clear() && ensure_request_live(ctx).is_ok(),
         ) {
             mcp_agent_mail_storage::SignalClearOutcome::RemoveFailed => tracing::warn!(
                 project = %project.slug,
@@ -6673,6 +6694,15 @@ mod tests {
             const { std::cell::RefCell::new(None) };
         static BEFORE_MESSAGE_REPLAY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
+        static BEFORE_INBOX_RECEIPTS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_before_inbox_receipts_hook() {
+        let hook = BEFORE_INBOX_RECEIPTS.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub(super) fn run_before_message_replay_hook() {
@@ -6695,6 +6725,7 @@ mod tests {
         fn drop(&mut self) {
             BEFORE_MESSAGE_ADMISSION.with(|slot| *slot.borrow_mut() = None);
             BEFORE_MESSAGE_REPLAY.with(|slot| *slot.borrow_mut() = None);
+            BEFORE_INBOX_RECEIPTS.with(|slot| *slot.borrow_mut() = None);
         }
     }
 
@@ -7053,6 +7084,194 @@ mod tests {
                         mcp_agent_mail_storage::list_pending_signals(&config, Some(&project.slug));
                     assert_eq!(pending.is_empty(), mark_read.unwrap_or(true));
                 }
+            });
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fetch_inbox_cancelled_after_query_preserves_both_unread_lanes_and_signal() {
+        const PROJECT: &str = "/cancelled-inbox-receipts";
+        async fn consume(ctx: &McpContext) -> McpResult<String> {
+            fetch_inbox(
+                ctx,
+                PROJECT.to_string(),
+                "BlueLake".to_string(),
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        }
+
+        let signals = tempfile::tempdir().expect("test signals directory");
+        let overrides = [
+            ("NOTIFICATIONS_ENABLED", "1"),
+            ("NOTIFICATIONS_DEBOUNCE_MS", "0"),
+            (
+                "NOTIFICATIONS_SIGNALS_DIR",
+                signals.path().to_str().unwrap(),
+            ),
+        ];
+        with_messaging_mailbox(&overrides, |mailbox| {
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("fixture context");
+                let pool = DbPool::new(&DbPoolConfig::from_env()).expect("fixture pool");
+                let project = ensure_project_row(&cx, &pool, PROJECT).await;
+                let project_id = project.id.unwrap();
+                let sender = register_agent_row(&cx, &pool, project_id, "RedFox").await;
+                let recipient = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                let agent_id = recipient.id.unwrap();
+                let mut message_ids = Vec::new();
+                for shared in [false, true] {
+                    let recipients = if shared {
+                        vec![]
+                    } else {
+                        vec![(agent_id, "to")]
+                    };
+                    let message = queries::create_message_with_recipients_topic(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender.id.unwrap(),
+                        "cancelled consuming read",
+                        "body",
+                        None,
+                        None,
+                        None,
+                        "normal",
+                        true,
+                        "[]",
+                        &recipients,
+                        shared.then_some("to"),
+                    )
+                    .await
+                    .into_result()
+                    .expect("seed unread message");
+                    message_ids.push(message.id.unwrap());
+                }
+                message_ids.sort_unstable();
+                let config = Config::get();
+                assert_eq!(
+                    mcp_agent_mail_storage::emit_notification_signal(
+                        &config,
+                        &project.slug,
+                        &recipient.name,
+                        None,
+                    ),
+                    mcp_agent_mail_storage::SignalEmitOutcome::Emitted
+                );
+
+                for ending in ["token", "scope", "deadline", "ambient"] {
+                    let request_cx = Cx::for_testing();
+                    let (ctx, lease) = McpContext::new(request_cx.clone(), 1)
+                        .begin_request_scope()
+                        .expect("request scope");
+                    let mut lease = Some(lease);
+                    let ended_scope = if ending == "scope" {
+                        lease.take()
+                    } else {
+                        None
+                    };
+                    let hook_ctx = ctx.clone();
+                    let hook_cx = request_cx.clone();
+                    let _hook_guard = MessageAdmissionHookGuard;
+                    BEFORE_INBOX_RECEIPTS.with_borrow_mut(|hook| {
+                        *hook = Some(Box::new(move || match ending {
+                            "token" => assert!(hook_ctx.request_cancellation().cancel()),
+                            "scope" => drop(ended_scope),
+                            "deadline" => drop(hook_ctx.with_budget_ceiling(
+                                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+                            )),
+                            _ => hook_cx.set_cancel_requested(true),
+                        }));
+                    });
+                    let error = consume(&ctx)
+                        .await
+                        .expect_err("a materialized page must not consume after cancellation");
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled, "{ending}");
+                    assert!(BEFORE_INBOX_RECEIPTS.with_borrow(|hook| hook.is_none()));
+                    if ending != "ambient" {
+                        assert!(
+                            ctx.ensure_live().is_err(),
+                            "original request must end: {ending}"
+                        );
+                    }
+                    assert_eq!(request_cx.is_cancel_requested(), ending == "ambient");
+                    drop(lease);
+
+                    let conn = mcp_agent_mail_db::DbConn::open_file(
+                        mailbox.database_path.to_str().unwrap(),
+                    )
+                    .expect("inspect durable receipts");
+                    let direct = conn
+                        .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                        .unwrap();
+                    assert_eq!(direct.len(), 1);
+                    assert_eq!(direct[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+                    assert_eq!(direct[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+                    assert!(
+                        conn.query_sync("SELECT message_id FROM project_mailbox_receipts", &[])
+                            .unwrap()
+                            .is_empty(),
+                        "cancelled fetch must not create a lazy shared receipt"
+                    );
+                    assert_eq!(
+                        mcp_agent_mail_storage::list_pending_signals(&config, Some(&project.slug))
+                            .len(),
+                        1,
+                        "cancellation must preserve the unread wakeup"
+                    );
+                }
+                mcp_agent_mail_db::recovery_state::visit_records(&mailbox.storage_root, |record| {
+                    if let mcp_agent_mail_db::recovery_state::RecoveryRecord::Receipt(receipt) =
+                        record
+                    {
+                        assert!(
+                            !message_ids.contains(&receipt.message_id) || receipt.read_ts.is_none(),
+                            "cancelled consumption must not publish a recovery receipt"
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+
+                let live = McpContext::new(Cx::for_testing(), 2);
+                let response: Value = serde_json::from_str(
+                    &consume(&live)
+                        .await
+                        .expect("live retry consumes both lanes"),
+                )
+                .unwrap();
+                assert_eq!(response.as_array().unwrap().len(), 2);
+                assert!(response.as_array().unwrap().iter().all(|message| {
+                    message["read_ts"].is_string() && message["ack_ts"].is_null()
+                }));
+                let mut preserved = Vec::new();
+                mcp_agent_mail_db::recovery_state::visit_records(&mailbox.storage_root, |record| {
+                    if let mcp_agent_mail_db::recovery_state::RecoveryRecord::Receipt(receipt) =
+                        record
+                        && receipt.agent_id == agent_id
+                        && receipt.read_ts.is_some()
+                    {
+                        preserved.push(receipt.message_id);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                preserved.sort_unstable();
+                preserved.dedup();
+                assert_eq!(preserved, message_ids);
+                assert!(
+                    mcp_agent_mail_storage::list_pending_signals(&config, Some(&project.slug))
+                        .is_empty()
+                );
             });
         });
     }

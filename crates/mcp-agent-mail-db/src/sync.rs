@@ -15,6 +15,52 @@ pub(crate) use inbox::with_snapshot as with_read_snapshot;
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
 
+/// Keep request cancellation distinct from SQL failures while synchronous
+/// receipt transactions unwind. A rollback failure remains a database error.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReceiptWriteError {
+    #[error(transparent)]
+    Database(#[from] DbError),
+    #[error("inbox read receipt request was cancelled")]
+    Cancelled(asupersync::CancelReason),
+}
+
+impl ReceiptWriteError {
+    pub(crate) fn into_database_error(self) -> DbError {
+        match self {
+            Self::Database(error) => error,
+            Self::Cancelled(_) => {
+                DbError::Internal("unguarded read receipt reported cancellation".to_string())
+            }
+        }
+    }
+}
+
+pub(crate) fn receipt_write_checkpoint(
+    cx: &asupersync::Cx,
+    request_live: &dyn Fn() -> bool,
+) -> Result<(), ReceiptWriteError> {
+    if cx.checkpoint().is_ok() && request_live() {
+        Ok(())
+    } else {
+        Err(ReceiptWriteError::Cancelled(
+            cx.cancel_reason().unwrap_or_else(|| {
+                asupersync::CancelReason::user("inbox read receipt request is no longer live")
+            }),
+        ))
+    }
+}
+
+pub(crate) fn receipt_write_outcome<T>(
+    result: Result<T, ReceiptWriteError>,
+) -> asupersync::Outcome<T, DbError> {
+    match result {
+        Ok(value) => asupersync::Outcome::Ok(value),
+        Err(ReceiptWriteError::Database(error)) => asupersync::Outcome::Err(error),
+        Err(ReceiptWriteError::Cancelled(reason)) => asupersync::Outcome::Cancelled(reason),
+    }
+}
+
 /// A body-free, durable delivery event for one inbox recipient.
 ///
 /// `seq` is a recipient-local cursor, not a message identifier. Consumers
@@ -1459,11 +1505,23 @@ fn direct_read_receipts(
     Ok(receipts)
 }
 
+#[cfg(test)]
 fn mark_messages_read_batch_sync_conn(
     conn: &DbConn,
     agent_id: i64,
     message_ids: &[i64],
 ) -> Result<Option<MarkMessagesReadBatch>, DbError> {
+    mark_messages_read_batch_sync_conn_with_checkpoint(conn, agent_id, message_ids, &|| Ok(()))
+        .map_err(ReceiptWriteError::into_database_error)
+}
+
+fn mark_messages_read_batch_sync_conn_with_checkpoint(
+    conn: &DbConn,
+    agent_id: i64,
+    message_ids: &[i64],
+    checkpoint: &dyn Fn() -> Result<(), ReceiptWriteError>,
+) -> Result<Option<MarkMessagesReadBatch>, ReceiptWriteError> {
+    checkpoint()?;
     if message_ids.is_empty() {
         return Ok(None);
     }
@@ -1475,7 +1533,9 @@ fn mark_messages_read_batch_sync_conn(
 
     let transaction = SyncWriteTransaction::begin(conn)?;
 
-    let result = (|| -> Result<Vec<i64>, DbError> {
+    let result = (|| -> Result<Vec<i64>, ReceiptWriteError> {
+        // BEGIN may have waited behind another writer after the request died.
+        checkpoint()?;
         // Observe the entire request before any chunk can change receipts.
         let mut expected = direct_read_receipts(conn, agent_id, &unique_message_ids)?;
         let mut updated_message_ids = Vec::new();
@@ -1486,6 +1546,7 @@ fn mark_messages_read_batch_sync_conn(
             }
         }
         for chunk in updated_message_ids.chunks(MAX_SYNC_IN_CLAUSE_ITEMS) {
+            checkpoint()?;
             let sql = format!(
                 "UPDATE message_recipients \
                  SET read_ts = ? \
@@ -1511,10 +1572,11 @@ fn mark_messages_read_batch_sync_conn(
         // ALL chunks and stats writes: a late trigger must not undo earlier
         // reads, alter ACK state, or change an already-read requested row.
         if direct_read_receipts(conn, agent_id, &unique_message_ids)? != expected {
-            return Err(DbError::Sqlite(
+            return Err(ReceiptWriteError::Database(DbError::Sqlite(
                 "direct read receipts did not match the requested state".into(),
-            ));
+            )));
         }
+        checkpoint()?;
         Ok(updated_message_ids)
     })();
 
@@ -1538,6 +1600,48 @@ pub fn mark_messages_read_batch_sync(
     agent_id: i64,
     message_ids: &[i64],
 ) -> Result<Option<MarkMessagesReadBatch>, DbError> {
+    mark_messages_read_batch_sync_with_checkpoint(
+        sqlite_path,
+        storage_root,
+        agent_id,
+        message_ids,
+        &|| Ok(()),
+    )
+    .map_err(ReceiptWriteError::into_database_error)
+}
+
+/// Publish direct read receipts only while the consuming request is live.
+///
+/// The predicate carries transport cancellation, scope and deadline state not
+/// present in the ambient `Cx`. It must be cheap and must not open a database
+/// connection. Cancellation observed before commit rolls back the entire
+/// batch. Once committed, recovery publication completes even if the request
+/// subsequently expires; committed state is never reported as rolled back.
+pub fn mark_messages_read_batch_sync_if_live(
+    cx: &asupersync::Cx,
+    sqlite_path: &str,
+    storage_root: &std::path::Path,
+    agent_id: i64,
+    message_ids: &[i64],
+    request_live: &dyn Fn() -> bool,
+) -> asupersync::Outcome<Option<MarkMessagesReadBatch>, DbError> {
+    receipt_write_outcome(mark_messages_read_batch_sync_with_checkpoint(
+        sqlite_path,
+        storage_root,
+        agent_id,
+        message_ids,
+        &|| receipt_write_checkpoint(cx, request_live),
+    ))
+}
+
+fn mark_messages_read_batch_sync_with_checkpoint(
+    sqlite_path: &str,
+    storage_root: &std::path::Path,
+    agent_id: i64,
+    message_ids: &[i64],
+    checkpoint: &dyn Fn() -> Result<(), ReceiptWriteError>,
+) -> Result<Option<MarkMessagesReadBatch>, ReceiptWriteError> {
+    checkpoint()?;
     if message_ids.is_empty() {
         return Ok(None);
     }
@@ -1557,18 +1661,19 @@ pub fn mark_messages_read_batch_sync(
         )
     };
     let conn = open_sync_conn(sqlite_path)?;
-    let result =
-        mark_messages_read_batch_sync_conn(&conn, agent_id, message_ids).and_then(|batch| {
-            if sqlite_path != ":memory:" {
-                crate::recovery_state::persist_receipts(
-                    &conn,
-                    storage_root,
-                    agent_id,
-                    message_ids,
-                )?;
-            }
-            Ok(batch)
-        });
+    let result = mark_messages_read_batch_sync_conn_with_checkpoint(
+        &conn,
+        agent_id,
+        message_ids,
+        checkpoint,
+    )
+    .and_then(|batch| {
+        // Do not cancel after COMMIT: these receipts must survive recovery.
+        if sqlite_path != ":memory:" {
+            crate::recovery_state::persist_receipts(&conn, storage_root, agent_id, message_ids)?;
+        }
+        Ok(batch)
+    });
     crate::close_db_conn(conn, "mark_messages_read_batch_sync connection");
     result
 }
@@ -1588,12 +1693,15 @@ impl<'a> SyncWriteTransaction<'a> {
         Ok(Self { conn, active: true })
     }
 
-    fn finish<T>(mut self, result: Result<T, DbError>) -> Result<T, DbError> {
+    fn finish<T, E>(mut self, result: Result<T, E>) -> Result<T, E>
+    where
+        E: From<DbError> + std::fmt::Display,
+    {
         let result = result.and_then(|value| {
             self.conn
                 .execute_sync("COMMIT", &[])
                 .map(|_| value)
-                .map_err(|e| DbError::Sqlite(e.to_string()))
+                .map_err(|e| E::from(DbError::Sqlite(e.to_string())))
         });
         match result {
             Ok(value) => {
@@ -1608,9 +1716,9 @@ impl<'a> SyncWriteTransaction<'a> {
                 Err(rollback) => {
                     // Drop makes one last attempt; report both failures,
                     // never a guarantee that this session is reusable.
-                    Err(DbError::Sqlite(format!(
+                    Err(E::from(DbError::Sqlite(format!(
                         "synchronous write failed ({error}); rollback failed ({rollback})"
-                    )))
+                    ))))
                 }
             },
         }
@@ -4643,6 +4751,98 @@ mod tests {
         .expect("one row should be updated");
 
         assert_eq!(batch.message_ids, vec![updated_message_id]);
+    }
+
+    #[test]
+    fn sync_read_receipts_cancel_before_commit_without_consuming_mail() {
+        for before_admission in [true, false] {
+            write_failure_fixture(|conn, _, recipient, first, second| {
+                rebuild_agent_inbox_stats_sync(conn, recipient).unwrap();
+                let observed_mutation = std::cell::Cell::new(false);
+                let cx = asupersync::Cx::for_testing();
+                let still_live = || {
+                    if before_admission {
+                        return false;
+                    }
+                    let receipts = direct_read_receipts(conn, recipient, &[first, second]).unwrap();
+                    let changed = receipts.values().all(|(read, _)| read.is_some());
+                    let stats = compute_agent_inbox_stats_sync(conn, recipient)
+                        .unwrap()
+                        .unwrap();
+                    if changed && stats.unread_count == 0 {
+                        observed_mutation.set(true);
+                        false
+                    } else {
+                        true
+                    }
+                };
+                let result = mark_messages_read_batch_sync_conn_with_checkpoint(
+                    conn,
+                    recipient,
+                    &[first, second],
+                    &|| receipt_write_checkpoint(&cx, &still_live),
+                );
+                assert!(matches!(
+                    receipt_write_outcome(result),
+                    asupersync::Outcome::Cancelled(_)
+                ));
+                assert_eq!(observed_mutation.get(), !before_admission);
+                assert!(
+                    !cx.is_cancel_requested(),
+                    "transport refusal is request-local"
+                );
+                assert_no_fixture_reads(conn, recipient);
+                let stats = conn
+                    .query_sync(
+                        "SELECT unread_count FROM inbox_stats WHERE agent_id = ?",
+                        &[Value::BigInt(recipient)],
+                    )
+                    .unwrap();
+                assert_eq!(stats[0].get_named::<i64>("unread_count").unwrap(), 2);
+
+                let committed = mark_messages_read_batch_sync_conn_with_checkpoint(
+                    conn,
+                    recipient,
+                    &[first, second],
+                    &|| receipt_write_checkpoint(&cx, &|| true),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(committed.message_ids, vec![first, second]);
+            });
+        }
+    }
+
+    #[test]
+    fn cancelled_receipt_requests_do_not_open_either_database_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("must-not-exist.sqlite3");
+        let cx = asupersync::Cx::for_testing();
+        for ambient in [false, true] {
+            cx.set_cancel_requested(ambient);
+            let direct = mark_messages_read_batch_sync_if_live(
+                &cx,
+                path.to_str().unwrap(),
+                dir.path(),
+                10,
+                &[1],
+                &|| ambient,
+            );
+            let shared = crate::project_mailbox::mark_project_mailbox_read_batch_sync_if_live(
+                &cx,
+                path.to_str().unwrap(),
+                dir.path(),
+                10,
+                &[1],
+                &|| ambient,
+            );
+            assert!(matches!(direct, asupersync::Outcome::Cancelled(_)));
+            assert!(matches!(shared, asupersync::Outcome::Cancelled(_)));
+            assert!(
+                !path.exists(),
+                "cancellation must precede database creation"
+            );
+        }
     }
 
     #[test]

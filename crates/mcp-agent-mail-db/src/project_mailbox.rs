@@ -48,6 +48,7 @@ use crate::queries::UNKNOWN_SENDER_DISPLAY;
 #[cfg(test)]
 use crate::sync::InboxBodyPolicy;
 use crate::sync::InboxFetchOptions;
+use crate::sync::{ReceiptWriteError, receipt_write_checkpoint, receipt_write_outcome};
 use sqlmodel_core::Value;
 use std::collections::HashMap;
 
@@ -1065,12 +1066,15 @@ impl<'a> ReceiptTransaction<'a> {
         Ok(Self { conn, active: true })
     }
 
-    fn finish<T>(mut self, result: Result<T, DbError>) -> Result<T, DbError> {
+    fn finish<T, E>(mut self, result: Result<T, E>) -> Result<T, E>
+    where
+        E: From<DbError> + std::fmt::Display,
+    {
         let result = result.and_then(|value| {
             self.conn
                 .execute_sync("COMMIT", &[])
                 .map(|_| value)
-                .map_err(|error| DbError::Sqlite(error.to_string()))
+                .map_err(|error| E::from(DbError::Sqlite(error.to_string())))
         });
         match result {
             Ok(value) => {
@@ -1085,9 +1089,9 @@ impl<'a> ReceiptTransaction<'a> {
                 Err(rollback) => {
                     // Drop makes one last cleanup attempt. The caller still
                     // receives an error, not a reusable-session guarantee.
-                    Err(DbError::Sqlite(format!(
+                    Err(E::from(DbError::Sqlite(format!(
                         "project mailbox receipt transaction failed ({error}); rollback failed ({rollback})"
-                    )))
+                    ))))
                 }
             },
         }
@@ -1135,6 +1139,19 @@ pub fn mark_project_mailbox_read_batch_sync_conn(
     agent_id: i64,
     message_ids: &[i64],
 ) -> Result<Option<ProjectMailboxReadBatch>, DbError> {
+    mark_project_mailbox_read_batch_sync_conn_with_checkpoint(conn, agent_id, message_ids, &|| {
+        Ok(())
+    })
+    .map_err(ReceiptWriteError::into_database_error)
+}
+
+fn mark_project_mailbox_read_batch_sync_conn_with_checkpoint(
+    conn: &DbConn,
+    agent_id: i64,
+    message_ids: &[i64],
+    checkpoint: &dyn Fn() -> Result<(), ReceiptWriteError>,
+) -> Result<Option<ProjectMailboxReadBatch>, ReceiptWriteError> {
+    checkpoint()?;
     if message_ids.is_empty() {
         return Ok(None);
     }
@@ -1144,7 +1161,9 @@ pub fn mark_project_mailbox_read_batch_sync_conn(
     let read_ts = crate::now_micros();
 
     let transaction = ReceiptTransaction::begin(conn)?;
-    let result = (|| -> Result<Vec<i64>, DbError> {
+    let result = (|| -> Result<Vec<i64>, ReceiptWriteError> {
+        // Admission may have waited behind a peer after transport cancellation.
+        checkpoint()?;
         let mut updated = Vec::new();
         let mut expected = visible_receipts(conn, agent_id, &unique)?;
         for (message_id, existing_read, _) in &mut expected {
@@ -1154,6 +1173,7 @@ pub fn mark_project_mailbox_read_batch_sync_conn(
             for (sql, params) in
                 receipt_write_statements(ReceiptUpdate::Read, *message_id, agent_id, read_ts)
             {
+                checkpoint()?;
                 conn.execute_sync(sql, &params)
                     .map_err(|error| DbError::Sqlite(error.to_string()))?;
             }
@@ -1163,6 +1183,7 @@ pub fn mark_project_mailbox_read_batch_sync_conn(
         if !updated.is_empty() {
             verify_read_receipts(conn, agent_id, &unique, &mut expected)?;
         }
+        checkpoint()?;
         Ok(updated)
     })();
     let updated = transaction.finish(result)?;
@@ -1179,6 +1200,47 @@ pub fn mark_project_mailbox_read_batch_sync(
     agent_id: i64,
     message_ids: &[i64],
 ) -> Result<Option<ProjectMailboxReadBatch>, DbError> {
+    mark_project_mailbox_read_batch_sync_with_checkpoint(
+        sqlite_path,
+        storage_root,
+        agent_id,
+        message_ids,
+        &|| Ok(()),
+    )
+    .map_err(ReceiptWriteError::into_database_error)
+}
+
+/// Publish shared-mailbox read receipts while the consuming request is live.
+///
+/// Checks transport liveness and the ambient context before opening the
+/// database, after writer admission, between mutations and before commit.
+/// Observed cancellation rolls back; a committed receipt still completes its
+/// recovery publication. The predicate must not acquire database connections.
+pub fn mark_project_mailbox_read_batch_sync_if_live(
+    cx: &asupersync::Cx,
+    sqlite_path: &str,
+    storage_root: &std::path::Path,
+    agent_id: i64,
+    message_ids: &[i64],
+    request_live: &dyn Fn() -> bool,
+) -> asupersync::Outcome<Option<ProjectMailboxReadBatch>, DbError> {
+    receipt_write_outcome(mark_project_mailbox_read_batch_sync_with_checkpoint(
+        sqlite_path,
+        storage_root,
+        agent_id,
+        message_ids,
+        &|| receipt_write_checkpoint(cx, request_live),
+    ))
+}
+
+fn mark_project_mailbox_read_batch_sync_with_checkpoint(
+    sqlite_path: &str,
+    storage_root: &std::path::Path,
+    agent_id: i64,
+    message_ids: &[i64],
+    checkpoint: &dyn Fn() -> Result<(), ReceiptWriteError>,
+) -> Result<Option<ProjectMailboxReadBatch>, ReceiptWriteError> {
+    checkpoint()?;
     if message_ids.is_empty() {
         return Ok(None);
     }
@@ -1201,19 +1263,20 @@ pub fn mark_project_mailbox_read_batch_sync(
         "PRAGMA busy_timeout = {}",
         mcp_agent_mail_core::config::DB_RUNTIME_BUSY_TIMEOUT_MS
     ));
-    let result =
-        mark_project_mailbox_read_batch_sync_conn(&conn, agent_id, message_ids).and_then(|batch| {
-            // Repeated reads also finish a prior failed post-commit publication.
-            if sqlite_path != ":memory:" {
-                crate::recovery_state::persist_receipts(
-                    &conn,
-                    storage_root,
-                    agent_id,
-                    message_ids,
-                )?;
-            }
-            Ok(batch)
-        });
+    let result = mark_project_mailbox_read_batch_sync_conn_with_checkpoint(
+        &conn,
+        agent_id,
+        message_ids,
+        checkpoint,
+    )
+    .and_then(|batch| {
+        // Repeated reads also finish a prior failed post-commit publication.
+        // COMMIT has already succeeded: cancellation must not omit recovery.
+        if sqlite_path != ":memory:" {
+            crate::recovery_state::persist_receipts(&conn, storage_root, agent_id, message_ids)?;
+        }
+        Ok(batch)
+    });
     crate::close_db_conn(conn, "mark_project_mailbox_read_batch_sync connection");
     result
 }
@@ -1580,6 +1643,71 @@ mod tests {
     fn assert_receipt_writer_released(conn: &DbConn) {
         conn.execute_raw("BEGIN IMMEDIATE").unwrap();
         conn.execute_raw("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn shared_read_receipts_cancel_before_commit_without_consuming_mail() {
+        for before_admission in [true, false] {
+            receipt_fixture(|conn| {
+                conn.execute_raw(
+                    "INSERT INTO project_mailbox_receipts VALUES (100, 20, NULL, 77), (100, 30, 11, 22)",
+                )
+                .unwrap();
+                let observed_mutation = std::cell::Cell::new(false);
+                let cx = asupersync::Cx::for_testing();
+                let still_live = || {
+                    if before_admission {
+                        return false;
+                    }
+                    let rows = conn
+                        .query_sync(
+                            "SELECT message_id FROM project_mailbox_receipts \
+                             WHERE agent_id = 20 AND read_ts IS NOT NULL ORDER BY message_id",
+                            &[],
+                        )
+                        .unwrap();
+                    if rows.len() == 2 {
+                        observed_mutation.set(true);
+                        false
+                    } else {
+                        true
+                    }
+                };
+                let result = mark_project_mailbox_read_batch_sync_conn_with_checkpoint(
+                    conn,
+                    20,
+                    &[100, 200],
+                    &|| receipt_write_checkpoint(&cx, &still_live),
+                );
+                assert!(matches!(
+                    receipt_write_outcome(result),
+                    asupersync::Outcome::Cancelled(_)
+                ));
+                assert_eq!(observed_mutation.get(), !before_admission);
+                let rows = conn
+                    .query_sync(
+                        "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts ORDER BY agent_id",
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(rows.len(), 2, "the new lazy receipt must roll back");
+                assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+                assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 77);
+                assert_eq!(rows[1].get_named::<i64>("read_ts").unwrap(), 11);
+                assert_eq!(rows[1].get_named::<i64>("ack_ts").unwrap(), 22);
+                assert_receipt_writer_released(conn);
+
+                let committed = mark_project_mailbox_read_batch_sync_conn_with_checkpoint(
+                    conn,
+                    20,
+                    &[100, 200],
+                    &|| receipt_write_checkpoint(&cx, &|| true),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(committed.message_ids, vec![100, 200]);
+            });
+        }
     }
 
     #[test]
