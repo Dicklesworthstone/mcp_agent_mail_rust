@@ -14643,23 +14643,14 @@ to skip auth for local requests.</p>
                     agent_hint.as_deref(),
                 );
 
-                // Record agent activity in the ATC engine for liveness tracking.
-                if let Some(ref agent) = agent_hint {
-                    atc::atc_observe_activity_with_project(
-                        agent,
-                        project_hint.as_deref(),
-                        mcp_agent_mail_core::timestamps::now_micros(),
-                    );
-                }
-
-                // Register agent in ATC on successful register_agent / macro_start_session.
-                if matches!(tool_name.as_str(), "register_agent" | "macro_start_session")
-                    && let Some(ref agent) = agent_hint
-                {
-                    let program =
-                        extract_arg_str(call_arguments.as_ref(), &["program"]).unwrap_or_default();
-                    atc::atc_register_agent_with_project(agent, &program, project_hint.as_deref());
-                }
+                record_atc_liveness_from_tool_result(
+                    &self.config,
+                    cx,
+                    &tool_name,
+                    call_arguments.as_ref(),
+                    &value,
+                    mcp_agent_mail_core::timestamps::now_micros(),
+                );
 
                 // Emit tool-call-end panel
                 if let Some(start) = call_start {
@@ -14959,6 +14950,163 @@ fn parse_call_tool_result_payload(call_result: &serde_json::Value) -> Option<ser
         }
     }
     None
+}
+
+struct AtcToolLivenessActor {
+    name: String,
+    registration: Option<(String, i64)>,
+}
+
+fn atc_tool_liveness_actor(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    call_result: &serde_json::Value,
+) -> Option<AtcToolLivenessActor> {
+    // A router-level Ok can still carry a failed tool result. Neither a failed
+    // registration nor a rejected request is evidence of agent activity.
+    if ["isError", "is_error"].iter().any(|field| {
+        call_result
+            .get(*field)
+            .is_some_and(|value| value.as_bool() != Some(false))
+    }) {
+        return None;
+    }
+    if matches!(
+        tool_name,
+        "register_agent" | "create_agent_identity" | "macro_start_session"
+    ) {
+        let payload = parse_call_tool_result_payload(call_result)?;
+        let agent = if tool_name == "macro_start_session" {
+            payload.get("agent")?
+        } else {
+            &payload
+        };
+        // Registration can generate, normalize, or adopt a name. The returned
+        // identity is authoritative; the optional request hint is not.
+        let name = agent.get("name")?.as_str()?.to_string();
+        let program = agent.get("program")?.as_str()?.to_string();
+        let project_id = json_i64_field(agent, "project_id").filter(|id| *id > 0)?;
+        return (!name.trim().is_empty()).then_some(AtcToolLivenessActor {
+            name,
+            registration: Some((program, project_id)),
+        });
+    }
+
+    // These fields identify the caller of each tool. The shared display hint
+    // also accepts inspection/contact targets and cannot establish liveness.
+    let fields: &[&str] = match tool_name {
+        "send_message" | "reply_message" => &["sender_name"],
+        "request_contact" => &["from_agent"],
+        "respond_contact" => &["to_agent"],
+        "macro_contact_handshake" => &["requester", "agent_name"],
+        "fetch_inbox"
+        | "fetch_inbox_events"
+        | "fetch_inbox_product"
+        | "mark_message_read"
+        | "mark_all_read"
+        | "acknowledge_message"
+        | "set_contact_policy"
+        | "file_reservation_paths"
+        | "release_file_reservations"
+        | "renew_file_reservations"
+        | "force_release_file_reservation"
+        | "check_file_reservation_conflicts"
+        | "acquire_build_slot"
+        | "renew_build_slot"
+        | "release_build_slot"
+        | "macro_prepare_thread"
+        | "macro_file_reservation_cycle" => &["agent_name"],
+        _ => return None,
+    };
+    let name = extract_arg_str(call_args, fields)?;
+    let name = mcp_agent_mail_core::models::normalize_agent_name(&name).unwrap_or(name);
+    (!name.trim().is_empty()).then_some(AtcToolLivenessActor {
+        name,
+        registration: None,
+    })
+}
+
+fn cached_atc_liveness_project(
+    config: &mcp_agent_mail_core::Config,
+    project_key: &str,
+) -> Option<mcp_agent_mail_db::ProjectRow> {
+    let project_key = project_key.trim();
+    if project_key.is_empty()
+        || project_key.len() > mcp_agent_mail_db::models::ATC_POPULATION_MAX_PROJECT_BYTES
+    {
+        return None;
+    }
+    let pool = mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_config(config))?;
+    let scope = pool.sqlite_identity_key();
+    let cache = mcp_agent_mail_db::cache::read_cache();
+    let project = if std::path::Path::new(project_key).is_absolute() {
+        cache.get_project_by_human_key_scoped(&scope, project_key)
+    } else {
+        cache.get_project_scoped(&scope, project_key)
+    }?;
+    // Only the already-resolved row supplies identity. Never turn a display
+    // slug, an unrelated generation's cache entry, or an unresolved path into
+    // a scope. A cache miss leaves durable population hydration responsible
+    // for the next observation; it does not add DB work to the caller's budget.
+    (project.id.is_some_and(|id| id > 0)
+        && !project.human_key.trim().is_empty()
+        && project.human_key.len() <= mcp_agent_mail_db::models::ATC_POPULATION_MAX_PROJECT_BYTES)
+        .then_some(project)
+}
+
+fn record_atc_liveness_from_tool_result(
+    config: &mcp_agent_mail_core::Config,
+    cx: &Cx,
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    call_result: &serde_json::Value,
+    timestamp_micros: i64,
+) -> bool {
+    let request_is_live = || {
+        cx.checkpoint().is_ok()
+            && cx
+                .budget()
+                .deadline
+                .is_none_or(|deadline| wall_now() < deadline)
+    };
+    if timestamp_micros <= 0 || !request_is_live() || !atc::atc_enabled() {
+        return false;
+    }
+    let Some(actor) = atc_tool_liveness_actor(tool_name, call_args, call_result) else {
+        return false;
+    };
+    let Some(project_key) = extract_arg_str(
+        call_args,
+        &["project_key", "project", "human_key", "project_slug"],
+    ) else {
+        return false;
+    };
+    let Some(project) = cached_atc_liveness_project(config, &project_key) else {
+        return false;
+    };
+    if !request_is_live() {
+        return false;
+    }
+    if let Some((program, registered_project)) = actor.registration {
+        if project.id != Some(registered_project) {
+            return false;
+        }
+        // Keep admission and observation under one engine lock. A rejected
+        // registration must not fall through to activity's unknown-tool path.
+        atc::atc_sync_agent_snapshot(
+            &actor.name,
+            &program,
+            Some(&project.human_key),
+            timestamp_micros,
+        );
+    } else {
+        atc::atc_observe_activity_with_project(
+            &actor.name,
+            Some(&project.human_key),
+            timestamp_micros,
+        );
+    }
+    true
 }
 
 fn parse_text_payload_json(text: &str) -> Option<serde_json::Value> {
@@ -41030,6 +41178,317 @@ first body
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn atc_liveness_actor_distinguishes_callers_from_inspection_targets() {
+        let arguments = serde_json::json!({
+            "agent_name": "InspectionTarget",
+            "from_agent": "ContactRequester",
+            "to_agent": "ContactResponder",
+            "requester": "HandshakeCaller",
+        });
+        let success = serde_json::json!({"isError": false});
+        for tool in ["whois", "list_contacts", "list_agents"] {
+            assert!(atc_tool_liveness_actor(tool, Some(&arguments), &success).is_none());
+        }
+        for (tool, expected) in [
+            ("request_contact", "ContactRequester"),
+            ("respond_contact", "ContactResponder"),
+            ("macro_contact_handshake", "HandshakeCaller"),
+        ] {
+            assert_eq!(
+                atc_tool_liveness_actor(tool, Some(&arguments), &success)
+                    .expect("actual tool caller")
+                    .name,
+                expected
+            );
+        }
+        let registration = serde_json::json!({
+            "structuredContent": {
+                "name": "ReturnedIdentity",
+                "program": "codex-cli",
+                "project_id": 7,
+            },
+        });
+        let request = serde_json::json!({"name": "requested-name"});
+        assert_eq!(
+            atc_tool_liveness_actor("register_agent", Some(&request), &registration)
+                .expect("returned registration identity")
+                .name,
+            "ReturnedIdentity"
+        );
+        for flag in ["isError", "is_error"] {
+            let mut failed = registration.clone();
+            failed[flag] = serde_json::json!(true);
+            assert!(atc_tool_liveness_actor("register_agent", Some(&request), &failed).is_none());
+        }
+    }
+
+    #[test]
+    fn atc_liveness_ingress_preserves_canonical_scope_and_generated_identity() {
+        const CHILD: &str = "AM_TEST_ATC_LIVENESS_INGRESS_CHILD";
+        const CHILD_COMPLETE: &str = "atc-liveness-ingress-child-complete";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::Builder::new()
+                .prefix("am-atc-liveness-ingress-")
+                .tempdir()
+                .expect("isolated liveness ingress fixture");
+            std::fs::create_dir(dir.path().join("project-alpha")).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::atc_liveness_ingress_preserves_canonical_scope_and_generated_identity",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "DATABASE_URL",
+                    format!("sqlite:///{}", dir.path().join("mail.sqlite3").display()),
+                )
+                .env("STORAGE_ROOT", dir.path().join("archive"))
+                .env("AM_ATC_ENABLED", "true")
+                .env("AM_ATC_WRITE_MODE", "live")
+                .env("AM_ATC_EXECUTOR_MODE", "shadow")
+                .env("ATC_LEARNING_DISABLED", "0")
+                .env("WORKTREES_ENABLED", "false")
+                .env("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .env("XDG_DATA_HOME", dir.path().join("data"))
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .current_dir(dir.path())
+                .output()
+                .expect("run isolated liveness ingress test");
+            assert!(
+                output.status.success(),
+                "liveness ingress fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETE),
+                "the isolated child must execute the full ingress regression"
+            );
+            return;
+        }
+
+        let config = mcp_agent_mail_core::Config::get();
+        atc::init_global_atc(&config);
+        let pool = {
+            let request_pool = mcp_agent_mail_tools::tool_util::get_db_pool().unwrap();
+            (*request_pool).clone()
+        };
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let root = std::env::current_dir().unwrap();
+        let project_key = root.join("project-alpha").to_string_lossy().into_owned();
+        let project = block_on(mcp_agent_mail_db::queries::ensure_project(
+            &cx,
+            &pool,
+            &project_key,
+        ))
+        .into_result()
+        .expect("real project and scoped project cache");
+        let registration = block_on(mcp_agent_mail_tools::register_agent(
+            &ctx,
+            project_key.clone(),
+            "codex-cli".to_string(),
+            "test-model".to_string(),
+            None,
+            Some("liveness ingress regression".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(false),
+        ))
+        .expect("real registration generates an agent name");
+        let agent: serde_json::Value = serde_json::from_str(&registration).unwrap();
+        let name = agent["name"].as_str().expect("generated name").to_string();
+        assert!(!name.is_empty());
+        let registration_args = serde_json::json!({
+            "project_key": project_key,
+            "program": "codex-cli",
+            "model": "test-model",
+        });
+        assert!(registration_args.get("name").is_none());
+        assert!(atc::atc_agent_scope_and_activity_for_test(&name).is_none());
+        let registration_result = serde_json::json!({
+            "content": [{"type": "text", "text": registration}],
+            "isError": false,
+        });
+        let anchor = mcp_agent_mail_db::now_micros() + 10_000_000;
+        assert!(record_atc_liveness_from_tool_result(
+            &config,
+            &cx,
+            "register_agent",
+            Some(&registration_args),
+            &registration_result,
+            anchor,
+        ));
+        assert_eq!(
+            atc::atc_agent_scope_and_activity_for_test(&name),
+            Some((Some(project.human_key.clone()), anchor))
+        );
+
+        let macro_args = serde_json::json!({"human_key": project_key, "program": "codex-cli"});
+        let macro_result = serde_json::json!({
+            "structuredContent": {"project": {
+                "id": project.id,
+                "human_key": project.human_key,
+                "slug": project.slug,
+            }, "agent": agent.clone()},
+        });
+        assert!(record_atc_liveness_from_tool_result(
+            &config,
+            &cx,
+            "macro_start_session",
+            Some(&macro_args),
+            &macro_result,
+            anchor + 1,
+        ));
+        let success = serde_json::json!({"content": [{"type": "text", "text": "[]"}]});
+        for (identifier, timestamp) in [
+            (&project.human_key, anchor + 2),
+            (&project.slug, anchor + 3),
+        ] {
+            let arguments = serde_json::json!({"project_key": identifier, "agent_name": name});
+            assert!(record_atc_liveness_from_tool_result(
+                &config,
+                &cx,
+                "fetch_inbox",
+                Some(&arguments),
+                &success,
+                timestamp,
+            ));
+            assert_eq!(
+                atc::atc_agent_scope_and_activity_for_test(&name),
+                Some((Some(project.human_key.clone()), timestamp))
+            );
+        }
+        let lowercase_name = name.to_ascii_lowercase();
+        assert_ne!(lowercase_name, name);
+        assert!(record_atc_liveness_from_tool_result(
+            &config,
+            &cx,
+            "fetch_inbox",
+            Some(&serde_json::json!({
+                "project_key": project.slug,
+                "agent_name": lowercase_name,
+            })),
+            &success,
+            anchor + 4,
+        ));
+        assert!(atc::atc_agent_scope_and_activity_for_test(&lowercase_name).is_none());
+        let retained = Some((Some(project.human_key.clone()), anchor + 4));
+        assert_eq!(atc::atc_agent_scope_and_activity_for_test(&name), retained);
+
+        let colliding_path = root.join("Project-Alpha").to_string_lossy().into_owned();
+        assert_ne!(colliding_path, project.human_key);
+        assert_eq!(
+            normalize_project_value(colliding_path.clone()),
+            normalize_project_value(project.human_key.clone()),
+            "the unresolved path must really collide as a display slug"
+        );
+        for identifier in [colliding_path, "missing-project".to_string()] {
+            let arguments = serde_json::json!({"project_key": identifier, "agent_name": name});
+            assert!(!record_atc_liveness_from_tool_result(
+                &config,
+                &cx,
+                "fetch_inbox",
+                Some(&arguments),
+                &success,
+                anchor + 100,
+            ));
+            assert_eq!(atc::atc_agent_scope_and_activity_for_test(&name), retained);
+        }
+        let mut mismatched_agent = agent;
+        mismatched_agent["project_id"] = serde_json::json!(project.id.unwrap() + 1);
+        assert!(!record_atc_liveness_from_tool_result(
+            &config,
+            &cx,
+            "register_agent",
+            Some(&registration_args),
+            &serde_json::json!({"structuredContent": mismatched_agent}),
+            anchor + 100,
+        ));
+        assert_eq!(atc::atc_agent_scope_and_activity_for_test(&name), retained);
+
+        let arguments = serde_json::json!({"project_key": project.slug, "agent_name": name});
+        for flag in ["isError", "is_error"] {
+            let mut failed = success.clone();
+            failed[flag] = serde_json::json!(true);
+            assert!(!record_atc_liveness_from_tool_result(
+                &config,
+                &cx,
+                "fetch_inbox",
+                Some(&arguments),
+                &failed,
+                anchor + 100,
+            ));
+            assert_eq!(atc::atc_agent_scope_and_activity_for_test(&name), retained);
+        }
+        for tool in ["whois", "list_contacts"] {
+            assert!(!record_atc_liveness_from_tool_result(
+                &config,
+                &cx,
+                tool,
+                Some(&arguments),
+                &success,
+                anchor + 100,
+            ));
+            assert_eq!(atc::atc_agent_scope_and_activity_for_test(&name), retained);
+        }
+        let cancelled = Cx::for_testing();
+        cancelled.cancel_with(asupersync::types::CancelKind::User, None);
+        let expired = Cx::for_testing_with_budget(
+            Budget::INFINITE.with_deadline(asupersync::Time::from_secs(0)),
+        );
+        for rejected_cx in [cancelled, expired] {
+            assert!(!record_atc_liveness_from_tool_result(
+                &config,
+                &rejected_cx,
+                "fetch_inbox",
+                Some(&arguments),
+                &success,
+                anchor + 100,
+            ));
+            assert_eq!(atc::atc_agent_scope_and_activity_for_test(&name), retained);
+        }
+
+        let unopened_path = root.join("must-not-bootstrap.sqlite3");
+        let mut unopened_config = (*config).clone();
+        unopened_config.database_url = format!("sqlite:///{}", unopened_path.display());
+        assert!(!record_atc_liveness_from_tool_result(
+            &unopened_config,
+            &cx,
+            "fetch_inbox",
+            Some(&arguments),
+            &success,
+            anchor + 100,
+        ));
+        assert!(
+            !unopened_path.exists(),
+            "observations cannot bootstrap a mailbox"
+        );
+        assert!(
+            mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_config(&unopened_config))
+                .is_none()
+        );
+        assert_eq!(atc::atc_agent_scope_and_activity_for_test(&name), retained);
+        let connection = block_on(pool.acquire(&cx)).into_result().unwrap();
+        assert_eq!(
+            connection
+                .query_sync("SELECT COUNT(*) FROM projects", &[])
+                .unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1,
+            "unresolved observation scopes cannot create projects"
+        );
+        println!("{CHILD_COMPLETE}");
     }
 
     #[test]

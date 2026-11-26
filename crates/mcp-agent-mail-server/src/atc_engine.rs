@@ -13239,6 +13239,14 @@ pub fn atc_agent_last_activity(agent: &str) -> Option<i64> {
         .filter(|ts| *ts > 0)
 }
 
+#[cfg(test)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn atc_agent_scope_and_activity_for_test(agent: &str) -> Option<(Option<String>, i64)> {
+    let engine = ATC_ENGINE.get()?.lock().ok()?;
+    let entry = engine.agents.get(agent)?;
+    Some((entry.project_key.clone(), entry.rhythm.last_activity_ts))
+}
+
 /// Record the outcome of an ATC decision for calibration feedback.
 pub fn atc_record_outcome(
     subsystem: AtcSubsystem,
