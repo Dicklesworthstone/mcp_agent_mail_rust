@@ -41310,7 +41310,7 @@ first body
         .expect("real registration generates an agent name");
         let agent: serde_json::Value = serde_json::from_str(&registration).unwrap();
         let name = agent["name"].as_str().expect("generated name").to_string();
-        assert!(!name.is_empty());
+        assert_ne!(name, "");
         let registration_args = serde_json::json!({
             "project_key": project_key,
             "program": "codex-cli",
@@ -41342,7 +41342,7 @@ first body
                 "id": project.id,
                 "human_key": project.human_key,
                 "slug": project.slug,
-            }, "agent": agent.clone()},
+            }, "agent": agent},
         });
         assert!(record_atc_liveness_from_tool_result(
             &config,
@@ -41462,7 +41462,7 @@ first body
         }
 
         let unopened_path = root.join("must-not-bootstrap.sqlite3");
-        let mut unopened_config = (*config).clone();
+        let mut unopened_config = config;
         unopened_config.database_url = format!("sqlite:///{}", unopened_path.display());
         assert!(!record_atc_liveness_from_tool_result(
             &unopened_config,
