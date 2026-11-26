@@ -18491,22 +18491,36 @@ fn classify_request(req: &JsonRpcRequest) -> (RequestKind, Option<String>) {
     (RequestKind::Other, None)
 }
 
+// Keep the Redis transition identical to RateLimitBucket::consume. Multiple
+// server processes can share a bucket while their clocks or policies differ;
+// elapsed time belongs to the stored policy, and an outstanding debit must
+// survive a policy change. Legacy two-field hashes retain their tokens and
+// timestamp, using the current policy until a complete policy is first stored.
 const RATE_LIMIT_REDIS_LUA: &str = r"local key = KEYS[1]
-local now = tonumber(ARGV[1])
+local requested_now = tonumber(ARGV[1])
 local rate = tonumber(ARGV[2])
-local burst = tonumber(ARGV[3])
-local state = redis.call('HMGET', key, 'tokens', 'ts')
+local burst = math.max(1, tonumber(ARGV[3]))
+local state = redis.call('HMGET', key, 'tokens', 'ts', 'rate', 'burst')
 local tokens = tonumber(state[1]) or burst
-local ts = tonumber(state[2]) or now
-local delta = now - ts
-tokens = math.min(burst, tokens + delta * rate)
+local ts = tonumber(state[2]) or requested_now
+local previous_rate = tonumber(state[3]) or rate
+local previous_burst = tonumber(state[4]) or burst
+local now = math.max(requested_now, ts)
+local refilled = math.min(previous_burst, tokens + (now - ts) * previous_rate)
+if refilled >= previous_burst then
+  tokens = burst
+else
+  tokens = math.min(refilled, burst)
+end
 local allowed = 0
 if tokens >= 1 then
   tokens = tokens - 1
   allowed = 1
 end
-redis.call('HMSET', key, 'tokens', tokens, 'ts', now)
-redis.call('EXPIRE', key, math.ceil(burst / math.max(rate, 0.001)))
+redis.call('HMSET', key, 'tokens', tokens, 'ts', now, 'rate', rate, 'burst', burst)
+-- Expiry must not forgive debt while a slower peer's clock catches up.
+local ttl = math.ceil((now - requested_now) + burst / rate)
+redis.call('EXPIRE', key, ttl)
 return allowed
 ";
 
@@ -18520,6 +18534,9 @@ async fn consume_rate_limit_redis(
 ) -> Result<bool, ()> {
     if per_minute == 0 {
         return Ok(true);
+    }
+    if key.len() > RATE_LIMIT_MAX_KEY_BYTES || !now.is_finite() {
+        return Ok(false);
     }
 
     let rate_per_sec = f64::from(per_minute) / 60.0;
@@ -30625,6 +30642,8 @@ first body
         static V1_EXPECTED: &[bool] = &[true, true, false, true];
         static V2_TIMES: &[f64] = &[2000.0, 2000.0, 2000.49, 2000.51];
         static V2_EXPECTED: &[bool] = &[true, false, false, true];
+        static BACKWARDS_TIMES: &[f64] = &[1000.0, 990.0, 1000.0, 1000.5, 1001.0];
+        static BACKWARDS_EXPECTED: &[bool] = &[true, true, false, false, true];
 
         const VECTORS: &[Vector] = &[
             Vector {
@@ -30638,6 +30657,20 @@ first body
                 name: "rpm120_burst1",
                 rpm: 120,
                 burst: 1,
+                times: V2_TIMES,
+                expected: V2_EXPECTED,
+            },
+            Vector {
+                name: "backwards_clock_preserves_remaining_credit",
+                rpm: 60,
+                burst: 2,
+                times: BACKWARDS_TIMES,
+                expected: BACKWARDS_EXPECTED,
+            },
+            Vector {
+                name: "zero_burst_normalizes_to_one",
+                rpm: 120,
+                burst: 0,
                 times: V2_TIMES,
                 expected: V2_EXPECTED,
             },
@@ -30745,6 +30778,169 @@ first body
             // Best-effort cleanup
             let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rate_limit_policy_changes_match_memory_and_redis_when_available() {
+        struct Scenario {
+            name: &'static str,
+            steps: &'static [(u32, u32, f64, bool)],
+        }
+
+        let scenarios = [
+            Scenario {
+                name: "faster_policy_cannot_refill_the_past",
+                steps: &[
+                    (1, 2, 1000.0, true),
+                    (1, 2, 1000.0, true),
+                    (600, 2, 1001.0, false),
+                    (600, 2, 1001.1, true),
+                    (600, 2, 1001.1, false),
+                ],
+            },
+            Scenario {
+                name: "slower_policy_preserves_earned_credit",
+                steps: &[
+                    (600, 2, 1000.0, true),
+                    (600, 2, 1000.0, true),
+                    (1, 2, 1000.25, true),
+                    (1, 2, 1000.25, true),
+                    (1, 2, 1000.25, false),
+                ],
+            },
+            Scenario {
+                name: "larger_burst_preserves_outstanding_debt",
+                steps: &[
+                    (60, 2, 1000.0, true),
+                    (60, 2, 1000.0, true),
+                    (60, 4, 1000.0, false),
+                    (60, 4, 1001.0, true),
+                    (60, 4, 1001.0, false),
+                ],
+            },
+            Scenario {
+                name: "fully_repaid_bucket_adopts_new_burst",
+                steps: &[
+                    (60, 1, 1000.0, true),
+                    (60, 3, 1001.0, true),
+                    (60, 3, 1001.0, true),
+                    (60, 3, 1001.0, true),
+                    (60, 3, 1001.0, false),
+                ],
+            },
+            Scenario {
+                name: "smaller_burst_caps_existing_credit",
+                steps: &[
+                    (60, 4, 1000.0, true),
+                    (60, 1, 1000.0, true),
+                    (60, 1, 1000.0, false),
+                ],
+            },
+        ];
+
+        for scenario in &scenarios {
+            let limiter = RateLimiter::new();
+            for &(rpm, burst, now, expected) in scenario.steps {
+                assert_eq!(
+                    limiter.allow_memory(scenario.name, rpm, burst, now, false),
+                    expected,
+                    "memory scenario={} time={now}",
+                    scenario.name,
+                );
+            }
+        }
+
+        let Some(redis_url) =
+            redis_url_or_skip("rate_limit_policy_changes_match_memory_and_redis_when_available")
+        else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let redis = block_on(RedisClient::connect(&cx, &redis_url)).expect("connect redis");
+        for scenario in &scenarios {
+            let suffix = REDIS_RATE_LIMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let key = format!(
+                "tools:policy:{}:{suffix}:{}",
+                std::process::id(),
+                scenario.name,
+            );
+            let redis_key = format!("rl:{key}");
+            let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+            for &(rpm, burst, now, expected) in scenario.steps {
+                let allowed = block_on(consume_rate_limit_redis(
+                    &cx, &redis, &key, rpm, burst, now,
+                ))
+                .expect("redis eval");
+                assert_eq!(
+                    allowed, expected,
+                    "redis scenario={} time={now}",
+                    scenario.name,
+                );
+            }
+            let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+        }
+    }
+
+    #[test]
+    fn rate_limit_redis_clock_skew_retains_timestamp_and_expiry_when_available() {
+        let Some(redis_url) = redis_url_or_skip(
+            "rate_limit_redis_clock_skew_retains_timestamp_and_expiry_when_available",
+        ) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let redis = block_on(RedisClient::connect(&cx, &redis_url)).expect("connect redis");
+        let suffix = REDIS_RATE_LIMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let key = format!("tools:clock_skew:{}:{suffix}", std::process::id());
+        let redis_key = format!("rl:{key}");
+        let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+
+        assert!(block_on(consume_rate_limit_redis(&cx, &redis, &key, 60, 1, 1000.0)).unwrap());
+        assert!(!block_on(consume_rate_limit_redis(&cx, &redis, &key, 60, 1, 990.0)).unwrap());
+        let timestamp = block_on(redis.hget(&cx, &redis_key, "ts"))
+            .expect("read timestamp")
+            .expect("timestamp persisted");
+        assert_eq!(std::str::from_utf8(&timestamp).unwrap(), "1000");
+        let ttl = block_on(redis.cmd(&cx, &["TTL", redis_key.as_str()]))
+            .expect("TTL")
+            .as_integer()
+            .expect("integer TTL");
+        assert!((9..=11).contains(&ttl), "clock-skew debt expired early: ttl={ttl}");
+        assert!(!block_on(consume_rate_limit_redis(&cx, &redis, &key, 60, 1, 1000.0)).unwrap());
+        assert!(block_on(consume_rate_limit_redis(&cx, &redis, &key, 60, 1, 1001.0)).unwrap());
+        let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+    }
+
+    #[test]
+    fn rate_limit_redis_legacy_bucket_preserves_debit_when_available() {
+        let Some(redis_url) =
+            redis_url_or_skip("rate_limit_redis_legacy_bucket_preserves_debit_when_available")
+        else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let redis = block_on(RedisClient::connect(&cx, &redis_url)).expect("connect redis");
+        let suffix = REDIS_RATE_LIMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let key = format!("tools:legacy_policy:{}:{suffix}", std::process::id());
+        let redis_key = format!("rl:{key}");
+        let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+        block_on(redis.cmd(
+            &cx,
+            &["HSET", redis_key.as_str(), "tokens", "0", "ts", "1000"],
+        ))
+        .expect("seed legacy two-field bucket");
+
+        assert!(!block_on(consume_rate_limit_redis(&cx, &redis, &key, 60, 2, 1000.0)).unwrap());
+        for (field, expected) in [("rate", "1"), ("burst", "2")] {
+            let value = block_on(redis.hget(&cx, &redis_key, field))
+                .expect("read stored policy")
+                .expect("policy field persisted");
+            assert_eq!(std::str::from_utf8(&value).unwrap(), expected);
+        }
+        assert!(block_on(consume_rate_limit_redis(&cx, &redis, &key, 60, 2, 1001.0)).unwrap());
+        assert!(!block_on(consume_rate_limit_redis(&cx, &redis, &key, 60, 2, 1001.0)).unwrap());
+        let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
     }
 
     #[test]
