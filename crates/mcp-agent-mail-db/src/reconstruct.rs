@@ -3189,6 +3189,11 @@ fn parse_and_insert_message(
         stats,
     )?;
 
+    // Current archives retain both the sender's project key and slug. They
+    // are reproduced from the resolved sender row during DB-only repair, so
+    // attest reply metadata only when that identity preserves both fields.
+    let sender_provenance_matches = reconstructed_sender_provenance_matches(conn, sender_id, &msg)?;
+
     let (recipients_json, to_names, cc_names, bcc_names) =
         normalize_archive_recipients_json(&msg, &file_path.display().to_string(), stats);
 
@@ -3243,12 +3248,17 @@ fn parse_and_insert_message(
                         &msg,
                         Some(cid),
                         duplicate_thread.as_deref(),
+                        sender_provenance_matches,
                     );
                     conn.execute_sync(
                         "UPDATE messages SET archive_metadata_json = NULL \
                          WHERE id = ? AND archive_metadata_json IS NOT NULL \
-                           AND archive_metadata_json IS NOT ?",
-                        &[Value::BigInt(cid), duplicate_metadata],
+                           AND (archive_metadata_json IS NOT ? OR sender_id != ?)",
+                        &[
+                            Value::BigInt(cid),
+                            duplicate_metadata,
+                            Value::BigInt(sender_id),
+                        ],
                     )
                     .map_err(|error| {
                         DbError::Sqlite(format!(
@@ -3307,8 +3317,13 @@ fn parse_and_insert_message(
         .as_deref()
         .map_or_else(|| Value::Null, |t| Value::Text(t.to_string()));
     let topic_val = topic.map_or_else(|| Value::Null, |value| Value::Text(value.to_string()));
-    let archive_metadata =
-        reconstructed_archive_metadata(frontmatter, &msg, canonical_id, thread_id.as_deref());
+    let archive_metadata = reconstructed_archive_metadata(
+        frontmatter,
+        &msg,
+        canonical_id,
+        thread_id.as_deref(),
+        sender_provenance_matches,
+    );
 
     let message_id = if let Some(cid) = canonical_id {
         // Plain INSERT: the id was verified free above. A conflict here means
@@ -3493,6 +3508,52 @@ fn invalidate_unresolved_archive_reply_parents(
     Ok(())
 }
 
+/// Sender project fields are ordinary current-envelope fields, not opaque
+/// extensions. They can be reconstructed from the sender foreign key only
+/// when every provided field agrees with that resolved project's identity.
+fn reconstructed_sender_provenance_matches(
+    conn: &DbConn,
+    sender_id: i64,
+    message: &serde_json::Value,
+) -> DbResult<bool> {
+    let project = message.get("sender_project");
+    let slug = message.get("sender_project_slug");
+    if project.is_none() && slug.is_none() {
+        return Ok(true);
+    }
+    if [project, slug].into_iter().flatten().any(|value| {
+        value
+            .as_str()
+            .is_none_or(|identity| identity.trim().is_empty())
+    }) {
+        return Ok(false);
+    }
+    let rows = conn
+        .query_sync(
+            "SELECT p.human_key, p.slug FROM agents a \
+             JOIN projects p ON p.id = a.project_id WHERE a.id = ?",
+            &[Value::BigInt(sender_id)],
+        )
+        .map_err(|error| {
+            DbError::Sqlite(format!("reconstruct: inspect sender project provenance: {error}"))
+        })?;
+    let Some(row) = rows.first() else {
+        return Ok(false);
+    };
+    let human_key = row.get_named::<String>("human_key").map_err(|error| {
+        DbError::Sqlite(format!("reconstruct: decode sender project key: {error}"))
+    })?;
+    let project_slug = row.get_named::<String>("slug").map_err(|error| {
+        DbError::Sqlite(format!("reconstruct: decode sender project slug: {error}"))
+    })?;
+    Ok(project
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value == human_key.as_str())
+        && slug
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|value| value == project_slug.as_str()))
+}
+
 /// Retain only complete, understood archive metadata. Unknown extensions and
 /// remapped identities remain NULL so reconciliation must find an original
 /// bundle instead of silently dropping fields or inventing reply lineage.
@@ -3501,27 +3562,50 @@ fn reconstructed_archive_metadata(
     message: &serde_json::Value,
     canonical_id: Option<i64>,
     thread_id: Option<&str>,
+    sender_provenance_matches: bool,
 ) -> Value {
     #[derive(serde::Deserialize)]
     struct ReplyProjection {
         #[serde(default, deserialize_with = "deserialize_recovered_reply_parent")]
         reply_to: Option<i64>,
+        #[serde(default)]
+        sender_project: Option<String>,
+        #[serde(default)]
+        sender_project_slug: Option<String>,
     }
-    let Some(id) = canonical_id else {
+    let Some(id) = canonical_id.filter(|_| sender_provenance_matches) else {
         return Value::Null;
     };
     // Decode from the original JSON too: Value has already collapsed any
-    // duplicate keys, while the typed parent projection rejects ambiguity.
+    // duplicate keys, while the typed projection rejects ambiguous reply
+    // parents and sender project fields.
     let Ok(parent_projection) = serde_json::from_str::<ReplyProjection>(raw) else {
         return Value::Null;
     };
     let Some(object) = message.as_object() else {
         return Value::Null;
     };
+    // Absence is the legacy format. An explicit null or empty identity is
+    // not absence and cannot be reproduced from the resolved sender row.
+    if [
+        ("sender_project", parent_projection.sender_project.as_deref()),
+        (
+            "sender_project_slug",
+            parent_projection.sender_project_slug.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .any(|(key, value)| {
+        object.contains_key(key) && value.is_none_or(|identity| identity.trim().is_empty())
+    }) {
+        return Value::Null;
+    }
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
             "id" | "from"
+                | "sender_project"
+                | "sender_project_slug"
                 | "to"
                 | "cc"
                 | "bcc"
@@ -9601,7 +9685,13 @@ mod tests {
         );
         let message = serde_json::json!({"id":2,"thread_id":"thread","reply_to":1});
         assert!(matches!(
-            reconstructed_archive_metadata(&message.to_string(), &message, None, Some("thread")),
+            reconstructed_archive_metadata(
+                &message.to_string(),
+                &message,
+                None,
+                Some("thread"),
+                true,
+            ),
             Value::Null
         ));
         assert!(matches!(
@@ -9609,7 +9699,8 @@ mod tests {
                 &message.to_string(),
                 &message,
                 Some(2),
-                Some("changed-thread")
+                Some("changed-thread"),
+                true,
             ),
             Value::Null
         ));
@@ -9619,7 +9710,50 @@ mod tests {
                 ambiguous,
                 &serde_json::from_str(ambiguous).unwrap(),
                 Some(2),
-                Some("thread")
+                Some("thread"),
+                true,
+            ),
+            Value::Null
+        ));
+    }
+
+    #[test]
+    fn recovered_archive_metadata_rejects_ambiguous_sender_provenance() {
+        for raw in [
+            r#"{"id":2,"thread_id":"thread","reply_to":1,"sender_project":null}"#,
+            r#"{"id":2,"thread_id":"thread","reply_to":1,"sender_project_slug":null}"#,
+            r#"{"id":2,"thread_id":"thread","reply_to":1,"sender_project":42}"#,
+            r#"{"id":2,"thread_id":"thread","reply_to":1,"sender_project_slug":[]}"#,
+            r#"{"id":2,"thread_id":"thread","reply_to":1,"sender_project":"  "}"#,
+            r#"{"id":2,"thread_id":"thread","reply_to":1,"sender_project_slug":""}"#,
+            r#"{"id":2,"thread_id":"thread","reply_to":1,"sender_project":"/peer","sender_project":"/peer"}"#,
+            r#"{"id":2,"thread_id":"thread","reply_to":1,"sender_project_slug":"peer","sender_project_slug":"other"}"#,
+        ] {
+            assert!(
+                matches!(
+                    reconstructed_archive_metadata(
+                        raw,
+                        &serde_json::from_str(raw).unwrap(),
+                        Some(2),
+                        Some("thread"),
+                        true,
+                    ),
+                    Value::Null
+                ),
+                "ambiguous provenance must remain unknown: {raw}"
+            );
+        }
+        let message = serde_json::json!({
+            "id":2,"thread_id":"thread","reply_to":1,
+            "sender_project":"/peer","sender_project_slug":"peer",
+        });
+        assert!(matches!(
+            reconstructed_archive_metadata(
+                &message.to_string(),
+                &message,
+                Some(2),
+                Some("thread"),
+                false,
             ),
             Value::Null
         ));
@@ -9743,14 +9877,22 @@ mod tests {
 
     #[test]
     fn reconstruct_duplicate_archive_metadata_requires_agreement() {
-        for (first_parent, second_parent, first_extension, second_extension, expected) in [
-            (Some(1), Some(2), false, false, None),
-            (None, Some(1), false, false, None),
-            (Some(1), None, false, false, None),
-            (Some(1), Some(1), false, true, None),
-            (Some(1), Some(1), true, false, None),
-            (Some(1), Some(1), false, false, Some("{\"reply_to\":1}")),
-            (None, None, false, false, Some("{}")),
+        for (
+            first_parent,
+            second_parent,
+            first_extension,
+            second_extension,
+            different_sender,
+            expected,
+        ) in [
+            (Some(1), Some(2), false, false, false, None),
+            (None, Some(1), false, false, false, None),
+            (Some(1), None, false, false, false, None),
+            (Some(1), Some(1), false, true, false, None),
+            (Some(1), Some(1), true, false, false, None),
+            (Some(1), Some(1), false, false, false, Some("{\"reply_to\":1}")),
+            (None, None, false, false, false, Some("{}")),
+            (Some(1), Some(1), false, false, true, None),
         ] {
             let tmp = tempfile::tempdir().expect("tempdir");
             let storage = tmp.path().join("archive");
@@ -9779,6 +9921,9 @@ mod tests {
             }
             if second_extension {
                 object.insert("custom_extension".to_string(), serde_json::json!("retain"));
+            }
+            if different_sender {
+                object.insert("from".to_string(), serde_json::json!("Bob"));
             }
             let second_path = first_path
                 .parent()
@@ -10040,6 +10185,101 @@ mod tests {
         assert_eq!(rows[0].get_as::<String>(0).unwrap(), "{}");
         assert_eq!(rows[1].get_as::<String>(0).unwrap(), r#"{"reply_to":1}"#);
         assert_eq!(rows[2].get_as::<Option<String>>(0).unwrap(), None);
+    }
+
+    #[test]
+    fn reconstruct_current_envelope_preserves_sender_and_reply_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = directory.path().join("archive");
+        write_recovery_identity_fixture(&storage, "a-delivery", Some(7), &[("Bob", Some(21))]);
+        write_recovery_identity_fixture(&storage, "z-sender", Some(42), &[("Alice", Some(99))]);
+        let messages = storage.join("projects/a-delivery/messages/2026/11");
+        std::fs::create_dir_all(&messages).unwrap();
+        let mut artifacts = Vec::new();
+        for id in 1..=4 {
+            // Same envelope fields emitted by send_message and notice_archive_json.
+            // Both sender provenance fields must survive through the sender FK.
+            let mut message = serde_json::json!({
+                "id":id,"from":"Alice",
+                "sender_project":"/z-sender","sender_project_slug":"z-sender",
+                "to":["Bob"],"cc":[],"bcc":[],
+                "subject":format!("current envelope {id}"),
+                "created":"2026-11-22T00:00:00Z",
+                "thread_id":"lineage","topic":null,
+                "project":"/a-delivery","project_slug":"a-delivery",
+                "importance":"normal","ack_required":true,"attachments":[],
+            });
+            if id > 1 {
+                message["reply_to"] = serde_json::json!(1);
+            }
+            if id == 3 {
+                message["custom_extension"] = serde_json::json!("retain original evidence");
+            }
+            if id == 4 {
+                // The key resolves the real foreign sender, but this conflicting
+                // slug cannot be reproduced by a later DB-only archive repair.
+                message["sender_project_slug"] = serde_json::json!("a-delivery");
+            }
+            let path = messages.join(format!("2026-11-22T00-00-00Z__message__{id}.md"));
+            let bytes = format!("---json\n{message}\n---\n\nbody {id}\n").into_bytes();
+            std::fs::write(&path, &bytes).unwrap();
+            artifacts.push((path, bytes));
+        }
+        let target = directory.path().join("reconstructed.db");
+        let stats = reconstruct_from_archive(&target, &storage).unwrap();
+        assert_eq!(
+            (stats.messages, stats.recipients, stats.parse_errors),
+            (4, 4, 0)
+        );
+        let conn = SqliteDbConn::open_file(target.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT m.id, m.project_id, m.sender_id, m.body_md, m.archive_metadata_json, \
+                        p.human_key, p.slug \
+                 FROM messages m JOIN agents a ON a.id = m.sender_id \
+                 JOIN projects p ON p.id = a.project_id ORDER BY m.id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        for (row, expected) in rows
+            .iter()
+            .zip([Some("{}"), Some(r#"{"reply_to":1}"#), None, None])
+        {
+            let id = row.get_named::<i64>("id").unwrap();
+            assert_eq!(row.get_named::<i64>("project_id").unwrap(), 7);
+            assert_eq!(row.get_named::<i64>("sender_id").unwrap(), 99);
+            assert_eq!(row.get_named::<String>("human_key").unwrap(), "/z-sender");
+            assert_eq!(row.get_named::<String>("slug").unwrap(), "z-sender");
+            assert_eq!(
+                row.get_named::<String>("body_md").unwrap().trim(),
+                format!("body {id}")
+            );
+            assert_eq!(
+                row.get_named::<Option<String>>("archive_metadata_json")
+                    .unwrap()
+                    .as_deref(),
+                expected,
+                "reply lineage authority for current envelope {id}"
+            );
+        }
+        assert!(
+            conn.query_sync("SELECT id FROM agents WHERE program = 'unknown'", &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            conn.query_sync("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .is_empty()
+        );
+        for (path, bytes) in artifacts {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                bytes,
+                "archive evidence is unchanged"
+            );
+        }
     }
 
     /// GH#282: an archived envelope addressed to the project mailbox restores
