@@ -1814,10 +1814,29 @@ fn ensure_no_file_readers(
     use std::os::fd::AsRawFd;
 
     let excluded_descriptor = excluded_descriptor.map(AsRawFd::as_raw_fd);
-    let output = std::process::Command::new("lsof")
-        .args(["-n", "-P", "-Fpf", "--"])
-        .arg(source)
-        .output()?;
+    let mut command = std::process::Command::new("lsof");
+    command.args(["-n", "-P", "-Fpf", "--"]).arg(source);
+    ensure_no_file_readers_with_command(
+        command,
+        excluded_descriptor,
+        std::time::Duration::from_secs(5),
+        4 * 1024 * 1024,
+    )
+}
+
+/// Reader discovery runs while retention owns the recovery/publication locks.
+/// Bound both the process and its pipes: a blocked host inventory, excessive
+/// output, or a descendant retaining a pipe must refuse admission rather than
+/// hold those locks indefinitely. Stderr remains part of the refusal policy.
+#[cfg(any(test, not(target_os = "linux")))]
+fn ensure_no_file_readers_with_command(
+    command: std::process::Command,
+    excluded_descriptor: Option<std::os::fd::RawFd>,
+    timeout: std::time::Duration,
+    max_output_bytes: usize,
+) -> io::Result<()> {
+    let output =
+        mcp_agent_mail_core::run_command_bounded(command, timeout, max_output_bytes, true)?;
     if excluded_descriptor.is_none()
         && output.status.code() == Some(1)
         && output.stdout.is_empty()
@@ -2028,6 +2047,180 @@ mod tests {
         let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         root
+    }
+
+    fn lsof_fixture_command(stdout: &str, stderr: &str, status: i32) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s' \"$1\"; printf '%s' \"$2\" >&2; exit \"$3\"",
+            "reader-inventory-fixture",
+            stdout,
+            stderr,
+            &status.to_string(),
+        ]);
+        command
+    }
+
+    #[test]
+    fn lsof_inventory_preserves_reader_and_failure_refusals() {
+        let own_reader = format!("p{}\nf7\n", std::process::id());
+        let another_reader = format!("{own_reader}f8\n");
+        let foreign_reader = "p1\nf7\n";
+        let cases = [
+            ("", "", 1, None, None),
+            (own_reader.as_str(), "", 0, Some(7), None),
+            (
+                another_reader.as_str(),
+                "",
+                0,
+                Some(7),
+                Some(io::ErrorKind::WouldBlock),
+            ),
+            (foreign_reader, "", 0, None, Some(io::ErrorKind::WouldBlock)),
+            ("", "", 0, Some(7), Some(io::ErrorKind::Other)),
+            ("", "inventory warning", 1, None, Some(io::ErrorKind::Other)),
+            (
+                own_reader.as_str(),
+                "inventory warning",
+                0,
+                Some(7),
+                Some(io::ErrorKind::Other),
+            ),
+            ("", "", 2, None, Some(io::ErrorKind::Other)),
+        ];
+        for (stdout, stderr, status, excluded, expected) in cases {
+            let result = ensure_no_file_readers_with_command(
+                lsof_fixture_command(stdout, stderr, status),
+                excluded,
+                std::time::Duration::from_secs(5),
+                4096,
+            );
+            assert_eq!(result.err().map(|error| error.kind()), expected);
+        }
+    }
+
+    #[test]
+    fn lsof_inventory_bounds_process_lifetime_and_reaps_the_child() {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        use std::time::{Duration, Instant};
+
+        let root = fixture();
+        let pid_file = root.join("reader-inventory.pid");
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "printf '%s\\n' \"$$\" > \"$1\"; exec sleep 30",
+                "reader-inventory-fixture",
+            ])
+            .arg(&pid_file);
+        let started = Instant::now();
+        let error =
+            ensure_no_file_readers_with_command(command, None, Duration::from_secs(1), 4096)
+                .unwrap_err();
+        let elapsed = started.elapsed();
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(elapsed < Duration::from_secs(3));
+        assert_eq!(
+            kill(Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[test]
+    fn lsof_inventory_bounds_stdout_and_stderr_together() {
+        let error = ensure_no_file_readers_with_command(
+            lsof_fixture_command("1234", "56789", 0),
+            None,
+            std::time::Duration::from_secs(5),
+            8,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lsof_inventory_bounds_descendant_pipe_lifetime() {
+        use nix::sys::prctl::set_child_subreaper;
+        use nix::sys::signal::{Signal, kill};
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+        use std::time::{Duration, Instant};
+
+        struct Descendant(Pid);
+        impl Drop for Descendant {
+            fn drop(&mut self) {
+                let _ = kill(self.0, Signal::SIGKILL);
+                let _ = waitpid(self.0, None);
+            }
+        }
+
+        const WORKER_ENV: &str = "AM_TEST_LSOF_PIPE_WORKER";
+        // Keep subreaper ownership out of the test runner's shared process.
+        // The isolated worker kills/reaps its own pipe-holding grandchild.
+        if std::env::var_os(WORKER_ENV).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "recovery_retention::namespace::tests::lsof_inventory_bounds_descendant_pipe_lifetime",
+                    "--nocapture",
+                ])
+                .env(WORKER_ENV, "1");
+            let output = mcp_agent_mail_core::run_command_bounded(
+                command,
+                Duration::from_secs(10),
+                64 * 1024,
+                true,
+            )
+            .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("reader descendant reaped"));
+            return;
+        }
+
+        set_child_subreaper(true).unwrap();
+        let root = fixture();
+        let pid_file = root.join("pipe-holder.pid");
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+                "reader-inventory-fixture",
+            ])
+            .arg(&pid_file);
+        let started = Instant::now();
+        let result =
+            ensure_no_file_readers_with_command(command, None, Duration::from_secs(1), 4096);
+        let elapsed = started.elapsed();
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let descendant = Descendant(Pid::from_raw(pid));
+        assert_eq!(
+            kill(descendant.0, None),
+            Ok(()),
+            "pipe holder is still alive"
+        );
+        drop(descendant);
+        assert_eq!(
+            kill(Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(elapsed < Duration::from_secs(3));
+        println!("reader descendant reaped");
     }
 
     #[cfg(target_os = "linux")]
