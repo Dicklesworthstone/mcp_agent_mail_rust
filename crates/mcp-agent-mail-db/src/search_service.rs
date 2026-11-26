@@ -11343,6 +11343,88 @@ mod tests {
         (root, pool, primary.unwrap())
     }
 
+    #[cfg(feature = "tantivy-engine")]
+    #[test]
+    fn thread_lexical_service_pages_canonical_message_backed_results() {
+        if !run_semantic_enabled_search_test_in_child(
+            "search_service::tests::thread_lexical_service_pages_canonical_message_backed_results",
+        ) {
+            return;
+        }
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context for real mailbox operations");
+            let (_root, pool, project) = query_hint_mailbox(&cx).await;
+            let project_id = project.id.unwrap();
+            let other_sender = crate::queries::register_agent(
+                &cx, &pool, project_id, "RedPeak", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_sync(
+                "UPDATE messages SET sender_id = ? WHERE id = 1",
+                &[Value::BigInt(other_sender.id.unwrap())],
+            )
+            .unwrap();
+            conn.execute_sync("UPDATE messages SET thread_id = 'thread-mail'", &[])
+                .unwrap();
+            drop(conn);
+
+            for search_engine in [Some(SearchEngine::Lexical), None] {
+                let options = SearchOptions {
+                    search_engine,
+                    ..Default::default()
+                };
+                let mut query = SearchQuery {
+                    doc_kind: DocKind::Thread,
+                    direction: Some(Direction::Outbox),
+                    agent_name: Some("BlueLake".to_string()),
+                    thread_id: Some("thread-mail".to_string()),
+                    limit: Some(1),
+                    ..SearchQuery::messages("commonmail", project_id)
+                };
+                assert!(!message_query_requires_sql_plan(&query));
+                let mut seen_cursors = HashSet::new();
+                for expected in [2, 3] {
+                    let page = execute_search(&cx, &pool, &query, &options)
+                        .await
+                        .into_result()
+                        .unwrap();
+                    assert_eq!(page.results.len(), 1, "engine {search_engine:?}");
+                    let result = &page.results[0].result;
+                    assert_eq!(result.id, expected);
+                    assert_eq!(result.doc_kind, DocKind::Thread);
+                    assert_eq!(result.project_id, Some(project_id));
+                    assert_eq!(result.from_agent.as_deref(), Some("BlueLake"));
+                    assert_eq!(result.thread_id.as_deref(), Some("thread-mail"));
+                    assert_eq!(result.body, "retained message body");
+                    let cursor = page.next_cursor.expect("full-page continuation");
+                    assert!(seen_cursors.insert(cursor.clone()));
+                    query.cursor = Some(cursor);
+                }
+                let terminal = execute_search(&cx, &pool, &query, &options)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert!(terminal.results.is_empty());
+                assert!(terminal.next_cursor.is_none());
+
+                query.cursor = None;
+                query.agent_name = Some("RedPeak".to_string());
+                let other_outbox = execute_search(&cx, &pool, &query, &options)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(other_outbox.results.len(), 1);
+                assert_eq!(other_outbox.results[0].result.id, 1);
+            }
+        });
+    }
+
     #[test]
     #[allow(deprecated)]
     fn shadow_keyword_search_pages_in_id_order_within_project() {

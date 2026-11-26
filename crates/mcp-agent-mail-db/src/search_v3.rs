@@ -455,7 +455,7 @@ fn build_search_filter(
 
     // Only pure outbox queries can enforce agent_name at lexical-filter time.
     if let Some(ref agent) = query.agent_name
-        && query.doc_kind == DocKind::Message
+        && matches!(query.doc_kind, DocKind::Message | DocKind::Thread)
         && matches!(query.direction, Some(Direction::Outbox))
     {
         filter.sender = Some(agent.clone());
@@ -469,12 +469,14 @@ fn build_search_filter(
     // Importance levels → filter
     filter.importance = importance_plan.filter;
 
-    // Doc kind
+    // Threads are a view over mailbox messages, just as in the SQL planner.
+    // Backfill stores those rows as message documents; there is no separate
+    // thread document to retrieve. Keep the requested kind on the results,
+    // but apply message filters before collecting the candidate page.
     let doc_kind = match query.doc_kind {
-        DocKind::Message => mcp_agent_mail_core::DocKind::Message,
+        DocKind::Message | DocKind::Thread => mcp_agent_mail_core::DocKind::Message,
         DocKind::Agent => mcp_agent_mail_core::DocKind::Agent,
         DocKind::Project => mcp_agent_mail_core::DocKind::Project,
-        DocKind::Thread => mcp_agent_mail_core::DocKind::Thread,
     };
     filter.doc_kind = Some(doc_kind);
 
@@ -3456,6 +3458,58 @@ mod tests {
     }
 
     #[test]
+    fn thread_search_uses_message_documents_and_preserves_result_kind() {
+        let bridge = setup_bridge_with_docs();
+        let mut query = PlannerQuery {
+            doc_kind: DocKind::Thread,
+            thread_id: Some("br-100".to_string()),
+            ..PlannerQuery::messages("migration", 1)
+        };
+        for canonical_candidates in [false, true] {
+            let results = bridge.search_inner(&query, canonical_candidates).unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, 1);
+            assert_eq!(results[0].doc_kind, DocKind::Thread);
+        }
+
+        query.project_id = Some(2);
+        assert!(bridge.search_inner(&query, true).unwrap().is_empty());
+        query.project_id = Some(1);
+        query.thread_id = Some("br-200".to_string());
+        assert!(bridge.search_inner(&query, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn thread_outbox_filters_sender_before_candidate_limit() {
+        let bridge = setup_bridge_with_docs();
+        let query = PlannerQuery {
+            doc_kind: DocKind::Thread,
+            limit: Some(1),
+            ..PlannerQuery::messages("migration OR deployment", 1)
+        };
+        for canonical_candidates in [false, true] {
+            let unfiltered = bridge.search_inner(&query, canonical_candidates).unwrap();
+            assert_eq!(unfiltered.len(), 1);
+            // Select the other sender: post-filtering a single unfiltered
+            // candidate would hide this matching message entirely.
+            let (sender, expected_id) = match unfiltered[0].id {
+                1 => ("RedPeak", 2),
+                2 => ("BlueLake", 1),
+                id => panic!("unexpected project candidate {id}"),
+            };
+            let outbox = PlannerQuery {
+                direction: Some(Direction::Outbox),
+                agent_name: Some(sender.to_string()),
+                ..query.clone()
+            };
+            let results = bridge.search_inner(&outbox, canonical_candidates).unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, expected_id);
+            assert_eq!(results[0].doc_kind, DocKind::Thread);
+        }
+    }
+
+    #[test]
     fn text_field_scope_keeps_every_term_to_its_field() {
         let bridge = setup_bridge_with_docs();
         let ids = |text: &str, scope: TextFieldScope| -> Vec<i64> {
@@ -3644,14 +3698,14 @@ mod tests {
     }
 
     #[test]
-    fn filter_thread_doc_kind() {
+    fn filter_thread_doc_kind_uses_mailbox_message_storage() {
         let query = PlannerQuery {
             text: "test".to_string(),
             doc_kind: DocKind::Thread,
             ..Default::default()
         };
         let filter = build_search_filter(&query, &build_importance_filter_plan(&query));
-        assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Thread));
+        assert_eq!(filter.doc_kind, Some(mcp_agent_mail_core::DocKind::Message));
     }
 
     #[test]
