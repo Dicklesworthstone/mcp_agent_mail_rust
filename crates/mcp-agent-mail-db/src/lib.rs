@@ -69,6 +69,7 @@ pub mod query_assistance;
 pub mod query_plan_diagnostics;
 pub mod reconstruct;
 mod reconstruct_delivery;
+mod reconstruct_idempotency;
 pub mod reconstruct_state;
 pub mod recovery_breaker;
 pub mod recovery_retention;

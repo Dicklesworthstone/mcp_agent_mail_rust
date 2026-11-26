@@ -125,6 +125,547 @@ fn expire_all_idempotency_keys(db_path: &Path) {
         .expect("age idempotency keys");
 }
 
+fn assert_live_salvage_preserves_committed_message_retry(cross_project: bool) {
+    use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
+    use sqlmodel_core::Value;
+
+    const KEY: &str = "recovered-committed-send";
+    const FINGERPRINT: &str = "opaque:original-payload-fingerprint";
+    let (pool, dir, source_path) = make_pool();
+    let home_project = setup_project(&pool);
+    let delivery_project = if cross_project {
+        setup_project(&pool)
+    } else {
+        home_project
+    };
+    let sender = setup_agent(&pool, home_project, "RedFox");
+    let amber = setup_agent(&pool, delivery_project, "AmberField");
+    let blue = setup_agent(&pool, delivery_project, "BlueLake");
+    let send = |pool: &DbPool,
+                scope_project: i64,
+                delivery_project: i64,
+                sender: i64,
+                recipients: [i64; 2],
+                fingerprint: &str| {
+        let pool = pool.clone();
+        let fingerprint = fingerprint.to_owned();
+        block_on(move |cx| async move {
+            let recipients = [(recipients[0], "to"), (recipients[1], "to")];
+            queries::create_message_with_recipients_idempotent(
+                &cx,
+                &pool,
+                delivery_project,
+                sender,
+                "accepted subject",
+                "accepted body",
+                Some("accepted-thread"),
+                "normal",
+                true,
+                "[]",
+                &recipients,
+                IdempotencyClaim {
+                    project_id: scope_project,
+                    tool: "send_message",
+                    key: KEY,
+                    fingerprint: &fingerprint,
+                },
+            )
+            .await
+        })
+        .into_result()
+        .expect("production idempotent send")
+    };
+    let accepted = match send(
+        &pool,
+        home_project,
+        delivery_project,
+        sender,
+        [blue, amber],
+        FINGERPRINT,
+    ) {
+        IdempotentOutcome::Fresh(row) => row,
+        other => panic!("first send must commit: {other:?}"),
+    };
+    let original_id = accepted.id.expect("committed message id");
+    let original_envelope: serde_json::Value =
+        serde_json::from_str(&accepted.recipients_json).unwrap();
+    assert_eq!(
+        original_envelope["to"],
+        serde_json::json!(["BlueLake", "AmberField"])
+    );
+
+    let source = DbConn::open_file(source_path.display().to_string()).unwrap();
+    let project_key = |id| {
+        source
+            .query_sync(
+                "SELECT human_key FROM projects WHERE id = ?",
+                &[Value::BigInt(id)],
+            )
+            .unwrap()[0]
+            .get_as::<String>(0)
+            .unwrap()
+    };
+    let home_key = project_key(home_project);
+    let delivery_key = project_key(delivery_project);
+    let recorded = source
+        .query_sync(
+            "SELECT result_json, created_ts, expires_ts FROM idempotency_keys \
+             WHERE project_id = ? AND tool = 'send_message' AND idempotency_key = ?",
+            &[Value::BigInt(home_project), Value::Text(KEY.to_owned())],
+        )
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    let mut expected: serde_json::Value =
+        serde_json::from_str(&recorded[0].get_as::<String>(0).unwrap()).unwrap();
+    assert_eq!(expected, serde_json::to_value(&accepted).unwrap());
+    let created_ts = recorded[0].get_as::<i64>(1).unwrap();
+    let expires_ts = recorded[0].get_as::<i64>(2).unwrap();
+    source
+        .execute_sync(
+            "UPDATE messages SET thread_id = 'current-thread' WHERE id = ?",
+            &[Value::BigInt(original_id)],
+        )
+        .unwrap();
+    drop(source);
+    drop(pool);
+
+    // Occupy the original numeric IDs with unrelated archived identities so
+    // every replay reference must follow the live salvage's identity maps.
+    let storage = dir.path().join("recovery-archive");
+    let occupied_projects = if cross_project {
+        vec![
+            (home_project, "archive-home"),
+            (delivery_project, "archive-delivery"),
+        ]
+    } else {
+        vec![(home_project, "archive-home")]
+    };
+    for (project_id, slug) in occupied_projects {
+        let path = storage.join("projects").join(slug);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("project.json"),
+            serde_json::json!({
+                "id": project_id,
+                "slug": slug,
+                "human_key": format!("/{slug}"),
+                "created_at": 17,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let archived_home = storage.join("projects/archive-home");
+    for (name, id) in [
+        ("ArchiveSender", sender),
+        ("ArchiveAmber", amber),
+        ("ArchiveBlue", blue),
+    ] {
+        let path = archived_home.join("agents").join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("profile.json"),
+            serde_json::json!({
+                "id": id,
+                "project_id": home_project,
+                "name": name,
+                "program": "codex-cli",
+                "model": "test-model",
+                "inception_ts": 20,
+                "last_active_ts": 30,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let archive_messages = archived_home.join("messages/2026/11");
+    std::fs::create_dir_all(&archive_messages).unwrap();
+    let archived_message = serde_json::json!({
+        "id": original_id,
+        "from": "ArchiveSender",
+        "to": ["ArchiveAmber", "ArchiveBlue"],
+        "cc": [],
+        "bcc": [],
+        "created_ts": 100 + original_id,
+        "subject": "unrelated archived message",
+        "attachments": [],
+    });
+    std::fs::write(
+        archive_messages.join(format!("2026-11-22T00-00-00Z__unrelated__{original_id}.md")),
+        format!("---json\n{archived_message}\n---\n\nunrelated archive body\n"),
+    )
+    .unwrap();
+
+    let candidate = dir.path().join("reconstructed.db");
+    mcp_agent_mail_db::reconstruct::reconstruct_from_archive_with_live_salvage(
+        &candidate,
+        &storage,
+        &source_path,
+    )
+    .expect("reconstruct committed request through guarded live salvage");
+
+    // Recovery output is canonical SQLite until pool admission. Do not open
+    // this inode through FrankenSQLite while the canonical inspector is live.
+    let recovered = CanonicalDbConn::open_file(candidate.display().to_string()).unwrap();
+    let project_id = |key: String| {
+        recovered
+            .query_sync(
+                "SELECT id FROM projects WHERE human_key = ?",
+                &[Value::Text(key)],
+            )
+            .unwrap()[0]
+            .get_as::<i64>(0)
+            .unwrap()
+    };
+    let mapped_home = project_id(home_key);
+    let mapped_delivery = project_id(delivery_key);
+    assert_ne!(mapped_home, home_project);
+    assert_ne!(mapped_delivery, delivery_project);
+    let agent_id = |project: i64, name: &str| {
+        recovered
+            .query_sync(
+                "SELECT id FROM agents WHERE project_id = ? AND name = ?",
+                &[Value::BigInt(project), Value::Text(name.to_owned())],
+            )
+            .unwrap()[0]
+            .get_as::<i64>(0)
+            .unwrap()
+    };
+    let mapped_sender = agent_id(mapped_home, "RedFox");
+    let mapped_amber = agent_id(mapped_delivery, "AmberField");
+    let mapped_blue = agent_id(mapped_delivery, "BlueLake");
+    assert_ne!(mapped_sender, sender);
+    assert_ne!(mapped_amber, amber);
+    assert_ne!(mapped_blue, blue);
+    let messages = recovered
+        .query_sync(
+            "SELECT id, thread_id, recipients_json FROM messages \
+             WHERE project_id = ? AND sender_id = ? AND subject = 'accepted subject'",
+            &[Value::BigInt(mapped_delivery), Value::BigInt(mapped_sender)],
+        )
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    let mapped_message = messages[0].get_as::<i64>(0).unwrap();
+    assert_ne!(mapped_message, original_id);
+    assert_eq!(messages[0].get_as::<String>(1).unwrap(), "current-thread");
+    let current_envelope: serde_json::Value =
+        serde_json::from_str(&messages[0].get_as::<String>(2).unwrap()).unwrap();
+    assert_eq!(
+        current_envelope["to"],
+        serde_json::json!(["AmberField", "BlueLake"])
+    );
+    expected["id"] = serde_json::json!(mapped_message);
+    expected["project_id"] = serde_json::json!(mapped_delivery);
+    expected["sender_id"] = serde_json::json!(mapped_sender);
+    let records = recovered
+        .query_sync(
+            "SELECT result_json, payload_fingerprint, created_ts, expires_ts \
+             FROM idempotency_keys WHERE project_id = ? \
+             AND tool = 'send_message' AND idempotency_key = ?",
+            &[Value::BigInt(mapped_home), Value::Text(KEY.to_owned())],
+        )
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    let restored_result: serde_json::Value =
+        serde_json::from_str(&records[0].get_as::<String>(0).unwrap()).unwrap();
+    assert_eq!(restored_result, expected);
+    assert_eq!(records[0].get_as::<String>(1).unwrap(), FINGERPRINT);
+    assert_eq!(records[0].get_as::<i64>(2).unwrap(), created_ts);
+    assert_eq!(records[0].get_as::<i64>(3).unwrap(), expires_ts);
+    drop(recovered);
+
+    let recovered_pool = DbPool::new(&DbPoolConfig {
+        database_url: format!("sqlite:///{}", candidate.display()),
+        storage_root: Some(storage),
+        run_migrations: false,
+        warmup_connections: 0,
+        ..Default::default()
+    })
+    .expect("admit reconstructed database through the production pool");
+    let retry = |fingerprint| {
+        send(
+            &recovered_pool,
+            mapped_home,
+            mapped_delivery,
+            mapped_sender,
+            [mapped_blue, mapped_amber],
+            fingerprint,
+        )
+    };
+    let replayed = match retry(FINGERPRINT) {
+        IdempotentOutcome::Replayed(row) => row,
+        other => panic!("recovered retry must replay: {other:?}"),
+    };
+    assert_eq!(serde_json::to_value(replayed).unwrap(), expected);
+    assert_eq!(count_rows(&candidate, "SELECT COUNT(*) FROM messages"), 2);
+    assert_eq!(
+        count_rows(&candidate, "SELECT COUNT(*) FROM message_recipients"),
+        4
+    );
+    assert_eq!(
+        count_rows(&candidate, "SELECT COUNT(*) FROM idempotency_keys"),
+        1
+    );
+    match retry("changed-payload-fingerprint") {
+        IdempotentOutcome::Conflict(conflict) => {
+            assert_eq!(conflict.tool, "send_message");
+            assert_eq!(conflict.key, KEY);
+            assert_eq!(conflict.original_fingerprint, FINGERPRINT);
+            assert_eq!(
+                conflict.attempted_fingerprint,
+                "changed-payload-fingerprint"
+            );
+            assert_eq!(conflict.original_created_ts, created_ts);
+        }
+        other => panic!("changed recovered request must conflict: {other:?}"),
+    }
+    assert_eq!(count_rows(&candidate, "SELECT COUNT(*) FROM messages"), 2);
+    assert_eq!(
+        count_rows(&candidate, "SELECT COUNT(*) FROM message_recipients"),
+        4
+    );
+    expire_all_idempotency_keys(&candidate);
+    match retry(FINGERPRINT) {
+        IdempotentOutcome::Fresh(row) => assert_ne!(row.id, Some(mapped_message)),
+        other => panic!("expired recovered request must become fresh: {other:?}"),
+    }
+    assert_eq!(count_rows(&candidate, "SELECT COUNT(*) FROM messages"), 3);
+    assert_eq!(
+        count_rows(&candidate, "SELECT COUNT(*) FROM message_recipients"),
+        6
+    );
+    assert_eq!(
+        count_rows(&candidate, "SELECT COUNT(*) FROM idempotency_keys"),
+        1
+    );
+}
+
+#[test]
+fn live_salvage_preserves_local_committed_message_retry() {
+    assert_live_salvage_preserves_committed_message_retry(false);
+}
+
+#[test]
+fn live_salvage_preserves_cross_project_committed_message_retry() {
+    assert_live_salvage_preserves_committed_message_retry(true);
+}
+
+#[test]
+fn live_salvage_refuses_corrupt_committed_retry_and_rolls_back_merge() {
+    use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
+    use sqlmodel_core::Value;
+
+    let (pool, dir, source_path) = make_pool();
+    let project = setup_project(&pool);
+    let sender = setup_agent(&pool, project, "RedFox");
+    let recipient = setup_agent(&pool, project, "BlueLake");
+    for (key, body) in [("A-valid", "first send"), ("Z-corrupt", "second send")] {
+        assert!(matches!(
+            send_idem(&pool, project, sender, recipient, body, key, "original-fp"),
+            IdempotentOutcome::Fresh(_)
+        ));
+    }
+    drop(pool);
+
+    let source = DbConn::open_file(source_path.display().to_string()).unwrap();
+    let rows = source
+        .query_sync(
+            "SELECT result_json FROM idempotency_keys WHERE idempotency_key = 'Z-corrupt'",
+            &[],
+        )
+        .unwrap();
+    let mut malformed: serde_json::Value =
+        serde_json::from_str(&rows[0].get_as::<String>(0).unwrap()).unwrap();
+    // This text used to trigger the outer corruption heuristic. A failure to
+    // preserve a committed receipt must never become archive-only success.
+    malformed["project_id"] = serde_json::json!("database disk image is malformed");
+    source
+        .execute_sync(
+            "UPDATE idempotency_keys SET result_json = ? WHERE idempotency_key = 'Z-corrupt'",
+            &[Value::Text(malformed.to_string())],
+        )
+        .unwrap();
+    let claims = |connection: &DbConn| {
+        connection
+            .query_sync(
+                "SELECT project_id, tool, idempotency_key, payload_fingerprint, \
+                 result_json, created_ts, expires_ts FROM idempotency_keys \
+                 ORDER BY project_id, idempotency_key",
+                &[],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get_as::<i64>(0).unwrap(),
+                    row.get_as::<String>(1).unwrap(),
+                    row.get_as::<String>(2).unwrap(),
+                    row.get_as::<String>(3).unwrap(),
+                    row.get_as::<String>(4).unwrap(),
+                    row.get_as::<i64>(5).unwrap(),
+                    row.get_as::<i64>(6).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let source_claims = claims(&source);
+    assert_eq!(source_claims.len(), 2);
+    drop(source);
+
+    let storage = dir.path().join("empty-archive");
+    std::fs::create_dir_all(storage.join("projects")).unwrap();
+    let candidate = dir.path().join("refused.db");
+    let error = mcp_agent_mail_db::reconstruct::reconstruct_from_archive_with_live_salvage(
+        &candidate,
+        &storage,
+        &source_path,
+    )
+    .expect_err("a committed malformed result must refuse recovery");
+    let message = error.to_string();
+    assert!(message.contains("send idempotency recovery refused:"));
+    assert!(message.contains("database disk image is malformed"));
+
+    // A-valid sorts before Z-corrupt, so both the already-restored claim and
+    // the preceding identity/message merge must roll back together.
+    assert!(candidate.is_file());
+    let recovered = CanonicalDbConn::open_file(candidate.display().to_string()).unwrap();
+    for table in [
+        "idempotency_keys",
+        "messages",
+        "message_recipients",
+        "agents",
+        "projects",
+    ] {
+        let rows = recovered
+            .query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .unwrap();
+        assert_eq!(rows[0].get_as::<i64>(0).unwrap(), 0, "rollback {table}");
+    }
+    drop(recovered);
+    let unchanged_source = DbConn::open_file(source_path.display().to_string()).unwrap();
+    assert_eq!(claims(&unchanged_source), source_claims);
+    assert_eq!(
+        unchanged_source
+            .query_sync("SELECT COUNT(*) FROM messages", &[])
+            .unwrap()[0]
+            .get_as::<i64>(0)
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn live_salvage_skips_expired_orphan_before_decoding_or_mapping_retry() {
+    use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
+    use sqlmodel_core::Value;
+
+    let (pool, dir, source_path) = make_pool();
+    let project = setup_project(&pool);
+    let sender = setup_agent(&pool, project, "RedFox");
+    let recipient = setup_agent(&pool, project, "BlueLake");
+    assert!(matches!(
+        send_idem(
+            &pool,
+            project,
+            sender,
+            recipient,
+            "retained send",
+            "valid-key",
+            "valid-fingerprint",
+        ),
+        IdempotentOutcome::Fresh(_)
+    ));
+    drop(pool);
+
+    let source = DbConn::open_file(source_path.display().to_string()).unwrap();
+    source
+        .execute_sync(
+            "INSERT INTO idempotency_keys \
+             (project_id, tool, idempotency_key, payload_fingerprint, result_json, created_ts, expires_ts) \
+             VALUES (?, 'send_message', 'expired-orphan', 'old-fingerprint', '{not-json', 0, 1)",
+            &[Value::BigInt(i64::MAX)],
+        )
+        .unwrap();
+    drop(source);
+
+    let storage = dir.path().join("empty-archive");
+    std::fs::create_dir_all(storage.join("projects")).unwrap();
+    let candidate = dir.path().join("reconstructed.db");
+    mcp_agent_mail_db::reconstruct::reconstruct_from_archive_with_live_salvage(
+        &candidate,
+        &storage,
+        &source_path,
+    )
+    .expect("expired orphan must not prevent recovery of the valid send");
+    let recovered = CanonicalDbConn::open_file(candidate.display().to_string()).unwrap();
+    let records = recovered
+        .query_sync(
+            "SELECT project_id, idempotency_key, result_json FROM idempotency_keys",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    let mapped_project = records[0].get_as::<i64>(0).unwrap();
+    assert_eq!(records[0].get_as::<String>(1).unwrap(), "valid-key");
+    let frozen: MessageRow =
+        serde_json::from_str(&records[0].get_as::<String>(2).unwrap()).unwrap();
+    let mapped_recipient = recovered
+        .query_sync(
+            "SELECT id FROM agents WHERE project_id = ? AND name = 'BlueLake'",
+            &[Value::BigInt(mapped_project)],
+        )
+        .unwrap()[0]
+        .get_as::<i64>(0)
+        .unwrap();
+    drop(recovered);
+
+    let recovered_pool = DbPool::new(&DbPoolConfig {
+        database_url: format!("sqlite:///{}", candidate.display()),
+        storage_root: Some(storage),
+        run_migrations: false,
+        warmup_connections: 0,
+        ..Default::default()
+    })
+    .unwrap();
+    let replayed = match send_idem(
+        &recovered_pool,
+        mapped_project,
+        frozen.sender_id,
+        mapped_recipient,
+        "retained send",
+        "valid-key",
+        "valid-fingerprint",
+    ) {
+        IdempotentOutcome::Replayed(row) => row,
+        other => panic!("valid recovered key must replay: {other:?}"),
+    };
+    assert_eq!(
+        serde_json::to_value(replayed).unwrap(),
+        serde_json::to_value(frozen).unwrap()
+    );
+    assert_eq!(count_rows(&candidate, "SELECT COUNT(*) FROM messages"), 1);
+    assert_eq!(
+        count_rows(&candidate, "SELECT COUNT(*) FROM message_recipients"),
+        1
+    );
+    assert_eq!(
+        count_rows(&candidate, "SELECT COUNT(*) FROM idempotency_keys"),
+        1
+    );
+    let unchanged_source = DbConn::open_file(source_path.display().to_string()).unwrap();
+    let expired = unchanged_source
+        .query_sync(
+            "SELECT project_id, result_json, expires_ts FROM idempotency_keys \
+             WHERE idempotency_key = 'expired-orphan'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].get_as::<i64>(0).unwrap(), i64::MAX);
+    assert_eq!(expired[0].get_as::<String>(1).unwrap(), "{not-json");
+    assert_eq!(expired[0].get_as::<i64>(2).unwrap(), 1);
+}
+
 /// Convenience: send an idempotent message with the given key + fingerprint.
 fn send_idem(
     pool: &DbPool,

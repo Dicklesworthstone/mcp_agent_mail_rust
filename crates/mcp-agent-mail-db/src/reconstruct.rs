@@ -65,7 +65,7 @@ fn open_read_only_salvage_db(path: &Path) -> DbResult<DbConn> {
 /// oversized file (a multi-GB message body, a crafted `profile.json`, …) OOMs
 /// the reconstruct path — which auto-runs on server-startup self-heal. The cap
 /// is generous relative to any legitimate mailbox artifact.
-const MAX_ARCHIVE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Keyset batch size for salvaging `messages` rows (br-5mnkl).
 ///
@@ -2641,7 +2641,9 @@ fn reconstruct_from_archive_with_salvage(
             }
             Err(error) => {
                 let message = error.to_string();
-                if crate::pool::is_corruption_error_message(&message) {
+                if !crate::reconstruct_idempotency::is_refusal(&error)
+                    && crate::pool::is_corruption_error_message(&message)
+                {
                     // Merge rolled back, including the salvage provenance.
                     // Keep the candidate for inspection, then evaluate its
                     // restored checkpoint authority before any promotion.
@@ -5287,10 +5289,41 @@ fn salvage_has_required_state_schema(
     Ok(complete)
 }
 
-#[allow(clippy::too_many_lines)]
 fn merge_salvaged_database(
     target_db_path: &Path,
     salvage_db_path: &Path,
+    reservation_provenance: &ReservationReplayProvenance,
+    stats: &mut ReconstructStats,
+) -> DbResult<DbConn> {
+    // An admitted readable source may carry committed retry protection that
+    // the archive cannot reconstruct. Inspect it before any merge error can
+    // be mistaken for permission to publish an archive-only candidate. Keep
+    // this read transaction open through the merge so its authority and rows
+    // come from the same source snapshot.
+    let salvage_conn = open_read_only_salvage_db(salvage_db_path)
+        .map_err(crate::reconstruct_idempotency::protect_error)?;
+    salvage_conn
+        .execute_raw("BEGIN DEFERRED;")
+        .map_err(|error| {
+            crate::reconstruct_idempotency::protect_error(DbError::Sqlite(error.to_string()))
+        })?;
+    let send_recovery = crate::reconstruct_idempotency::inspect_source(&salvage_conn)?;
+    send_recovery.protect_merge(merge_salvaged_database_inner(
+        target_db_path,
+        salvage_db_path,
+        salvage_conn,
+        &send_recovery,
+        reservation_provenance,
+        stats,
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
+fn merge_salvaged_database_inner(
+    target_db_path: &Path,
+    salvage_db_path: &Path,
+    salvage_conn: DbConn,
+    send_recovery: &crate::reconstruct_idempotency::SendClaimRecovery,
     reservation_provenance: &ReservationReplayProvenance,
     stats: &mut ReconstructStats,
 ) -> DbResult<DbConn> {
@@ -5306,8 +5339,6 @@ fn merge_salvaged_database(
             target_db_path.display()
         ))
     })?;
-    let salvage_conn = open_read_only_salvage_db(salvage_db_path)?;
-
     let has_projects = table_exists(&salvage_conn, "projects")?;
     let has_agents = table_exists(&salvage_conn, "agents")?;
     let has_agent_deregistrations = table_exists(&salvage_conn, "agent_deregistrations")?;
@@ -7467,6 +7498,15 @@ fn merge_salvaged_database(
         for message_id in recipient_json_updates {
             sync_reconstructed_message_recipients_json(&target_conn, message_id)?;
         }
+
+        crate::reconstruct_idempotency::salvage_send_claims(
+            &salvage_conn,
+            &target_conn,
+            &project_id_map,
+            &agent_id_map,
+            &message_id_map,
+            send_recovery,
+        )?;
 
         // ATC telemetry now lives in the independent sidecar DB (atc.sqlite3),
         // which salvage/reconstruct never replaces (br-bvq1x.11.7). The rebuilt
@@ -16467,6 +16507,56 @@ archive body
             agent_count, 0,
             "failed salvage merge should not leak partially inserted agents"
         );
+    }
+
+    #[test]
+    fn reconstruct_live_send_claim_refuses_corruption_before_claim_restore() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_protected_salvage.db");
+        let salvage_db_path = tmp.path().join("protected_salvage.db");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+
+        let source = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        source
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .unwrap();
+        source
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (100, 'protected-source', '/protected-source', 1); \
+                 INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (10, 100, 'RedFox', 'test', 'test', 1, 1); \
+                 INSERT INTO idempotency_keys \
+                 (project_id, tool, idempotency_key, payload_fingerprint, result_json, created_ts, expires_ts) \
+                 VALUES (100, 'send_message', 'must-retain', 'opaque-fingerprint', '{}', 1, 9223372036854775807);",
+            )
+            .unwrap();
+        drop(source);
+
+        // Fail in the old message scan, before the new receipt-restoration
+        // helper runs. A known live key still forbids archive-only fallback.
+        FAIL_SALVAGE_QUERY_MESSAGES.with(|hook| hook.set(true));
+        let error =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect_err("earlier corruption cannot discard admitted retry protection");
+        let message = error.to_string();
+        assert!(
+            message.contains("send idempotency recovery refused"),
+            "{message}"
+        );
+        assert!(
+            message.contains("database disk image is malformed"),
+            "{message}"
+        );
+
+        let candidate = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        for table in ["projects", "agents", "messages", "idempotency_keys"] {
+            let rows = candidate
+                .query_sync(&format!("SELECT COUNT(*) AS count FROM {table}"), &[])
+                .unwrap();
+            assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 0, "{table}");
+        }
     }
 
     #[test]
