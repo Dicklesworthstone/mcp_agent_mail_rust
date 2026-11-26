@@ -2791,7 +2791,7 @@ mod tests {
         let mut row = sample_row();
         row.expected_loss = -1.5;
         row.runner_up_loss = Some(0.25);
-        let mut outcome = synthetic_outcome(Value::Null);
+        let mut outcome = synthetic_outcome(serde_json::json!({"count": 1}));
         outcome.actual_loss = Some(0.5);
         outcome.regret = Some(-0.25);
         row.outcome = Some(outcome);
