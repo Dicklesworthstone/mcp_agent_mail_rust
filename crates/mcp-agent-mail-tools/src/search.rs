@@ -1137,8 +1137,8 @@ pub(crate) fn parse_time_range_with_aliases(
 ///   Default `false` preserves the lightweight FTS5 result-list cost; set `true` when the
 ///   caller intends to read the message contents directly from search output (e.g. when
 ///   `fetch_inbox` or `ReadMcpResourceTool` is unavailable from a spawned pane).
-/// - `recipient_kind`: Keep messages delivered as `to`, `cc`, or `bcc` to any
-///   recipient. Filtering never exposes BCC identities.
+/// - `recipient_kind`: Keep direct or shared-mailbox deliveries as `to`, `cc`,
+///   or `bcc`. Filtering never exposes BCC identities.
 /// - `diagnostics`: Optional degraded-mode metadata for budget/timeout signals
 ///
 /// # Returns
@@ -1185,7 +1185,8 @@ ranking : str
 sender : str
     Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.
 recipient_kind : str
-    Keep messages delivered to any agent as "to", "cc", or "bcc". BCC identities are never returned.
+    Keep direct agent or shared project-mailbox deliveries as "to", "cc", or "bcc".
+    BCC identities are never returned.
     Sparse matches may reach the bounded page budget before filling limit. Continue with next_cursor,
     including when result is empty; diagnostics and guidance identify a partial page.
 importance : str
@@ -2040,6 +2041,201 @@ mod tests {
                 assert!(last.results.is_empty());
                 assert!(last.next_cursor.is_none());
             }
+        });
+    }
+
+    async fn seed_shared_recipient_search_deliveries(
+        ctx: &McpContext,
+        pool: &mcp_agent_mail_db::DbPool,
+    ) {
+        let conn = match pool.acquire(ctx.cx()).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => panic!("acquire shared corpus connection: {error}"),
+            Outcome::Cancelled(reason) => {
+                panic!("acquire shared corpus connection cancelled: {reason:?}");
+            }
+            Outcome::Panicked(payload) => {
+                panic!(
+                    "acquire shared corpus connection panicked: {}",
+                    payload.message()
+                );
+            }
+        };
+        conn.execute_raw(
+            "BEGIN IMMEDIATE;
+             INSERT INTO messages (id,project_id,sender_id,subject,body_md,created_ts) VALUES
+                (1001,2,6,'needle','shared CC body',1001000000),
+                (1002,2,6,'needle','shared TO body',1002000000);
+             INSERT INTO project_mailbox_deliveries (message_id,project_id,kind,delivered_ts) VALUES
+                (95,1,'cc',20000000),
+                (96,1,'cc',20000000),
+                (1001,2,'cc',1001000000),
+                (1002,2,'to',1002000000);
+             COMMIT;",
+        )
+        .expect("shared-only, mixed and duplicate delivery corpus");
+    }
+
+    #[test]
+    fn recipient_kind_search_includes_shared_deliveries_without_duplicate_hits() {
+        with_recipient_search_corpus(|ctx, pool| async move {
+            seed_shared_recipient_search_deliveries(&ctx, &pool).await;
+            // Span more than one IN-list batch and repeat mixed direct/shared
+            // matches. Foreign shared deliveries must remain outside project 1.
+            let mut ids: Vec<i64> = (1..=700).collect();
+            ids.extend([95, 96, 1001, 1002]);
+            let matching = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::message_ids_with_recipient_kind(
+                    ctx.cx(),
+                    &pool,
+                    1,
+                    "cc",
+                    &ids,
+                )
+                .await,
+            )
+            .expect("batched direct and shared delivery query");
+            let mut expected: HashSet<i64> = (1..=96).filter(|id| id % 3 == 0).collect();
+            expected.insert(95);
+            assert_eq!(matching, expected);
+            assert!(
+                db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::project_has_recipient_kind(
+                        ctx.cx(),
+                        &pool,
+                        2,
+                        "cc",
+                    )
+                    .await,
+                )
+                .expect("shared-only kind is present")
+            );
+            for (kind, expected_id) in [("cc", 1001), ("to", 1002), ("bcc", 1000)] {
+                let response = call_recipient_search_tool(&ctx, "other-search", kind, None, None)
+                    .await
+                    .expect("registered search tool includes shared deliveries");
+                let hits = response["result"].as_array().expect("search hits");
+                assert_eq!(hits.len(), 1, "{kind}");
+                assert_eq!(hits[0]["id"], expected_id, "{kind}");
+                assert!(hits[0].get("bcc").is_none(), "no BCC identities");
+            }
+        });
+    }
+
+    #[test]
+    fn shared_recipient_kind_search_preserves_sparse_continuation() {
+        with_recipient_search_corpus(|ctx, pool| async move {
+            seed_shared_recipient_search_deliveries(&ctx, &pool).await;
+            let conn = match pool.acquire(ctx.cx()).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(error) => panic!("acquire sparse corpus connection: {error}"),
+                Outcome::Cancelled(reason) => {
+                    panic!("acquire sparse corpus connection cancelled: {reason:?}");
+                }
+                Outcome::Panicked(payload) => {
+                    panic!(
+                        "acquire sparse corpus connection panicked: {}",
+                        payload.message()
+                    );
+                }
+            };
+            conn.execute_raw("BEGIN IMMEDIATE")
+                .expect("begin sparse corpus");
+            for id in 2000_i64..2080 {
+                use mcp_agent_mail_db::sqlmodel_core::Value;
+                conn.execute_sync(
+                    "INSERT INTO messages (id,project_id,sender_id,subject,body_md,created_ts)
+                     VALUES (?,2,6,'needle','newer direct message',2000000000)",
+                    &[Value::BigInt(id)],
+                )
+                .expect("newer message");
+                conn.execute_sync(
+                    "INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (?,7,'to')",
+                    &[Value::BigInt(id)],
+                )
+                .expect("newer direct delivery");
+            }
+            conn.execute_raw("COMMIT").expect("commit sparse corpus");
+            drop(conn);
+
+            let mut query = SearchQuery::messages("from:OtherLake", 2);
+            query.limit = Some(1);
+            let options = recipient_search_options();
+            let (first, diagnostics) =
+                search_with_recipient_kind(&ctx, &pool, &query, &options, Some("cc"))
+                    .await
+                    .expect("bounded shared-kind search");
+            assert!(
+                first.results.is_empty(),
+                "shared CC is beyond the first 64 candidates"
+            );
+            assert_eq!(
+                diagnostics
+                    .expect("partial page diagnostics")
+                    .budget_exhausted,
+                Some(true)
+            );
+            query.cursor = Some(
+                first
+                    .next_cursor
+                    .expect("shared-only kind must not report exhaustion"),
+            );
+            let (second, _) = search_with_recipient_kind(&ctx, &pool, &query, &options, Some("cc"))
+                .await
+                .expect("continue to the shared delivery");
+            assert_eq!(
+                second
+                    .results
+                    .iter()
+                    .map(|hit| hit.result.id)
+                    .collect::<Vec<_>>(),
+                [1001]
+            );
+        });
+    }
+
+    #[test]
+    fn recipient_kind_search_rejects_partial_shared_schema() {
+        with_recipient_search_corpus(|ctx, pool| async move {
+            seed_shared_recipient_search_deliveries(&ctx, &pool).await;
+            let conn = match pool.acquire(ctx.cx()).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(error) => panic!("acquire schema fixture connection: {error}"),
+                Outcome::Cancelled(reason) => {
+                    panic!("acquire schema fixture connection cancelled: {reason:?}");
+                }
+                Outcome::Panicked(payload) => {
+                    panic!(
+                        "acquire schema fixture connection panicked: {}",
+                        payload.message()
+                    );
+                }
+            };
+            conn.execute_raw(
+                "ALTER TABLE project_mailbox_deliveries RENAME TO retained_shared_deliveries",
+            )
+            .expect("retain shared data while making its expected table unavailable");
+            drop(conn);
+
+            let matching = mcp_agent_mail_db::queries::message_ids_with_recipient_kind(
+                ctx.cx(),
+                &pool,
+                1,
+                "cc",
+                &[95, 96],
+            )
+            .await;
+            assert!(
+                matches!(matching, Outcome::Err(_)),
+                "a partial shared schema must not silently return direct-only matches"
+            );
+            let presence =
+                mcp_agent_mail_db::queries::project_has_recipient_kind(ctx.cx(), &pool, 2, "cc")
+                    .await;
+            assert!(
+                matches!(presence, Outcome::Err(_)),
+                "a partial shared schema cannot prove a shared-only kind absent"
+            );
         });
     }
 

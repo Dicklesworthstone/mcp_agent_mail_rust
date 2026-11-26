@@ -12118,9 +12118,9 @@ pub async fn list_message_recipient_names_by_message(
 
 /// Select message IDs with at least one delivery of `kind` in this project.
 ///
-/// Reads the delivery table, rather than the denormalized recipient names, and
-/// returns no recipient identities (in particular, no BCC names). Batching
-/// keeps a large search page below the engine's parameter limit.
+/// Reads direct and shared-mailbox deliveries, rather than the denormalized
+/// recipient names, and returns no recipient identities (in particular, no BCC
+/// names). Batching keeps a large search page below the engine's parameter limit.
 pub async fn message_ids_with_recipient_kind(
     cx: &Cx,
     pool: &DbPool,
@@ -12140,37 +12140,66 @@ pub async fn message_ids_with_recipient_kind(
     let tracked = tracked(&*conn);
     let mut out = HashSet::new();
     for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-        let placeholders = placeholders(chunk.len());
-        let sql = format!(
+        // Reuse the same binds in both branches so shared deliveries do not
+        // double the parameter count or shrink the existing batch bound.
+        let placeholders = (3..chunk.len() + 3)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let direct_sql = format!(
             "SELECT DISTINCT r.message_id \
              FROM message_recipients r JOIN messages m ON m.id = r.message_id \
-             WHERE m.project_id = ? AND r.kind = ? \
+             WHERE m.project_id = ?1 AND r.kind = ?2 \
                AND r.message_id IN ({placeholders})"
+        );
+        let sql = format!(
+            "{direct_sql} \
+             UNION \
+             SELECT d.message_id \
+             FROM project_mailbox_deliveries d JOIN messages m ON m.id = d.message_id \
+             WHERE m.project_id = ?1 AND d.project_id = ?1 AND d.kind = ?2 \
+               AND d.message_id IN ({placeholders})"
         );
         let mut params = Vec::with_capacity(chunk.len() + 2);
         params.push(Value::BigInt(project_id));
         params.push(Value::Text(kind.to_string()));
         params.extend(chunk.iter().copied().map(Value::BigInt));
-        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-            Outcome::Ok(rows) => {
-                for row in rows {
-                    match row.get_as::<i64>(0) {
-                        Ok(id) => {
-                            out.insert(id);
-                        }
-                        Err(error) => return Outcome::Err(map_sql_error(&error)),
-                    }
+        let rows = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error)
+                if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                    &error.to_string(),
+                ) =>
+            {
+                if let Err(error) =
+                    crate::project_mailbox::allow_absent_shared_schema(&**conn, &error.to_string())
+                {
+                    return Outcome::Err(error);
+                }
+                match map_sql_outcome(traw_query(cx, &tracked, &direct_sql, &params).await) {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
                 }
             }
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
             Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        for row in rows {
+            match row.get_as::<i64>(0) {
+                Ok(id) => {
+                    out.insert(id);
+                }
+                Err(error) => return Outcome::Err(map_sql_error(&error)),
+            }
         }
     }
     Outcome::Ok(out)
 }
 
-/// Whether this project has any delivery of `kind`.
+/// Whether this project has any direct or shared-mailbox delivery of `kind`.
 ///
 /// A filtered search can prove that later pages cannot match without walking
 /// the entire search result set. Other projects do not defeat this shortcut.
@@ -12187,16 +12216,42 @@ pub async fn project_has_recipient_kind(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
     let tracked = tracked(&*conn);
-    let sql = "SELECT 1 FROM message_recipients r \
-               JOIN messages m ON m.id = r.message_id \
-               WHERE m.project_id = ? AND r.kind = ? LIMIT 1";
+    let direct_sql = "SELECT 1 FROM message_recipients r \
+                      JOIN messages m ON m.id = r.message_id \
+                      WHERE m.project_id = ?1 AND r.kind = ?2";
+    let sql = format!(
+        "{direct_sql} \
+         UNION ALL \
+         SELECT 1 FROM project_mailbox_deliveries d \
+         JOIN messages m ON m.id = d.message_id \
+         WHERE m.project_id = ?1 AND d.project_id = ?1 AND d.kind = ?2 LIMIT 1"
+    );
     let params = [Value::BigInt(project_id), Value::Text(kind.to_string())];
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => Outcome::Ok(!rows.is_empty()),
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            if let Err(error) =
+                crate::project_mailbox::allow_absent_shared_schema(&**conn, &error.to_string())
+            {
+                return Outcome::Err(error);
+            }
+            let legacy_sql = format!("{direct_sql} LIMIT 1");
+            match map_sql_outcome(traw_query(cx, &tracked, &legacy_sql, &params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
+        }
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    Outcome::Ok(!rows.is_empty())
 }
 
 /// Get message by ID

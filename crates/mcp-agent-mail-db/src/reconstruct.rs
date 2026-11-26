@@ -3535,7 +3535,9 @@ fn reconstructed_sender_provenance_matches(
             &[Value::BigInt(sender_id)],
         )
         .map_err(|error| {
-            DbError::Sqlite(format!("reconstruct: inspect sender project provenance: {error}"))
+            DbError::Sqlite(format!(
+                "reconstruct: inspect sender project provenance: {error}"
+            ))
         })?;
     let Some(row) = rows.first() else {
         return Ok(false);
@@ -3588,7 +3590,10 @@ fn reconstructed_archive_metadata(
     // Absence is the legacy format. An explicit null or empty identity is
     // not absence and cannot be reproduced from the resolved sender row.
     if [
-        ("sender_project", parent_projection.sender_project.as_deref()),
+        (
+            "sender_project",
+            parent_projection.sender_project.as_deref(),
+        ),
         (
             "sender_project_slug",
             parent_projection.sender_project_slug.as_deref(),
@@ -9890,7 +9895,14 @@ mod tests {
             (Some(1), None, false, false, false, None),
             (Some(1), Some(1), false, true, false, None),
             (Some(1), Some(1), true, false, false, None),
-            (Some(1), Some(1), false, false, false, Some("{\"reply_to\":1}")),
+            (
+                Some(1),
+                Some(1),
+                false,
+                false,
+                false,
+                Some("{\"reply_to\":1}"),
+            ),
             (None, None, false, false, false, Some("{}")),
             (Some(1), Some(1), false, false, true, None),
         ] {
