@@ -2195,8 +2195,9 @@ pub enum ArchiveBacklogPush {
     /// durable acknowledgment
     /// (br-ack-fast: "do not report queued/durable unless the journal persisted").
     QueuedEphemeral,
-    /// The backlog was at capacity; the op was dropped. The DB row remains
-    /// authoritative (parity tooling reports the drift as DB-ahead).
+    /// The backlog was at capacity, stopped, or owned by another mailbox;
+    /// the op was not admitted. The DB row remains authoritative (parity
+    /// tooling reports the drift as DB-ahead).
     Dropped,
 }
 
@@ -2379,6 +2380,56 @@ enum ArchiveBacklogRetirement {
     Corrupt,
 }
 
+/// A routing identity, not publication authority. Retained operations must
+/// never resume under a different server's mailbox configuration. Resolve
+/// existing prefixes so creating a previously absent directory or using an
+/// alias does not change the identity. Keep the database URL comparison strict
+/// rather than guess that two different databases share an archive.
+#[derive(PartialEq, Eq)]
+struct ArchiveBacklogOwner {
+    storage_root: PathBuf,
+    database_url: String,
+    signals_root: PathBuf,
+}
+
+impl ArchiveBacklogOwner {
+    fn from_config(config: &Config) -> Self {
+        fn resolved(path: &Path) -> PathBuf {
+            let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            canonicalize_with_existing_prefix(&absolute).unwrap_or(absolute)
+        }
+        Self {
+            storage_root: resolved(&config.storage_root),
+            database_url: config.database_url.clone(),
+            signals_root: resolved(&config.notifications_signals_dir),
+        }
+    }
+}
+
+struct ArchiveBacklogAdmission {
+    owner: Option<ArchiveBacklogOwner>,
+    /// Includes journal publishers and recovery batches until their entries
+    /// are queued. The mutex is never held across filesystem work.
+    publishers: usize,
+}
+
+struct ArchiveBacklogPublisher<'a> {
+    backlog: &'a ArchiveRetryBacklog,
+}
+
+impl Drop for ArchiveBacklogPublisher<'_> {
+    fn drop(&mut self) {
+        let mut admission = self
+            .backlog
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.publishers -= 1;
+        drop(admission);
+        self.backlog.wake.notify_all();
+    }
+}
+
 struct ArchiveRetryBacklog {
     queue: Mutex<VecDeque<ArchiveBacklogEntry>>,
     /// Canonical paths owned by publishing, queued, executing, or retiring
@@ -2387,6 +2438,10 @@ struct ArchiveRetryBacklog {
     owned_journals: Mutex<BTreeSet<PathBuf>>,
     drain_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     lifecycle: Mutex<()>,
+    admission: Mutex<ArchiveBacklogAdmission>,
+    stopping: AtomicBool,
+    pause: Mutex<()>,
+    wake: Condvar,
     /// Claim and admit each sorted recovery batch together. Ordinary producers
     /// do not take this gate, and no journal payload is read while it is held.
     recovery_admission: Mutex<()>,
@@ -2432,6 +2487,13 @@ impl ArchiveRetryBacklog {
             owned_journals: Mutex::new(BTreeSet::new()),
             drain_handle: Mutex::new(None),
             lifecycle: Mutex::new(()),
+            admission: Mutex::new(ArchiveBacklogAdmission {
+                owner: None,
+                publishers: 0,
+            }),
+            stopping: AtomicBool::new(false),
+            pause: Mutex::new(()),
+            wake: Condvar::new(),
             recovery_admission: Mutex::new(()),
             depth: AtomicU64::new(0),
             reserved: AtomicU64::new(0),
@@ -2450,6 +2512,59 @@ impl ArchiveRetryBacklog {
         );
     }
 
+    fn admit_publisher(&self, config: &Config) -> Option<ArchiveBacklogPublisher<'_>> {
+        let requested = ArchiveBacklogOwner::from_config(config);
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stopping.load(Ordering::Acquire)
+            || admission
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner != &requested)
+        {
+            return None;
+        }
+        admission.owner.get_or_insert(requested);
+        admission.publishers += 1;
+        Some(ArchiveBacklogPublisher { backlog: self })
+    }
+
+    fn request_stop(&self) {
+        // Share the wait mutex when setting the predicate so a worker cannot
+        // miss the stop notification between checking it and going to sleep.
+        let _pause = self
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.stopping.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+
+    fn pause_until_retry_or_stop(&self, duration: Duration) {
+        let pause = self
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _wait = self
+            .wake
+            .wait_timeout_while(pause, duration, |_| !self.stopping.load(Ordering::Acquire))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+
+    fn fully_drained(&self) -> bool {
+        let admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.publishers == 0 && self.reserved.load(Ordering::Relaxed) == 0 && queue.is_empty()
+    }
+
     /// Durably journal and enqueue an op. `cap` bounds the in-memory queue; on
     /// overflow the op is dropped (DB stays authoritative). The request path
     /// performs journal file sync and, on Unix, directory-ancestry sync.
@@ -2461,6 +2576,16 @@ impl ArchiveRetryBacklog {
     /// The return value reflects **actual durability**: [`ArchiveBacklogPush::Queued`]
     /// only when the journal persisted, else [`ArchiveBacklogPush::QueuedEphemeral`].
     fn push(&self, op: WriteOp, cap: u64) -> ArchiveBacklogPush {
+        // Count the complete publication, not just the queued entry: shutdown
+        // must also wait for a pusher currently syncing its journal to disk.
+        let Some(_publisher) = self.admit_publisher(write_op_config(&op)) else {
+            self.dropped_total.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                "archive retry backlog admission closed or owned by another mailbox; \
+                 archive op not admitted (DB authoritative)"
+            );
+            return ArchiveBacklogPush::Dropped;
+        };
         // Reserve a slot under the lock: count both live entries and in-flight
         // reservations against `cap` so parallel pushers serialize on the bound.
         {
@@ -2548,6 +2673,13 @@ impl ArchiveRetryBacklog {
     /// Batching prevents newer live enqueues from splitting recovered order;
     /// it does not reorder live work already admitted before this batch.
     fn push_recovered(&self, config: &Config, files: Vec<PathBuf>) -> u64 {
+        let Some(_publisher) = self.admit_publisher(config) else {
+            tracing::warn!(
+                "archive backlog recovery admission closed or owned by another mailbox; \
+                 pending journals remain on disk"
+            );
+            return 0;
+        };
         let _admission = self
             .recovery_admission
             .lock()
@@ -3344,17 +3476,30 @@ fn archive_backlog_journal_resolve(path: &Path) -> std::io::Result<()> {
 }
 
 fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
-    let _lifecycle = backlog
-        .lifecycle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A completed publisher must not wait behind a shutdown join. Its entry
+    // and journal remain owned even when this attempt cannot start a worker.
+    let _lifecycle = match backlog.lifecycle.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if backlog.stopping.load(Ordering::Acquire) {
+        return;
+    }
     {
-        let handle = backlog
+        let mut handle = backlog
             .drain_handle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if handle.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
+        }
+        if let Some(finished) = handle.take()
+            && finished.join().is_err()
+        {
+            tracing::warn!(
+                "archive backlog: previous worker panicked; retained entries will retry"
+            );
         }
     }
     let handle = std::thread::Builder::new()
@@ -3376,6 +3521,164 @@ fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
 }
 
+/// Bind startup recovery to its mailbox, or reopen a fully stopped generation.
+/// Normal repeated recovery must not reset the stop flag or replace a worker
+/// that is still exiting. Startup may wait behind an ongoing bounded shutdown.
+fn archive_backlog_prepare_recovery(
+    backlog: &ArchiveRetryBacklog,
+    config: &Config,
+) -> std::result::Result<(), &'static str> {
+    let requested = ArchiveBacklogOwner::from_config(config);
+    let _lifecycle = backlog
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut admission = backlog
+        .admission
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let different_owner = admission
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner != &requested);
+    if !backlog.stopping.load(Ordering::Acquire) {
+        if different_owner {
+            return Err("another mailbox owns the active retry backlog");
+        }
+        admission.owner = Some(requested);
+        return Ok(());
+    }
+    if admission.publishers != 0 || backlog.reserved.load(Ordering::Relaxed) != 0 {
+        return Err("previous journal publishers have not quiesced");
+    }
+    let mut handle = backlog
+        .drain_handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if handle.as_ref().is_some_and(|worker| !worker.is_finished()) {
+        return Err("previous retry worker has not exited");
+    }
+    if different_owner
+        && (!backlog
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+            || !backlog
+                .owned_journals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty())
+    {
+        // Do not drain A's in-memory operations after B acquires mailbox
+        // authority, or let A's retained debt silently consume B's capacity.
+        return Err("previous mailbox still owns pending archive work");
+    }
+    if let Some(finished) = handle.take()
+        && finished.join().is_err()
+    {
+        tracing::warn!("archive backlog: stopped worker panicked; retained entries will retry");
+    }
+    admission.owner = Some(requested);
+    backlog.stopping.store(false, Ordering::Release);
+    Ok(())
+}
+
+fn archive_backlog_kick_pending(backlog: &'static ArchiveRetryBacklog) {
+    let pending = !backlog
+        .queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty();
+    if pending {
+        archive_backlog_ensure_drain(backlog);
+    }
+}
+
+fn archive_backlog_shutdown_inner(backlog: &ArchiveRetryBacklog, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let _lifecycle = loop {
+        match backlog.lifecycle.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
+    };
+    backlog.request_stop();
+    loop {
+        let publishers = backlog
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .publishers;
+        let mut handle = backlog
+            .drain_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if publishers == 0
+            && backlog.reserved.load(Ordering::Relaxed) == 0
+            && handle
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            if let Some(finished) = handle.take()
+                && finished.join().is_err()
+            {
+                tracing::warn!(
+                    "archive backlog: worker panicked before shutdown; pending work retained"
+                );
+            }
+            return true;
+        }
+        drop(handle);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Never detach the worker or clear its stop request. Startup must
+            // observe its actual exit and all publishers before reopening.
+            return false;
+        }
+        let pause = backlog
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _wait = backlog
+            .wake
+            .wait_timeout(pause, remaining.min(Duration::from_millis(10)))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+/// Close retry admission and stop the worker within `timeout`.
+///
+/// A true result certifies that the worker and admitted journal publishers
+/// have exited; it does not mean pending work was materialized. Queued payloads
+/// and journal ownership remain intact for explicit startup recovery. Only
+/// durably journaled entries are guaranteed to survive process exit.
+///
+/// A false result means shutdown is incomplete: the lifecycle was busy or an
+/// admitted publication is still running. A blocked filesystem/publication
+/// operation cannot be preempted and may still mutate the archive or enqueue
+/// a Git commit after return. Its handle remains owned, and recovery refuses
+/// an overlapping generation. Call before the final async commit flush; that
+/// flush is only best effort when shutdown is incomplete.
+#[must_use]
+pub fn archive_backlog_shutdown(timeout: Duration) -> bool {
+    let stopped = archive_backlog_shutdown_inner(&ARCHIVE_BACKLOG, timeout);
+    if !stopped {
+        tracing::warn!(
+            "archive retry backlog shutdown incomplete; publication may still finish and \
+             enqueue commits; worker handle and journal debt remain owned"
+        );
+    }
+    stopped
+}
+
 /// Background drain loop. Single drainer, so the front entry is stable across
 /// the unlocked `write_op_sync` call (only pushes append to the back). Writer
 /// panics become failed attempts in `write_op_sync`, so they retain the journal
@@ -3389,10 +3692,12 @@ fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
 /// on disk — while the git commit still batches. This runs on the backlog
 /// thread, never the request thread, so the tool reply stays decoupled.
 fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
-    loop {
+    while !backlog.stopping.load(Ordering::Acquire) {
         match backlog.drain_step() {
             ArchiveBacklogDrainStep::Empty => {
-                std::thread::sleep(Duration::from_millis(ARCHIVE_BACKLOG_IDLE_INTERVAL_MS));
+                backlog.pause_until_retry_or_stop(Duration::from_millis(
+                    ARCHIVE_BACKLOG_IDLE_INTERVAL_MS,
+                ));
             }
             // Materialized: loop immediately to drain the next entry with no sleep.
             // DeadLettered (F3): the poisoned head was ledgered and removed;
@@ -3404,10 +3709,11 @@ fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
                 let backoff = ARCHIVE_BACKLOG_DRAIN_INTERVAL_MS
                     .saturating_mul(u64::from(attempts.min(50)))
                     .min(ARCHIVE_BACKLOG_MAX_BACKOFF_MS);
-                std::thread::sleep(Duration::from_millis(backoff));
+                backlog.pause_until_retry_or_stop(Duration::from_millis(backoff));
             }
         }
     }
+    backlog.wake.notify_all();
 }
 
 /// Durably queue an archive write op for strictly-asynchronous background retry.
@@ -3440,10 +3746,31 @@ pub fn archive_backlog_push(op: WriteOp) -> ArchiveBacklogPush {
 /// recovered operation plus the bounded live queue; path metadata remains
 /// proportional to the number of pending journals. The whole recovery batch
 /// precedes subsequently admitted writes, including mutable profiles/signals.
+/// Reopens a stopped backlog only after its previous worker and publishers
+/// exit. A different mailbox cannot take over retained in-memory work. A
+/// refusal leaves retry admission with its previous owner; it does not abort
+/// the caller's server startup.
 pub fn archive_backlog_recover(config: &Config) {
+    let backlog = &*ARCHIVE_BACKLOG;
+    if let Err(reason) = archive_backlog_prepare_recovery(backlog, config) {
+        tracing::warn!(
+            reason,
+            "archive backlog: recovery refused; retry admission retains its previous owner"
+        );
+        // A valid publisher may have lost its nonblocking start attempt while
+        // recovery held the lifecycle gate, even if this recovery was refused
+        // for another mailbox. This never reopens a stopped generation.
+        archive_backlog_kick_pending(backlog);
+        return;
+    }
+    // Reopen admission even on a clean boot with no journal directory. A
+    // retained ephemeral payload may also need to resume without any files.
     let dir = archive_backlog_journal_dir_for(config);
-    let read_dir = match fs::read_dir(&dir) {
-        Ok(read_dir) => read_dir,
+    let mut files: Vec<PathBuf> = match fs::read_dir(&dir) {
+        Ok(read_dir) => read_dir
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect(),
         Err(error) => {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(
@@ -3452,24 +3779,22 @@ pub fn archive_backlog_recover(config: &Config) {
                     "archive backlog: cannot scan journal dir during recovery"
                 );
             }
-            return;
+            Vec::new()
         }
     };
-    let mut files: Vec<PathBuf> = read_dir
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .collect();
     files.sort();
 
-    let backlog = &*ARCHIVE_BACKLOG;
     let recovered = backlog.push_recovered(config, files);
     if recovered > 0 {
         tracing::warn!(
             recovered,
             "archive backlog: admitted pending journals for background recovery after restart"
         );
-        archive_backlog_ensure_drain(backlog);
     }
+    // Also kick entries already owned before the scan. A live publisher can
+    // enqueue while prepare_recovery owns the lifecycle gate, lose its start
+    // attempt, and then be correctly skipped by journal deduplication here.
+    archive_backlog_kick_pending(backlog);
 }
 
 /// Current number of entries in the archive retry backlog, including journals
@@ -3480,22 +3805,25 @@ pub fn archive_backlog_depth() -> u64 {
 }
 
 /// Block until the archive retry backlog drains to empty or the timeout elapses.
-/// Returns true if it fully drained. Test/shutdown helper.
+/// Returns true if it fully drained, including admitted journal publishers.
+/// Returns false immediately if work remains in a stopped generation; it never
+/// reopens admission. Test/shutdown helper.
 #[must_use]
 pub fn archive_backlog_flush_blocking(timeout: Duration) -> bool {
     let backlog = &*ARCHIVE_BACKLOG;
+    if backlog.fully_drained() {
+        return true;
+    }
+    if backlog.stopping.load(Ordering::Acquire) {
+        return false;
+    }
     archive_backlog_ensure_drain(backlog);
     let deadline = Instant::now() + timeout;
     loop {
-        if backlog
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-        {
+        if backlog.fully_drained() {
             return true;
         }
-        if Instant::now() >= deadline {
+        if backlog.stopping.load(Ordering::Acquire) || Instant::now() >= deadline {
             return false;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -29831,6 +30159,526 @@ mod tests {
         }
     }
 
+    fn backlog_test_signal_config(root: &Path) -> Config {
+        let mut config = test_config(root);
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = root.join("signals");
+        config
+    }
+
+    fn backlog_test_signal_op(config: &Config, agent: &str) -> WriteOp {
+        WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "backlog-lifecycle".to_string(),
+            agent_name: agent.to_string(),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn archive_backlog_shutdown_retains_blocked_worker_and_pending_message() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_shutdown_retains_blocked_worker_and_pending_message",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "shutdown-fence").unwrap();
+        flush_async_commits();
+        let backlog = &*ARCHIVE_BACKLOG;
+        for id in [7001, 7002] {
+            assert_eq!(
+                backlog.push(backlog_test_message_op(&config, "shutdown-fence", id), 8),
+                ArchiveBacklogPush::Queued
+            );
+        }
+        let journals: Vec<_> = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.journal_path.clone().unwrap())
+            .collect();
+        let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let root = archive.repo_root.clone();
+        let holder = std::thread::spawn(move || {
+            let _fence = ArchiveMutationGuard::begin_at(&root);
+            held_tx.send(()).unwrap();
+            // A broken unbounded join must fail the elapsed-time assertion,
+            // rather than hang the subprocess forever behind this fixture.
+            let _ = release_rx.recv_timeout(Duration::from_secs(15));
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        archive_backlog_ensure_drain(backlog);
+        let worker_id = backlog
+            .drain_handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .thread()
+            .id();
+        let waiting = &mcp_agent_mail_core::global_metrics()
+            .storage
+            .archive_fence_wait_since_us;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while waiting.load() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let observed_wait = waiting.load() != 0;
+        let started = Instant::now();
+        let stopped_while_blocked = archive_backlog_shutdown(Duration::from_millis(30));
+        let stop_elapsed = started.elapsed();
+        let same_owner_refused = archive_backlog_prepare_recovery(backlog, &config).is_err();
+        let mut other = config.clone();
+        other.storage_root = tmp.path().join("other-mailbox");
+        archive_backlog_recover(&other);
+        let late_push = backlog.push(backlog_test_message_op(&config, "shutdown-fence", 7003), 8);
+        archive_backlog_ensure_drain(backlog);
+        let retained_id = backlog
+            .drain_handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|worker| worker.thread().id());
+        let remained_stopped = backlog.stopping.load(Ordering::Acquire);
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(archive_backlog_shutdown(Duration::from_secs(5)));
+        assert!(
+            observed_wait,
+            "the actual writer must reach the held publication fence"
+        );
+        assert!(!stopped_while_blocked, "a live writer is not quiescent");
+        assert!(stop_elapsed < Duration::from_secs(1));
+        assert!(same_owner_refused && remained_stopped);
+        assert_eq!(retained_id, Some(worker_id));
+        assert_eq!(late_push, ArchiveBacklogPush::Dropped);
+        assert_eq!(backlog.depth.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert!(backlog.drain_handle.lock().unwrap().is_none());
+        assert!(!archive_backlog_flush_blocking(Duration::from_millis(20)));
+        assert!(
+            backlog.drain_handle.lock().unwrap().is_none(),
+            "flush must not reopen admission"
+        );
+
+        // A true stop precedes the final Git flush, including the commit from
+        // the write that was still blocked when the first stop timed out.
+        flush_async_commits();
+        let mut first_paths = Vec::new();
+        collect_canonical_message_paths_with_id(
+            &archive.root.join("messages"),
+            7001,
+            &mut first_paths,
+        )
+        .unwrap();
+        assert_eq!(first_paths.len(), 1);
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let committed = tree
+            .get_path(first_paths[0].strip_prefix(&archive.repo_root).unwrap())
+            .unwrap();
+        assert_eq!(
+            repo.find_blob(committed.id()).unwrap().content(),
+            fs::read(&first_paths[0]).unwrap()
+        );
+        let mut second_paths = Vec::new();
+        collect_canonical_message_paths_with_id(
+            &archive.root.join("messages"),
+            7002,
+            &mut second_paths,
+        )
+        .unwrap();
+        assert!(second_paths.is_empty());
+        archive_backlog_recover(&other);
+        assert!(backlog.stopping.load(Ordering::Acquire));
+        assert!(
+            !other.storage_root.exists(),
+            "refused recovery must leave the other mailbox untouched"
+        );
+
+        archive_backlog_recover(&config);
+        assert!(archive_backlog_flush_blocking(Duration::from_secs(10)));
+        assert!(archive_backlog_shutdown(Duration::from_secs(5)));
+        flush_async_commits();
+        collect_canonical_message_paths_with_id(
+            &archive.root.join("messages"),
+            7002,
+            &mut second_paths,
+        )
+        .unwrap();
+        assert_eq!(second_paths.len(), 1);
+        let (message, body) = read_message_file(&second_paths[0]).unwrap();
+        assert_eq!(message["id"], 7002);
+        assert_eq!(body.trim(), "Body for message 7002");
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 2);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 2);
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+        for journal in journals {
+            assert!(!journal.exists());
+            assert!(
+                journal
+                    .parent()
+                    .unwrap()
+                    .join("resolved")
+                    .join(journal.file_name().unwrap())
+                    .is_file()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_shutdown_counts_inflight_journal_publishers() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_shutdown_counts_inflight_journal_publishers",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = backlog_test_signal_config(&tmp.path().join("first"));
+        let backlog = Arc::new(ArchiveRetryBacklog::new());
+        let writer_backlog = Arc::clone(&backlog);
+        let op = backlog_test_signal_op(&config, "PublishedSignal");
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let publisher = std::thread::spawn(move || {
+            let mut paused = false;
+            let _hook = install_archive_backlog_directory_sync_test_hook(move |_| {
+                if !paused {
+                    paused = true;
+                    published_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                Ok(())
+            });
+            writer_backlog.push(op, 8)
+        });
+        published_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let journal = backlog
+            .owned_journals
+            .lock()
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone();
+        let journal_bytes = fs::read(&journal).unwrap();
+        let observed_publishers = backlog.admission.lock().unwrap().publishers;
+        let observed_reserved = backlog.reserved.load(Ordering::Relaxed);
+        let drained_while_publishing = backlog.fully_drained();
+        let stopped_while_publishing =
+            archive_backlog_shutdown_inner(&backlog, Duration::from_millis(30));
+        let restarted_while_publishing =
+            archive_backlog_prepare_recovery(&backlog, &config).is_ok();
+        let late_push = backlog.push(backlog_test_signal_op(&config, "LateSignal"), 8);
+        resume_tx.send(()).unwrap();
+        let accepted = publisher.join().unwrap();
+        assert_eq!(observed_publishers, 1);
+        assert_eq!(observed_reserved, 1);
+        assert!(!drained_while_publishing && !stopped_while_publishing);
+        assert!(!restarted_while_publishing);
+        assert_eq!(late_push, ArchiveBacklogPush::Dropped);
+        assert_eq!(accepted, ArchiveBacklogPush::Queued);
+        assert!(archive_backlog_shutdown_inner(
+            &backlog,
+            Duration::from_secs(1)
+        ));
+        assert_eq!(backlog.depth.load(Ordering::Relaxed), 1);
+        assert!(backlog.owns_journal(&journal));
+
+        let other = backlog_test_signal_config(&tmp.path().join("second"));
+        assert!(archive_backlog_prepare_recovery(&backlog, &other).is_err());
+        assert!(!other.storage_root.exists());
+        archive_backlog_prepare_recovery(&backlog, &config).unwrap();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        assert!(backlog.fully_drained());
+        assert!(
+            config
+                .notifications_signals_dir
+                .join("projects/backlog-lifecycle/agents/PublishedSignal.signal")
+                .is_file()
+        );
+        assert!(
+            !config
+                .notifications_signals_dir
+                .join("projects/backlog-lifecycle/agents/LateSignal.signal")
+                .exists()
+        );
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            fs::read(
+                journal
+                    .parent()
+                    .unwrap()
+                    .join("resolved")
+                    .join(journal.file_name().unwrap())
+            )
+            .unwrap(),
+            journal_bytes
+        );
+        assert!(archive_backlog_shutdown_inner(
+            &backlog,
+            Duration::from_secs(1)
+        ));
+        archive_backlog_prepare_recovery(&backlog, &other).unwrap();
+        assert_eq!(
+            backlog.push(backlog_test_signal_op(&config, "OldMailbox"), 8),
+            ArchiveBacklogPush::Dropped
+        );
+        assert_eq!(
+            backlog.push(backlog_test_signal_op(&other, "NewMailbox"), 8),
+            ArchiveBacklogPush::Queued
+        );
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        assert!(
+            other
+                .notifications_signals_dir
+                .join("projects/backlog-lifecycle/agents/NewMailbox.signal")
+                .is_file()
+        );
+        assert!(archive_backlog_shutdown_inner(
+            &backlog,
+            Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn archive_backlog_shutdown_interrupts_retirement_backoff_and_reopens_clean_mailbox() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_shutdown_interrupts_retirement_backoff_and_reopens_clean_mailbox",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = backlog_test_signal_config(&tmp.path().join("retirement"));
+        let backlog = &*ARCHIVE_BACKLOG;
+        assert_eq!(
+            backlog.push(backlog_test_signal_op(&config, "RetiredSignal"), 8),
+            ArchiveBacklogPush::Queued
+        );
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let journal_bytes = fs::read(&journal).unwrap();
+        let resolved = journal.parent().unwrap().join("resolved");
+        fs::write(&resolved, b"retirement blocker").unwrap();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(_)
+        ));
+        let signal = config
+            .notifications_signals_dir
+            .join("projects/backlog-lifecycle/agents/RetiredSignal.signal");
+        fs::write(&signal, b"newer signal must survive retirement retry").unwrap();
+        // Reach the real maximum retirement backoff without spending seconds
+        // replaying identical failed moves. The next move still fails on disk.
+        backlog.queue.lock().unwrap().front_mut().unwrap().attempts = 49;
+        archive_backlog_ensure_drain(backlog);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observed_backoff = loop {
+            let ready = backlog
+                .queue
+                .lock()
+                .unwrap()
+                .front()
+                .is_some_and(|entry| entry.retirement.is_some() && entry.attempts >= 50);
+            if ready || Instant::now() >= deadline {
+                break ready;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let started = Instant::now();
+        let stopped = archive_backlog_shutdown(Duration::from_millis(200));
+        let elapsed = started.elapsed();
+        assert!(observed_backoff && stopped);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "stop must interrupt the five-second backoff"
+        );
+        assert_eq!(backlog.depth.load(Ordering::Relaxed), 1);
+        assert!(backlog.owns_journal(&journal));
+        archive_backlog_ensure_drain(backlog);
+        assert!(backlog.drain_handle.lock().unwrap().is_none());
+        assert!(!archive_backlog_flush_blocking(Duration::from_millis(20)));
+        assert_eq!(
+            fs::read(&signal).unwrap(),
+            b"newer signal must survive retirement retry"
+        );
+
+        fs::rename(
+            &resolved,
+            journal
+                .parent()
+                .unwrap()
+                .join("retirement-blocker-preserved"),
+        )
+        .unwrap();
+        archive_backlog_recover(&config);
+        assert!(
+            backlog.drain_handle.lock().unwrap().is_some(),
+            "recovery must start the retained retirement without a flush kick"
+        );
+        assert!(archive_backlog_flush_blocking(Duration::from_secs(5)));
+        assert!(archive_backlog_shutdown(Duration::from_secs(5)));
+        assert_eq!(
+            fs::read(&signal).unwrap(),
+            b"newer signal must survive retirement retry"
+        );
+        assert_eq!(
+            fs::read(resolved.join(journal.file_name().unwrap())).unwrap(),
+            journal_bytes
+        );
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+
+        for (name, ephemeral) in [("fresh-mailbox", false), ("ephemeral-mailbox", true)] {
+            let mut fresh = backlog_test_signal_config(&tmp.path().join(name));
+            fresh.notifications_signals_dir = tmp.path().join(format!("{name}-signals"));
+            if ephemeral {
+                // The signal destination is writable, but no journal can be
+                // created below this file. Retain the ephemeral op in memory.
+                fs::write(&fresh.storage_root, b"journal directory blocker").unwrap();
+            }
+            assert!(!archive_backlog_journal_dir_for(&fresh).exists());
+            archive_backlog_recover(&fresh);
+            assert!(
+                !backlog.stopping.load(Ordering::Acquire),
+                "a missing journal directory must not leave admission closed"
+            );
+            let lifecycle = backlog.lifecycle.lock().unwrap();
+            let outcome = archive_backlog_push(backlog_test_signal_op(&fresh, "FreshSignal"));
+            drop(lifecycle);
+            assert_eq!(
+                outcome,
+                if ephemeral {
+                    ArchiveBacklogPush::QueuedEphemeral
+                } else {
+                    ArchiveBacklogPush::Queued
+                }
+            );
+            assert!(archive_backlog_shutdown(Duration::from_secs(1)));
+            assert_eq!(backlog.depth.load(Ordering::Relaxed), 1);
+            archive_backlog_recover(&fresh);
+            assert!(
+                backlog.drain_handle.lock().unwrap().is_some(),
+                "recovery must resume retained payloads even without a journal directory"
+            );
+            assert!(archive_backlog_flush_blocking(Duration::from_secs(5)));
+            assert!(archive_backlog_shutdown(Duration::from_secs(5)));
+            assert!(
+                fresh
+                    .notifications_signals_dir
+                    .join("projects/backlog-lifecycle/agents/FreshSignal.signal")
+                    .is_file()
+            );
+            assert!(backlog.fully_drained());
+            assert!(backlog.owned_journals.lock().unwrap().is_empty());
+        }
+        assert_eq!(backlog.ephemeral_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn archive_backlog_recovery_starts_owned_work_after_lifecycle_contention() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_recovery_starts_owned_work_after_lifecycle_contention",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let backlog = &*ARCHIVE_BACKLOG;
+        assert!(archive_backlog_flush_blocking(Duration::ZERO));
+        assert!(
+            backlog.drain_handle.lock().unwrap().is_none(),
+            "an empty flush must not start a worker"
+        );
+        for (index, refuse_recovery) in [false, true].into_iter().enumerate() {
+            let config = backlog_test_signal_config(&tmp.path().join(format!("mailbox-{index}")));
+            archive_backlog_recover(&config);
+            let lifecycle = backlog.lifecycle.lock().unwrap();
+            assert_eq!(
+                archive_backlog_push(backlog_test_signal_op(&config, "OwnedSignal")),
+                ArchiveBacklogPush::Queued
+            );
+            assert!(backlog.drain_handle.lock().unwrap().is_none());
+            let journal = backlog
+                .queue
+                .lock()
+                .unwrap()
+                .front()
+                .unwrap()
+                .journal_path
+                .clone()
+                .unwrap();
+            let journal_bytes = fs::read(&journal).unwrap();
+            // A busy lifecycle is a bounded incomplete stop, not proof that
+            // admission closed. The pending owner must still be able to run.
+            assert!(!archive_backlog_shutdown(Duration::from_millis(10)));
+            assert!(!backlog.stopping.load(Ordering::Acquire));
+            drop(lifecycle);
+            let requested = if refuse_recovery {
+                backlog_test_signal_config(&tmp.path().join("wrong-mailbox"))
+            } else {
+                config.clone()
+            };
+            // The scan finds no unowned journal, or recovery is refused. Both
+            // cases must still kick the publisher whose start lost the gate.
+            archive_backlog_recover(&requested);
+            assert!(
+                backlog.drain_handle.lock().unwrap().is_some(),
+                "recovery itself must start the worker before any flush can rescue it"
+            );
+            assert!(archive_backlog_flush_blocking(Duration::from_secs(5)));
+            assert!(archive_backlog_shutdown(Duration::from_secs(5)));
+            assert!(
+                config
+                    .notifications_signals_dir
+                    .join("projects/backlog-lifecycle/agents/OwnedSignal.signal")
+                    .is_file()
+            );
+            assert_eq!(
+                fs::read(
+                    journal
+                        .parent()
+                        .unwrap()
+                        .join("resolved")
+                        .join(journal.file_name().unwrap())
+                )
+                .unwrap(),
+                journal_bytes
+            );
+            assert_eq!(
+                backlog.enqueued_total.load(Ordering::Relaxed),
+                u64::try_from(index + 1).unwrap()
+            );
+            assert_eq!(
+                backlog.drained_total.load(Ordering::Relaxed),
+                u64::try_from(index + 1).unwrap()
+            );
+            assert!(backlog.owned_journals.lock().unwrap().is_empty());
+            if refuse_recovery {
+                assert!(!requested.storage_root.exists());
+            }
+        }
+    }
+
     #[test]
     fn persisted_write_op_round_trips_message_bundle() {
         let tmp = TempDir::new().unwrap();
@@ -30540,6 +31388,7 @@ mod tests {
             .first()
             .unwrap()
             .clone();
+        let journal_bytes = fs::read(&journal).unwrap();
         // The actual recovery entrypoint must ignore both the in-flight
         // publisher and an alias spelling of its configured directory.
         archive_backlog_recover(&config);
@@ -30557,23 +31406,35 @@ mod tests {
 
         archive_backlog_recover(&config);
         archive_backlog_recover(&aliased);
+        assert!(archive_backlog_flush_blocking(Duration::from_secs(5)));
         assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
-        assert_eq!(backlog.backlog_state().0, 1);
-        assert_eq!(backlog.owned_journals.lock().unwrap().len(), 1);
-        assert!(matches!(
-            backlog.drain_step(),
-            ArchiveBacklogDrainStep::Materialized
-        ));
-        assert!(
-            config
-                .notifications_signals_dir
-                .join("projects/owned-journal/agents/OwnedSignal.signal")
-                .is_file()
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.backlog_state().0, 0);
+        let signal = config
+            .notifications_signals_dir
+            .join("projects/owned-journal/agents/OwnedSignal.signal");
+        assert!(!fs::read(&signal).unwrap().is_empty());
+        assert!(!journal.exists());
+        assert_eq!(
+            fs::read(
+                journal
+                    .parent()
+                    .unwrap()
+                    .join("resolved")
+                    .join(journal.file_name().unwrap())
+            )
+            .unwrap(),
+            journal_bytes
         );
         assert!(backlog.owned_journals.lock().unwrap().is_empty());
         // This scan observation predates retirement. Once the old owner
         // releases its key, it still must not become a new queued mutation.
+        fs::write(&signal, b"newer signal after retirement").unwrap();
         assert_eq!(backlog.push_recovered(&config, vec![journal]), 0);
+        archive_backlog_recover(&aliased);
+        assert!(archive_backlog_flush_blocking(Duration::from_secs(5)));
+        assert!(archive_backlog_shutdown(Duration::from_secs(5)));
+        assert_eq!(fs::read(&signal).unwrap(), b"newer signal after retirement");
         assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
         assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
         assert_eq!(backlog.backlog_state().0, 0);
@@ -31306,6 +32167,11 @@ mod tests {
 
     #[test]
     fn archive_backlog_recover_replays_journaled_op_after_crash() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_recover_replays_journaled_op_after_crash",
+        ) {
+            return;
+        }
         // Crash-safety (c): an op journaled but never materialized (process killed
         // after DB commit, before archive write) is replayed on restart and drains
         // to the durable archive. Messages have no DB->archive reconcile-on-read, so
@@ -31687,6 +32553,11 @@ mod tests {
 
     #[test]
     fn archive_backlog_resolved_journal_is_not_replayed_by_recover() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_resolved_journal_is_not_replayed_by_recover",
+        ) {
+            return;
+        }
         // RULE 1 + idempotency: a journal retired into resolved/ (op already
         // durable) is NOT re-materialized by a subsequent recover — recover reads
         // only top-level *.json, never the resolved/ subdir.

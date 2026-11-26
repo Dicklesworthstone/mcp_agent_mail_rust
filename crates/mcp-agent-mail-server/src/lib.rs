@@ -1060,11 +1060,22 @@ fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
     disk_monitor::shutdown();
     retention::shutdown();
     maintenance::shutdown();
-    mcp_agent_mail_storage::wbq_shutdown();
-    mcp_agent_mail_storage::flush_async_commits();
+    shutdown_archive_write_queues();
     // A sync interrupted by exit would leave `.git/index.lock` behind.
     mcp_agent_mail_storage::stop_archive_index_sync(Duration::from_secs(10));
     cleanup_shutdown_sqlite_sidecars(config);
+}
+
+fn shutdown_archive_write_queues() {
+    mcp_agent_mail_storage::wbq_shutdown();
+    // Both archive queues can enqueue Git commits. Stop the retry worker and
+    // its admitted journal publishers before the final coalescer flush.
+    if !mcp_agent_mail_storage::archive_backlog_shutdown(Duration::from_secs(10)) {
+        tracing::warn!(
+            "archive retry shutdown incomplete; final async commit flush is best effort"
+        );
+    }
+    mcp_agent_mail_storage::flush_async_commits();
 }
 
 fn cleanup_shutdown_sqlite_sidecars(config: &mcp_agent_mail_core::Config) {
@@ -2301,8 +2312,7 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
         disk_monitor::shutdown();
         retention::shutdown();
         maintenance::shutdown();
-        mcp_agent_mail_storage::wbq_shutdown();
-        mcp_agent_mail_storage::flush_async_commits();
+        shutdown_archive_write_queues();
         Ok(())
     }
 }
@@ -4827,8 +4837,7 @@ fn run_http_supervised(
     disk_monitor::shutdown();
     maintenance::shutdown();
     stop_atc_operator_runtime();
-    mcp_agent_mail_storage::wbq_shutdown();
-    mcp_agent_mail_storage::flush_async_commits();
+    shutdown_archive_write_queues();
     if let Some(dashboard) = dashboard.as_ref() {
         dashboard.shutdown();
     }
@@ -4894,8 +4903,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
         Ok(runtime) => runtime,
         Err(err) => {
             stop_atc_operator_runtime();
-            mcp_agent_mail_storage::wbq_shutdown();
-            mcp_agent_mail_storage::flush_async_commits();
+            shutdown_archive_write_queues();
             return Err(err);
         }
     };
@@ -4919,8 +4927,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
             set_tui_state_handle(None);
             drop(http_runtime);
             stop_atc_operator_runtime();
-            mcp_agent_mail_storage::wbq_shutdown();
-            mcp_agent_mail_storage::flush_async_commits();
+            shutdown_archive_write_queues();
             return Err(err);
         }
     };
@@ -5017,8 +5024,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
         disk_monitor::shutdown();
         maintenance::shutdown();
         stop_atc_operator_runtime();
-        mcp_agent_mail_storage::wbq_shutdown();
-        mcp_agent_mail_storage::flush_async_commits();
+        shutdown_archive_write_queues();
 
         return supervisor_result;
     }
@@ -5055,8 +5061,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
     disk_monitor::shutdown();
     maintenance::shutdown();
     stop_atc_operator_runtime();
-    mcp_agent_mail_storage::wbq_shutdown();
-    mcp_agent_mail_storage::flush_async_commits();
+    shutdown_archive_write_queues();
 
     // Return first error encountered
     combine_tui_and_supervisor_results(tui_result, supervisor_result)

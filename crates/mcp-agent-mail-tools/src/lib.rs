@@ -4213,9 +4213,42 @@ pub(crate) mod test_support {
         pub storage_root: PathBuf,
     }
 
-    fn drain_archive_writes() {
-        mcp_agent_mail_storage::wbq_flush();
+    #[derive(Debug)]
+    struct ArchiveDrain {
+        wbq: mcp_agent_mail_storage::WbqFlushOutcome,
+        drained: bool,
+        stopped: bool,
+        lag: mcp_agent_mail_storage::ArchiveLagSnapshot,
+    }
+
+    impl ArchiveDrain {
+        fn quiescent(&self) -> bool {
+            matches!(
+                self.wbq,
+                mcp_agent_mail_storage::WbqFlushOutcome::Drained
+                    | mcp_agent_mail_storage::WbqFlushOutcome::PersistenceFailed
+                    | mcp_agent_mail_storage::WbqFlushOutcome::NoQueue
+            ) && self.drained
+                && self.stopped
+        }
+    }
+
+    fn drain_archive_writes() -> ArchiveDrain {
+        let wbq = mcp_agent_mail_storage::wbq_flush_status();
+        let drained = mcp_agent_mail_storage::archive_backlog_flush_blocking(
+            std::time::Duration::from_secs(10),
+        );
+        let stopped =
+            mcp_agent_mail_storage::archive_backlog_shutdown(std::time::Duration::from_secs(10));
+        // Both archive queues can enqueue commits. The retry worker must be
+        // stopped before this final flush and before its tempdir disappears.
         mcp_agent_mail_storage::flush_async_commits();
+        ArchiveDrain {
+            wbq,
+            drained,
+            stopped,
+            lag: mcp_agent_mail_storage::archive_lag_snapshot(),
+        }
     }
 
     /// Initialize the real private mailbox before a tight checkout-outage probe.
@@ -4239,13 +4272,15 @@ pub(crate) mod test_support {
     /// Run `f` with `DATABASE_URL` and `STORAGE_ROOT` pointed at a fresh
     /// tempdir (plus `extra_overrides`), serialized by `lock`.
     ///
-    /// The write-back queue and the async commit coalescer are process-global.
+    /// The write-back/retry queues and async commit coalescer are process-global.
     /// If a test's archive writes are still queued when its tempdir is removed,
     /// they fail with ENOENT after retries and set the sticky durability flag.
     /// Every later `send_message` in the same test binary then refuses with
     /// `DURABILITY_DEGRADED`, far from the test that caused it. This harness
-    /// drains both queues before the tempdir is removed, and fails the test
-    /// that degraded durability instead of an unrelated later one.
+    /// drains the queues and stops the retry generation before the tempdir is
+    /// removed, and fails the test that degraded durability instead of an
+    /// unrelated later one. A new mailbox explicitly recovers its generation;
+    /// active-owner protection is never bypassed to switch test roots.
     pub fn with_isolated_mailbox<T>(
         lock: &Mutex<()>,
         label: &str,
@@ -4276,7 +4311,7 @@ pub(crate) mod test_support {
         ];
         overrides.extend_from_slice(extra_overrides);
 
-        let (result, stats, degraded) =
+        let (result, stats, degraded, before, after) =
             mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, || {
                 // Settle whatever an earlier test (possibly from a module that
                 // does not use this harness) left queued, so any degradation
@@ -4285,17 +4320,38 @@ pub(crate) mod test_support {
                 // so clearing the flag before taking the serializer could wipe
                 // a degradation another module's running test just caused.
                 mcp_agent_mail_storage::wbq_start();
-                drain_archive_writes();
+                let before = drain_archive_writes();
                 mcp_agent_mail_storage::clear_durability_degraded();
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mailbox)));
-                drain_archive_writes();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    assert!(
+                        before.quiescent(),
+                        "{label} could not settle the previous archive generation: {before:?}"
+                    );
+                    mcp_agent_mail_storage::archive_backlog_recover(
+                        &mcp_agent_mail_core::Config::get(),
+                    );
+                    f(&mailbox)
+                }));
+                let after = drain_archive_writes();
                 let stats = mcp_agent_mail_storage::wbq_stats();
                 let degraded = mcp_agent_mail_storage::durability_degraded();
                 mcp_agent_mail_storage::clear_durability_degraded();
-                (result, stats, degraded)
+                (result, stats, degraded, before, after)
             });
         mcp_agent_mail_core::Config::reset_cached();
-        drop(temp);
+        let cleanup_succeeded = after.quiescent()
+            && !degraded
+            && after.lag.dropped_total == before.lag.dropped_total
+            && after.lag.dead_lettered_total == before.lag.dead_lettered_total;
+        if cleanup_succeeded {
+            drop(temp);
+        } else {
+            let retained = temp.keep();
+            eprintln!(
+                "{label}: retained mailbox {} because archive cleanup failed or was incomplete: {after:?}",
+                retained.display()
+            );
+        }
 
         match result {
             Ok(value) => {
@@ -4303,9 +4359,68 @@ pub(crate) mod test_support {
                     !degraded,
                     "{label} test degraded WBQ durability (its own archive writes failed): {stats:?}"
                 );
+                assert!(
+                    after.quiescent(),
+                    "{label} test left archive work pending or running: {after:?}"
+                );
+                assert_eq!(
+                    (after.lag.dropped_total, after.lag.dead_lettered_total),
+                    (before.lag.dropped_total, before.lag.dead_lettered_total),
+                    "{label} test lost archive retry work (dropped, dead-lettered): {after:?}"
+                );
                 value
             }
             Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[test]
+    fn isolated_mailbox_settles_retry_workers_on_return_and_unwind() {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let signals = tempfile::tempdir().expect("fixture lifecycle signals");
+        let overrides = [
+            ("NOTIFICATIONS_ENABLED", "1"),
+            ("NOTIFICATIONS_DEBOUNCE_MS", "0"),
+            (
+                "NOTIFICATIONS_SIGNALS_DIR",
+                signals.path().to_str().unwrap(),
+            ),
+        ];
+        for (agent, should_panic) in [("BlueLake", false), ("RedFox", true), ("GreenStone", false)]
+        {
+            let result = std::panic::catch_unwind(|| {
+                with_isolated_mailbox(&LOCK, "retry worker lifecycle", &overrides, |_| {
+                    let config = mcp_agent_mail_core::Config::get();
+                    let queued = mcp_agent_mail_storage::archive_backlog_push(
+                        mcp_agent_mail_storage::WriteOp::NotificationSignal {
+                            config: (*config).clone(),
+                            project_slug: "fixture-lifecycle".to_string(),
+                            agent_name: agent.to_string(),
+                            metadata: None,
+                        },
+                    );
+                    assert_eq!(queued, mcp_agent_mail_storage::ArchiveBacklogPush::Queued);
+                    if should_panic {
+                        panic!("expected fixture unwind");
+                    }
+                });
+            });
+            if should_panic {
+                let panic = result.expect_err("fixture must preserve the original panic");
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"expected fixture unwind")
+                );
+            } else {
+                result.expect("each new mailbox must own and drain its retry generation");
+            }
+            assert!(
+                signals
+                    .path()
+                    .join(format!("projects/fixture-lifecycle/agents/{agent}.signal"))
+                    .is_file(),
+                "cleanup must materialize queued work even while unwinding"
+            );
         }
     }
 }

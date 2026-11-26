@@ -3756,10 +3756,9 @@ pub fn run_with_invocation_name(invocation_name: &'static str) -> i32 {
     };
     let result = execute(cli);
     // One-shot commands can enqueue archive writes just before returning.
-    // Drain this process's queue and commits before the binary calls exit;
-    // neither shutdown operation initializes storage for read-only commands.
-    mcp_agent_mail_storage::wbq_shutdown();
-    mcp_agent_mail_storage::flush_async_commits();
+    // Drain both archive queues and commits before the binary calls exit.
+    // Empty queue shutdown does not initialize storage for read-only commands.
+    shutdown_cli_archive_writes();
     let archive = mcp_agent_mail_storage::wbq_stats();
     let pending = archive.enqueued.saturating_sub(archive.drained);
     if archive.unrecoverable_errors > 0 || pending > 0 {
@@ -3780,6 +3779,28 @@ pub fn run_with_invocation_name(invocation_name: &'static str) -> i32 {
             emit_error(&err);
             err_exit_code(&err)
         }
+    }
+}
+
+fn shutdown_cli_archive_writes() {
+    mcp_agent_mail_storage::wbq_shutdown();
+    // A one-shot command may have used durable retry instead of the WBQ.
+    // Give those entries a chance to materialize before this process exits,
+    // then stop publishers before the final Git flush. Callers that hold
+    // mailbox mutation locks keep them through this cleanup.
+    let drained =
+        mcp_agent_mail_storage::archive_backlog_flush_blocking(std::time::Duration::from_secs(10));
+    let stopped =
+        mcp_agent_mail_storage::archive_backlog_shutdown(std::time::Duration::from_secs(10));
+    mcp_agent_mail_storage::flush_async_commits();
+    if !drained || !stopped || mcp_agent_mail_storage::archive_backlog_depth() != 0 {
+        // Most CLI commands have no tracing subscriber. Keep a committed
+        // mailbox result successful, but never silently claim archive drain.
+        eprintln!(
+            "warning: archive retry shutdown is incomplete or work remains pending. \
+             Successful mailbox writes remain in SQLite; avoid resending. \
+             Durably journaled retries will resume when the mailbox server starts."
+        );
     }
 }
 
@@ -44367,8 +44388,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 // This offline command exits immediately after rendering. Drain
                 // its queued welcome archive before the process ends, while the
                 // mailbox mutation locks still protect this operation.
-                mcp_agent_mail_storage::wbq_shutdown();
-                mcp_agent_mail_storage::flush_async_commits();
+                shutdown_cli_archive_writes();
             }
             output::emit_output(&payload, fmt, || {
                 output::success(&format!("Contact handshake: {from} → {to}"));

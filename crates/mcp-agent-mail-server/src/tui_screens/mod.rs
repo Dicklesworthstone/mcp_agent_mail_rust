@@ -192,9 +192,48 @@ pub(crate) fn operator_result(
     ))
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct OperatorTestArchiveDrain {
+    wbq: mcp_agent_mail_storage::WbqFlushOutcome,
+    drained: bool,
+    stopped: bool,
+    lag: mcp_agent_mail_storage::ArchiveLagSnapshot,
+}
+
+#[cfg(test)]
+impl OperatorTestArchiveDrain {
+    fn quiescent(&self) -> bool {
+        matches!(
+            self.wbq,
+            mcp_agent_mail_storage::WbqFlushOutcome::Drained
+                | mcp_agent_mail_storage::WbqFlushOutcome::PersistenceFailed
+                | mcp_agent_mail_storage::WbqFlushOutcome::NoQueue
+        ) && self.drained
+            && self.stopped
+    }
+}
+
+#[cfg(test)]
+fn drain_operator_test_archive_writes() -> OperatorTestArchiveDrain {
+    let wbq = mcp_agent_mail_storage::wbq_flush_status();
+    let drained =
+        mcp_agent_mail_storage::archive_backlog_flush_blocking(std::time::Duration::from_secs(10));
+    let stopped =
+        mcp_agent_mail_storage::archive_backlog_shutdown(std::time::Duration::from_secs(10));
+    mcp_agent_mail_storage::flush_async_commits();
+    OperatorTestArchiveDrain {
+        wbq,
+        drained,
+        stopped,
+        lag: mcp_agent_mail_storage::archive_lag_snapshot(),
+    }
+}
+
 /// Run `f` against a fresh file-backed mailbox in a tempdir, with the tool
 /// layer's `DATABASE_URL` and `STORAGE_ROOT` pointing at it. `f` receives the
-/// absolute key of a project directory inside that tempdir.
+/// absolute key of a project directory inside that tempdir. Archive workers
+/// settle before its environment and directory are released, even on unwind.
 #[cfg(test)]
 pub(crate) fn with_operator_test_mailbox<T>(f: impl FnOnce(&str) -> T) -> T {
     let temp = tempfile::tempdir().expect("operator test tempdir");
@@ -205,16 +244,66 @@ pub(crate) fn with_operator_test_mailbox<T>(f: impl FnOnce(&str) -> T) -> T {
     let database_url = format!("sqlite://{}", temp.path().join("storage.sqlite3").display());
     let storage_root = storage_root.to_string_lossy().to_string();
     let project_key = project_root.to_string_lossy().to_string();
-    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-        &[
-            ("DATABASE_URL", database_url.as_str()),
-            ("STORAGE_ROOT", storage_root.as_str()),
-            // The project root is a `.tmpXXXXXX` tempdir inside this isolated
-            // mailbox, which the ephemeral-root guard otherwise refuses.
-            ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
-        ],
-        || f(&project_key),
-    )
+    let (result, before, after, degraded) =
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.as_str()),
+                // The project root is a `.tmpXXXXXX` tempdir inside this isolated
+                // mailbox, which the ephemeral-root guard otherwise refuses.
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+            ],
+            || {
+                mcp_agent_mail_storage::wbq_start();
+                let before = drain_operator_test_archive_writes();
+                mcp_agent_mail_storage::clear_durability_degraded();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    assert!(
+                        before.quiescent(),
+                        "operator fixture could not settle the previous archive generation: {before:?}"
+                    );
+                    mcp_agent_mail_storage::archive_backlog_recover(
+                        &mcp_agent_mail_core::Config::get(),
+                    );
+                    f(&project_key)
+                }));
+                // Keep the test's mailbox authority and filesystem alive until
+                // publishers have stopped and their final Git work is flushed.
+                let after = drain_operator_test_archive_writes();
+                let degraded = mcp_agent_mail_storage::durability_degraded();
+                mcp_agent_mail_storage::clear_durability_degraded();
+                (result, before, after, degraded)
+            },
+        );
+    let cleanup_succeeded = after.quiescent()
+        && !degraded
+        && after.lag.dropped_total == before.lag.dropped_total
+        && after.lag.dead_lettered_total == before.lag.dead_lettered_total;
+    if cleanup_succeeded {
+        drop(temp);
+    } else {
+        let retained = temp.keep();
+        eprintln!(
+            "operator fixture retained mailbox {} because archive cleanup failed or was incomplete: {after:?}",
+            retained.display()
+        );
+    }
+    match result {
+        Ok(value) => {
+            assert!(!degraded, "operator test degraded archive write durability");
+            assert!(
+                after.quiescent(),
+                "operator test left archive work pending or running: {after:?}"
+            );
+            assert_eq!(
+                (after.lag.dropped_total, after.lag.dead_lettered_total),
+                (before.lag.dropped_total, before.lag.dead_lettered_total),
+                "operator test lost archive retry work (dropped, dead-lettered): {after:?}"
+            );
+            value
+        }
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 /// Create the project at `project_key` and register `agents` with an open

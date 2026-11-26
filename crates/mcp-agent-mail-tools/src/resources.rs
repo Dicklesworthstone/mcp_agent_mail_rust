@@ -11745,8 +11745,16 @@ mod resource_shape_tests {
                                 .collect::<Vec<_>>(),
                             expected
                         );
-                        assert!(messages.iter().all(|message| message.get("body_md").is_none()));
-                        assert!(messages.iter().all(|message| message["id"] != fresh.id.unwrap()));
+                        assert!(
+                            messages
+                                .iter()
+                                .all(|message| message.get("body_md").is_none())
+                        );
+                        assert!(
+                            messages
+                                .iter()
+                                .all(|message| message["id"] != fresh.id.unwrap())
+                        );
                         assert_eq!(messages[0]["kind"], "to");
                         if messages.len() == 2 {
                             assert_eq!(messages[1]["kind"], "project");
