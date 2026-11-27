@@ -3671,20 +3671,6 @@ impl UnifiedMessageAggregate {
 }
 
 #[cfg(test)]
-fn collect_unified_message_aggregates(
-    cx: &Cx,
-    pool: &DbPool,
-    projects_rows: &[ProjectRow],
-    limit: usize,
-    filter_importance: Option<&str>,
-) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
-    if limit == 0 || projects_rows.is_empty() {
-        return Ok(Vec::new());
-    }
-    unified::collect(cx, pool, projects_rows, limit, filter_importance).map(|page| page.messages)
-}
-
-#[cfg(test)]
 fn reference_collect_unified_message_aggregates(
     cx: &Cx,
     pool: &DbPool,
@@ -3754,18 +3740,10 @@ fn render_unified_inbox(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
-    let projects_rows = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-
-    let mut page = unified::collect(
-        cx,
-        pool,
-        &projects_rows,
-        limit,
-        normalized_filter.as_deref(),
-    )?;
+    let mut page = unified::collect(cx, pool, limit, normalized_filter.as_deref())?;
     let mut projects = Vec::new();
     let mut total_agents: usize = 0;
-    for p in &projects_rows {
+    for p in &page.projects {
         let pid = p.id.unwrap_or(0);
         let agents = page.agents.remove(&pid).unwrap_or_default();
         if agents.is_empty() {
@@ -7068,9 +7046,9 @@ mod fresh_eyes_regression_tests {
             message_id,
         )));
 
-        let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
-        let aggregates = collect_unified_message_aggregates(&cx, &pool, &projects, 10, None)
-            .expect("aggregation should succeed");
+        let aggregates = unified::collect(&cx, &pool, 10, None)
+            .expect("aggregation should succeed")
+            .messages;
 
         assert_eq!(
             aggregates.len(),
@@ -7155,9 +7133,9 @@ mod fresh_eyes_regression_tests {
             &[(sender.id.expect("sender id"), "to")],
         )));
 
-        let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
-        let aggregates = collect_unified_message_aggregates(&cx, &pool, &projects, 10, None)
-            .expect("aggregation should succeed");
+        let aggregates = unified::collect(&cx, &pool, 10, None)
+            .expect("aggregation should succeed")
+            .messages;
         let root_aggregate = aggregates
             .iter()
             .find(|aggregate| aggregate.id == root_id)
@@ -7213,10 +7191,9 @@ mod fresh_eyes_regression_tests {
             &[(recipient.id.expect("recipient id"), "to")],
         )));
 
-        let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
-        let aggregates =
-            collect_unified_message_aggregates(&cx, &pool, &projects, 10, Some("high"))
-                .expect("filtered aggregation should succeed");
+        let aggregates = unified::collect(&cx, &pool, 10, Some("high"))
+            .expect("filtered aggregation should succeed")
+            .messages;
 
         assert_eq!(
             aggregates.len(),

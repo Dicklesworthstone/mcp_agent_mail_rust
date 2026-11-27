@@ -5344,6 +5344,37 @@ async fn list_projects_with_tracked(
     Outcome::Ok(out)
 }
 
+/// Timestamp lookup for a project already known to be referenced without a project row.
+/// The public inventory and roster-only navigation must choose the same source.
+#[must_use]
+pub fn orphan_project_creation_query(project_id: i64, now_us: i64) -> (&'static str, [Value; 5]) {
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            "SELECT COALESCE( \
+                     (SELECT MIN(m.created_ts) FROM messages m WHERE m.project_id = ?), \
+                     (SELECT MIN(a.inception_ts) FROM agents a WHERE a.project_id = ?), \
+                     (SELECT MIN(fr.created_ts) FROM file_reservations fr \
+                      WHERE fr.project_id = ? \
+                        AND ({}) \
+                        AND fr.expires_ts > ?), \
+                     (SELECT MIN(ppl.created_at) FROM product_project_links ppl WHERE ppl.project_id = ?), \
+                     0 \
+                 ) AS created_at",
+            active_reservation_predicate_for("fr")
+        )
+    });
+    (
+        SQL.as_str(),
+        [
+            Value::BigInt(project_id),
+            Value::BigInt(project_id),
+            Value::BigInt(project_id),
+            Value::BigInt(now_us),
+            Value::BigInt(project_id),
+        ],
+    )
+}
+
 /// Placeholder rows for project ids that are referenced by messages, agents,
 /// active file reservations, or product links but have no `projects` row.
 ///
@@ -5411,36 +5442,15 @@ async fn list_orphan_project_placeholders_with_tracked(
         }
     }
 
-    let orphan_created_at_sql = format!(
-        "SELECT COALESCE( \
-                     (SELECT MIN(m.created_ts) FROM messages m WHERE m.project_id = ?), \
-                     (SELECT MIN(a.inception_ts) FROM agents a WHERE a.project_id = ?), \
-                     (SELECT MIN(fr.created_ts) FROM file_reservations fr \
-                      WHERE fr.project_id = ? \
-                        AND ({}) \
-                        AND fr.expires_ts > ?), \
-                     (SELECT MIN(ppl.created_at) FROM product_project_links ppl WHERE ppl.project_id = ?), \
-                     0 \
-                 ) AS created_at",
-        active_reservation_predicate_for("fr")
-    );
-
     for project_id in orphan_project_ids {
-        let created_params = [
-            Value::BigInt(project_id),
-            Value::BigInt(project_id),
-            Value::BigInt(project_id),
-            Value::BigInt(now_us),
-            Value::BigInt(project_id),
-        ];
-        let created_at_rows = match map_sql_outcome(
-            traw_query(cx, tracked, &orphan_created_at_sql, &created_params).await,
-        ) {
-            Outcome::Ok(rows) => rows,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
+        let (sql, created_params) = orphan_project_creation_query(project_id, now_us);
+        let created_at_rows =
+            match map_sql_outcome(traw_query(cx, tracked, sql, &created_params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
         let created_at = created_at_rows
             .first()
             .and_then(|row| row.get(0).and_then(value_as_i64))

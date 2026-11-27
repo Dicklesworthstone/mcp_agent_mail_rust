@@ -262,40 +262,29 @@ struct SelectedMessage {
     recipients: Vec<Receipt>,
 }
 
-#[derive(Default)]
 pub(super) struct UnifiedPage {
     pub(super) messages: Vec<UnifiedMessageAggregate>,
     pub(super) agents: ProjectAgents,
+    pub(super) projects: Vec<ProjectRow>,
 }
 
 struct SelectedPage {
     messages: Vec<SelectedMessage>,
     agents: ProjectAgents,
-    message_projects: Vec<ProjectRow>,
+    projects: Vec<ProjectRow>,
 }
 
 pub(super) fn collect(
     cx: &Cx,
     pool: &DbPool,
-    projects: &[ProjectRow],
     limit: usize,
     importance: Option<&str>,
 ) -> Result<UnifiedPage, (u16, String)> {
-    if projects.is_empty() {
-        return Ok(UnifiedPage::default());
-    }
-    let project_ids: Vec<_> = projects
-        .iter()
-        .map(|project| project.id.unwrap_or(0))
-        .collect();
-    let SelectedPage {
-        messages: selected,
-        agents,
-        ..
-    } = block_on_outcome(cx, fetch(cx, pool, Some(&project_ids), limit, importance))?;
+    let page = block_on_outcome(cx, fetch(cx, pool, true, limit, importance))?;
     Ok(UnifiedPage {
-        messages: aggregate(selected, projects)?,
-        agents,
+        messages: aggregate(page.messages, &page.projects)?,
+        agents: page.agents,
+        projects: page.projects,
     })
 }
 
@@ -308,8 +297,8 @@ pub(super) fn collect_messages(
     limit: usize,
     importance: Option<&str>,
 ) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
-    let page = block_on_outcome(cx, fetch(cx, pool, None, limit, importance))?;
-    aggregate(page.messages, &page.message_projects)
+    let page = block_on_outcome(cx, fetch(cx, pool, false, limit, importance))?;
+    aggregate(page.messages, &page.projects)
 }
 
 fn aggregate(
@@ -360,7 +349,7 @@ fn aggregate(
 async fn fetch(
     cx: &Cx,
     pool: &DbPool,
-    project_ids: Option<&[i64]>,
+    include_navigation: bool,
     limit: usize,
     importance: Option<&str>,
 ) -> Outcome<SelectedPage, DbError> {
@@ -369,13 +358,6 @@ async fn fetch(
     }
     if i64::try_from(limit).is_err() {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
-    }
-    if project_ids.is_some_and(<[i64]>::is_empty) {
-        return Outcome::Ok(SelectedPage {
-            messages: Vec::new(),
-            agents: ProjectAgents::new(),
-            message_projects: Vec::new(),
-        });
     }
     let connection = match pool.acquire(cx).await {
         Outcome::Ok(connection) => connection,
@@ -397,8 +379,10 @@ async fn fetch(
         interrupted: std::cell::Cell::new(false),
     };
     let result = in_snapshot(&checked, || {
-        if let Some(project_ids) = project_ids {
-            let roster = read_roster(&checked, project_ids)?;
+        if include_navigation {
+            let projects = read_navigation_projects(&checked)?;
+            let project_ids: Vec<_> = projects.iter().filter_map(|p| p.id).collect();
+            let roster = read_roster(&checked, &project_ids)?;
             let messages = read(
                 &checked,
                 &roster.selected,
@@ -409,15 +393,15 @@ async fn fetch(
             Ok(SelectedPage {
                 messages,
                 agents: roster.agents,
-                message_projects: Vec::new(),
+                projects,
             })
         } else {
             let messages = read_all_projects(&checked, limit, importance)?;
-            let message_projects = read_message_projects(&checked, &messages)?;
+            let projects = read_message_projects(&checked, &messages)?;
             Ok(SelectedPage {
                 messages,
                 agents: ProjectAgents::new(),
-                message_projects,
+                projects,
             })
         }
     });
@@ -761,6 +745,48 @@ fn read_with_viewers(
     hydrate(conn, selected)
 }
 
+/// Navigation renders only projects with agents. Starting at the roster avoids
+/// discovering project IDs from every message, reservation and product link.
+/// Look up recovery timestamps only for missing project rows that can appear
+/// in this view. Keep the same creation order as the complete project list.
+fn read_navigation_projects(conn: &impl SyncQuery) -> Result<Vec<ProjectRow>, DbError> {
+    let rows = conn
+        .query_sync(
+            "SELECT refs.project_id, p.id, p.slug, p.human_key, p.created_at \
+             FROM (SELECT DISTINCT project_id FROM agents WHERE project_id IS NOT NULL) refs \
+             LEFT JOIN projects p ON p.id = refs.project_id",
+            &[],
+        )
+        .map_err(database_error)?;
+    let now_us = mcp_agent_mail_db::timestamps::now_micros();
+    let mut projects = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(id) = row.get(0).and_then(value_as_i64) else {
+            continue;
+        };
+        let project = if row.get(1).and_then(value_as_i64).is_some() {
+            ProjectRow {
+                id: Some(id),
+                slug: row.get_named("slug").map_err(database_error)?,
+                human_key: row.get_named("human_key").map_err(database_error)?,
+                created_at: row.get(4).and_then(value_as_i64).unwrap_or_default(),
+            }
+        } else {
+            let (sql, params) =
+                mcp_agent_mail_db::queries::orphan_project_creation_query(id, now_us);
+            let timestamps = conn.query_sync(sql, &params).map_err(database_error)?;
+            let created_at = timestamps
+                .first()
+                .and_then(|row| row.get(0).and_then(value_as_i64))
+                .unwrap_or_default();
+            mcp_agent_mail_db::queries::orphaned_project_placeholder(id, created_at)
+        };
+        projects.push(project);
+    }
+    projects.sort_by_key(|project| (project.created_at, project.id.unwrap_or_default()));
+    Ok(projects)
+}
+
 /// Message labels do not need the complete recovery/navigation inventory.
 /// Selected message rows already prove that each missing project is referenced.
 /// Resolve those exact keys, preserving the usual orphan display name without
@@ -1093,6 +1119,47 @@ mod tests {
             conn.execute_raw(sql).unwrap();
         }
         (dir, conn)
+    }
+
+    #[test]
+    fn navigation_resolves_only_rostered_projects_and_preserves_orphan_order() {
+        let (_dir, conn) = navigation_fixture();
+        conn.execute_raw(
+            "CREATE TABLE file_reservations(id INTEGER PRIMARY KEY, project_id INTEGER, created_ts INTEGER, released_ts INTEGER, expires_ts INTEGER);
+             CREATE TABLE file_reservation_releases(reservation_id INTEGER PRIMARY KEY);
+             CREATE TABLE product_project_links(product_id INTEGER, project_id INTEGER, created_at INTEGER);
+             INSERT INTO projects VALUES(4,'empty','/empty',-100);
+             INSERT INTO agents(id,project_id,name,inception_ts) VALUES(30,3,'AgentOnly',-10);
+             INSERT INTO messages(id,project_id,created_ts) VALUES(99,5,-100);
+             INSERT INTO file_reservations VALUES(1,6,-200,NULL,9223372036854775807);
+             INSERT INTO product_project_links VALUES(1,7,-300);
+             PRAGMA query_only=ON",
+        )
+        .unwrap();
+        let traced = Traced {
+            conn: &conn,
+            statements: RefCell::new(Vec::new()),
+        };
+        let projects = in_snapshot(&traced, || read_navigation_projects(&traced)).unwrap();
+        let rows: Vec<_> = projects
+            .iter()
+            .map(|p| (p.id.unwrap(), p.slug.as_str(), p.created_at))
+            .collect();
+        // Message time wins over the earlier agent's inception in project 2.
+        assert_eq!(
+            rows,
+            [
+                (3, "[unknown-project-3]", -10),
+                (1, "one", 0),
+                (2, "[unknown-project-2]", 500),
+            ]
+        );
+        let statements = traced.statements.borrow();
+        assert_eq!(statements.len(), 3);
+        for (sql, params) in &statements[1..] {
+            assert!(sql.contains("MIN(m.created_ts)"));
+            assert!(matches!(params.first(), Some(Value::BigInt(2 | 3))));
+        }
     }
 
     #[test]
@@ -2231,7 +2298,7 @@ mod tests {
                         &cx, &pool, &projects, limit, importance,
                     )
                     .unwrap();
-                    let current = collect(&cx, &pool, &projects, limit, importance).unwrap();
+                    let current = collect(&cx, &pool, limit, importance).unwrap();
                     let message_only = collect_messages(&cx, &pool, limit, importance).unwrap();
                     let original = project(original);
                     assert_eq!(current.agents[&71].len(), 3);
