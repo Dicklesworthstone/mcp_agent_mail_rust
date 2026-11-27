@@ -14038,6 +14038,51 @@ fn update_thread_digest(
 /// Maximum concurrent WebP conversion threads for parallel attachment processing.
 const MAX_CONCURRENT_CONVERSIONS: usize = 4;
 
+// The chunk size bounds one request. Bound source and decoder buffers across
+// simultaneous requests as well, independently of archive publication.
+static ATTACHMENT_WORKERS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+// Decoding a compressed source can allocate far more than its input size.
+// Preserve the previous single-codec peak, including the decoder's own
+// allocation limits, without making unrelated archive writers wait for it.
+static ATTACHMENT_CODEC: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static ATTACHMENT_ENCODED_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct AttachmentWorker;
+
+impl AttachmentWorker {
+    fn acquire() -> Option<Self> {
+        // A nested caller already excludes publication. It must not wait for
+        // workers that could themselves be waiting for its fence.
+        if ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get) != 0 {
+            return None;
+        }
+        let (count, wake) = &ATTACHMENT_WORKERS;
+        let count = count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut count = wake
+            .wait_while(count, |n| *n >= MAX_CONCURRENT_CONVERSIONS)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count += 1;
+        Some(Self)
+    }
+}
+
+impl Drop for AttachmentWorker {
+    fn drop(&mut self) {
+        let (count, wake) = &ATTACHMENT_WORKERS;
+        *count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+        wake.notify_one();
+    }
+}
+
 /// Fallback attachment size limit used only when `Config::max_attachment_bytes`
 /// is zero (unlimited).  In that case we still guard against pathological
 /// decode times during WebP conversion.
@@ -14153,7 +14198,7 @@ fn store_explicit_attachment(
     file_path: &Path,
     embed_policy: EmbedPolicy,
 ) -> Result<StoredAttachment> {
-    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
+    let _worker = AttachmentWorker::acquire();
     let bytes = read_attachment_bytes(file_path, config.max_attachment_bytes)?;
     let convert = image::guess_format(&bytes)
         .or_else(|_| image::ImageFormat::from_path(file_path))
@@ -14299,7 +14344,7 @@ pub fn store_attachment(
     file_path: &Path,
     embed_policy: EmbedPolicy,
 ) -> Result<StoredAttachment> {
-    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
+    let _worker = AttachmentWorker::acquire();
     let original_bytes = read_attachment_bytes(file_path, config.max_attachment_bytes)?;
     store_image_attachment_bytes(archive, config, file_path, &original_bytes, embed_policy)
 }
@@ -14327,47 +14372,69 @@ fn store_image_attachment_bytes(
         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
         .unwrap_or_default();
 
-    // Ensure attachment directories
     let project_root = archive_project_root_checked(archive)?;
     let attach_dir = project_root.join("attachments");
     let webp_dir = attach_dir.join(prefix);
     let manifest_dir = attach_dir.join("_manifests");
     let audit_dir = attach_dir.join("_audit");
-    ensure_dir(&webp_dir)?;
-    ensure_dir(&manifest_dir)?;
-    ensure_dir(&audit_dir)?;
 
     // -- Cache check: skip conversion if this SHA1 was already converted --
     let webp_filename = format!("{digest}.webp");
     let webp_path = webp_dir.join(&webp_filename);
     let manifest_path = manifest_dir.join(format!("{digest}.json"));
-    if webp_path.exists() && manifest_path.exists() {
-        return store_attachment_from_cache(
+    let cached = || {
+        store_attachment_from_cache(
             archive,
             config,
             &webp_path,
             &manifest_path,
             &digest,
             embed_policy,
-        );
+        )
+    };
+    let cache_exists = || webp_path.exists() && manifest_path.exists();
+    if cache_exists() {
+        let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
+        archive_project_root_checked(archive)?;
+        if cache_exists() {
+            return cached();
+        }
     }
 
     let mut rel_paths = Vec::new();
 
     // Convert to WebP
+    let codec = ATTACHMENT_CODEC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let img = image::load_from_memory(original_bytes)
         .map_err(|e| StorageError::InvalidPath(format!("Failed to decode image: {e}")))?;
     let (width, height) = img.dimensions();
 
     // Encode to WebP using the image crate
     let mut webp_bytes = Vec::new();
-    let rgba = img.to_rgba8();
+    let rgba = img.into_rgba8();
     let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut webp_bytes);
     encoder
         .encode(&rgba, width, height, image::ExtendedColorType::Rgba8)
         .map_err(|e| StorageError::InvalidPath(format!("WebP encode error: {e}")))?;
 
+    drop(rgba);
+    drop(codec);
     let content_sha256 = hex::encode(Sha256::digest(&webp_bytes));
+    #[cfg(test)]
+    if let Some(hook) = ATTACHMENT_ENCODED_TEST_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    let mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
+    archive_project_root_checked(archive)?;
+    if cache_exists() {
+        // Another worker may have published while this one was encoding.
+        return cached();
+    }
+    ensure_dir(&webp_dir)?;
+    ensure_dir(&manifest_dir)?;
+    ensure_dir(&audit_dir)?;
     atomic_write_bytes(&webp_path, &webp_bytes, true)?;
     let webp_rel = rel_path_cached(&archive.canonical_repo_root, &webp_path)?;
     rel_paths.push(webp_rel.clone());
@@ -14418,6 +14485,8 @@ fn store_image_attachment_bytes(
     audit_file.write_all(b"\n")?;
     rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &audit_path)?);
 
+    drop(mutation);
+
     // Decide inline vs file based on policy
     let should_inline = match embed_policy {
         EmbedPolicy::Inline => true,
@@ -14466,7 +14535,7 @@ pub fn store_raw_attachment(
     file_path: &Path,
     max_bytes: usize,
 ) -> Result<StoredAttachment> {
-    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
+    let _worker = AttachmentWorker::acquire();
     let bytes = read_attachment_bytes(file_path, max_bytes)?;
     store_raw_attachment_bytes(archive, file_path, &bytes)
 }
@@ -14489,6 +14558,8 @@ fn store_raw_attachment_bytes(
         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
         .unwrap_or_default();
 
+    let content_sha256 = hex::encode(Sha256::digest(bytes));
+    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
     let project_root = archive_project_root_checked(archive)?;
     let attach_dir = project_root.join("attachments");
     let file_dir = attach_dir.join("files").join(prefix);
@@ -14527,7 +14598,7 @@ fn store_raw_attachment_bytes(
         media_type: "application/octet-stream".to_string(),
         bytes: bytes.len(),
         sha1: digest,
-        content_sha256: Some(hex::encode(Sha256::digest(bytes))),
+        content_sha256: Some(content_sha256),
         width: 0,
         height: 0,
         data_base64: None,
@@ -27072,6 +27143,61 @@ mod tests {
             Rgba([(x * 64) as u8, (y * 64) as u8, 128, 255])
         });
         img.save(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_attachment_encoders_share_one_published_cache_entry() {
+        if !isolated_coalescer_regression(
+            "tests::concurrent_attachment_encoders_share_one_published_cache_entry",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "concurrent-attachments").unwrap();
+        let source = tmp.path().join("test.png");
+        create_test_png(&source);
+        let (ready, encoded) = std::sync::mpsc::channel();
+        let (first, second) = std::thread::scope(|scope| {
+            let fence = ArchiveMutationGuard::begin_at(&archive.repo_root);
+            let [first, second] = [true, false].map(|explicit| {
+                let ready = ready.clone();
+                let (archive, config, source) = (&archive, &config, &source);
+                scope.spawn(move || {
+                    ATTACHMENT_ENCODED_TEST_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || ready.send(()).unwrap()));
+                    });
+                    if explicit {
+                        store_explicit_attachment(archive, config, source, EmbedPolicy::File)
+                    } else {
+                        store_attachment(archive, config, source, EmbedPolicy::File)
+                    }
+                })
+            });
+            let both_encoded = (0..2).all(|_| encoded.recv_timeout(Duration::from_secs(5)).is_ok());
+            drop(fence);
+            let results = (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            );
+            assert!(
+                both_encoded,
+                "source reads and WebP encoding waited on publication"
+            );
+            results
+        });
+        assert_eq!(first.meta.path, second.meta.path);
+        assert_eq!(first.meta.content_sha256, second.meta.content_sha256);
+        let webp = fs::read(archive.repo_root.join(first.meta.path.unwrap())).unwrap();
+        assert_eq!(
+            Some(hex::encode(Sha256::digest(&webp))),
+            first.meta.content_sha256
+        );
+        let audit = archive
+            .root
+            .join("attachments/_audit")
+            .join(format!("{}.log", first.meta.sha1));
+        assert_eq!(fs::read_to_string(audit).unwrap().lines().count(), 1);
     }
 
     #[test]
