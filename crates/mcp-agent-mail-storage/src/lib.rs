@@ -3279,17 +3279,30 @@ const fn write_op_config(op: &WriteOp) -> &Config {
     }
 }
 
-fn archive_backlog_write_tmp(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // create_new: refusing to follow/truncate an existing file turns a name
-    // collision into a loud failure instead of silently destroying another
-    // writer's in-flight journal.
+/// Publish only into an unoccupied journal name. Cleanup belongs to the writer
+/// that created the temporary file: a create-new collision must leave another
+/// publisher's in-flight journal untouched.
+fn archive_backlog_publish_journal(
+    tmp_path: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
+        .open(tmp_path)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    // Close our handle before either move, including on Windows.
+    drop(file);
+    let published = written.and_then(|()| {
+        mcp_agent_mail_db::pool::rename_noreplace_preserving_source(tmp_path, final_path)
+    });
+    if published.is_err() {
+        // The existing destination is evidence too. Preserve our candidate
+        // separately, and never quarantine a temp whose creation we refused.
+        let _ = archive_backlog_quarantine_file(tmp_path, "failed");
+    }
+    published
 }
 
 struct ArchiveBacklogJournal {
@@ -3380,14 +3393,8 @@ fn archive_backlog_journal_write(
     } else {
         None
     };
-    if let Err(error) = archive_backlog_write_tmp(&tmp_path, &bytes) {
-        tracing::warn!(error = %error, "archive backlog: journal write failed; in-memory only");
-        let _ = archive_backlog_quarantine_file(&tmp_path, "failed");
-        return None;
-    }
-    if let Err(error) = fs::rename(&tmp_path, &final_path) {
-        tracing::warn!(error = %error, "archive backlog: journal rename failed; in-memory only");
-        let _ = archive_backlog_quarantine_file(&tmp_path, "failed");
+    if let Err(error) = archive_backlog_publish_journal(&tmp_path, &final_path, &bytes) {
+        tracing::warn!(error = %error, "archive backlog: journal publication failed; in-memory only");
         return None;
     }
     #[cfg(unix)]
@@ -30906,6 +30913,111 @@ mod tests {
             resolved.exists(),
             "journal preserved under resolved/ (not deleted)"
         );
+    }
+
+    #[test]
+    fn archive_backlog_publication_preserves_existing_journal_and_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let original = serde_json::to_vec(&PersistedWriteOp::from_op(
+            &backlog_test_message_op(&config, "journal-collision", 1),
+        ))
+        .unwrap();
+        let candidate = serde_json::to_vec(&PersistedWriteOp::from_op(
+            &backlog_test_message_op(&config, "journal-collision", 2),
+        ))
+        .unwrap();
+        let path = tmp.path().join("occupied.json");
+        let staging = path.with_extension("json.tmp");
+        archive_backlog_publish_journal(&staging, &path, &original).unwrap();
+
+        let error = archive_backlog_publish_journal(&staging, &path, &candidate)
+            .expect_err("publishing a new op must not replace an accepted journal");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!staging.exists());
+        let retained = tmp.path().join("failed/occupied.json.tmp");
+        assert_eq!(fs::read(&retained).unwrap(), candidate);
+        assert!(matches!(
+            archive_backlog_read_journal(&config, &path),
+            Ok(WriteOp::MessageBundle { message_json, .. }) if message_json["id"] == 1
+        ));
+
+        // A fresh publication can still carry the refused operation, and the
+        // first accepted journal remains independently replayable.
+        let retried = tmp.path().join("retried.json");
+        archive_backlog_publish_journal(
+            &retried.with_extension("json.tmp"),
+            &retried,
+            &candidate,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&retained).unwrap(), candidate);
+        assert!(matches!(
+            archive_backlog_read_journal(&config, &retried),
+            Ok(WriteOp::MessageBundle { message_json, .. }) if message_json["id"] == 2
+        ));
+    }
+
+    #[test]
+    fn archive_backlog_publication_leaves_another_publishers_temp_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("in-flight.json");
+        let staging = path.with_extension("json.tmp");
+        let mut owner = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .unwrap();
+        owner.write_all(b"original ").unwrap();
+
+        let error = archive_backlog_publish_journal(&staging, &path, b"colliding publication")
+            .expect_err("a competing publisher must not take ownership of an existing temp");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&staging).unwrap(), b"original ");
+        assert!(!path.exists());
+        assert!(!tmp.path().join("failed").exists());
+
+        // The original writer must be able to finish through its open handle
+        // and publish the same pathname after the competing attempt returns.
+        owner.write_all(b"journal").unwrap();
+        owner.sync_all().unwrap();
+        drop(owner);
+        mcp_agent_mail_db::pool::rename_noreplace_preserving_source(&staging, &path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"original journal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_publication_preserves_occupied_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let foreign = tmp.path().join("foreign");
+        fs::write(&foreign, b"foreign evidence").unwrap();
+        for collision_at_temp in [true, false] {
+            let case = tmp.path().join(if collision_at_temp { "temp" } else { "final" });
+            fs::create_dir(&case).unwrap();
+            let path = case.join("occupied.json");
+            let staging = path.with_extension("json.tmp");
+            let occupied = if collision_at_temp { &staging } else { &path };
+            std::os::unix::fs::symlink(&foreign, occupied).unwrap();
+
+            let error = archive_backlog_publish_journal(&staging, &path, b"candidate journal")
+                .expect_err("occupied symlinks must remain untouched");
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read_link(occupied).unwrap(), foreign);
+            assert_eq!(fs::read(&foreign).unwrap(), b"foreign evidence");
+            if collision_at_temp {
+                assert!(!path.exists());
+                assert!(!case.join("failed").exists());
+            } else {
+                assert!(!staging.exists());
+                assert_eq!(
+                    fs::read(case.join("failed/occupied.json.tmp")).unwrap(),
+                    b"candidate journal"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
