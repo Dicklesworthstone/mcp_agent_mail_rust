@@ -2349,8 +2349,10 @@ impl PersistedWriteOp {
 #[derive(Clone)]
 enum ArchiveBacklogPayload {
     Ready(Arc<WriteOp>),
-    /// Recovery retains only the path and a shared runtime configuration until
-    /// this entry reaches the front. Historical bodies stay on disk.
+    /// Journal-backed work retains only its path and runtime configuration
+    /// until this entry reaches the front. Recovery batches share one config;
+    /// live entries use this only after confirmed journal durability and keep
+    /// their originating config.
     Journal(Arc<Config>),
     /// Materialization exhausted its retries, but no journal or durable
     /// dead-letter record preserves the operation. Retry only recording the
@@ -2592,6 +2594,8 @@ impl ArchiveRetryBacklog {
     /// TOCTOU race).
     /// The return value reflects **actual durability**: [`ArchiveBacklogPush::Queued`]
     /// only when the journal persisted, else [`ArchiveBacklogPush::QueuedEphemeral`].
+    /// Confirmed journals carry the payload on disk rather than retaining a
+    /// second full copy in every live entry; only the front is hydrated.
     fn push(&self, op: WriteOp, cap: u64) -> ArchiveBacklogPush {
         // Count the complete publication, not just the queued entry: shutdown
         // must also wait for a pusher currently syncing its journal to disk.
@@ -2631,6 +2635,17 @@ impl ArchiveRetryBacklog {
         let journal = archive_backlog_journal_write(&op, Some(self));
         let durable = journal.as_ref().is_some_and(|journal| journal.durable);
         let journal_path = journal.map(|journal| journal.path);
+        let payload = if durable {
+            // Admission has already confirmed the complete journal's file and
+            // supported directory syncs. Reuse recovery's lazy hydration, but
+            // keep this operation's own runtime configuration rather than the
+            // current process defaults. Moving it releases the body now.
+            ArchiveBacklogPayload::Journal(Arc::new(write_op_into_config(op)))
+        } else {
+            // Even a visible post-rename candidate is insufficient when its
+            // directory durability was not confirmed. Retain the complete op.
+            ArchiveBacklogPayload::Ready(Arc::new(op))
+        };
         {
             let mut queue = self
                 .queue
@@ -2639,7 +2654,7 @@ impl ArchiveRetryBacklog {
             // Release the reservation and enqueue the real entry atomically.
             self.reserved.fetch_sub(1, Ordering::Relaxed);
             queue.push_back(ArchiveBacklogEntry {
-                payload: ArchiveBacklogPayload::Ready(Arc::new(op)),
+                payload,
                 journal_path,
                 first_enqueued_at: Instant::now(),
                 attempts: 0,
@@ -3339,6 +3354,17 @@ fn archive_backlog_journal_key(path: &Path) -> std::io::Result<PathBuf> {
 
 /// Borrow the runtime `Config` carried by any `WriteOp` variant.
 const fn write_op_config(op: &WriteOp) -> &Config {
+    match op {
+        WriteOp::MessageBundle { config, .. }
+        | WriteOp::AgentProfile { config, .. }
+        | WriteOp::FileReservation { config, .. }
+        | WriteOp::NotificationSignal { config, .. }
+        | WriteOp::ClearSignal { config, .. } => config,
+    }
+}
+
+/// Preserve runtime behavior while releasing a durably journaled payload.
+fn write_op_into_config(op: WriteOp) -> Config {
     match op {
         WriteOp::MessageBundle { config, .. }
         | WriteOp::AgentProfile { config, .. }
@@ -31338,6 +31364,10 @@ mod tests {
             let backlog = ArchiveRetryBacklog::new();
             assert_eq!(backlog.push(op, 8), ArchiveBacklogPush::QueuedEphemeral);
             drop(hook);
+            assert!(matches!(
+                backlog.queue.lock().unwrap().front().unwrap().payload,
+                ArchiveBacklogPayload::Ready(_)
+            ));
             assert_eq!(backlog.backlog_state().0, 1);
             assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
             assert_eq!(backlog.ephemeral_total.load(Ordering::Relaxed), 1);
@@ -31443,6 +31473,138 @@ mod tests {
             .join("resolved")
             .join(path.file_name().unwrap());
         assert_eq!(fs::read(resolved).unwrap(), candidate);
+    }
+
+    #[test]
+    fn archive_backlog_live_journals_release_bodies_and_replay_exactly_after_retry() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_live_journals_release_bodies_and_replay_exactly_after_retry",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let projects = config.storage_root.join("projects");
+        fs::create_dir_all(&projects).unwrap();
+        let project = "live-lazy-backlog";
+        fs::write(projects.join(project), b"project publication blocker").unwrap();
+        let backlog = ArchiveRetryBacklog::new();
+        let mut expected = Vec::new();
+        for id in 1..=4_i64 {
+            let mut per_op = config.clone();
+            per_op.git_author_name = format!("Journal Author {id}");
+            let mut op = backlog_test_message_op(&per_op, project, id);
+            let WriteOp::MessageBundle {
+                message_json,
+                body_md,
+                ..
+            } = &mut op
+            else {
+                unreachable!();
+            };
+            *body_md = format!("Large original body {id}\n").repeat(16_384);
+            let content = render_message_bundle_content(message_json, body_md).unwrap();
+            expected.push((
+                id,
+                hex::encode(Sha256::digest(content.as_bytes())),
+                per_op.git_author_name,
+            ));
+            assert_eq!(backlog.push(op.clone(), 4), ArchiveBacklogPush::Queued);
+            // The accepted journal freezes the supplied content and config;
+            // later caller-side edits must never affect lazy materialization.
+            let WriteOp::MessageBundle {
+                config,
+                message_json,
+                body_md,
+                ..
+            } = &mut op
+            else {
+                unreachable!();
+            };
+            config.git_author_name = "Changed after admission".into();
+            message_json["subject"] = serde_json::json!("Changed after admission");
+            *body_md = "Changed after admission".into();
+        }
+        {
+            let queue = backlog.queue.lock().unwrap();
+            assert_eq!(queue.len(), expected.len());
+            for (entry, (_, _, author)) in queue.iter().zip(&expected) {
+                let ArchiveBacklogPayload::Journal(config) = &entry.payload else {
+                    panic!("durable live entries must not retain message bodies");
+                };
+                assert_eq!(&config.git_author_name, author);
+                assert!(entry.journal_path.as_ref().unwrap().is_file());
+            }
+        }
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(1)
+        ));
+        let hydrated = {
+            let queue = backlog.queue.lock().unwrap();
+            let ArchiveBacklogPayload::Ready(op) = &queue[0].payload else {
+                panic!("only the front operation should hydrate");
+            };
+            assert_eq!(write_op_config(op).git_author_name, expected[0].2);
+            assert!(
+                queue
+                    .iter()
+                    .skip(1)
+                    .all(|entry| matches!(entry.payload, ArchiveBacklogPayload::Journal(_)))
+            );
+            Arc::downgrade(op)
+        };
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(2)
+        ));
+        {
+            let queue = backlog.queue.lock().unwrap();
+            let ArchiveBacklogPayload::Ready(op) = &queue[0].payload else {
+                panic!("a failed front retains one hydrated operation");
+            };
+            assert!(Arc::ptr_eq(&hydrated.upgrade().unwrap(), op));
+        }
+        fs::rename(
+            projects.join(project),
+            projects.join("publication-blocker-preserved"),
+        )
+        .unwrap();
+        for _ in &expected {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::Materialized
+            ));
+            assert!(hydrated.upgrade().is_none());
+            assert!(
+                backlog
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|entry| matches!(entry.payload, ArchiveBacklogPayload::Journal(_)))
+            );
+        }
+        assert!(backlog.fully_drained());
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+        flush_async_commits();
+        let archive = ensure_archive(&config, project).unwrap();
+        for (id, digest, _) in expected {
+            let WriteOp::MessageBundle {
+                message_json,
+                sender,
+                recipients,
+                ..
+            } = backlog_test_message_op(&config, project, id)
+            else {
+                unreachable!();
+            };
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message_json, &sender, &recipients).unwrap();
+            for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+                assert_eq!(hex::encode(Sha256::digest(fs::read(path).unwrap())), digest);
+            }
+        }
     }
 
     #[test]
@@ -33380,6 +33542,10 @@ mod tests {
         );
         // Still enqueued in memory for best-effort drain, and counted.
         assert_eq!(backlog.backlog_state().0, 1, "op enqueued in memory");
+        assert!(matches!(
+            backlog.queue.lock().unwrap().front().unwrap().payload,
+            ArchiveBacklogPayload::Ready(_)
+        ));
         assert_eq!(backlog.ephemeral_total.load(Ordering::Relaxed), 1);
         assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
     }
