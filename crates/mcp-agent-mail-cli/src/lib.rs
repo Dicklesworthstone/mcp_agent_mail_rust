@@ -101828,44 +101828,33 @@ fn inbox_events_direct(
         },
         config.limit,
     );
+    let protect_cursor = |cursor| {
+        let storage_root = pool_config.storage_root.as_deref().ok_or_else(|| {
+            InboxEventsReadError::Other(CliError::Other(
+                "inbox-events requires the configured archive root to protect its cursor"
+                    .to_string(),
+            ))
+        })?;
+        mcp_agent_mail_db::reconstruct_state::record_issued_cursor(storage_root, cursor)
+            .map_err(|error| InboxEventsReadError::Other(CliError::Other(error.to_string())))
+    };
     match page {
         Ok(page) => {
-            let storage_root = pool_config.storage_root.as_deref().ok_or_else(|| {
-                InboxEventsReadError::Other(CliError::Other(
-                    "inbox-events requires the configured archive root to protect its cursor"
-                        .to_string(),
-                ))
-            })?;
-            mcp_agent_mail_db::reconstruct_state::record_issued_cursor(
-                storage_root,
-                page.tail_cursor,
-            )
-            .map_err(|error| InboxEventsReadError::Other(CliError::Other(error.to_string())))?;
+            protect_cursor(page.tail_cursor)?;
             Ok(inbox_events_page_from_direct(page, config.position_now))
         }
         Err(mcp_agent_mail_db::sync::InboxDeliveryEventError::CursorExpired {
             after,
             oldest_available,
         }) => {
-            if let Some(storage_root) = pool_config.storage_root.as_deref() {
-                mcp_agent_mail_db::reconstruct_state::record_issued_cursor(
-                    storage_root,
-                    oldest_available.saturating_sub(1),
-                )
-                .map_err(|error| InboxEventsReadError::Other(CliError::Other(error.to_string())))?;
-            }
+            protect_cursor(oldest_available)?;
             Err(InboxEventsReadError::CursorExpired {
                 after,
                 oldest_available_cursor: oldest_available,
             })
         }
         Err(mcp_agent_mail_db::sync::InboxDeliveryEventError::CursorAhead { after, tail }) => {
-            if let Some(storage_root) = pool_config.storage_root.as_deref() {
-                mcp_agent_mail_db::reconstruct_state::record_issued_cursor(storage_root, tail)
-                    .map_err(|error| {
-                        InboxEventsReadError::Other(CliError::Other(error.to_string()))
-                    })?;
-            }
+            protect_cursor(tail)?;
             Err(InboxEventsReadError::CursorAhead {
                 after,
                 tail_cursor: tail,

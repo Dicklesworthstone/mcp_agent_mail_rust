@@ -12502,9 +12502,9 @@ pub async fn fetch_inbox_delivery_events(
             after,
             oldest_available,
         }) => {
-            if let Err(error) =
-                archive_issued_delivery_cursor(pool, oldest_available.saturating_sub(1))
-            {
+            // Both the advertised coordinate and its predecessor (resume
+            // after) belong to this ledger. A second rebuild must expire both.
+            if let Err(error) = archive_issued_delivery_cursor(pool, oldest_available) {
                 return Outcome::Err(error);
             }
             Outcome::Err(DbError::invalid(
@@ -23591,6 +23591,24 @@ mod tests {
         let ceiling: serde_json::Value =
             serde_json::from_slice(&std::fs::read(ceiling_path).unwrap()).unwrap();
         assert_eq!(ceiling["issued_through"], page.tail_cursor);
+        runtime.block_on(async {
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw("DELETE FROM inbox_delivery_events")
+                .unwrap();
+        });
+        let expired = runtime
+            .block_on(fetch_inbox_delivery_events(&cx, &pool, 1, 1, Some(0), 10))
+            .into_result()
+            .expect_err("the pruned delivery expires an old cursor");
+        assert!(matches!(
+            expired,
+            asupersync::OutcomeError::Err(DbError::InvalidArgument { field: "after", .. })
+        ));
+        let ceiling: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(storage_root.join("recovery-state/delivery-cursor.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ceiling["issued_through"], page.tail_cursor + 1);
         assert_eq!(crate::write_barrier::active_writer_count(), 0);
     }
 

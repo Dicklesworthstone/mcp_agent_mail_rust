@@ -1362,10 +1362,21 @@ fn inbox_delivery_events_in_snapshot(
     events.sort_by_key(|event| event.seq);
     events.truncate(limit_with_probe);
     let has_more = events.len() > limit;
-    if has_more {
-        events.pop();
-    }
-    let next_cursor = events.last().map_or(cursor, |event| event.seq);
+    let next_unreturned = if has_more {
+        events.pop().map(|event| event.seq)
+    } else {
+        None
+    };
+    let last_delivered = events.last().map_or(cursor, |event| event.seq);
+    // Bootstrap can see retained events below a later retention hole. Once
+    // every visible event through the hole is returned, resume at its floor.
+    // If another retained event still precedes it, report the actual position:
+    // resuming can signal expiry, but must never silently skip that event.
+    let next_cursor = if next_unreturned.is_some_and(|seq| seq <= pruned_through_cursor) {
+        last_delivered
+    } else {
+        last_delivered.max(pruned_through_cursor)
+    };
 
     Ok(InboxDeliveryEventPage {
         events,
@@ -3467,6 +3478,56 @@ mod tests {
         assert_eq!(empty.tail_cursor, before.tail_cursor);
         assert_eq!(empty.next_cursor, before.tail_cursor);
         assert!(!empty.has_more);
+        let fresh = inbox_delivery_events_from_conn(&conn, project, viewer, None, 10).unwrap();
+        assert_eq!(fresh.events, empty.events);
+        assert_eq!(fresh.next_cursor, before.tail_cursor);
+        assert_eq!(
+            inbox_delivery_events_from_conn(&conn, project, viewer, Some(fresh.next_cursor), 10)
+                .expect("the first empty page must issue a resumable cursor"),
+            fresh
+        );
+    }
+
+    #[test]
+    fn bootstrap_continuation_respects_retained_events_on_both_sides_of_a_hole() {
+        let conn = test_conn();
+        let project = insert_project(&conn);
+        let sender = insert_agent(&conn, project, "Sender");
+        let viewer = insert_agent(&conn, project, "Viewer");
+        for _ in 0..5 {
+            let message = insert_message(&conn, project, sender, "retention");
+            conn.execute_sync(
+                "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(?,?,'to')",
+                &[Value::BigInt(message), Value::BigInt(viewer)],
+            )
+            .unwrap();
+        }
+        let page =
+            |after, limit| inbox_delivery_events_from_conn(&conn, project, viewer, after, limit);
+        let original = page(None, 5).unwrap();
+        let hole = original.events[3].seq;
+        conn.execute_sync(
+            "DELETE FROM inbox_delivery_events WHERE seq = ?",
+            &[Value::BigInt(hole)],
+        )
+        .unwrap();
+
+        let partial = page(None, 2).unwrap();
+        assert_eq!(partial.events, original.events[..2]);
+        assert!(partial.has_more);
+        assert_eq!(partial.next_cursor, original.events[1].seq);
+        assert!(matches!(
+            page(Some(partial.next_cursor), 2),
+            Err(InboxDeliveryEventError::CursorExpired { .. })
+        ));
+
+        let through_hole = page(None, 3).unwrap();
+        assert_eq!(through_hole.events, original.events[..3]);
+        assert!(through_hole.has_more);
+        assert_eq!(through_hole.next_cursor, hole);
+        let resumed = page(Some(through_hole.next_cursor), 3).unwrap();
+        assert_eq!(resumed.events, original.events[4..]);
+        assert!(!resumed.has_more);
     }
 
     #[test]
