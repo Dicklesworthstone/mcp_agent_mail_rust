@@ -7987,6 +7987,27 @@ pub async fn set_agent_contact_policy(
     Outcome::Ok(agent)
 }
 
+/// Lifecycle markers are authority, not optional display metadata. Preserve
+/// the mailbox's recognized legacy numeric representations, but never turn a
+/// present, undecodable marker into the absence of retirement/deregistration.
+/// A tombstone row must carry a timestamp even if a damaged or legacy schema
+/// no longer enforces its NOT NULL constraint.
+fn decode_lifecycle_timestamp(
+    value: Option<&Value>,
+    column: &'static str,
+    nullable: bool,
+) -> crate::DbResult<Option<i64>> {
+    match value {
+        Some(Value::Null) if nullable => Ok(None),
+        Some(value) => value_as_i64(value).map(Some).ok_or_else(|| {
+            DbError::Schema(format!("invalid lifecycle timestamp in {column}"))
+        }),
+        None => Err(DbError::Schema(format!(
+            "missing lifecycle timestamp column {column}"
+        ))),
+    }
+}
+
 async fn get_agent_deregistered_at_in_tx(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
@@ -8001,7 +8022,17 @@ async fn get_agent_deregistered_at_in_tx(
         )
         .await,
     ) {
-        Outcome::Ok(rows) => Outcome::Ok(rows.first().and_then(row_first_i64)),
+        Outcome::Ok(rows) => match rows.first() {
+            Some(row) => match decode_lifecycle_timestamp(
+                row.get(0),
+                "agent_deregistrations.deregistered_at",
+                false,
+            ) {
+                Ok(timestamp) => Outcome::Ok(timestamp),
+                Err(error) => Outcome::Err(error),
+            },
+            None => Outcome::Ok(None),
+        },
         Outcome::Err(error) => Outcome::Err(error),
         Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => Outcome::Panicked(payload),
@@ -10214,7 +10245,7 @@ async fn ensure_agents_active_in_tx(
     let mut states: HashMap<i64, (String, Option<i64>, Option<i64>)> = HashMap::new();
     for chunk in agent_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
         let mut sql = format!(
-            "SELECT a.id, a.name, a.retired_at, d.deregistered_at \
+            "SELECT a.id, a.name, a.retired_at, d.deregistered_at, d.agent_id \
              FROM agents a \
              LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
              WHERE a.id IN ({})",
@@ -10242,14 +10273,33 @@ async fn ensure_agents_active_in_tx(
                     _ => None,
                 })
                 .unwrap_or_else(|| format!("agent-{agent_id}"));
-            states.insert(
-                agent_id,
-                (
-                    name,
-                    row.get(2).and_then(value_as_i64),
-                    row.get(3).and_then(value_as_i64),
-                ),
-            );
+            let retired_at = match decode_lifecycle_timestamp(
+                row.get(2),
+                "agents.retired_at",
+                true,
+            ) {
+                Ok(timestamp) => timestamp,
+                Err(error) => return Outcome::Err(error),
+            };
+            // NULL from a missing LEFT JOIN row means no tombstone. NULL in
+            // an existing tombstone is corrupt authority, never reactivation.
+            let deregistered_at = match row.get(4) {
+                Some(Value::Null) => None,
+                Some(_) => match decode_lifecycle_timestamp(
+                    row.get(3),
+                    "agent_deregistrations.deregistered_at",
+                    false,
+                ) {
+                    Ok(timestamp) => timestamp,
+                    Err(error) => return Outcome::Err(error),
+                },
+                None => {
+                    return Outcome::Err(DbError::Schema(
+                        "missing lifecycle tombstone identity column".to_string(),
+                    ));
+                }
+            };
+            states.insert(agent_id, (name, retired_at, deregistered_at));
         }
     }
 
@@ -26430,6 +26480,189 @@ mod tests {
                         }
                     }
                 }
+            });
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn malformed_lifecycle_authority_blocks_new_work_and_preserves_rows() {
+        fn assert_schema_error<T: std::fmt::Debug>(outcome: Outcome<T, DbError>) {
+            let Outcome::Err(DbError::Schema(message)) = outcome else {
+                panic!("malformed lifecycle authority must be refused: {outcome:?}");
+            };
+            assert!(message.contains("lifecycle timestamp"), "{message}");
+            assert!(!message.contains("synthetic-malformed-marker"));
+        }
+
+        fn durable_rows(path: &str) -> Vec<Vec<Vec<Value>>> {
+            // Reopen the real database independently of the mutating pool.
+            // Compare every typed value, not Row's randomized lookup cache.
+            let conn = crate::DbConn::open_file(path).expect("reopen lifecycle database");
+            [
+                ("agents", "id"),
+                ("agent_deregistrations", "agent_id"),
+                ("messages", "id"),
+                ("message_recipients", "message_id, agent_id"),
+                ("inbox_delivery_events", "seq"),
+                ("inbox_delivery_cursor_state", "project_id, scope, scope_id"),
+                ("inbox_stats", "agent_id"),
+                ("file_reservations", "id"),
+                ("agent_links", "id"),
+                ("idempotency_keys", "project_id, tool, idempotency_key"),
+                ("sqlite_sequence", "name"),
+            ]
+            .into_iter()
+            .map(|(table, order)| {
+                conn.query_sync(&format!("SELECT * FROM {table} ORDER BY {order}"), &[])
+                    .expect("read durable lifecycle state")
+                    .into_iter()
+                    .map(|row| row.values().cloned().collect())
+                    .collect()
+            })
+            .collect()
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("lifecycle authority runtime");
+        for damaged in ["retirement", "deregistration", "null_tombstone"] {
+            let (cx, pool, _dir) = setup_test_pool(&format!("lifecycle-{damaged}.db"));
+            runtime.block_on(async {
+                let project_id = ensure_project(&cx, &pool, "/tmp/lifecycle-authority")
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .id
+                    .unwrap();
+                let agent = register_agent(
+                    &cx, &pool, project_id, "BlueLake", "test", "test",
+                    Some("preserve profile"), None, None,
+                )
+                .await
+                .into_result()
+                .unwrap();
+                let agent_id = agent.id.unwrap();
+                let peer_id = register_agent(
+                    &cx, &pool, project_id, "GreenStone", "test", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+                let original = create_message_with_recipients(
+                    &cx, &pool, project_id, agent_id, "retained message", "retained body",
+                    None, "normal", true, "[]", &[(peer_id, "to")],
+                )
+                .await
+                .into_result()
+                .expect("absent lifecycle markers allow ordinary mail");
+                let lease = create_file_reservations(
+                    &cx, &pool, project_id, agent_id, &["src/held.rs"], 3600, true, "retained",
+                )
+                .await
+                .into_result()
+                .unwrap();
+                request_contact(
+                    &cx, &pool, project_id, agent_id, project_id, peer_id, "retained", 3600,
+                )
+                .await
+                .into_result()
+                .unwrap();
+
+                {
+                    let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                    if damaged == "retirement" {
+                        conn.execute_sync(
+                            "UPDATE agents SET retired_at = ? WHERE id = ?",
+                            &[
+                                Value::Text("synthetic-malformed-marker".to_string()),
+                                Value::BigInt(agent_id),
+                            ],
+                        )
+                        .unwrap();
+                    } else {
+                        if damaged == "null_tombstone" {
+                            // A retained legacy schema may lack today's NOT NULL
+                            // constraint. Keep its table instead of discarding it.
+                            conn.execute_raw(
+                                "ALTER TABLE agent_deregistrations RENAME TO retained_lifecycle_fixture; \
+                                 CREATE TABLE agent_deregistrations (\
+                                     agent_id INTEGER PRIMARY KEY REFERENCES agents(id), \
+                                     deregistered_at INTEGER);",
+                            )
+                            .unwrap();
+                        }
+                        conn.execute_sync(
+                            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (?, ?)",
+                            &[
+                                Value::BigInt(agent_id),
+                                if damaged == "null_tombstone" {
+                                    Value::Null
+                                } else {
+                                    Value::Text("synthetic-malformed-marker".to_string())
+                                },
+                            ],
+                        )
+                        .unwrap();
+                    }
+                }
+                let before = durable_rows(pool.sqlite_path());
+                for (sender, recipient) in [(agent_id, peer_id), (peer_id, agent_id)] {
+                    assert_schema_error(create_message_with_recipients(
+                        &cx, &pool, project_id, sender, "must not send", "refused",
+                        None, "normal", false, "[]", &[(recipient, "to")],
+                    ).await);
+                    assert_schema_error(request_contact(
+                        &cx, &pool, project_id, sender, project_id, recipient, "must not request", 7200,
+                    ).await);
+                }
+                assert_schema_error(create_file_reservations_idempotent(
+                    &cx, &pool, project_id, agent_id, &["src/new.rs"], 7200, true, "refused",
+                    IdempotencyClaim {
+                        project_id,
+                        tool: "file_reservation_paths",
+                        key: "must-not-claim",
+                        fingerprint: "must-not-claim-fingerprint",
+                    },
+                ).await);
+                assert_schema_error(renew_reservations(
+                    &cx, &pool, project_id, agent_id, 7200, None, Some(&[lease[0].id.unwrap()]),
+                ).await);
+                assert_schema_error(respond_contact(
+                    &cx, &pool, project_id, agent_id, project_id, peer_id, true, 7200,
+                ).await);
+                assert_schema_error(set_agent_contact_policy(&cx, &pool, agent_id, "open").await);
+
+                if damaged != "retirement" {
+                    assert_schema_error(get_agent_deregistered_at(&cx, &pool, agent_id).await);
+                    assert_schema_error(register_agent(
+                        &cx, &pool, project_id, "BlueLake", "changed", "changed",
+                        Some("must not replace profile"), None, None,
+                    ).await);
+                    assert_schema_error(set_agent_retired_at(&cx, &pool, agent_id, None).await);
+                    assert_schema_error(set_agent_retired_at(&cx, &pool, agent_id, Some(444)).await);
+                    assert_schema_error(deregister_agent(&cx, &pool, agent_id, 444).await);
+                }
+                assert_eq!(durable_rows(pool.sqlite_path()), before, "{damaged}");
+                assert_eq!(
+                    get_message(&cx, &pool, original.id.unwrap())
+                        .await.into_result().unwrap().body_md,
+                    "retained body",
+                    "damaged lifecycle authority must not erase message history",
+                );
+
+                // Refusing this identity must not disable healthy agents in the
+                // same mailbox. Both its absent tombstone and NULL retirement
+                // remain valid, distinct from the damaged marker above.
+                create_message_with_recipients(
+                    &cx, &pool, project_id, peer_id, "healthy self mail", "accepted",
+                    None, "normal", false, "[]", &[(peer_id, "to")],
+                )
+                .await
+                .into_result()
+                .expect("healthy identity still sends");
             });
         }
     }
