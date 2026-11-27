@@ -19,11 +19,6 @@ use crate::{DbConn, DbError, DbPool};
 
 const HYDRATE_BATCH: usize = 256;
 const SHARED_PAGE_SIZE: usize = 128;
-const DIRECT_PAGE_SQL: &str = "SELECT message_id, kind, read_ts, ack_ts \
-    FROM message_recipients WHERE agent_id = ? ORDER BY message_id ASC LIMIT 256";
-const DIRECT_NEXT_SQL: &str = "SELECT message_id, kind, read_ts, ack_ts \
-    FROM message_recipients WHERE agent_id = ? AND message_id > ? \
-    ORDER BY message_id ASC LIMIT 256";
 const ACK_HEADER_COLUMNS: &str = "id, project_id, sender_id, created_ts, ack_required";
 
 // Retain the previous relational definition only as a test oracle. Production
@@ -363,25 +358,10 @@ fn direct_window(
     let mut after = None;
     let mut window = OldestWindow::new();
     loop {
-        let (sql, params) = after.map_or_else(
-            || (DIRECT_PAGE_SQL, vec![Value::BigInt(agent_id)]),
-            |id| {
-                (
-                    DIRECT_NEXT_SQL,
-                    vec![Value::BigInt(agent_id), Value::BigInt(id)],
-                )
-            },
-        );
-        let rows = conn.query_sync(sql, &params).map_err(db_error)?;
-        if rows.len() > HYDRATE_BATCH {
-            return Err(DbError::Internal(
-                "pending acknowledgement receipt page exceeded its bound".into(),
-            ));
-        }
-        let finished = rows.len() < HYDRATE_BATCH;
+        let rows = inbox::receipt_page(conn, agent_id, after)?;
+        let finished = rows.len() < inbox::PAGE_SIZE;
         let mut pending = BTreeMap::new();
-        for row in rows {
-            let id = row.get_named::<i64>("message_id").map_err(db_error)?;
+        for (id, row) in rows {
             if after.is_some_and(|previous| id <= previous) {
                 return Err(DbError::Internal(
                     "pending acknowledgement receipt cursor did not advance".into(),
@@ -766,6 +746,7 @@ fn hydrate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::inbox::{RECIPIENT_NEXT_SQL, RECIPIENT_PAGE_SQL};
     use std::cell::RefCell;
     use std::future::Future;
 
@@ -1200,7 +1181,7 @@ mod tests {
         impl SyncQuery for Interrupt<'_> {
             fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
                 let rows = self.conn.query_sync(sql, params)?;
-                if sql == DIRECT_PAGE_SQL && !self.fired.replace(true) {
+                if sql == RECIPIENT_PAGE_SQL && !self.fired.replace(true) {
                     self.cx.set_cancel_requested(true);
                 }
                 Ok(rows)
@@ -1265,7 +1246,7 @@ mod tests {
         impl SyncQuery for Racing<'_> {
             fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
                 let rows = self.reader.query_sync(sql, params)?;
-                if sql == DIRECT_PAGE_SQL && !self.committed.replace(true) {
+                if sql == RECIPIENT_PAGE_SQL && !self.committed.replace(true) {
                     self.writer.execute_raw(
                         "BEGIN IMMEDIATE; UPDATE messages SET body_md='peer body' WHERE id=3; \
                          UPDATE project_mailbox_receipts SET ack_ts=999 WHERE message_id=3 AND agent_id=2; \
@@ -1457,10 +1438,19 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .filter(|(sql, _, _)| sql == DIRECT_NEXT_SQL)
+                .filter(|(sql, _, _)| sql == RECIPIENT_NEXT_SQL)
                 .count()
                 >= 2
         );
+        assert!(
+            calls
+                .iter()
+                .any(|(sql, _, _)| sql == inbox::RECIPIENT_NEXT_COUNT_SQL)
+        );
+        assert!(calls.iter().all(|(sql, _, _)| {
+            !sql.contains("FROM message_recipients WHERE agent_id = ?")
+                || !sql.contains("ORDER BY")
+        }));
         assert!(calls.iter().all(|(sql, _, rows)| !sql.contains("JOIN")
             && !sql.contains("UNION")
             && *rows <= HYDRATE_BATCH));
@@ -1573,7 +1563,7 @@ mod tests {
         impl SyncQuery for CancelSecondPage<'_> {
             fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
                 let rows = self.conn.query_sync(sql, params)?;
-                if sql == DIRECT_PAGE_SQL || sql == DIRECT_NEXT_SQL {
+                if sql == RECIPIENT_PAGE_SQL || sql == RECIPIENT_NEXT_SQL {
                     self.pages.set(self.pages.get() + 1);
                     if self.pages.get() == 2 {
                         self.cx.set_cancel_requested(true);
@@ -1621,7 +1611,7 @@ mod tests {
         impl SyncQuery for Duplicate<'_> {
             fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
                 let mut rows = self.0.query_sync(sql, params)?;
-                if sql == DIRECT_PAGE_SQL && !rows.is_empty() {
+                if sql == RECIPIENT_PAGE_SQL && !rows.is_empty() {
                     rows.extend(self.0.query_sync(sql, params)?);
                 }
                 Ok(rows)

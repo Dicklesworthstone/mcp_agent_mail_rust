@@ -17,7 +17,7 @@ use crate::models::MessageRow;
 use crate::pool::SyncQuery;
 use crate::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY};
 
-const PAGE_SIZE: usize = 256;
+pub(crate) const PAGE_SIZE: usize = 256;
 /// Receipt pages carry no ORDER BY: with one, the pinned engine seeks on
 /// `agent_id` alone and walks the agent's whole receipt history for every
 /// page. [`receipt_page`] sorts the rows and proves a full page is the lowest
@@ -452,7 +452,7 @@ fn newest_first_window(
 /// receipt. A full one is used only when the index count over its ID range
 /// equals its size, i.e. it is exactly the lowest remaining IDs; under a plan
 /// that returns rows in any other order the page is re-read with ORDER BY.
-fn receipt_page(
+pub(crate) fn receipt_page(
     conn: &impl SyncQuery,
     agent_id: i64,
     after: Option<i64>,
