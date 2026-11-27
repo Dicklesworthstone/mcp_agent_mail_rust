@@ -19,7 +19,7 @@ const METADATA_BATCH_ROWS: usize = 128;
 // accepts opaque fingerprints, so leave room beyond the usual 64 hex bytes.
 const MAX_CLAIM_METADATA_BYTES: i64 = 4096;
 
-pub(crate) struct SendClaimRecovery {
+pub struct SendClaimRecovery {
     has_live_claims: bool,
     cutoff: i64,
     source_has_topic: bool,
@@ -35,7 +35,7 @@ impl SendClaimRecovery {
     }
 }
 
-pub(crate) fn protect_error(error: DbError) -> DbError {
+pub fn protect_error(error: DbError) -> DbError {
     if is_refusal(&error) {
         error
     } else {
@@ -43,7 +43,7 @@ pub(crate) fn protect_error(error: DbError) -> DbError {
     }
 }
 
-pub(crate) fn is_refusal(error: &DbError) -> bool {
+pub fn is_refusal(error: &DbError) -> bool {
     matches!(error, DbError::Internal(message) if message.starts_with(ERROR_PREFIX))
 }
 
@@ -103,7 +103,7 @@ fn migration_applied(source: &impl SyncQuery, id: &str) -> DbResult<bool> {
 /// Establish retry authority before *any* merge work can fall back to an
 /// archive-only candidate. The source has already passed integrity admission;
 /// losing a table or failing this probe is not evidence of a legacy database.
-pub(crate) fn inspect_source(source: &impl SyncQuery) -> DbResult<SendClaimRecovery> {
+pub fn inspect_source(source: &impl SyncQuery) -> DbResult<SendClaimRecovery> {
     let cutoff = crate::timestamps::now_micros();
     let mut recovery = SendClaimRecovery {
         has_live_claims: false,
@@ -453,7 +453,7 @@ fn verify_message(
 /// In particular, reply fingerprints contain a numeric parent id; do not
 /// reinterpret those fingerprints as send receipts during an id remap.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn salvage_send_claims(
+pub fn salvage_send_claims(
     source: &impl SyncQuery,
     target: &crate::CanonicalDbConn,
     project_ids: &HashMap<i64, i64>,
