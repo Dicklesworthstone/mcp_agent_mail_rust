@@ -4216,6 +4216,9 @@ pub struct AtcEngine {
     /// A nonzero count permanently marks liveness coverage as incomplete;
     /// forgetting the refused identities must not restore release authority.
     agent_capacity_refusals: u64,
+    /// Prior routes' latest event for each rebound name. This rejects late observations
+    /// without treating another project's activity as evidence about the current route.
+    previous_route_activity: HashMap<String, i64>,
     /// Cached deterministic agent ordering for summary rendering.
     sorted_agent_names: Vec<String>,
     /// Whether the cached agent ordering must be rebuilt.
@@ -4421,6 +4424,7 @@ impl AtcEngine {
             liveness_core,
             conflict_core: default_conflict_core(),
             agents: HashMap::new(),
+            previous_route_activity: HashMap::new(),
             agent_capacity_refusals: 0,
             sorted_agent_names: Vec::new(),
             agent_order_dirty: false,
@@ -5531,6 +5535,66 @@ impl AtcEngine {
         from == ATC_AGENT_NAME || to.iter().any(|t| t == ATC_AGENT_NAME)
     }
 
+    /// Keep routing changes from turning another project's silence or accumulated
+    /// posterior into a release. The first explicit scope can enrich program
+    /// metadata but cannot certify earlier unscoped liveness. A changed key
+    /// also needs fresh evidence when a slug may denote more than one path.
+    fn rebind_liveness_project(
+        &mut self,
+        name: &str,
+        project_key: Option<&str>,
+        program: Option<&str>,
+    ) -> bool {
+        let Some(incoming) = project_key else {
+            return false;
+        };
+        let Some(entry) = self.agents.get_mut(name) else {
+            return false;
+        };
+        if entry.project_key.as_deref() == Some(incoming) {
+            return false;
+        }
+        let floor = self
+            .previous_route_activity
+            .entry(name.to_owned())
+            .or_default();
+        *floor = (*floor).max(entry.rhythm.last_activity_ts);
+        let program = program.or_else(|| entry.project_key.is_some().then_some("unknown-tool"));
+        if let Some(program) = program {
+            entry.program.clear();
+            entry.program.push_str(program);
+        }
+        entry.project_key = Some(incoming.to_owned());
+        entry.state = LivenessState::Alive;
+        entry.rhythm = Self::seeded_rhythm(&entry.program);
+        entry.suspect_since = 0;
+        entry.probe_sent_at = 0;
+        entry.sprt_log_lr = 0.0;
+        entry.core = self.liveness_core.clone();
+        // Both callers reschedule. Keeping schedule_version monotonic retires
+        // all old heap entries, including a return to a previously seen key.
+        self.dirty_agents.remove(name);
+        if self.pending_liveness_feedback.remove(name).is_some() {
+            self.censored_experience_count = self.censored_experience_count.saturating_add(1);
+        }
+        if let Some(lock) = ATC_THRESHOLDS.get()
+            && let Ok(mut thresholds) = lock.lock()
+            && let Some(threshold) = thresholds.get_mut(name)
+        {
+            *threshold = AdaptiveThreshold::new(self.config.suspicion_k);
+        }
+        true
+    }
+
+    fn latest_route_activity(&self, name: &str, entry: &AgentLivenessEntry) -> i64 {
+        entry.rhythm.last_activity_ts.max(
+            self.previous_route_activity
+                .get(name)
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+
     /// Register or update an agent for liveness tracking.
     ///
     /// Returns whether the identity is tracked. At capacity, existing agents
@@ -5551,19 +5615,15 @@ impl AtcEngine {
             return false;
         }
         let project_key = project_key.map(str::trim).filter(|value| !value.is_empty());
+        let rebound = self.rebind_liveness_project(name, project_key, Some(program));
         if let Some(entry) = self.agents.get_mut(name) {
             let program_changed = entry.program != program;
-            let project_changed =
-                project_key.is_some_and(|incoming| entry.project_key.as_deref() != Some(incoming));
-            if !program_changed && !project_changed {
+            if !rebound && !program_changed {
                 // Periodic durable population refreshes commonly replay an
                 // identical snapshot. Treat that as a true no-op: allocating
                 // replacement Strings and pushing another scheduler heap item
                 // every minute created needless long-running daemon churn.
                 return true;
-            }
-            if project_changed {
-                entry.project_key = project_key.map(ToOwned::to_owned);
             }
             if program_changed {
                 entry.program.clear();
@@ -5644,7 +5704,7 @@ impl AtcEngine {
         // AgentRhythm keeps its timestamp monotonic, but stale observations
         // previously still consumed feedback, changed project attribution,
         // resurrected dead agents, and churned the scheduler.
-        if timestamp_micros <= entry.rhythm.last_activity_ts {
+        if timestamp_micros <= self.latest_route_activity(agent, entry) {
             return;
         }
         if project_key.is_some_and(|key| key.len() > ATC_POPULATION_MAX_PROJECT_BYTES) {
@@ -5655,12 +5715,10 @@ impl AtcEngine {
             return;
         }
         let project_key = project_key.map(str::trim).filter(|value| !value.is_empty());
+        self.rebind_liveness_project(agent, project_key, None);
         self.resolve_pending_feedback_on_activity(agent, project_key, timestamp_micros);
         let mut resurrected = false;
         if let Some(entry) = self.agents.get_mut(agent) {
-            if let Some(project_key) = project_key {
-                entry.project_key = Some(project_key.to_string());
-            }
             entry.rhythm.observe(timestamp_micros);
             // Any activity resets to Alive (resurrection)
             if entry.state != LivenessState::Alive {
@@ -7064,7 +7122,8 @@ mod engine_tests {
         assert_eq!(entry.program, "codex-cli");
         assert_eq!(entry.project_key.as_deref(), Some("/new"));
         assert_eq!(entry.rhythm.last_activity_ts, 6_000_000);
-        assert_eq!(engine.pending_liveness_feedback.len(), 1);
+        assert!(engine.pending_liveness_feedback.is_empty());
+        assert_eq!(engine.censored_experience_count, 1);
         assert_eq!(engine.agent_capacity_refusals, 1_000);
         assert_eq!(
             engine.current_release_guard_reason().as_deref(),
@@ -8442,6 +8501,94 @@ mod engine_tests {
             assert_eq!(engine.resolved_experience_count, expected_resolved);
             assert_eq!(engine.censored_experience_count, 1 - expected_resolved);
             assert!(engine.pending_liveness_feedback.is_empty());
+        }
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn changing_project_requires_new_liveness_evidence_before_a_release() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+        let name = "BlueFox";
+        for previous in [Some("/alpha"), None] {
+            for via_registration in [true, false] {
+                let mut engine = AtcEngine::new_for_testing();
+                engine.register_agent(name, "codex-cli", previous);
+                engine.observe_activity(name, previous, 1_000_000);
+                engine.observe_activity(name, previous, 2_000_000);
+                engine.record_pending_liveness_feedback(
+                    name,
+                    LivenessAction::Suspect,
+                    2.0,
+                    2_000_000,
+                );
+                let entry = engine.agents.get_mut(name).unwrap();
+                entry.state = LivenessState::Flaky;
+                entry.probe_sent_at = 2_000_000;
+                entry.suspect_since = 2_000_000;
+                entry.sprt_log_lr = 10.0;
+                for _ in 0..30 {
+                    entry.core.update_posterior(&[
+                        (LivenessState::Alive, 0.01),
+                        (LivenessState::Flaky, 0.05),
+                        (LivenessState::Dead, 0.95),
+                    ]);
+                }
+                assert_eq!(
+                    engine
+                        .incumbent_policy
+                        .choose_action(entry.core.posterior(), false, false)
+                        .0,
+                    LivenessAction::ReleaseReservations
+                );
+                let old_schedule = entry.schedule_version;
+                engine.mark_agents_dirty();
+
+                if via_registration {
+                    engine.register_agent(name, "claude-code", Some("/beta"));
+                    engine.mark_agents_dirty();
+                    assert!(engine.evaluate_liveness(1_000_000_000).actions.is_empty());
+                } else {
+                    engine.observe_activity(name, Some("/beta"), 3_000_000);
+                }
+                let entry = &engine.agents[name];
+                assert_eq!(entry.project_key.as_deref(), Some("/beta"));
+                assert_eq!(entry.state, LivenessState::Alive);
+                assert_eq!(entry.core.posterior(), engine.liveness_core.posterior());
+                assert_eq!(entry.probe_sent_at, 0);
+                assert_eq!(entry.suspect_since, 0);
+                assert!(entry.sprt_log_lr.abs() < f64::EPSILON);
+                assert_eq!(entry.rhythm.observation_count, 0);
+                assert!(entry.rhythm.recent_intervals.is_empty());
+                assert_eq!(
+                    entry.rhythm.last_activity_ts,
+                    if via_registration { 0 } else { 3_000_000 }
+                );
+                assert!(entry.schedule_version > old_schedule);
+                assert!(engine.pending_liveness_feedback.is_empty());
+                assert_eq!(engine.censored_experience_count, 1);
+                let expected_program = if via_registration {
+                    "claude-code"
+                } else if previous.is_some() {
+                    "unknown-tool"
+                } else {
+                    "codex-cli"
+                };
+                assert_eq!(entry.program, expected_program);
+
+                // Delayed events cannot reattach the old project or re-create
+                // its issued activity coordinate after a round trip.
+                engine.observe_activity(name, previous, 2_000_000);
+                assert_eq!(engine.agents[name].project_key.as_deref(), Some("/beta"));
+                engine.register_agent(name, "codex-cli", Some("/alpha"));
+                engine.observe_activity(name, Some("/alpha"), 2_000_000);
+                assert_eq!(engine.agents[name].rhythm.last_activity_ts, 0);
+                engine.observe_activity(name, Some("/alpha"), 4_000_000);
+                assert_eq!(engine.agents[name].rhythm.last_activity_ts, 4_000_000);
+            }
         }
         reset_global_atc_state_for_test(&config);
     }
@@ -12631,7 +12778,7 @@ pub fn atc_sync_agent_snapshot(
     // a different project. Keep the newer route and its program together.
     // A bare slug can describe multiple directories and cannot prove a rebind.
     if let Some(entry) = e.agents.get(name)
-        && last_activity_ts <= entry.rhythm.last_activity_ts
+        && last_activity_ts <= e.latest_route_activity(name, entry)
         && let (Some(current), Some(incoming)) = (entry.project_key.as_deref(), project_key)
         && current != incoming
         && incoming.len() <= ATC_POPULATION_MAX_PROJECT_BYTES
@@ -14468,6 +14615,25 @@ mod alien_enhancement_tests {
         assert_eq!(
             engine.release_effect_admission(&effect),
             Err("release_project_changed")
+        );
+        drop(engine);
+
+        // Re-registration alone cannot erase the old time boundary. A queued
+        // population snapshot cannot undo the rebind while beta has no rhythm.
+        atc_sync_agent_snapshot(name, "stale-program", Some("/alpha"), last_active);
+        {
+            let engine = ATC_ENGINE.get().unwrap().lock().unwrap();
+            assert_eq!(engine.agents[name].project_key.as_deref(), Some("/beta"));
+            assert_eq!(engine.agents[name].rhythm.last_activity_ts, 0);
+        }
+        atc_register_agent_with_project(name, "codex-cli", Some("/alpha"));
+        atc_observe_activity_with_project(name, Some("/alpha"), last_active);
+        effect.project_key = Some("/alpha".into());
+        let engine = ATC_ENGINE.get().unwrap().lock().unwrap();
+        assert_eq!(engine.agents[name].rhythm.last_activity_ts, 0);
+        assert_eq!(
+            engine.release_effect_admission(&effect),
+            Err("release_liveness_changed")
         );
         drop(engine);
         reset_global_atc_state_for_test(&config);
