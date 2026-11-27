@@ -2283,61 +2283,81 @@ impl MailAppModel {
             .notify(Toast::new(message).icon(icon).duration(duration));
     }
 
-    fn execute_rethread_message(&mut self, message_id: i64, target_thread_id: &str) {
-        let target_thread_id = target_thread_id.trim();
-        if target_thread_id.is_empty() {
-            return;
-        }
-
-        // Hold the promotion lease from before the raw live fd is opened until
-        // the UPDATE has completed. Otherwise a recovery rename in between can
-        // redirect this operator mutation into the quarantined old generation.
-        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    fn execute_rethread_message(
+        &mut self,
+        request: mcp_agent_mail_db::sync::MessageThreadMove,
+    ) -> Cmd<MailMsg> {
         let snapshot = self.state.config_snapshot();
-        let cfg = DbPoolConfig {
-            database_url: snapshot.raw_database_url,
-            ..Default::default()
-        };
-        let Ok(path) = cfg.sqlite_path() else {
-            self.record_action_outcome(ActionOutcome::Failure {
-                operation: "rethread_message".to_string(),
-                error: "failed to resolve sqlite path".to_string(),
-            });
-            return;
-        };
-        let Ok(conn) = crate::open_interactive_sync_db_connection(&path) else {
-            self.record_action_outcome(ActionOutcome::Failure {
-                operation: "rethread_message".to_string(),
-                error: format!("failed to open database at {path}"),
-            });
-            return;
-        };
-
-        match mcp_agent_mail_db::sync::update_message_thread_id(&conn, message_id, target_thread_id)
-        {
-            Ok(true) => {
-                self.record_action_outcome(ActionOutcome::Success {
-                    operation: "rethread_message".to_string(),
-                    summary: format!("Moved #{message_id} to thread {target_thread_id}"),
-                });
-            }
-            Ok(false) => {
-                // No-op (already in thread)
-            }
-            Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
-                self.notifications.notify(
-                    Toast::new(format!("Message {message_id} not found"))
-                        .icon(ToastIcon::Warning)
-                        .duration(Duration::from_secs(3)),
-                );
-            }
-            Err(e) => {
-                self.record_action_outcome(ActionOutcome::Failure {
-                    operation: "rethread_message".to_string(),
-                    error: format!("update failed: {e}"),
-                });
-            }
-        }
+        let operation = format!("rethread_message:{}", request.message_id);
+        self.record_action_outcome(ActionOutcome::InFlight {
+            operation: operation.clone(),
+        });
+        map_screen_cmd(crate::tui_screens::operator_task(
+            self.active_screen(),
+            &operation,
+            move || {
+                // Open the live fd only after acquiring the promotion lease,
+                // and keep it through recovery publication. All admission, DB
+                // and filesystem waits happen on the operator task executor.
+                let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+                let cfg = DbPoolConfig {
+                    database_url: snapshot.raw_database_url,
+                    ..Default::default()
+                };
+                let path = cfg.sqlite_path().map_err(|error| error.to_string())?;
+                let conn = crate::open_interactive_sync_db_connection(&path)
+                    .map_err(|error| format!("Failed to open message database: {error}"))?;
+                let changed = mcp_agent_mail_db::sync::update_message_thread_id(&conn, &request)
+                    .map_err(|error| error.to_string())?;
+                if changed {
+                    mcp_agent_mail_db::search_service::note_message_ingested();
+                }
+                let root = Path::new(&snapshot.storage_root);
+                let paths = mcp_agent_mail_db::recovery_state::persist_thread_assignment(
+                    &conn,
+                    root,
+                    request.message_id,
+                )
+                .map_err(|error| {
+                    format!(
+                        "Message #{} is in thread {}; recovery publication is pending: {error}. \
+                         Retry the same move to finish publication",
+                        request.message_id, request.target_thread_id,
+                    )
+                })?;
+                let recovery_saved = !paths.is_empty();
+                if changed && !recovery_saved {
+                    return Err(format!(
+                        "Message #{} moved, but its recovery assignment is missing; refresh and check archive health",
+                        request.message_id,
+                    ));
+                }
+                mcp_agent_mail_db::recovery_state::note_pending_archive_paths(root, paths);
+                Ok(OperatorTaskResult {
+                    summary: if changed {
+                        format!(
+                            "Moved #{} to thread {}",
+                            request.message_id, request.target_thread_id
+                        )
+                    } else if recovery_saved {
+                        format!(
+                            "Message #{}: thread unchanged; recovery saved",
+                            request.message_id
+                        )
+                    } else {
+                        format!(
+                            "Message #{} is already in the selected thread",
+                            request.message_id
+                        )
+                    },
+                    data: serde_json::json!({
+                        "message_id": request.message_id,
+                        "thread_id": request.target_thread_id,
+                        "changed": changed,
+                    }),
+                })
+            },
+        ))
     }
 
     /// Copy text to the terminal clipboard via OSC 52, with system and
@@ -2605,15 +2625,13 @@ impl MailAppModel {
                 Cmd::none()
             }
             "rethread_message" => {
-                if let Some((message_id, target_thread_id)) = parse_rethread_operation_arg(arg) {
-                    self.execute_rethread_message(message_id, &target_thread_id);
-                } else {
-                    self.notifications.notify(
-                        Toast::new(format!("Invalid rethread operation: {operation}"))
-                            .icon(ToastIcon::Warning)
-                            .duration(Duration::from_secs(3)),
-                    );
-                }
+                // Legacy string actions omit project and source identity.
+                // Only the typed action emitted by a current view may mutate.
+                self.notifications.notify(
+                    Toast::new("Select the message and destination thread again before moving")
+                        .icon(ToastIcon::Warning)
+                        .duration(Duration::from_secs(3)),
+                );
                 Cmd::none()
             }
 
@@ -5424,6 +5442,9 @@ impl Model for MailAppModel {
                 self.apply_deep_link_with_transition(target);
                 Cmd::none()
             }
+            MailMsg::Screen(MailScreenMsg::RethreadMessage(request)) => {
+                self.execute_rethread_message(request)
+            }
             MailMsg::Screen(MailScreenMsg::OperatorCompleted {
                 screen,
                 operation,
@@ -5431,7 +5452,15 @@ impl Model for MailAppModel {
             }) => {
                 // Navigation must not send a late result to a different
                 // screen or bring the operator back to the old screen.
-                if let Some(origin) = self.screen_manager.existing_mut(screen) {
+                if operation.starts_with("rethread_message:") {
+                    // A move changes both browsers, including a destination
+                    // view opened while the worker was running.
+                    for browser in [MailScreenId::Messages, MailScreenId::Threads] {
+                        if let Some(view) = self.screen_manager.existing_mut(browser) {
+                            view.handle_operator_result(&operation, &result);
+                        }
+                    }
+                } else if let Some(origin) = self.screen_manager.existing_mut(screen) {
                     origin.handle_operator_result(&operation, &result);
                 }
                 // Forms retain their own pending request identity and their
@@ -8017,16 +8046,6 @@ fn extract_numeric_id(context: &str) -> Option<i64> {
         return Some(id);
     }
     None
-}
-
-fn parse_rethread_operation_arg(arg: &str) -> Option<(i64, String)> {
-    let (id_part, target_thread_id) = arg.split_once(':')?;
-    let message_id = id_part.parse::<i64>().ok()?;
-    let target_thread_id = target_thread_id.trim();
-    if target_thread_id.is_empty() {
-        return None;
-    }
-    Some((message_id, target_thread_id.to_string()))
 }
 
 fn extract_reservation_agent(event: &MailEvent) -> Option<&str> {
@@ -15123,18 +15142,105 @@ first body
     }
 
     #[test]
-    fn parse_rethread_operation_arg_valid() {
-        assert_eq!(
-            parse_rethread_operation_arg("55:br-123"),
-            Some((55, "br-123".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_rethread_operation_arg_rejects_invalid_shapes() {
-        assert_eq!(parse_rethread_operation_arg("55"), None);
-        assert_eq!(parse_rethread_operation_arg("abc:br-1"), None);
-        assert_eq!(parse_rethread_operation_arg("55:   "), None);
+    fn rethread_task_defers_writes_and_publishes_recovery_without_changing_navigation() {
+        use crate::tui_screens::{
+            operator_tool_context, seed_operator_test_project, with_operator_test_conn,
+            with_operator_test_mailbox,
+        };
+        with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["GreenCastle", "BlueLake"]);
+            let send = |thread: &str| {
+                let sent: serde_json::Value = serde_json::from_str(
+                    &fastmcp_core::block_on(mcp_agent_mail_tools::messaging::send_message(
+                        &operator_tool_context(),
+                        project_key.to_string(),
+                        "GreenCastle".to_string(),
+                        vec!["BlueLake".to_string()],
+                        format!("Move test {thread}"),
+                        "Message body".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                        Some(thread.to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .expect("send message"),
+                )
+                .unwrap();
+                sent["deliveries"][0]["payload"]["id"].as_i64().unwrap()
+            };
+            let id = send("old-thread");
+            send("target:007");
+            let config = Config::get();
+            let mut model = MailAppModel::new(TuiSharedState::new(&config));
+            model.activate_screen(MailScreenId::Messages);
+            let request = mcp_agent_mail_db::sync::MessageThreadMove {
+                message_id: id,
+                source_project_slug: slug.clone(),
+                source_thread_id: "old-thread".to_string(),
+                target_project_slug: slug,
+                target_thread_id: "target:007".to_string(),
+            };
+            let command = model.update(MailMsg::Screen(MailScreenMsg::RethreadMessage(request)));
+            let read_thread = || {
+                with_operator_test_conn(|conn| {
+                    conn.query_sync(
+                        "SELECT thread_id FROM messages WHERE id = ?",
+                        &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id)],
+                    )
+                    .unwrap()[0]
+                        .get_named::<String>("thread_id")
+                        .unwrap()
+                })
+            };
+            assert_eq!(
+                read_thread(),
+                "old-thread",
+                "dispatch must not write on the UI loop"
+            );
+            model.update(MailMsg::SwitchScreen(MailScreenId::Threads));
+            let Cmd::Task(_, run) = command else {
+                panic!("rethread must run as a deferred operator task");
+            };
+            let completion = run();
+            assert!(
+                matches!(
+                    &completion,
+                    MailMsg::Screen(MailScreenMsg::OperatorCompleted { result: Ok(_), .. })
+                ),
+                "{completion:?}"
+            );
+            model.update(completion);
+            assert_eq!(read_thread(), "target:007");
+            assert_eq!(model.active_screen(), MailScreenId::Threads);
+            assert!(matches!(
+                model.action_outcomes.back(),
+                Some(ActionOutcome::Success { .. })
+            ));
+            let mut recovered = false;
+            mcp_agent_mail_db::recovery_state::visit_records(&config.storage_root, |record| {
+                if let mcp_agent_mail_db::recovery_state::RecoveryRecord::ThreadAssignment(record) =
+                    record
+                {
+                    recovered |= record.message_id == id
+                        && record.original_thread_id.as_deref() == Some("old-thread")
+                        && record.thread_id == "target:007";
+                }
+                Ok(())
+            })
+            .expect("complete durable recovery record");
+            assert!(
+                recovered,
+                "success must include the durable thread assignment"
+            );
+        });
     }
 
     // ── dispatch_execute_operation tests ─────────────────────────

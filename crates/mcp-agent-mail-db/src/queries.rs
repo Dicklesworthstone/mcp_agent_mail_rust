@@ -7999,9 +7999,9 @@ fn decode_lifecycle_timestamp(
 ) -> crate::DbResult<Option<i64>> {
     match value {
         Some(Value::Null) if nullable => Ok(None),
-        Some(value) => value_as_i64(value).map(Some).ok_or_else(|| {
-            DbError::Schema(format!("invalid lifecycle timestamp in {column}"))
-        }),
+        Some(value) => value_as_i64(value)
+            .map(Some)
+            .ok_or_else(|| DbError::Schema(format!("invalid lifecycle timestamp in {column}"))),
         None => Err(DbError::Schema(format!(
             "missing lifecycle timestamp column {column}"
         ))),
@@ -10273,11 +10273,8 @@ async fn ensure_agents_active_in_tx(
                     _ => None,
                 })
                 .unwrap_or_else(|| format!("agent-{agent_id}"));
-            let retired_at = match decode_lifecycle_timestamp(
-                row.get(2),
-                "agents.retired_at",
-                true,
-            ) {
+            let retired_at = match decode_lifecycle_timestamp(row.get(2), "agents.retired_at", true)
+            {
                 Ok(timestamp) => timestamp,
                 Err(error) => return Outcome::Err(error),
             };
@@ -14976,13 +14973,15 @@ SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.t
        NULL AS recipient_name, NULL AS recipient_kind, \
        m.sender_id, a.project_id AS sender_project_id, \
        NULL AS recipient_read_ts, NULL AS recipient_ack_ts, \
-       sp.human_key AS sender_project_key, sp.slug AS sender_project_slug \
+       sp.human_key AS sender_project_key, sp.slug AS sender_project_slug, \
+       ta.assignment_json AS thread_assignment_json \
 FROM (SELECT id, project_id, sender_id, subject, body_md, thread_id, topic, \
              importance, ack_required, created_ts, recipients_json, attachments, \
              archive_metadata_json FROM messages WHERE id = ?1) m \
 JOIN projects p ON p.id = m.project_id \
 JOIN agents a ON a.id = m.sender_id \
 JOIN projects sp ON sp.id = a.project_id \
+LEFT JOIN message_thread_assignments ta ON ta.message_id = m.id \
 WHERE length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
       length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
       length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
@@ -14990,7 +14989,8 @@ WHERE length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
       length(CAST(sp.human_key AS BLOB)) + length(CAST(sp.slug AS BLOB)) + \
       COALESCE(length(CAST(m.thread_id AS BLOB)), 0) + \
       COALESCE(length(CAST(m.topic AS BLOB)), 0) + \
-      COALESCE(length(CAST(m.archive_metadata_json AS BLOB)), 0) <= ?2 \
+      COALESCE(length(CAST(m.archive_metadata_json AS BLOB)), 0) + \
+      COALESCE(length(CAST(ta.assignment_json AS BLOB)), 0) <= ?2 \
 UNION ALL \
 SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
        NULL, NULL, NULL, mr.agent_id, a.project_id, \
@@ -15001,7 +15001,7 @@ SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, N
             THEN mr.read_ts ELSE 'invalid_receipt' END, \
        CASE WHEN mr.ack_ts IS NULL OR typeof(mr.ack_ts) = 'integer' \
             THEN mr.ack_ts ELSE 'invalid_receipt' END, \
-       NULL, NULL \
+       NULL, NULL, NULL \
 FROM (SELECT message_id, agent_id, kind, read_ts, ack_ts \
       FROM message_recipients WHERE message_id = ?1) mr \
 LEFT JOIN agents a ON a.id = mr.agent_id \
@@ -15010,13 +15010,13 @@ SELECT 2, d.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NU
        NULL, NULL, NULL, NULL, d.project_id, \
        CASE WHEN length(CAST(p.slug AS BLOB)) <= ?3 THEN 'project:' || p.slug ELSE NULL END, \
        CASE WHEN length(CAST(d.kind AS BLOB)) <= 3 THEN d.kind ELSE NULL END, \
-       NULL, NULL, NULL, NULL, NULL, NULL \
+       NULL, NULL, NULL, NULL, NULL, NULL, NULL \
 FROM (SELECT message_id, project_id, kind \
       FROM project_mailbox_deliveries WHERE message_id = ?1) d \
 LEFT JOIN projects p ON p.id = d.project_id \
 ORDER BY row_kind, recipient_id";
 
-const MESSAGE_ARCHIVE_SOURCE_COLUMNS: usize = 26;
+const MESSAGE_ARCHIVE_SOURCE_COLUMNS: usize = 27;
 
 fn message_archive_source_sql() -> String {
     // The pinned compound-select executor requires a literal LIMIT. All
@@ -41954,7 +41954,11 @@ mod tests {
                     let agent_id = registered.id.unwrap();
                     let active = if by_name {
                         set_agent_contact_policy_by_name(
-                            &cx, &pool, project_id, " bluelake ", "contacts_only",
+                            &cx,
+                            &pool,
+                            project_id,
+                            " bluelake ",
+                            "contacts_only",
                         )
                         .await
                     } else {
@@ -41978,7 +41982,11 @@ mod tests {
                     let mut waiting = std::pin::pin!(async {
                         if by_name {
                             set_agent_contact_policy_by_name(
-                                &cx, &pool, project_id, " bluelake ", "open",
+                                &cx,
+                                &pool,
+                                project_id,
+                                " bluelake ",
+                                "open",
                             )
                             .await
                         } else {
@@ -47370,9 +47378,8 @@ mod tests {
             .expect("runtime");
         for deferred in [false, true] {
             for deregister in [false, true] {
-                let (_cx, pool, _dir) = setup_test_pool(&format!(
-                    "activity-lifecycle-{deferred}-{deregister}.db"
-                ));
+                let (_cx, pool, _dir) =
+                    setup_test_pool(&format!("activity-lifecycle-{deferred}-{deregister}.db"));
                 let lifecycle_pool = DbPool::new(&crate::pool::DbPoolConfig {
                     database_url: format!("sqlite:///{}", pool.sqlite_path()),
                     storage_root: Some(pool.storage_root().to_path_buf()),
@@ -47398,7 +47405,15 @@ mod tests {
                     .into_result()
                     .expect("agent");
                     let peer = register_agent(
-                        &cx, &pool, project_id, "GreenStone", "test", "test", None, None, None,
+                        &cx,
+                        &pool,
+                        project_id,
+                        "GreenStone",
+                        "test",
+                        "test",
+                        None,
+                        None,
+                        None,
                     )
                     .await
                     .into_result()
@@ -47450,15 +47465,11 @@ mod tests {
                     .expect("lifecycle commits before activity admission");
                     crate::read_cache().put_agent_scoped(&scope, &active);
                     drop(held);
-                    asupersync::time::timeout(
-                        cx.now(),
-                        std::time::Duration::from_secs(5),
-                        waiting,
-                    )
-                    .await
-                    .expect("activity admission watchdog")
-                    .into_result()
-                    .expect("inactive activity is a harmless no-op");
+                    asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), waiting)
+                        .await
+                        .expect("activity admission watchdog")
+                        .into_result()
+                        .expect("inactive activity is a harmless no-op");
                     let stored = get_agent_by_id_fresh(&cx, &pool, agent_id)
                         .await
                         .into_result()

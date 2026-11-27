@@ -536,14 +536,16 @@ struct ActiveMessageDrag {
     cursor_x: u16,
     cursor_y: u16,
     hovered_thread_id: Option<String>,
+    hovered_project_slug: Option<String>,
     hovered_is_valid: bool,
     invalid_hover: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ThreadDropVisual<'a> {
-    source_thread_id: &'a str,
+    source_project_slug: &'a str,
     hovered_thread_id: Option<&'a str>,
+    hovered_project_slug: Option<&'a str>,
     invalid_hover: bool,
 }
 
@@ -1280,6 +1282,7 @@ impl ThreadExplorerScreen {
             cursor_x: pending.cursor_x,
             cursor_y: pending.cursor_y,
             hovered_thread_id: None,
+            hovered_project_slug: None,
             hovered_is_valid: false,
             invalid_hover: true,
         });
@@ -1304,19 +1307,22 @@ impl ThreadExplorerScreen {
 
     fn update_active_message_drag(&mut self, state: &TuiSharedState, cursor_x: u16, cursor_y: u16) {
         self.promote_pending_message_drag_if_due(state);
-        let hovered_thread_id = if point_in_rect(self.last_list_area.get(), cursor_x, cursor_y) {
+        let hovered = if point_in_rect(self.last_list_area.get(), cursor_x, cursor_y) {
             self.thread_index_at_list_y(cursor_y)
-                .and_then(|idx| self.threads.get(idx).map(|t| t.thread_id.clone()))
+                .and_then(|idx| self.threads.get(idx))
+                .filter(|thread| !thread.thread_id.is_empty())
+                .map(|thread| (thread.thread_id.clone(), thread.project_slug.clone()))
         } else {
             None
         };
         if let MessageDragState::Active(active) = &mut self.message_drag {
             active.cursor_x = cursor_x;
             active.cursor_y = cursor_y;
-            active.hovered_thread_id.clone_from(&hovered_thread_id);
-            active.hovered_is_valid = hovered_thread_id
-                .as_deref()
-                .is_some_and(|tid| tid != active.source_thread_id);
+            active.hovered_thread_id = hovered.as_ref().map(|(thread, _)| thread.clone());
+            active.hovered_project_slug = hovered.as_ref().map(|(_, project)| project.clone());
+            active.hovered_is_valid = hovered.as_ref().is_some_and(|(_, project)| {
+                !project.is_empty() && project == &active.source_project_slug
+            });
             active.invalid_hover = !active.hovered_is_valid;
             self.publish_active_drag_snapshot(state);
         }
@@ -1333,16 +1339,18 @@ impl ThreadExplorerScreen {
                 active.hovered_thread_id.as_deref().map_or_else(
                     || Cmd::None,
                     |target_thread_id| {
-                        if !target_thread_id.is_empty()
-                            && target_thread_id != active.source_thread_id
-                        {
-                            let op = format!(
-                                "rethread_message:{}:{target_thread_id}",
-                                active.message_id
-                            );
-                            Cmd::msg(MailScreenMsg::ActionExecute(
-                                op,
-                                active.source_thread_id.clone(),
+                        if !target_thread_id.is_empty() {
+                            Cmd::msg(MailScreenMsg::RethreadMessage(
+                                mcp_agent_mail_db::sync::MessageThreadMove {
+                                    message_id: active.message_id,
+                                    source_project_slug: active.source_project_slug.clone(),
+                                    source_thread_id: active.source_thread_id.clone(),
+                                    target_project_slug: active
+                                        .hovered_project_slug
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    target_thread_id: target_thread_id.to_string(),
+                                },
                             ))
                         } else {
                             Cmd::None
@@ -1384,21 +1392,27 @@ impl ThreadExplorerScreen {
         let Some(marker) = state.keyboard_move_snapshot() else {
             return Cmd::None;
         };
-        let Some(target_thread_id) = self
+        let Some(target) = self
             .threads
             .get(self.cursor)
-            .map(|thread| thread.thread_id.as_str())
-            .filter(|thread_id| !thread_id.is_empty())
+            .filter(|thread| !thread.thread_id.is_empty())
         else {
             return Cmd::None;
         };
-        if target_thread_id == marker.source_thread_id {
+        if target.project_slug.is_empty() || target.project_slug != marker.source_project_slug {
             return Cmd::None;
         }
 
-        let op = format!("rethread_message:{}:{target_thread_id}", marker.message_id);
         state.clear_keyboard_move_snapshot();
-        Cmd::msg(MailScreenMsg::ActionExecute(op, marker.source_thread_id))
+        Cmd::msg(MailScreenMsg::RethreadMessage(
+            mcp_agent_mail_db::sync::MessageThreadMove {
+                message_id: marker.message_id,
+                source_project_slug: marker.source_project_slug,
+                source_thread_id: marker.source_thread_id,
+                target_project_slug: target.project_slug.clone(),
+                target_thread_id: target.thread_id.clone(),
+            },
+        ))
     }
 
     fn clamp_detail_cursor_to_tree_rows(&mut self) {
@@ -2055,8 +2069,9 @@ impl MailScreen for ThreadExplorerScreen {
         }
         let drop_visual = match &self.message_drag {
             MessageDragState::Active(active) => Some(ThreadDropVisual {
-                source_thread_id: active.source_thread_id.as_str(),
+                source_project_slug: active.source_project_slug.as_str(),
                 hovered_thread_id: active.hovered_thread_id.as_deref(),
+                hovered_project_slug: active.hovered_project_slug.as_deref(),
                 invalid_hover: active.invalid_hover,
             }),
             _ => None,
@@ -2435,6 +2450,12 @@ impl MailScreen for ThreadExplorerScreen {
         operation: &str,
         result: &Result<OperatorTaskResult, String>,
     ) {
+        if operation.starts_with("rethread_message:") {
+            // Refresh even on a journal error after the live move committed.
+            self.list_dirty = true;
+            self.detail_dirty = true;
+            return;
+        }
         if operation != "summarize" {
             return;
         }
@@ -3325,10 +3346,8 @@ fn render_thread_list(
     );
     let title = fit_panel_title(&title, area.width);
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let hovered_valid_drop = drop_visual.is_some_and(|drag| {
-        drag.hovered_thread_id
-            .is_some_and(|tid| tid != drag.source_thread_id)
-    });
+    let hovered_valid_drop =
+        drop_visual.is_some_and(|drag| !drag.invalid_hover && drag.hovered_thread_id.is_some());
     let border_color = if drop_visual.is_some_and(|drag| drag.invalid_hover) {
         tp.severity_warn
     } else if hovered_valid_drop {
@@ -3384,13 +3403,17 @@ fn render_thread_list(
     for (view_idx, thread) in viewport.iter().enumerate() {
         let abs_idx = start + view_idx;
         let is_selected = abs_idx == cursor_clamped;
-        let keyboard_marked_source =
-            keyboard_move.is_some_and(|marker| marker.source_thread_id == thread.thread_id);
-        let valid_drop_zone =
-            drop_visual.is_some_and(|drag| thread.thread_id != drag.source_thread_id);
-        let hovered_here = drop_visual
-            .and_then(|drag| drag.hovered_thread_id)
-            .is_some_and(|tid| tid == thread.thread_id);
+        let keyboard_marked_source = keyboard_move.is_some_and(|marker| {
+            marker.source_thread_id == thread.thread_id
+                && marker.source_project_slug == thread.project_slug
+        });
+        let valid_drop_zone = drop_visual.is_some_and(|drag| {
+            !thread.project_slug.is_empty() && thread.project_slug == drag.source_project_slug
+        });
+        let hovered_here = drop_visual.is_some_and(|drag| {
+            drag.hovered_thread_id == Some(thread.thread_id.as_str())
+                && drag.hovered_project_slug == Some(thread.project_slug.as_str())
+        });
         let marker = if hovered_here && valid_drop_zone {
             "\u{25b8}"
         } else if is_selected {
@@ -5108,11 +5131,14 @@ mod tests {
         let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 2, 4);
         let cmd = screen.update(&up, &state);
         match cmd {
-            Cmd::Msg(MailScreenMsg::ActionExecute(op, ctx)) => {
-                assert_eq!(op, "rethread_message:77:t2");
-                assert_eq!(ctx, "t1");
+            Cmd::Msg(MailScreenMsg::RethreadMessage(request)) => {
+                assert_eq!(request.message_id, 77);
+                assert_eq!(request.source_thread_id, "t1");
+                assert_eq!(request.target_thread_id, "t2");
+                assert_eq!(request.source_project_slug, "test-proj");
+                assert_eq!(request.target_project_slug, "test-proj");
             }
-            _ => panic!("expected ActionExecute command"),
+            _ => panic!("expected scoped rethread command"),
         }
         assert!(matches!(screen.message_drag, MessageDragState::Idle));
         assert!(state.message_drag_snapshot().is_none());
@@ -5174,7 +5200,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_drop_on_same_thread_is_noop() {
+    fn mouse_drop_on_same_thread_dispatches_idempotent_publication_retry() {
         let mut screen = ThreadExplorerScreen::new();
         screen.threads.push(make_thread("t1", 3, 2));
         screen.threads.push(make_thread("t2", 2, 2));
@@ -5197,7 +5223,10 @@ mod tests {
         let _ = screen.update(&drag, &state);
         let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 2, 2);
         let cmd = screen.update(&up, &state);
-        assert!(matches!(cmd, Cmd::None));
+        assert!(
+            matches!(cmd, Cmd::Msg(MailScreenMsg::RethreadMessage(request))
+            if request.message_id == 88 && request.source_thread_id == request.target_thread_id)
+        );
         assert!(matches!(screen.message_drag, MessageDragState::Idle));
         assert!(state.message_drag_snapshot().is_none());
     }
@@ -5249,22 +5278,45 @@ mod tests {
             message_id: 88,
             subject: "Subj".to_string(),
             source_thread_id: "t1".to_string(),
-            source_project_slug: "project".to_string(),
+            source_project_slug: "test-proj".to_string(),
         }));
 
         let cmd = screen.update(&ctrl_key(KeyCode::Char('v')), &state);
         match cmd {
-            Cmd::Msg(MailScreenMsg::ActionExecute(op, ctx)) => {
-                assert_eq!(op, "rethread_message:88:t2");
-                assert_eq!(ctx, "t1");
+            Cmd::Msg(MailScreenMsg::RethreadMessage(request)) => {
+                assert_eq!(request.message_id, 88);
+                assert_eq!(request.source_thread_id, "t1");
+                assert_eq!(request.target_thread_id, "t2");
+                assert_eq!(request.source_project_slug, "test-proj");
+                assert_eq!(request.target_project_slug, "test-proj");
             }
-            _ => panic!("expected ActionExecute command"),
+            _ => panic!("expected scoped rethread command"),
         }
         assert!(state.keyboard_move_snapshot().is_none());
     }
 
     #[test]
-    fn ctrl_v_same_thread_is_noop_and_preserves_marker() {
+    fn ctrl_v_foreign_project_is_noop_and_preserves_marker() {
+        let mut screen = ThreadExplorerScreen::new();
+        let mut target = make_thread("t2", 2, 2);
+        target.project_slug = "foreign".to_string();
+        screen.threads.push(target);
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
+            message_id: 88,
+            subject: "Subj".to_string(),
+            source_thread_id: "t1".to_string(),
+            source_project_slug: "test-proj".to_string(),
+        }));
+        assert!(matches!(
+            screen.update(&ctrl_key(KeyCode::Char('v')), &state),
+            Cmd::None
+        ));
+        assert_eq!(state.keyboard_move_snapshot().unwrap().message_id, 88);
+    }
+
+    #[test]
+    fn ctrl_v_same_thread_dispatches_idempotent_publication_retry() {
         let mut screen = ThreadExplorerScreen::new();
         screen.threads.push(make_thread("t1", 3, 2));
         screen.cursor = 0;
@@ -5273,16 +5325,15 @@ mod tests {
             message_id: 88,
             subject: "Subj".to_string(),
             source_thread_id: "t1".to_string(),
-            source_project_slug: "project".to_string(),
+            source_project_slug: "test-proj".to_string(),
         }));
 
         let cmd = screen.update(&ctrl_key(KeyCode::Char('v')), &state);
-        assert!(matches!(cmd, Cmd::None));
-        let marker = state
-            .keyboard_move_snapshot()
-            .expect("keyboard move marker should remain");
-        assert_eq!(marker.message_id, 88);
-        assert_eq!(marker.source_thread_id, "t1");
+        assert!(
+            matches!(cmd, Cmd::Msg(MailScreenMsg::RethreadMessage(request))
+            if request.message_id == 88 && request.source_thread_id == request.target_thread_id)
+        );
+        assert!(state.keyboard_move_snapshot().is_none());
     }
 
     #[test]

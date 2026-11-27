@@ -4614,7 +4614,7 @@ fn discover_file_reservations(
     Ok(())
 }
 
-fn sanitize_reconstructed_thread_id(raw: &str) -> Option<String> {
+pub(crate) fn sanitize_reconstructed_thread_id(raw: &str) -> Option<String> {
     let sanitized: String = raw
         .trim()
         .chars()
@@ -7274,6 +7274,28 @@ fn merge_salvaged_database_inner(
             }
         }
 
+        if table_exists(&salvage_conn, "message_thread_assignments")? {
+            // The readable source can contain a newer committed move whose
+            // journal publication was interrupted. Import it before archive
+            // overlays; replay's revision check prevents an older checkpoint
+            // from rolling it back. Retained ledger rows resolve by full stable
+            // identity even when their live message was already pruned.
+            crate::recovery_state::visit_current_thread_assignments(
+                &salvage_conn,
+                &mut |record| {
+                    if let crate::recovery_state::RecoveryRecord::ThreadAssignment(assignment) =
+                        record
+                    {
+                        crate::reconstruct_state::restore_thread_assignment(
+                            &target_conn,
+                            assignment,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
         if has_recipients {
             let recipient_columns = table_columns(&salvage_conn, "message_recipients")?;
             let recipient_select = build_salvage_select(
@@ -7701,6 +7723,10 @@ impl ArchivedIdentityIds {
                 RecoveryRecord::Contact(contact) => {
                     ids.agent(contact.from)?;
                     ids.agent(contact.to)?;
+                }
+                RecoveryRecord::ThreadAssignment(assignment) => {
+                    ids.project(assignment.message_project)?;
+                    ids.agent(assignment.sender)?;
                 }
             }
             Ok(())
@@ -8552,6 +8578,7 @@ fn apply_delta_in_transaction(
         )));
     }
     let mut applied = 0usize;
+    let has_thread_assignments = table_exists(conn, "message_thread_assignments")?;
     for id in missing {
         let rows = conn
             .query_sync(
@@ -8576,6 +8603,23 @@ fn apply_delta_in_transaction(
                     "incremental apply: retain unknown reply lineage for {id}: {error}"
                 ))
             })?;
+            if has_thread_assignments {
+                let assignments = conn.query_sync(
+                    "SELECT assignment_json FROM message_thread_assignments WHERE message_id = ?",
+                    &[Value::BigInt(*id)],
+                ).map_err(|error| DbError::Sqlite(format!("incremental apply: thread assignment {id}: {error}")))?;
+                if let Some(assignment) = assignments.first() {
+                    let raw: String = assignment.get_named("assignment_json").map_err(|error| {
+                        DbError::Sqlite(format!(
+                            "incremental apply: thread assignment {id}: {error}"
+                        ))
+                    })?;
+                    crate::reconstruct_state::restore_thread_assignment(
+                        conn,
+                        crate::recovery_state::decode_thread_assignment(&raw)?,
+                    )?;
+                }
+            }
             applied += 1;
         }
     }

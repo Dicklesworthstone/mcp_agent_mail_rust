@@ -112,6 +112,25 @@ pub struct ContactRecord {
     pub expires_ts: Option<i64>,
 }
 
+/// Explicit authority for a logical thread change. The original envelope stays
+/// immutable; the identity prevents a reused numeric ID from inheriting a move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadAssignmentRecord {
+    pub message_id: i64,
+    pub message_project: ProjectIdentity,
+    pub sender: AgentIdentity,
+    pub message_created_ts: i64,
+    pub message_subject: String,
+    pub message_body_sha256: String,
+    /// Reconstruction historically removes leading blank lines. Retaining
+    /// exactly that prefix lets the digest prove and restore the original body.
+    pub message_body_prefix: String,
+    pub original_thread_id: Option<String>,
+    pub thread_id: String,
+    pub revision: i64,
+}
+
 fn deserialize_contact_status<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<String, D::Error> {
@@ -125,6 +144,7 @@ pub enum RecoveryRecord {
     Agent(AgentIdentity),
     Receipt(ReceiptRecord),
     Contact(ContactRecord),
+    ThreadAssignment(ThreadAssignmentRecord),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +156,8 @@ pub struct Manifest {
     pub agents: u64,
     pub receipts: u64,
     pub contacts: u64,
+    #[serde(default)]
+    pub thread_assignments: u64,
 }
 
 /// Opaque, bounded witness for reusing an archive read snapshot. Equality
@@ -715,6 +737,244 @@ fn contact(row: &Row) -> DbResult<ContactRecord> {
     })
 }
 
+const THREAD_MESSAGE_SELECT: &str = "SELECT m.id, m.project_id, m.sender_id, \
+    m.created_ts, m.subject, m.body_md, m.thread_id, \
+    p.slug AS project_slug, p.human_key AS project_key, a.name AS sender, \
+    a.project_id AS sender_project_id, sp.slug AS sender_project_slug, \
+    sp.human_key AS sender_project_key, t.assignment_json AS thread_assignment_json \
+    FROM messages m JOIN projects p ON p.id = m.project_id \
+    JOIN agents a ON a.id = m.sender_id JOIN projects sp ON sp.id = a.project_id \
+    LEFT JOIN message_thread_assignments t ON t.message_id = m.id";
+
+fn thread_assignment_identity(
+    row: &Row,
+    original_thread_id: Option<String>,
+    thread_id: String,
+    revision: i64,
+) -> DbResult<ThreadAssignmentRecord> {
+    let text = |name| {
+        row.get_named::<String>(name)
+            .map_err(|error| state_error("thread identity", error))
+    };
+    let number = |name| {
+        row.get_named::<i64>(name)
+            .map_err(|error| state_error("thread identity", error))
+    };
+    let body = text("body_md")?;
+    let prefix_bytes = body.len() - body.trim_start_matches(['\n', '\r']).len();
+    Ok(ThreadAssignmentRecord {
+        message_id: number("id")?,
+        message_project: ProjectIdentity {
+            id: number("project_id")?,
+            slug: text("project_slug")?,
+            human_key: text("project_key")?,
+        },
+        sender: AgentIdentity {
+            id: number("sender_id")?,
+            name: text("sender")?,
+            project: ProjectIdentity {
+                id: number("sender_project_id")?,
+                slug: text("sender_project_slug")?,
+                human_key: text("sender_project_key")?,
+            },
+        },
+        message_created_ts: number("created_ts")?,
+        message_subject: text("subject")?,
+        message_body_sha256: hex::encode(Sha256::digest(body.as_bytes())),
+        message_body_prefix: body[..prefix_bytes].to_string(),
+        original_thread_id,
+        thread_id,
+        revision,
+    })
+}
+
+pub(crate) fn decode_thread_assignment(raw: &str) -> DbResult<ThreadAssignmentRecord> {
+    if raw.len() as u64 > MAX_RECORD_BYTES {
+        return Err(state_error(
+            "thread assignment",
+            "record exceeds bounded size limit",
+        ));
+    }
+    let assignment: ThreadAssignmentRecord =
+        serde_json::from_str(raw).map_err(|error| state_error("thread assignment", error))?;
+    validate_thread_assignment(&assignment)?;
+    Ok(assignment)
+}
+
+fn validate_thread_assignment(record: &ThreadAssignmentRecord) -> DbResult<()> {
+    if record.message_id <= 0
+        || record.message_project.id <= 0
+        || record.sender.id <= 0
+        || record.sender.project.id <= 0
+        || record.revision <= 0
+        || record.thread_id.trim_matches(' ').is_empty()
+        || !record
+            .message_body_prefix
+            .bytes()
+            .all(|byte| matches!(byte, b'\r' | b'\n'))
+        || record.message_body_sha256.len() != 64
+        || !record
+            .message_body_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(state_error(
+            "thread assignment",
+            "invalid identity, revision, or target",
+        ));
+    }
+    Ok(())
+}
+
+fn assignment_from_message_row(row: &Row) -> DbResult<Option<ThreadAssignmentRecord>> {
+    let raw: Option<String> = row
+        .get_named("thread_assignment_json")
+        .map_err(|error| state_error("thread assignment", error))?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let assignment = decode_thread_assignment(&raw)?;
+    let current: Option<String> = row
+        .get_named("thread_id")
+        .map_err(|error| state_error("thread assignment", error))?;
+    if current.as_deref() != Some(assignment.thread_id.as_str())
+        || thread_assignment_identity(
+            row,
+            assignment.original_thread_id.clone(),
+            assignment.thread_id.clone(),
+            assignment.revision,
+        )? != assignment
+    {
+        return Err(state_error(
+            "thread assignment",
+            "logical thread or immutable message identity disagrees with its assignment",
+        ));
+    }
+    Ok(Some(assignment))
+}
+
+/// Return the original archive thread only when the same observation proves
+/// the explicit assignment still belongs to the live message. The projection
+/// retains both logical thread and assignment bytes for retention's recheck.
+pub fn archive_thread_id(row: &Row) -> DbResult<Option<String>> {
+    if let Some(assignment) = assignment_from_message_row(row)? {
+        Ok(assignment.original_thread_id)
+    } else {
+        row.get_named("thread_id")
+            .map_err(|error| state_error("thread assignment", error))
+    }
+}
+
+pub(crate) fn store_thread_assignment(
+    conn: &impl SyncQuery,
+    assignment: &ThreadAssignmentRecord,
+) -> DbResult<()> {
+    validate_thread_assignment(assignment)?;
+    let raw = serde_json::to_string(assignment)
+        .map_err(|error| state_error("thread assignment encode", error))?;
+    if raw.len() as u64 > MAX_RECORD_BYTES {
+        return Err(state_error(
+            "thread assignment",
+            "record exceeds bounded size limit",
+        ));
+    }
+    // SyncQuery serves both database engines and exposes only raw execution.
+    // JSON escapes NULs; doubling every quote makes this one SQL text literal.
+    conn.execute_raw(&format!(
+        "INSERT INTO message_thread_assignments(message_id, assignment_json) VALUES ({}, '{}') \
+         ON CONFLICT(message_id) DO UPDATE SET assignment_json = excluded.assignment_json",
+        assignment.message_id,
+        raw.replace('\'', "''"),
+    ))
+    .map_err(|error| state_error("thread assignment write", error))?;
+    Ok(())
+}
+
+/// Record a guarded move inside the caller's existing write transaction,
+/// immediately before updating `messages.thread_id`. Repeated moves preserve
+/// the first exact envelope thread, including NULL and whitespace.
+pub fn record_thread_assignment(
+    conn: &impl SyncQuery,
+    message_id: i64,
+    old_raw_thread: Option<&str>,
+    target: &str,
+) -> DbResult<()> {
+    let rows = query(
+        conn,
+        &format!("{THREAD_MESSAGE_SELECT} WHERE m.id = ?"),
+        &[Value::BigInt(message_id)],
+    )?;
+    let row = rows.first().ok_or_else(|| {
+        state_error(
+            "thread assignment",
+            "message or its immutable identity is missing",
+        )
+    })?;
+    let current: Option<String> = row
+        .get_named("thread_id")
+        .map_err(|error| state_error("thread assignment", error))?;
+    if current.as_deref() != old_raw_thread {
+        return Err(state_error("thread assignment", "source thread changed"));
+    }
+    let mut assignment = if let Some(mut previous) = assignment_from_message_row(row)? {
+        previous.revision = previous
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| state_error("thread assignment", "revision space exhausted"))?;
+        previous
+    } else {
+        thread_assignment_identity(row, current, target.to_string(), 1)?
+    };
+    assignment.thread_id = target.to_string();
+    store_thread_assignment(conn, &assignment)
+}
+
+fn current_thread_assignment(
+    conn: &impl SyncQuery,
+    message_id: i64,
+) -> DbResult<Option<ThreadAssignmentRecord>> {
+    let rows = query(
+        conn,
+        "SELECT assignment_json FROM message_thread_assignments WHERE message_id = ?",
+        &[Value::BigInt(message_id)],
+    )?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let raw: String = row
+        .get_named("assignment_json")
+        .map_err(|error| state_error("thread assignment", error))?;
+    let assignment = decode_thread_assignment(&raw)?;
+    if assignment.message_id != message_id {
+        return Err(state_error(
+            "thread assignment",
+            "ledger key differs from its identity",
+        ));
+    }
+    let messages = query(
+        conn,
+        &format!("{THREAD_MESSAGE_SELECT} WHERE m.id = ?"),
+        &[Value::BigInt(message_id)],
+    )?;
+    if let Some(message) = messages.first() {
+        assignment_from_message_row(message)?;
+    } else if !query(
+        conn,
+        "SELECT id FROM messages WHERE id = ?",
+        &[Value::BigInt(message_id)],
+    )?
+    .is_empty()
+    {
+        return Err(state_error(
+            "thread assignment",
+            "live message identity is incomplete",
+        ));
+    }
+    // Retention removes live rows, but their immutable archive and logical
+    // assignment remain recoverable through every later baseline.
+    Ok(Some(assignment))
+}
+
 fn record_name(record: &RecoveryRecord) -> DbResult<String> {
     let (kind, identity) = match record {
         RecoveryRecord::Project(project) => ("project", serde_json::to_vec(project)),
@@ -733,6 +993,18 @@ fn record_name(record: &RecoveryRecord) -> DbResult<String> {
         RecoveryRecord::Contact(contact) => (
             "contact",
             serde_json::to_vec(&(contact.id, &contact.from, &contact.to)),
+        ),
+        RecoveryRecord::ThreadAssignment(assignment) => (
+            "thread",
+            serde_json::to_vec(&(
+                assignment.message_id,
+                &assignment.message_project,
+                &assignment.sender,
+                assignment.message_created_ts,
+                &assignment.message_subject,
+                &assignment.message_body_sha256,
+                &assignment.original_thread_id,
+            )),
         ),
     };
     let identity = identity.map_err(|error| state_error("record identity", error))?;
@@ -767,6 +1039,7 @@ fn validate_document(document: &RecordDocument, generation: &str) -> DbResult<()
                 return Err(state_error("contact", "unknown contact decision"));
             }
         }
+        RecoveryRecord::ThreadAssignment(record) => validate_thread_assignment(record)?,
     }
     Ok(())
 }
@@ -793,6 +1066,7 @@ fn validate_incremental_name(name: &str) -> DbResult<()> {
     let digest = name
         .strip_prefix("receipt-")
         .or_else(|| name.strip_prefix("contact-"))
+        .or_else(|| name.strip_prefix("thread-"))
         .and_then(|suffix| suffix.strip_suffix(".json"));
     if !digest.is_some_and(|digest| {
         digest.len() == 64
@@ -978,6 +1252,7 @@ fn git_artifact_parts(path: &str) -> DbResult<(&str, Option<&str>)> {
     let record_digest = name
         .strip_prefix("receipt-")
         .or_else(|| name.strip_prefix("contact-"))
+        .or_else(|| name.strip_prefix("thread-"))
         .and_then(|name| name.strip_suffix(".json"));
     if !matches!(name, BASELINE_FILE | SUPERSEDED_FILE)
         && !record_digest.is_some_and(|digest| {
@@ -1169,7 +1444,10 @@ fn collect_git_generation_inventory(
                     "non-UTF-8 recovery filename",
                 ));
             };
-            if name.starts_with("receipt-") || name.starts_with("contact-") {
+            if name.starts_with("receipt-")
+                || name.starts_with("contact-")
+                || name.starts_with("thread-")
+            {
                 paths.insert(format!(
                     "{DIRECTORY}/{}/{name}",
                     generation_directory(&manifest.generation)?
@@ -1217,6 +1495,16 @@ fn write_record(
     let name = record_name(&record)?;
     let previous = read_incremental_record(directory, &name, generation)?;
     if let Some((previous, _)) = &previous {
+        if let (RecoveryRecord::ThreadAssignment(current), RecoveryRecord::ThreadAssignment(old)) =
+            (&record, &previous.record)
+            && (current.revision < old.revision
+                || (current.revision == old.revision && current != old))
+        {
+            return Err(state_error(
+                "thread assignment publication",
+                "database assignment is older than or conflicts with the archived revision",
+            ));
+        }
         if let (RecoveryRecord::Receipt(current), RecoveryRecord::Receipt(old)) =
             (&mut record, &previous.record)
         {
@@ -1291,6 +1579,7 @@ impl BaselineWriter<'_> {
             RecoveryRecord::Agent(_) => self.manifest.agents += 1,
             RecoveryRecord::Receipt(_) => self.manifest.receipts += 1,
             RecoveryRecord::Contact(_) => self.manifest.contacts += 1,
+            RecoveryRecord::ThreadAssignment(_) => self.manifest.thread_assignments += 1,
         }
         let bytes = encode_record(&self.manifest.generation, record)?;
         self.file
@@ -1405,6 +1694,39 @@ fn visit_current_contacts(
     Ok(())
 }
 
+pub(crate) fn visit_current_thread_assignments(
+    conn: &impl SyncQuery,
+    visit: &mut impl FnMut(RecoveryRecord) -> DbResult<()>,
+) -> DbResult<()> {
+    let mut last_id = i64::MIN;
+    loop {
+        let rows = query(
+            conn,
+            &format!(
+                "SELECT message_id FROM message_thread_assignments \
+                      WHERE message_id > ? ORDER BY message_id LIMIT {BATCH_ROWS}"
+            ),
+            &[Value::BigInt(last_id)],
+        )?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            last_id = row
+                .get_named("message_id")
+                .map_err(|error| state_error("thread assignment", error))?;
+            let assignment = current_thread_assignment(conn, last_id)?.ok_or_else(|| {
+                state_error(
+                    "thread assignment",
+                    "ledger row disappeared during its snapshot",
+                )
+            })?;
+            visit(RecoveryRecord::ThreadAssignment(assignment))?;
+        }
+    }
+    Ok(())
+}
+
 fn verify_checkpoint_counts(conn: &impl SyncQuery, manifest: &Manifest) -> DbResult<()> {
     verify_recovery_counts(
         conn,
@@ -1413,6 +1735,7 @@ fn verify_checkpoint_counts(conn: &impl SyncQuery, manifest: &Manifest) -> DbRes
             ("agents", manifest.agents),
             ("receipts", manifest.receipts),
             ("contacts", manifest.contacts),
+            ("thread_assignments", manifest.thread_assignments),
         ],
     )
 }
@@ -1424,7 +1747,8 @@ fn verify_recovery_counts(conn: &impl SyncQuery, written_counts: &[(&str, u64)])
          (SELECT COUNT(*) FROM agents) AS agents, \
          (SELECT COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL OR ack_ts IS NOT NULL) \
            + (SELECT COUNT(*) FROM project_mailbox_receipts WHERE read_ts IS NOT NULL OR ack_ts IS NOT NULL) AS receipts, \
-         (SELECT COUNT(*) FROM agent_links) AS contacts",
+         (SELECT COUNT(*) FROM agent_links) AS contacts, \
+         (SELECT COUNT(*) FROM message_thread_assignments) AS thread_assignments",
         &[],
     )?;
     let counts = counts
@@ -1461,12 +1785,14 @@ fn stream_checkpoint(
             agents: 0,
             receipts: 0,
             contacts: 0,
+            thread_assignments: 0,
         },
         digest: Sha256::new(),
     };
     checkpoint_identities(conn, &mut writer)?;
     visit_current_receipts(conn, &mut |record| writer.push(record))?;
     visit_current_contacts(conn, &mut |record| writer.push(record))?;
+    visit_current_thread_assignments(conn, &mut |record| writer.push(record))?;
     verify_checkpoint_counts(conn, &writer.manifest)?;
     writer.manifest.baseline_sha256 = hex::encode(writer.digest.finalize());
     Ok(writer.manifest)
@@ -1527,7 +1853,10 @@ fn validate_checkpoint_generation(
             .map_err(|error| state_error("generation inventory", error))?
             .file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("receipt-") || name.starts_with("contact-") {
+        if name.starts_with("receipt-")
+            || name.starts_with("contact-")
+            || name.starts_with("thread-")
+        {
             return Err(state_error(
                 "checkpoint",
                 "refusing to reactivate an abandoned generation with incremental records",
@@ -1629,10 +1958,23 @@ fn reconcile_incomplete_publication(
             contacts += 1;
             Ok(())
         })?;
+        let mut thread_assignments = 0u64;
+        visit_current_thread_assignments(conn, &mut |record| {
+            write_record(state, root, &directory, generation, revision, record)?;
+            thread_assignments += 1;
+            Ok(())
+        })?;
         // The baseline may predate new projects/agents. Check the two mutable
         // state lanes against their raw table counts so missing identity joins
         // cannot turn a partial refresh into completed publication authority.
-        verify_recovery_counts(conn, &[("receipts", receipts), ("contacts", contacts)])
+        verify_recovery_counts(
+            conn,
+            &[
+                ("receipts", receipts),
+                ("contacts", contacts),
+                ("thread_assignments", thread_assignments),
+            ],
+        )
     })
     .map_err(|error| state_error("incomplete publication reconciliation", error))?;
     state.validate()
@@ -1661,6 +2003,14 @@ pub fn ensure_checkpoint(conn: &impl SyncQuery, root: &Path) -> DbResult<Manifes
         }
         queue_superseded_generations(&state, root)?;
         let directory = state.generation(&generation, false)?;
+        // A process may stop after the SQL move commits but before the first
+        // journal write. Startup republishes the small assignment ledger from
+        // one current snapshot, including retained archive-only messages.
+        crate::sync::with_read_snapshot(conn, || {
+            visit_current_thread_assignments(conn, &mut |record| {
+                write_record(&state, root, &directory, &generation, revision, record)
+            })
+        })?;
         note_pending_archive_paths(
             root,
             [
@@ -1686,7 +2036,9 @@ pub fn ensure_checkpoint(conn: &impl SyncQuery, root: &Path) -> DbResult<Manifes
             // Recovery filenames are a case-sensitive on-disk schema. A
             // differently cased extension is not a canonical record.
             #[allow(clippy::case_sensitive_file_extension_comparisons)]
-            if (name.starts_with("receipt-") || name.starts_with("contact-"))
+            if (name.starts_with("receipt-")
+                || name.starts_with("contact-")
+                || name.starts_with("thread-"))
                 && name.ends_with(".json")
             {
                 note_pending_archive_paths(
@@ -1987,6 +2339,36 @@ pub fn persist_contact(
     })
 }
 
+/// Publish the latest committed assignment under the journal's inter-process
+/// lock. A delayed caller rereads current state, so it cannot overwrite a newer
+/// move. Calling this after an unchanged retry also completes prior disk debt.
+pub fn persist_thread_assignment(
+    conn: &impl SyncQuery,
+    root: &Path,
+    message_id: i64,
+) -> DbResult<Vec<String>> {
+    let state = LockedState::open(root, true)?;
+    let generation = ensure_generation(conn)?;
+    with_read_revision(&state, conn, root, &generation, |revision| {
+        let directory = state.generation(&generation, true)?;
+        let mut paths = Vec::new();
+        crate::sync::with_read_snapshot(conn, || {
+            if let Some(assignment) = current_thread_assignment(conn, message_id)? {
+                let record = RecoveryRecord::ThreadAssignment(assignment);
+                paths.push(format!(
+                    "{DIRECTORY}/{}/{}",
+                    generation_directory(&generation)?,
+                    record_name(&record)?
+                ));
+                write_record(&state, root, &directory, &generation, revision, record)?;
+            }
+            Ok(())
+        })?;
+        state.validate()?;
+        Ok(paths)
+    })
+}
+
 fn checked_baseline(generation: &JournalDirectory, manifest: &Manifest) -> DbResult<File> {
     let mut baseline = generation
         .open_file(BASELINE_FILE, JournalFileMode::Read)
@@ -2025,6 +2407,7 @@ fn visit_baseline(
     let mut contacts = 0u64;
     let mut projects = 0u64;
     let mut agents = 0u64;
+    let mut thread_assignments = 0u64;
     loop {
         let mut bytes = Vec::new();
         let size = reader
@@ -2049,6 +2432,7 @@ fn visit_baseline(
             RecoveryRecord::Agent(_) => agents += 1,
             RecoveryRecord::Receipt(_) => receipts += 1,
             RecoveryRecord::Contact(_) => contacts += 1,
+            RecoveryRecord::ThreadAssignment(_) => thread_assignments += 1,
         }
         visit(document.record)?;
     }
@@ -2056,6 +2440,7 @@ fn visit_baseline(
         || agents != manifest.agents
         || receipts != manifest.receipts
         || contacts != manifest.contacts
+        || thread_assignments != manifest.thread_assignments
     {
         return Err(state_error(
             "baseline count",
@@ -2085,7 +2470,10 @@ fn visit_incremental_records(
                 "non-UTF-8 recovery filename",
             ));
         };
-        if !name.starts_with("receipt-") && !name.starts_with("contact-") {
+        if !name.starts_with("receipt-")
+            && !name.starts_with("contact-")
+            && !name.starts_with("thread-")
+        {
             continue;
         }
         let (document, digest) =
@@ -2181,13 +2569,14 @@ mod tests {
             "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY, generation_id TEXT NOT NULL);
              CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL);
-             CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, created_ts INTEGER NOT NULL, subject TEXT NOT NULL);
+             CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, created_ts INTEGER NOT NULL, subject TEXT NOT NULL, sender_id INTEGER NOT NULL DEFAULT 17, body_md TEXT NOT NULL DEFAULT 'body', thread_id TEXT);
+             CREATE TABLE message_thread_assignments (message_id INTEGER PRIMARY KEY, assignment_json TEXT NOT NULL);
              CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id));
              CREATE TABLE project_mailbox_receipts (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id));
              CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_project_id INTEGER, a_agent_id INTEGER, b_project_id INTEGER, b_agent_id INTEGER, status TEXT, reason TEXT, created_ts INTEGER, updated_ts INTEGER, expires_ts INTEGER);
              INSERT INTO projects VALUES (7, 'sender-project', '/work/sender'), (19, 'recipient-project', '/work/recipient');
              INSERT INTO agents VALUES (17, 7, 'BlueLake'), (29, 19, 'RedFox');
-             INSERT INTO messages VALUES (41, 19, 100, 'Cross-project message'), (52, 19, 200, 'Shared project message');
+             INSERT INTO messages(id, project_id, created_ts, subject) VALUES (41, 19, 100, 'Cross-project message'), (52, 19, 200, 'Shared project message');
              INSERT INTO message_recipients VALUES (41, 29, 111, NULL);
              INSERT INTO project_mailbox_receipts VALUES (52, 29, 222, 333);
              INSERT INTO agent_links VALUES (93, 7, 17, 19, 29, 'ApPrOvEd', 'review', 10, 20, 999999);",
@@ -2226,6 +2615,90 @@ mod tests {
         )
         .unwrap();
         record_name(&RecoveryRecord::Receipt(receipt(&rows[0], false).unwrap())).unwrap()
+    }
+
+    fn move_test_message(conn: &impl SyncQuery, old: Option<&str>, target: &str) {
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        record_thread_assignment(conn, 41, old, target).unwrap();
+        conn.execute_raw(&format!(
+            "UPDATE messages SET thread_id = '{}' WHERE id = 41",
+            target.replace('\'', "''"),
+        ))
+        .unwrap();
+        conn.execute_raw("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn thread_assignments_preserve_original_and_latest_state_after_retention_and_new_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        move_test_message(&conn, None, "first:thread");
+        persist_thread_assignment(&conn, root.path(), 41).unwrap();
+        move_test_message(&conn, Some("first:thread"), "reviewer's thread");
+        // The delayed first caller publishes the current revision, not a
+        // retained event payload. A later retry is idempotent.
+        persist_thread_assignment(&conn, root.path(), 41).unwrap();
+        persist_thread_assignment(&conn, root.path(), 41).unwrap();
+        let (_, all) = records(root.path());
+        let assignment = all
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                RecoveryRecord::ThreadAssignment(assignment) => Some(assignment),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(assignment.original_thread_id, None);
+        assert_eq!(assignment.thread_id, "reviewer's thread");
+        assert_eq!(assignment.revision, 2);
+        assert_sealed_inventory(root.path());
+
+        conn.execute_raw(
+            "DELETE FROM message_recipients WHERE message_id = 41; \
+                          DELETE FROM messages WHERE id = 41; \
+                          UPDATE db_identity SET generation_id = 'replacement'",
+        )
+        .unwrap();
+        let manifest = ensure_checkpoint(&conn, root.path()).unwrap();
+        assert_eq!(manifest.thread_assignments, 1);
+        let (_, all) = records(root.path());
+        assert!(all.iter().any(|record| matches!(record,
+            RecoveryRecord::ThreadAssignment(assignment)
+                if assignment.original_thread_id.is_none()
+                    && assignment.thread_id == "reviewer's thread"
+                    && assignment.revision == 2)));
+        assert_sealed_inventory(root.path());
+    }
+
+    #[test]
+    fn thread_assignment_startup_repairs_commit_before_publication_and_rejects_identity_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = database();
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        move_test_message(&conn, None, "new-thread");
+        // Model exit after COMMIT, before the mutation could start a journal
+        // publication. Startup must not accept the old complete seal as enough.
+        ensure_checkpoint(&conn, root.path()).unwrap();
+        let (_, all) = records(root.path());
+        assert!(all.iter().any(|record| matches!(record,
+            RecoveryRecord::ThreadAssignment(assignment) if assignment.thread_id == "new-thread")));
+        assert_sealed_inventory(root.path());
+        conn.execute_raw("UPDATE messages SET body_md = 'different identity' WHERE id = 41")
+            .unwrap();
+        let error = persist_thread_assignment(&conn, root.path(), 41).unwrap_err();
+        assert!(error.to_string().contains("immutable message identity"));
+    }
+
+    #[test]
+    fn thread_assignment_transaction_rollback_cannot_leave_an_overlay() {
+        let conn = database();
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        record_thread_assignment(&conn, 41, None, "destination").unwrap();
+        conn.execute_raw("ROLLBACK").unwrap();
+        assert!(current_thread_assignment(&conn, 41).unwrap().is_none());
+        assert!(record_thread_assignment(&conn, 41, Some("stale-source"), "destination").is_err());
+        assert!(current_thread_assignment(&conn, 41).unwrap().is_none());
     }
 
     #[test]
@@ -2977,7 +3450,7 @@ mod tests {
             "{failure}"
         );
         assert_eq!(read_revision_witness(root.path()).unwrap(), None);
-        conn.execute_raw("INSERT INTO messages VALUES (63, 19, 300, 'Restored message identity')")
+        conn.execute_raw("INSERT INTO messages(id, project_id, created_ts, subject) VALUES (63, 19, 300, 'Restored message identity')")
             .unwrap();
         persist_contact(&conn, root.path(), 17, 29).unwrap();
         assert!(read_revision_witness(root.path()).unwrap().is_some());
@@ -3190,7 +3663,7 @@ mod tests {
         let conn = database();
         conn.execute_raw(
             "WITH RECURSIVE ids(id) AS (SELECT 1000 UNION ALL SELECT id + 1 FROM ids WHERE id < 1599)
-             INSERT INTO messages SELECT id, 19, id, 'Historical message' FROM ids;
+             INSERT INTO messages(id, project_id, created_ts, subject) SELECT id, 19, id, 'Historical message' FROM ids;
              INSERT INTO message_recipients SELECT id, 29, 888, 999 FROM messages WHERE id >= 1000;",
         ).unwrap();
         let observed = Observed {

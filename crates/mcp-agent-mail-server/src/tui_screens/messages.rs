@@ -380,6 +380,10 @@ impl RenderItem for MessageEntry {
 }
 
 impl MessageEntry {
+    fn conversation_key(&self) -> String {
+        mcp_agent_mail_db::queries::canonical_thread_id(self.id, Some(&self.thread_id))
+    }
+
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn render_row(
         &self,
@@ -615,8 +619,9 @@ struct MessageRenderRow<'a> {
 
 #[derive(Clone, Copy)]
 struct MessageDropVisual<'a> {
-    source_thread_id: &'a str,
+    source_project_slug: &'a str,
     hovered_thread_id: Option<&'a str>,
+    hovered_project_slug: Option<&'a str>,
     invalid_hover: bool,
 }
 
@@ -740,6 +745,7 @@ struct ActiveMessageDrag {
     cursor_x: u16,
     cursor_y: u16,
     hovered_thread_id: Option<String>,
+    hovered_project_slug: Option<String>,
     hovered_is_valid: bool,
     invalid_hover: bool,
 }
@@ -2582,23 +2588,16 @@ impl MessageBrowserScreen {
         (idx < self.results.len()).then_some(idx)
     }
 
-    fn thread_id_for_result_index(&self, idx: usize) -> Option<String> {
-        self.results.get(idx).and_then(|entry| {
-            if entry.thread_id.is_empty() {
-                None
-            } else {
-                Some(entry.thread_id.clone())
-            }
-        })
-    }
-
     fn begin_pending_message_drag_for_result(&mut self, idx: usize, mouse_x: u16, mouse_y: u16) {
         let Some(entry) = self.results.get(idx) else {
             return;
         };
+        if entry.id <= 0 || entry.project_slug.is_empty() {
+            return;
+        }
         self.message_drag = MessageDragState::Pending(PendingMessageDrag {
             message_id: entry.id,
-            source_thread_id: entry.thread_id.clone(),
+            source_thread_id: entry.conversation_key(),
             source_project_slug: entry.project_slug.clone(),
             subject: entry.subject.clone(),
             started_at: Instant::now(),
@@ -2622,6 +2621,7 @@ impl MessageBrowserScreen {
             cursor_x: pending.cursor_x,
             cursor_y: pending.cursor_y,
             hovered_thread_id: None,
+            hovered_project_slug: None,
             hovered_is_valid: false,
             invalid_hover: true,
         });
@@ -2646,19 +2646,22 @@ impl MessageBrowserScreen {
 
     fn update_active_message_drag(&mut self, state: &TuiSharedState, cursor_x: u16, cursor_y: u16) {
         self.promote_pending_message_drag_if_due(state);
-        let hovered_thread_id = if point_in_rect(self.last_results_area.get(), cursor_x, cursor_y) {
+        let hovered = if point_in_rect(self.last_results_area.get(), cursor_x, cursor_y) {
             self.result_index_at_y(cursor_y)
-                .and_then(|idx| self.thread_id_for_result_index(idx))
+                .and_then(|idx| self.results.get(idx))
+                .filter(|entry| entry.id > 0)
+                .map(|entry| (entry.conversation_key(), entry.project_slug.clone()))
         } else {
             None
         };
         if let MessageDragState::Active(active) = &mut self.message_drag {
             active.cursor_x = cursor_x;
             active.cursor_y = cursor_y;
-            active.hovered_thread_id.clone_from(&hovered_thread_id);
-            active.hovered_is_valid = hovered_thread_id
-                .as_deref()
-                .is_some_and(|tid| tid != active.source_thread_id);
+            active.hovered_thread_id = hovered.as_ref().map(|(thread, _)| thread.clone());
+            active.hovered_project_slug = hovered.as_ref().map(|(_, project)| project.clone());
+            active.hovered_is_valid = hovered.as_ref().is_some_and(|(_, project)| {
+                !project.is_empty() && project == &active.source_project_slug
+            });
             active.invalid_hover = !active.hovered_is_valid;
             self.publish_active_drag_snapshot(state);
         }
@@ -2675,16 +2678,18 @@ impl MessageBrowserScreen {
                 active.hovered_thread_id.as_deref().map_or_else(
                     || Cmd::None,
                     |target_thread_id| {
-                        if !target_thread_id.is_empty()
-                            && target_thread_id != active.source_thread_id
-                        {
-                            let op = format!(
-                                "rethread_message:{}:{target_thread_id}",
-                                active.message_id
-                            );
-                            Cmd::msg(MailScreenMsg::ActionExecute(
-                                op,
-                                active.source_thread_id.clone(),
+                        if !target_thread_id.is_empty() {
+                            Cmd::msg(MailScreenMsg::RethreadMessage(
+                                mcp_agent_mail_db::sync::MessageThreadMove {
+                                    message_id: active.message_id,
+                                    source_project_slug: active.source_project_slug.clone(),
+                                    source_thread_id: active.source_thread_id.clone(),
+                                    target_project_slug: active
+                                        .hovered_project_slug
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    target_thread_id: target_thread_id.to_string(),
+                                },
                             ))
                         } else {
                             Cmd::None
@@ -2746,13 +2751,13 @@ impl MessageBrowserScreen {
         let Some(entry) = self.selected_result_entry() else {
             return;
         };
-        if entry.thread_id.is_empty() {
+        if entry.id <= 0 || entry.project_slug.is_empty() {
             return;
         }
         state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
             message_id: entry.id,
             subject: entry.subject.clone(),
-            source_thread_id: entry.thread_id.clone(),
+            source_thread_id: entry.conversation_key(),
             source_project_slug: entry.project_slug.clone(),
         }));
     }
@@ -2764,20 +2769,24 @@ impl MessageBrowserScreen {
         let Some(marker) = state.keyboard_move_snapshot() else {
             return Cmd::None;
         };
-        let Some(target_thread_id) = self
-            .selected_result_entry()
-            .map(|entry| entry.thread_id.as_str())
-            .filter(|thread_id| !thread_id.is_empty())
-        else {
+        let Some(target) = self.selected_result_entry().filter(|entry| entry.id > 0) else {
             return Cmd::None;
         };
-        if target_thread_id == marker.source_thread_id {
+        let target_thread_id = target.conversation_key();
+        if target.project_slug.is_empty() || target.project_slug != marker.source_project_slug {
             return Cmd::None;
         }
 
-        let op = format!("rethread_message:{}:{target_thread_id}", marker.message_id);
         state.clear_keyboard_move_snapshot();
-        Cmd::msg(MailScreenMsg::ActionExecute(op, marker.source_thread_id))
+        Cmd::msg(MailScreenMsg::RethreadMessage(
+            mcp_agent_mail_db::sync::MessageThreadMove {
+                message_id: marker.message_id,
+                source_project_slug: marker.source_project_slug,
+                source_thread_id: marker.source_thread_id,
+                target_project_slug: target.project_slug.clone(),
+                target_thread_id,
+            },
+        ))
     }
 
     const fn detail_visible(&self) -> bool {
@@ -3762,6 +3771,12 @@ impl MailScreen for MessageBrowserScreen {
         operation: &str,
         result: &Result<OperatorTaskResult, String>,
     ) {
+        if operation.starts_with("rethread_message:") {
+            // A publication error can follow a committed database move.
+            self.search_dirty = true;
+            self.debounce_remaining = 0;
+            return;
+        }
         if let Some((kind @ ("compose" | "quick_reply"), request_id)) = operation.split_once(':')
             && let Ok(request_id) = request_id.parse::<u64>()
         {
@@ -4025,8 +4040,9 @@ impl MailScreen for MessageBrowserScreen {
         let results_focused = matches!(self.focus, Focus::ResultList);
         let drop_visual = match &self.message_drag {
             MessageDragState::Active(active) => Some(MessageDropVisual {
-                source_thread_id: active.source_thread_id.as_str(),
+                source_project_slug: active.source_project_slug.as_str(),
                 hovered_thread_id: active.hovered_thread_id.as_deref(),
+                hovered_project_slug: active.hovered_project_slug.as_deref(),
                 invalid_hover: active.invalid_hover,
             }),
             _ => None,
@@ -5138,10 +5154,8 @@ fn render_results_list(
         format!("Results ({})", results.len())
     };
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let hovered_valid_drop = drop_visual.is_some_and(|drag| {
-        drag.hovered_thread_id
-            .is_some_and(|tid| tid != drag.source_thread_id)
-    });
+    let hovered_valid_drop =
+        drop_visual.is_some_and(|drag| !drag.invalid_hover && drag.hovered_thread_id.is_some());
     let border_color = if drop_visual.is_some_and(|drag| drag.invalid_hover) {
         tp.severity_warn
     } else if hovered_valid_drop {
@@ -5184,9 +5198,12 @@ fn render_results_list(
             entry,
             shimmer_progress: shimmer_progresses[idx],
             drop_zone: drop_visual.map_or(MessageDropZoneState::None, |drag| {
-                let thread_id = (!entry.thread_id.is_empty()).then_some(entry.thread_id.as_str());
-                let hovered_here = drag.hovered_thread_id == thread_id;
-                let valid = thread_id.is_some_and(|tid| tid != drag.source_thread_id);
+                let thread_id = entry.conversation_key();
+                let hovered_here = drag.hovered_thread_id == Some(thread_id.as_str())
+                    && drag.hovered_project_slug == Some(entry.project_slug.as_str());
+                let valid = entry.id > 0
+                    && !entry.project_slug.is_empty()
+                    && entry.project_slug == drag.source_project_slug;
                 if hovered_here {
                     if valid {
                         MessageDropZoneState::HoveredValid
@@ -8152,18 +8169,21 @@ first body
         let cmd = screen.update(&up, &state);
 
         match cmd {
-            Cmd::Msg(MailScreenMsg::ActionExecute(op, ctx)) => {
-                assert_eq!(op, "rethread_message:10:thread-b");
-                assert_eq!(ctx, "thread-a");
+            Cmd::Msg(MailScreenMsg::RethreadMessage(request)) => {
+                assert_eq!(request.message_id, 10);
+                assert_eq!(request.source_thread_id, "thread-a");
+                assert_eq!(request.target_thread_id, "thread-b");
+                assert_eq!(request.source_project_slug, "proj");
+                assert_eq!(request.target_project_slug, "proj");
             }
-            _ => panic!("expected ActionExecute command"),
+            _ => panic!("expected scoped rethread command"),
         }
         assert!(state.message_drag_snapshot().is_none());
         assert!(matches!(screen.message_drag, MessageDragState::Idle));
     }
 
     #[test]
-    fn mouse_drop_on_same_thread_is_noop() {
+    fn mouse_drop_on_same_thread_dispatches_idempotent_publication_retry() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.search_dirty = false;
@@ -8183,7 +8203,10 @@ first body
         let _ = screen.update(&drag, &state);
         let up = mouse_event(MouseEventKind::Up(MouseButton::Left), 2, 5);
         let cmd = screen.update(&up, &state);
-        assert!(matches!(cmd, Cmd::None));
+        assert!(
+            matches!(cmd, Cmd::Msg(MailScreenMsg::RethreadMessage(request))
+            if request.message_id == 10 && request.source_thread_id == request.target_thread_id)
+        );
         assert!(state.message_drag_snapshot().is_none());
         assert!(matches!(screen.message_drag, MessageDragState::Idle));
     }
@@ -8258,17 +8281,20 @@ first body
 
         let cmd = screen.update(&ctrl_key(KeyCode::Char('v')), &state);
         match cmd {
-            Cmd::Msg(MailScreenMsg::ActionExecute(op, ctx)) => {
-                assert_eq!(op, "rethread_message:10:thread-b");
-                assert_eq!(ctx, "thread-a");
+            Cmd::Msg(MailScreenMsg::RethreadMessage(request)) => {
+                assert_eq!(request.message_id, 10);
+                assert_eq!(request.source_thread_id, "thread-a");
+                assert_eq!(request.target_thread_id, "thread-b");
+                assert_eq!(request.source_project_slug, "proj");
+                assert_eq!(request.target_project_slug, "proj");
             }
-            _ => panic!("expected ActionExecute command"),
+            _ => panic!("expected scoped rethread command"),
         }
         assert!(state.keyboard_move_snapshot().is_none());
     }
 
     #[test]
-    fn ctrl_v_same_thread_is_noop_and_preserves_marker() {
+    fn ctrl_v_same_thread_dispatches_idempotent_publication_retry() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.search_dirty = false;
@@ -8282,12 +8308,79 @@ first body
         }));
 
         let cmd = screen.update(&ctrl_key(KeyCode::Char('v')), &state);
-        assert!(matches!(cmd, Cmd::None));
-        let marker = state
-            .keyboard_move_snapshot()
-            .expect("keyboard move marker should remain");
-        assert_eq!(marker.message_id, 10);
-        assert_eq!(marker.source_thread_id, "thread-a");
+        assert!(
+            matches!(cmd, Cmd::Msg(MailScreenMsg::RethreadMessage(request))
+            if request.message_id == 10 && request.source_thread_id == request.target_thread_id)
+        );
+        assert!(state.keyboard_move_snapshot().is_none());
+    }
+
+    #[test]
+    fn ctrl_v_other_project_is_noop_and_preserves_marker() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+        let mut target = test_message_entry(11, "thread-b", "Subject B");
+        target.project_slug = "other-project".to_string();
+        screen.results = vec![target];
+        state.set_keyboard_move_snapshot(Some(KeyboardMoveSnapshot {
+            message_id: 10,
+            subject: "Subject A".to_string(),
+            source_thread_id: "thread-a".to_string(),
+            source_project_slug: "proj".to_string(),
+        }));
+        assert!(matches!(
+            screen.update(&ctrl_key(KeyCode::Char('v')), &state),
+            Cmd::None
+        ));
+        assert_eq!(state.keyboard_move_snapshot().unwrap().message_id, 10);
+    }
+
+    #[test]
+    fn keyboard_move_uses_canonical_root_and_preserves_exact_destination_key() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+        screen.results = vec![
+            test_message_entry(10, "", "Standalone message"),
+            test_message_entry(11, "  target:007  ", "Destination"),
+        ];
+        screen.update(&ctrl_key(KeyCode::Char('x')), &state);
+        assert_eq!(
+            state.keyboard_move_snapshot().unwrap().source_thread_id,
+            "10"
+        );
+        screen.cursor = 1;
+        let Cmd::Msg(MailScreenMsg::RethreadMessage(request)) =
+            screen.update(&ctrl_key(KeyCode::Char('v')), &state)
+        else {
+            panic!("standalone messages must be movable");
+        };
+        assert_eq!(request.source_thread_id, "10");
+        assert_eq!(request.target_thread_id, "  target:007  ");
+    }
+
+    #[test]
+    fn mouse_drop_other_project_is_invalid_even_with_different_thread_key() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_dirty = false;
+        let mut target = test_message_entry(11, "thread-b", "Subject B");
+        target.project_slug = "other-project".to_string();
+        screen.results = vec![test_message_entry(10, "thread-a", "Subject A"), target];
+        screen.last_results_area.set(Rect::new(0, 4, 40, 10));
+        screen.begin_pending_message_drag_for_result(0, 2, 5);
+        if let MessageDragState::Pending(pending) = &mut screen.message_drag {
+            pending.started_at = Instant::now()
+                .checked_sub(MESSAGE_DRAG_HOLD_DELAY + Duration::from_millis(1))
+                .unwrap();
+        }
+        screen.update_active_message_drag(&state, 2, 6);
+        let snapshot = state.message_drag_snapshot().unwrap();
+        assert!(snapshot.invalid_hover);
+        assert!(!snapshot.hovered_is_valid);
+        assert!(matches!(screen.finish_message_drag(&state), Cmd::None));
+        assert!(state.message_drag_snapshot().is_none());
     }
 
     #[test]

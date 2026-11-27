@@ -292,48 +292,137 @@ fn message_delivery_receipt_in_snapshot(
     })
 }
 
-/// Synchronously update the thread ID of a message.
+/// The identities observed when an operator selects a message and its destination.
+/// Thread keys are exact, project-scoped values, including standalone root IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageThreadMove {
+    pub message_id: i64,
+    pub source_project_slug: String,
+    pub source_thread_id: String,
+    pub target_project_slug: String,
+    pub target_thread_id: String,
+}
+
+fn message_thread_exists(conn: &DbConn, project_id: i64, thread_id: &str) -> Result<bool, DbError> {
+    let explicit = conn
+        .query_sync(
+            "SELECT id FROM messages WHERE project_id = ? AND thread_id = ? LIMIT 1",
+            &[
+                Value::BigInt(project_id),
+                Value::Text(thread_id.to_string()),
+            ],
+        )
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    if !explicit.is_empty() {
+        return Ok(true);
+    }
+    // Keep both probes indexed while the write transaction is held. Only the
+    // exact decimal root ID aliases an unthreaded message; "007" stays distinct.
+    let Some(root_id) = thread_id
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0 && id.to_string() == thread_id)
+    else {
+        return Ok(false);
+    };
+    conn.query_sync(
+        "SELECT id FROM messages WHERE id = ? AND project_id = ? \
+         AND (thread_id IS NULL OR TRIM(thread_id) = '') LIMIT 1",
+        &[Value::BigInt(root_id), Value::BigInt(project_id)],
+    )
+    .map(|rows| !rows.is_empty())
+    .map_err(|error| DbError::Sqlite(error.to_string()))
+}
+
+/// Move a message only if its observed source and destination are still valid.
 ///
-/// Returns `Ok(true)` if the thread ID was updated, `Ok(false)` if it was already the target ID.
-/// Returns `Err` if the message was not found or if a database error occurred.
+/// Scope checks, the immutable archive-thread ledger, and the live thread update
+/// share one write transaction. Returns false for an already completed move so
+/// the caller can retry publishing its recovery record after a filesystem error.
+/// The caller must publish that record before reporting durable success.
 pub fn update_message_thread_id(
     conn: &DbConn,
-    message_id: i64,
-    target_thread_id: &str,
+    request: &MessageThreadMove,
 ) -> Result<bool, DbError> {
-    let target_thread_id = target_thread_id.trim();
-    if target_thread_id.is_empty() {
-        return Ok(false);
+    if request.message_id <= 0
+        || request.source_project_slug.is_empty()
+        || request.target_project_slug.is_empty()
+        || request.source_thread_id.trim_matches(' ').is_empty()
+        || request.target_thread_id.trim_matches(' ').is_empty()
+    {
+        return Err(DbError::invalid(
+            "thread_move",
+            "A message move requires its source and destination project and thread",
+        ));
+    }
+    if request.source_project_slug != request.target_project_slug {
+        return Err(DbError::invalid(
+            "thread_project_mismatch",
+            "Messages can only move between threads in the same project",
+        ));
     }
 
-    let lookup_sql = "SELECT thread_id FROM messages WHERE id = ? LIMIT 1";
-    let rows = conn
-        .query_sync(lookup_sql, &[Value::BigInt(message_id)])
+    let transaction = SyncWriteTransaction::begin(conn)?;
+    transaction.finish((|| {
+        let rows = conn
+            .query_sync(
+                "SELECT m.project_id, m.thread_id, p.slug AS project_slug \
+                 FROM messages m JOIN projects p ON p.id = m.project_id WHERE m.id = ?",
+                &[Value::BigInt(request.message_id)],
+            )
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let row = rows.first().ok_or_else(|| DbError::NotFound {
+            entity: "Message",
+            identifier: request.message_id.to_string(),
+        })?;
+        let project_slug: String = row
+            .get_named("project_slug")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        if project_slug != request.source_project_slug {
+            return Err(DbError::invalid(
+                "thread_project_mismatch",
+                "The selected message no longer belongs to the observed project",
+            ));
+        }
+        let current_thread: Option<String> = row
+            .get_named("thread_id")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let current_key =
+            crate::queries::canonical_thread_id(request.message_id, current_thread.as_deref());
+        if current_key == request.target_thread_id {
+            return Ok(false);
+        }
+        if current_key != request.source_thread_id {
+            return Err(DbError::invalid(
+                "thread_source_changed",
+                "The message moved since it was selected; refresh and select it again",
+            ));
+        }
+        let project_id: i64 = row
+            .get_named("project_id")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        if !message_thread_exists(conn, project_id, &request.target_thread_id)? {
+            return Err(DbError::NotFound {
+                entity: "Thread",
+                identifier: format!("{project_slug}/{}", request.target_thread_id),
+            });
+        }
+        crate::recovery_state::record_thread_assignment(
+            conn,
+            request.message_id,
+            current_thread.as_deref(),
+            &request.target_thread_id,
+        )?;
+        conn.execute_sync(
+            "UPDATE messages SET thread_id = ? WHERE id = ?",
+            &[
+                Value::Text(request.target_thread_id.clone()),
+                Value::BigInt(request.message_id),
+            ],
+        )
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
-
-    let mut row_iter = rows.into_iter();
-    let row = row_iter.next().ok_or_else(|| DbError::NotFound {
-        entity: "Message",
-        identifier: message_id.to_string(),
-    })?;
-
-    let current_thread_id = row.get_named::<String>("thread_id").ok();
-
-    if current_thread_id.as_deref() == Some(target_thread_id) {
-        return Ok(false);
-    }
-
-    let update_sql = "UPDATE messages SET thread_id = ? WHERE id = ?";
-    conn.execute_sync(
-        update_sql,
-        &[
-            Value::Text(target_thread_id.to_string()),
-            Value::BigInt(message_id),
-        ],
-    )
-    .map_err(|e| DbError::Sqlite(e.to_string()))?;
-
-    Ok(true)
+        Ok(true)
+    })())
 }
 
 pub fn fetch_inbox_rows_from_conn(
@@ -3686,17 +3775,42 @@ mod tests {
 
     // ── update_message_thread_id tests ───────────────────────────────
 
+    fn thread_move(message_id: i64, source: &str, target: &str) -> MessageThreadMove {
+        MessageThreadMove {
+            message_id,
+            source_project_slug: "test".to_string(),
+            source_thread_id: source.to_string(),
+            target_project_slug: "test".to_string(),
+            target_thread_id: target.to_string(),
+        }
+    }
+
+    fn stored_thread(conn: &DbConn, message_id: i64) -> Option<String> {
+        conn.query_sync(
+            "SELECT thread_id FROM messages WHERE id = ?",
+            &[Value::BigInt(message_id)],
+        )
+        .unwrap()[0]
+            .get_named("thread_id")
+            .unwrap()
+    }
+
     #[test]
-    fn update_thread_id_empty_target_returns_false() {
+    fn update_thread_id_rejects_missing_scope_or_target() {
         let conn = test_conn();
-        assert!(!update_message_thread_id(&conn, 1, "").unwrap());
-        assert!(!update_message_thread_id(&conn, 1, "   ").unwrap());
+        for target in ["", "   "] {
+            assert!(update_message_thread_id(&conn, &thread_move(1, "old", target)).is_err());
+        }
+        let mut request = thread_move(1, "old", "new");
+        request.source_project_slug.clear();
+        assert!(update_message_thread_id(&conn, &request).is_err());
     }
 
     #[test]
     fn update_thread_id_nonexistent_message_returns_not_found() {
         let conn = test_conn();
-        let err = update_message_thread_id(&conn, 99999, "new-thread").unwrap_err();
+        let err =
+            update_message_thread_id(&conn, &thread_move(99999, "old", "new-thread")).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -3716,7 +3830,11 @@ mod tests {
         let aid = insert_agent(&conn, pid, "TestAgent");
         let mid = insert_message(&conn, pid, aid, "original-thread");
 
-        let result = update_message_thread_id(&conn, mid, "original-thread").unwrap();
+        let result = update_message_thread_id(
+            &conn,
+            &thread_move(mid, "original-thread", "original-thread"),
+        )
+        .unwrap();
         assert!(
             !result,
             "should return false when thread_id is already the target"
@@ -3724,52 +3842,137 @@ mod tests {
     }
 
     #[test]
-    fn update_thread_id_different_value_returns_true() {
+    fn update_thread_id_moves_message_and_advances_search_rewrite_clock() {
         let conn = test_conn();
         let pid = insert_project(&conn);
         let aid = insert_agent(&conn, pid, "TestAgent");
         let mid = insert_message(&conn, pid, aid, "old-thread");
-
-        let result = update_message_thread_id(&conn, mid, "new-thread").unwrap();
-        assert!(result, "should return true when thread_id changes");
-
-        // Verify the update persisted
-        let rows = conn
+        insert_message(&conn, pid, aid, "new-thread");
+        let before: i64 = conn
             .query_sync(
-                "SELECT thread_id FROM messages WHERE id = ?",
-                &[Value::BigInt(mid)],
+                "SELECT rewrite_revision FROM lexical_change_clock WHERE id = 1",
+                &[],
             )
+            .unwrap()[0]
+            .get_named("rewrite_revision")
             .unwrap();
-        let thread_id = rows
-            .into_iter()
-            .next()
-            .and_then(|r| r.get_named::<String>("thread_id").ok())
+        let request = thread_move(mid, "old-thread", "new-thread");
+        let result = update_message_thread_id(&conn, &request).unwrap();
+        assert!(result, "should return true when thread_id changes");
+        assert_eq!(stored_thread(&conn, mid).as_deref(), Some("new-thread"));
+        let after: i64 = conn
+            .query_sync(
+                "SELECT rewrite_revision FROM lexical_change_clock WHERE id = 1",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named("rewrite_revision")
             .unwrap();
-        assert_eq!(thread_id, "new-thread");
+        assert!(
+            after > before,
+            "search must rebuild historical thread facets"
+        );
+        assert!(
+            !update_message_thread_id(&conn, &request).unwrap(),
+            "the original request can retry recovery publication without a second move"
+        );
     }
 
     #[test]
-    fn update_thread_id_trims_whitespace() {
+    fn update_thread_id_preserves_exact_thread_keys() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let aid = insert_agent(&conn, pid, "TestAgent");
+        let mid = insert_message(&conn, pid, aid, " old ");
+        insert_message(&conn, pid, aid, "  new:007  ");
+        assert!(
+            update_message_thread_id(&conn, &thread_move(mid, " old ", "  new:007  ")).unwrap()
+        );
+        assert_eq!(stored_thread(&conn, mid).as_deref(), Some("  new:007  "));
+    }
+
+    #[test]
+    fn update_thread_id_supports_standalone_root_conversations() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let aid = insert_agent(&conn, pid, "TestAgent");
+        let mid = insert_message(&conn, pid, aid, "");
+        let target = insert_message(&conn, pid, aid, "   ");
+        conn.execute_sync(
+            "UPDATE messages SET thread_id = NULL WHERE id = ?",
+            &[Value::BigInt(mid)],
+        )
+        .unwrap();
+        assert!(
+            update_message_thread_id(
+                &conn,
+                &thread_move(mid, &mid.to_string(), &target.to_string()),
+            )
+            .unwrap()
+        );
+        assert_eq!(stored_thread(&conn, mid), Some(target.to_string()));
+    }
+
+    #[test]
+    fn update_thread_id_rejects_cross_project_and_forged_scope() {
         let conn = test_conn();
         let pid = insert_project(&conn);
         let aid = insert_agent(&conn, pid, "TestAgent");
         let mid = insert_message(&conn, pid, aid, "old");
-
-        let result = update_message_thread_id(&conn, mid, "  new-thread  ").unwrap();
-        assert!(result);
-
-        let rows = conn
-            .query_sync(
-                "SELECT thread_id FROM messages WHERE id = ?",
-                &[Value::BigInt(mid)],
-            )
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('other', '/tmp/other', 1)",
+            &[],
+        )
+        .unwrap();
+        let other: i64 = conn
+            .query_sync("SELECT id FROM projects WHERE slug = 'other'", &[])
+            .unwrap()[0]
+            .get_named("id")
             .unwrap();
-        let thread_id = rows
-            .into_iter()
-            .next()
-            .and_then(|r| r.get_named::<String>("thread_id").ok())
+        let other_agent = insert_agent(&conn, other, "OtherAgent");
+        insert_message(&conn, other, other_agent, "foreign-thread");
+        let mut request = thread_move(mid, "old", "foreign-thread");
+        request.target_project_slug = "other".to_string();
+        assert!(update_message_thread_id(&conn, &request).is_err());
+        request.source_project_slug = "other".to_string();
+        assert!(update_message_thread_id(&conn, &request).is_err());
+        request.source_project_slug = "test".to_string();
+        request.target_project_slug = "test".to_string();
+        assert!(matches!(
+            update_message_thread_id(&conn, &request),
+            Err(DbError::NotFound {
+                entity: "Thread",
+                ..
+            })
+        ));
+        assert_eq!(stored_thread(&conn, mid).as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn update_thread_id_rejects_stale_source_and_missing_destination() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let aid = insert_agent(&conn, pid, "TestAgent");
+        let mid = insert_message(&conn, pid, aid, "current");
+        insert_message(&conn, pid, aid, "target");
+        assert!(update_message_thread_id(&conn, &thread_move(mid, "stale", "target")).is_err());
+        assert!(matches!(
+            update_message_thread_id(&conn, &thread_move(mid, "current", "gone")),
+            Err(DbError::NotFound {
+                entity: "Thread",
+                ..
+            })
+        ));
+        assert_eq!(stored_thread(&conn, mid).as_deref(), Some("current"));
+        let assignments: i64 = conn
+            .query_sync("SELECT COUNT(*) AS n FROM message_thread_assignments", &[])
+            .unwrap()[0]
+            .get_named("n")
             .unwrap();
-        assert_eq!(thread_id, "new-thread");
+        assert_eq!(
+            assignments, 0,
+            "refused moves must not create recovery authority"
+        );
     }
 
     // ── dispatch_root_message tests ──────────────────────────────────

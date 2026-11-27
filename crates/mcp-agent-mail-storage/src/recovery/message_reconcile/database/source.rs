@@ -199,7 +199,8 @@ pub(super) fn prepare_source_rows(id: i64, rows: &[Row]) -> Result<PreparedMessa
         "bcc": routing["bcc"],
         "subject": text("subject")?,
         "created": mcp_agent_mail_db::micros_to_iso(created),
-        "thread_id": row.get_named::<Option<String>>("thread_id").map_err(source_error)?,
+        "thread_id": mcp_agent_mail_db::recovery_state::archive_thread_id(row)
+            .map_err(source_error)?,
         "topic": row.get_named::<Option<String>>("topic").map_err(source_error)?,
         "project": text("project_key")?,
         "project_slug": project_slug,
@@ -433,11 +434,11 @@ ORDER BY row_kind, recipient_id";
         assert_eq!(actual.len(), expected.len());
         for (expected, actual) in expected.iter().zip(actual) {
             // Preserve every field of the pre-GH#404 projection. New snapshots
-            // additionally compare the sender's project key and slug; legacy
-            // controls intentionally retain their original 24-column shape.
+            // additionally compare sender identity and explicit assignments;
+            // legacy controls retain their original 24-column shape.
             let expected_columns = expected.values().count();
-            assert!(matches!(expected_columns, 24 | 26));
-            assert_eq!(actual.values().count(), 26);
+            assert!(matches!(expected_columns, 24 | 26 | 27));
+            assert_eq!(actual.values().count(), 27);
             for column in 0..expected_columns {
                 assert!(expected.get(column).is_some());
                 assert_eq!(actual.get(column), expected.get(column), "column {column}");
@@ -536,6 +537,111 @@ ORDER BY row_kind, recipient_id";
             reconcile_prepared(config, original).unwrap(),
             ReconcileResult::default()
         );
+    }
+
+    #[test]
+    fn explicit_thread_moves_preserve_immutable_archives_and_reject_wrong_identity() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_sync(
+                "UPDATE messages SET thread_id = 'original-thread', archive_metadata_json = '{}' WHERE id = 901",
+                &[],
+            )
+            .unwrap();
+            conn.execute_raw(
+                "INSERT INTO messages(id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, thread_id, archive_metadata_json) \
+                 VALUES (902, 101, 101, 'Destination A', 'Target body', 'normal', 0, 1000001, 'target-a', '{}'), \
+                        (903, 101, 101, 'Destination B', 'Target body', 'normal', 0, 1000002, 'target-b', '{}')",
+            )
+            .unwrap();
+            drop(conn);
+            let original = prepare_message(cx, pool, 901).unwrap();
+            assert_eq!(original.message["thread_id"], "original-thread");
+            assert_eq!(
+                reconcile_prepared(config, &original).unwrap().files_created,
+                5
+            );
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &original.message,
+                &original.sender,
+                &original.recipients,
+            )
+            .unwrap()
+            .0;
+            let copies: Vec<_> = [&paths.canonical, &paths.outbox]
+                .into_iter()
+                .chain(&paths.inbox)
+                .map(|path| (path, std::fs::read(path).unwrap()))
+                .collect();
+
+            for (source, destination) in [("original-thread", "target-a"), ("target-a", "target-b")]
+            {
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                assert!(
+                    mcp_agent_mail_db::sync::update_message_thread_id(
+                        &conn,
+                        &mcp_agent_mail_db::sync::MessageThreadMove {
+                            message_id: 901,
+                            source_project_slug: "project".to_string(),
+                            source_thread_id: source.to_string(),
+                            target_project_slug: "project".to_string(),
+                            target_thread_id: destination.to_string(),
+                        },
+                    )
+                    .unwrap()
+                );
+                mcp_agent_mail_db::recovery_state::persist_thread_assignment(
+                    &*conn,
+                    &config.storage_root,
+                    901,
+                )
+                .unwrap();
+                let logical: String = conn
+                    .query_sync("SELECT thread_id FROM messages WHERE id = 901", &[])
+                    .unwrap()[0]
+                    .get_named("thread_id")
+                    .unwrap();
+                assert_eq!(logical, destination);
+                drop(conn);
+
+                let prepared = prepare_message(cx, pool, 901).unwrap();
+                assert_eq!(prepared.message["thread_id"], "original-thread");
+                assert_eq!(
+                    reconcile_prepared(config, &prepared).unwrap(),
+                    ReconcileResult::default()
+                );
+                for (path, bytes) in &copies {
+                    assert_eq!(&std::fs::read(path).unwrap(), bytes);
+                }
+            }
+
+            // A ledger entry cannot authorize immutable content for a different
+            // message, even when the numeric key and logical thread still match.
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let raw: String = conn
+                .query_sync(
+                    "SELECT assignment_json FROM message_thread_assignments WHERE message_id = 901",
+                    &[],
+                )
+                .unwrap()[0]
+                .get_named("assignment_json")
+                .unwrap();
+            let mut record: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            record["message_subject"] = json!("A different message");
+            conn.execute_sync(
+                "UPDATE message_thread_assignments SET assignment_json = ? WHERE message_id = 901",
+                &[SqlValue::Text(record.to_string())],
+            )
+            .unwrap();
+            drop(conn);
+            let error = prepare_message(cx, pool, 901).unwrap_err();
+            assert!(error.contains("immutable message identity"), "{error}");
+            for (path, bytes) in &copies {
+                assert_eq!(&std::fs::read(path).unwrap(), bytes);
+            }
+        });
     }
 
     #[test]

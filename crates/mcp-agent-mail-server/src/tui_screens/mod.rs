@@ -772,6 +772,8 @@ pub enum MailScreenMsg {
     /// Execute an action-menu operation on the active screen.
     /// Contains `(operation, context_id)`.
     ActionExecute(String, String),
+    /// Move one message using both identities observed by the originating view.
+    RethreadMessage(mcp_agent_mail_db::sync::MessageThreadMove),
     /// A background action completed for its originating screen.
     OperatorCompleted {
         screen: MailScreenId,

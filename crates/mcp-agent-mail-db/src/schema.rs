@@ -98,6 +98,13 @@ CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created
 CREATE INDEX IF NOT EXISTS idx_msg_project_importance_created ON messages(project_id, importance, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_ack_required_id ON messages(ack_required, id);
 
+-- Explicit logical thread changes do not rewrite immutable message artifacts.
+-- No live-row foreign key: retention must preserve assignments for archived mail.
+CREATE TABLE IF NOT EXISTS message_thread_assignments (
+    message_id INTEGER PRIMARY KEY,
+    assignment_json TEXT NOT NULL
+);
+
 -- Message recipients (many-to-many)
 CREATE TABLE IF NOT EXISTS message_recipients (
     message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -5611,6 +5618,43 @@ mod tests {
             !same_owned_creation_sql("DROP INDEX first", "DROP INDEX second", "INDEX"),
             "two missing creation prefixes cannot establish schema ownership"
         );
+    }
+
+    #[test]
+    fn thread_assignment_migration_upgrades_existing_mail_without_rewriting_it() {
+        fn assert_upgrade(conn: &impl crate::pool::SyncQuery, sql: &str) {
+            conn.execute_raw(
+                "CREATE TABLE messages(id INTEGER PRIMARY KEY, thread_id TEXT); \
+                 INSERT INTO messages VALUES(7, 'original')",
+            )
+            .unwrap();
+            conn.execute_raw(sql).unwrap();
+            conn.execute_raw(sql).unwrap();
+            let rows = conn
+                .query_sync("SELECT thread_id FROM messages WHERE id = 7", &[])
+                .unwrap();
+            assert_eq!(
+                rows[0].get_named::<String>("thread_id").unwrap(),
+                "original"
+            );
+            conn.execute_raw("INSERT INTO message_thread_assignments VALUES(7, '{}'); DELETE FROM messages WHERE id = 7").unwrap();
+            assert_eq!(
+                conn.query_sync("SELECT message_id FROM message_thread_assignments", &[])
+                    .unwrap()
+                    .len(),
+                1,
+                "retention must preserve overlays for still-archived messages"
+            );
+        }
+        let migration = schema_migrations_base()
+            .into_iter()
+            .find(|migration| migration.id == "v1_create_table_message_thread_assignments")
+            .expect("the additive ledger must participate in normal existing-DB migration");
+        assert_upgrade(
+            &crate::CanonicalDbConn::open_memory().unwrap(),
+            &migration.up,
+        );
+        assert_upgrade(&DbConn::open_memory().unwrap(), &migration.up);
     }
 
     fn block_on<F, Fut, T>(f: F) -> T

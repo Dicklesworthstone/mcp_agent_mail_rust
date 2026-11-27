@@ -11,10 +11,12 @@ use crate::error::{DbError, DbResult};
 use crate::pool::SyncQuery;
 use crate::recovery_state::{
     AgentIdentity, ContactRecord, Manifest, ProjectIdentity, ReceiptRecord, RecoveryRecord,
+    ThreadAssignmentRecord,
 };
 use fs2::FileExt as _;
 use mcp_agent_mail_core::journal_io::{JournalDirectory, JournalFileMode};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use sqlmodel_core::Value;
 use std::io::{Read as _, Write as _};
 use std::path::Path;
@@ -401,6 +403,150 @@ fn restore_contact(
     Ok(())
 }
 
+fn assignment_message_body(record: &ThreadAssignmentRecord, body: String) -> Option<String> {
+    if hex::encode(Sha256::digest(body.as_bytes())) == record.message_body_sha256 {
+        return Some(body);
+    }
+    let restored = format!("{}{body}", record.message_body_prefix);
+    (hex::encode(Sha256::digest(restored.as_bytes())) == record.message_body_sha256)
+        .then_some(restored)
+}
+
+fn resolve_assignment_message(
+    conn: &CanonicalDbConn,
+    project: i64,
+    sender: i64,
+    record: &ThreadAssignmentRecord,
+) -> DbResult<(i64, String, Option<String>)> {
+    let params = [
+        Value::BigInt(project),
+        Value::BigInt(sender),
+        Value::BigInt(record.message_created_ts),
+        Value::Text(record.message_subject.clone()),
+        Value::BigInt(record.message_id),
+    ];
+    let select = "SELECT id, body_md, thread_id FROM messages \
+                  WHERE project_id = ? AND sender_id = ? AND created_ts = ? AND subject = ?";
+    let exact = conn
+        .query_sync(&format!("{select} AND id = ?"), &params)
+        .map_err(error)?;
+    if let Some(row) = exact.first()
+        && let Some(body) =
+            assignment_message_body(record, row.get_named("body_md").map_err(error)?)
+    {
+        return Ok((
+            record.message_id,
+            body,
+            row.get_named("thread_id").map_err(error)?,
+        ));
+    }
+    // A canonical ID can collide with a different archived generation. Accept
+    // one complete matching identity; never assign a move by numeric ID alone.
+    let candidates = conn
+        .query_sync(&format!("{select} ORDER BY id LIMIT 3"), &params[..4])
+        .map_err(error)?;
+    if candidates.len() >= 3 {
+        return Err(error("thread assignment message identity is ambiguous"));
+    }
+    let mut matched = None;
+    for row in candidates {
+        if let Some(body) =
+            assignment_message_body(record, row.get_named("body_md").map_err(error)?)
+        {
+            if matched.is_some() {
+                return Err(error("thread assignment message identity is ambiguous"));
+            }
+            matched = Some((
+                row.get_named("id").map_err(error)?,
+                body,
+                row.get_named("thread_id").map_err(error)?,
+            ));
+        }
+    }
+    matched.ok_or_else(|| {
+        error(format!(
+            "thread assignment message {} is absent or changed",
+            record.message_id
+        ))
+    })
+}
+
+/// Replay a versioned logical overlay after the original messages. Used by
+/// both archive-only replay and readable-salvage merge in their transactions.
+pub(crate) fn restore_thread_assignment(
+    conn: &CanonicalDbConn,
+    mut record: ThreadAssignmentRecord,
+) -> DbResult<()> {
+    let project = resolve_project(conn, &record.message_project)?;
+    let sender = resolve_agent(conn, &record.sender)?;
+    let sender_project = resolve_project(conn, &record.sender.project)?;
+    let (message, body, current_thread) =
+        resolve_assignment_message(conn, project, sender, &record)?;
+    record.message_id = message;
+    record.message_project.id = project;
+    record.sender.id = sender;
+    record.sender.project.id = sender_project;
+    let existing = conn
+        .query_sync(
+            "SELECT assignment_json FROM message_thread_assignments WHERE message_id = ?",
+            &[Value::BigInt(message)],
+        )
+        .map_err(error)?;
+    if let Some(existing) = existing.first() {
+        let raw: String = existing.get_named("assignment_json").map_err(error)?;
+        let previous = crate::recovery_state::decode_thread_assignment(&raw)?;
+        let mut identity = previous.clone();
+        identity.thread_id.clone_from(&record.thread_id);
+        identity.revision = record.revision;
+        let original = previous.original_thread_id.as_deref();
+        let normalized_original =
+            original.and_then(crate::reconstruct::sanitize_reconstructed_thread_id);
+        if identity != record
+            || (current_thread.as_deref() != Some(previous.thread_id.as_str())
+                && current_thread.as_deref() != original
+                && current_thread != normalized_original)
+        {
+            return Err(error(
+                "thread assignment conflicts with recovered message identity or current state",
+            ));
+        }
+        if previous.revision == record.revision && previous.thread_id != record.thread_id {
+            return Err(error(
+                "same thread assignment revision has conflicting targets",
+            ));
+        }
+        if previous.revision > record.revision {
+            record = previous;
+        }
+    } else {
+        let original = record.original_thread_id.as_deref();
+        let normalized_original =
+            original.and_then(crate::reconstruct::sanitize_reconstructed_thread_id);
+        let normalized_target =
+            crate::reconstruct::sanitize_reconstructed_thread_id(&record.thread_id);
+        if current_thread.as_deref() != original
+            && current_thread != normalized_original
+            && current_thread.as_deref() != Some(record.thread_id.as_str())
+            && current_thread != normalized_target
+        {
+            return Err(error(
+                "thread assignment cannot overwrite an unexplained thread change",
+            ));
+        }
+    }
+    crate::recovery_state::store_thread_assignment(conn, &record)?;
+    conn.execute_sync(
+        "UPDATE messages SET thread_id = ?, body_md = ? WHERE id = ?",
+        &[
+            Value::Text(record.thread_id),
+            Value::Text(body),
+            Value::BigInt(message),
+        ],
+    )
+    .map_err(error)?;
+    Ok(())
+}
+
 /// Apply a validated baseline followed by its latest per-key records. Receipt
 /// authority additionally requires an unchanged, completed publication witness
 /// around the replay. Missing or invalid witnesses still permit inspection.
@@ -460,6 +606,9 @@ pub(crate) fn restore(
             RecoveryRecord::Contact(contact) => {
                 restore_contact(conn, contact, !reset_cursors)?;
                 restored.contacts += 1;
+            }
+            RecoveryRecord::ThreadAssignment(assignment) => {
+                restore_thread_assignment(conn, assignment)?;
             }
         }
         Ok(())
@@ -1187,6 +1336,179 @@ mod tests {
             .unwrap()
             .require_recovery_state()
             .unwrap();
+    }
+
+    #[test]
+    fn archive_only_rebuild_replays_thread_moves_without_rewriting_original_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("archive");
+        archive(&root);
+        let message_file = root.join("projects/project/messages/2026/11/message-4000.md");
+        let original = std::fs::read(&message_file).unwrap();
+        let source = directory.path().join("source.sqlite3");
+        crate::reconstruct::reconstruct_from_archive(&source, &root).unwrap();
+        let conn = CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+        crate::recovery_state::ensure_checkpoint(&conn, &root).unwrap();
+        record_issued_cursor(&root, 70_000).unwrap();
+        for (old, target) in [(None, "review"), (Some("review"), "review:phase 2")] {
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            crate::recovery_state::record_thread_assignment(&conn, 4000, old, target).unwrap();
+            conn.execute_sync(
+                "UPDATE messages SET thread_id = ? WHERE id = 4000",
+                &[Value::Text(target.into())],
+            )
+            .unwrap();
+            conn.execute_raw("COMMIT").unwrap();
+            crate::recovery_state::persist_thread_assignment(&conn, &root, 4000).unwrap();
+        }
+        drop(conn);
+        std::fs::rename(&source, directory.path().join("quarantined.sqlite3")).unwrap();
+        let rebuilt = directory.path().join("rebuilt.sqlite3");
+        let stats = crate::reconstruct::reconstruct_from_archive(&rebuilt, &root).unwrap();
+        stats.require_recovery_state().unwrap();
+        let conn = CanonicalDbConn::open_file(rebuilt.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT m.thread_id, t.assignment_json FROM messages m \
+             JOIN message_thread_assignments t ON t.message_id = m.id WHERE m.id = 4000",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            rows[0].get_named::<String>("thread_id").unwrap(),
+            "review:phase 2"
+        );
+        let assignment = crate::recovery_state::decode_thread_assignment(
+            &rows[0].get_named::<String>("assignment_json").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(assignment.original_thread_id, None);
+        assert_eq!(assignment.revision, 2);
+        assert_eq!(std::fs::read(&message_file).unwrap(), original);
+        let next = crate::recovery_state::ensure_checkpoint(&conn, &root).unwrap();
+        assert_eq!(next.thread_assignments, 1);
+    }
+
+    #[test]
+    fn readable_salvage_preserves_a_newer_thread_assignment_than_the_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("archive");
+        archive(&root);
+        let source = directory.path().join("source.sqlite3");
+        crate::reconstruct::reconstruct_from_archive(&source, &root).unwrap();
+        let conn = CanonicalDbConn::open_file(source.to_str().unwrap()).unwrap();
+        crate::recovery_state::ensure_checkpoint(&conn, &root).unwrap();
+        record_issued_cursor(&root, 70_000).unwrap();
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        crate::recovery_state::record_thread_assignment(&conn, 4000, None, "published").unwrap();
+        conn.execute_raw("UPDATE messages SET thread_id = 'published' WHERE id = 4000; COMMIT")
+            .unwrap();
+        crate::recovery_state::persist_thread_assignment(&conn, &root, 4000).unwrap();
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        crate::recovery_state::record_thread_assignment(
+            &conn,
+            4000,
+            Some("published"),
+            "newer-committed",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "UPDATE messages SET thread_id = 'newer-committed' WHERE id = 4000; COMMIT",
+        )
+        .unwrap();
+        drop(conn);
+
+        let rebuilt = directory.path().join("rebuilt.sqlite3");
+        let stats = crate::reconstruct::reconstruct_from_archive_with_private_salvage(
+            &rebuilt, &root, &source,
+        )
+        .unwrap();
+        stats.require_recovery_state().unwrap();
+        let conn = CanonicalDbConn::open_file(rebuilt.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT thread_id FROM messages WHERE id = 4000", &[])
+            .unwrap();
+        assert_eq!(
+            rows[0].get_named::<String>("thread_id").unwrap(),
+            "newer-committed"
+        );
+    }
+
+    #[test]
+    fn thread_assignment_replay_restores_proven_body_prefix_and_refuses_reused_identity() {
+        let source = mailbox();
+        source
+            .execute_raw(
+                "UPDATE messages SET body_md = char(10) || char(13) || 'body' WHERE id = 4000",
+            )
+            .unwrap();
+        source.execute_raw("BEGIN IMMEDIATE").unwrap();
+        crate::recovery_state::record_thread_assignment(&source, 4000, None, "destination")
+            .unwrap();
+        source
+            .execute_raw("UPDATE messages SET thread_id = 'destination' WHERE id = 4000; COMMIT")
+            .unwrap();
+        let rows = source
+            .query_sync(
+                "SELECT assignment_json FROM message_thread_assignments WHERE message_id = 4000",
+                &[],
+            )
+            .unwrap();
+        let assignment = crate::recovery_state::decode_thread_assignment(
+            &rows[0].get_named::<String>("assignment_json").unwrap(),
+        )
+        .unwrap();
+        let target = mailbox();
+        restore_thread_assignment(&target, assignment.clone()).unwrap();
+        let rows = target
+            .query_sync(
+                "SELECT thread_id, body_md FROM messages WHERE id = 4000",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            rows[0].get_named::<String>("thread_id").unwrap(),
+            "destination"
+        );
+        assert_eq!(rows[0].get_named::<String>("body_md").unwrap(), "\n\rbody");
+        let remapped = mailbox();
+        remapped
+            .execute_raw(
+                "UPDATE messages SET body_md = 'unrelated generation' WHERE id = 4000; \
+             INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+             SELECT 5000,project_id,sender_id,subject,'body',created_ts FROM messages WHERE id = 4000",
+            )
+            .unwrap();
+        restore_thread_assignment(&remapped, assignment.clone()).unwrap();
+        let rows = remapped
+            .query_sync(
+                "SELECT id,thread_id FROM messages WHERE id IN (4000,5000) ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            rows[0].get_named::<Option<String>>("thread_id").unwrap(),
+            None
+        );
+        assert_eq!(
+            rows[1].get_named::<String>("thread_id").unwrap(),
+            "destination"
+        );
+        let ledger = remapped
+            .query_sync("SELECT message_id FROM message_thread_assignments", &[])
+            .unwrap();
+        assert_eq!(ledger[0].get_named::<i64>("message_id").unwrap(), 5000);
+        let mismatched = mailbox();
+        mismatched
+            .execute_raw("UPDATE messages SET body_md = 'unrelated message' WHERE id = 4000")
+            .unwrap();
+        assert!(restore_thread_assignment(&mismatched, assignment).is_err());
+        assert!(
+            mismatched
+                .query_sync("SELECT message_id FROM message_thread_assignments", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
