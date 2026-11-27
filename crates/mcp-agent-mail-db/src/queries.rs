@@ -45831,7 +45831,7 @@ mod tests {
                     "inclusive cutoff and oldest-first limit must apply to both delivery kinds"
                 );
                 for row in &metadata {
-                    assert!(row.message.body_md.is_empty());
+                    assert_eq!(row.message.body_md, "");
                     let original = rows
                         .iter()
                         .find(|original| original.message.id == row.message.id)
@@ -45962,7 +45962,7 @@ mod tests {
                 .expect("metadata fallback preserves the inclusive cutoff");
             assert_eq!(metadata.len(), 1);
             assert_eq!(metadata[0].message.id, Some(1));
-            assert!(metadata[0].message.body_md.is_empty());
+            assert_eq!(metadata[0].message.body_md, "");
             assert!(
                 fetch_unacked_for_agent_metadata_before(&cx, &pool, 1, 2, 9, 1)
                     .await
