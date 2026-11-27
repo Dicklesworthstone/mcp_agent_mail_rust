@@ -1367,6 +1367,7 @@ async fn resolve_or_register_agent(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
     project_id: i64,
+    project_slug: &str,
     agent_name: &str,
     sender: &mcp_agent_mail_db::AgentRow,
     config: &Config,
@@ -1441,63 +1442,8 @@ async fn resolve_or_register_agent(
             crate::proof_gate::reject_auto_registration_if_enabled(
                 "send_message auto-registration of recipient",
             )?;
-            match mcp_agent_mail_db::queries::register_agent(
-                ctx.cx(),
-                pool,
-                project_id,
-                &agent_name_norm,
-                "unknown",
-                "unknown",
-                None,
-                None,
-                None,
-            )
-            .await
-            {
-                Outcome::Ok(_) => {}
-                Outcome::Err(DbError::Sqlite(message))
-                    if is_agent_unique_constraint_error(&message) =>
-                {
-                    tracing::debug!(
-                        project_id,
-                        agent = %agent_name,
-                        "auto-register race detected; loading existing agent row"
-                    );
-                }
-                Outcome::Err(e) => return Err(db_error_to_mcp_error(e)),
-                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-                Outcome::Panicked(p) => {
-                    return Err(McpError::internal_error(format!(
-                        "Internal panic: {}",
-                        p.message()
-                    )));
-                }
-            }
-            let row = db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name_norm)
-                    .await,
-            )?;
-            // GH#301: an implicitly registered recipient must exist in the
-            // archive too, or DB and archive identity inventories drift
-            // (db agents = archive agents + 1) and a reconstruct cannot
-            // recreate the placeholder. Archive the same profile shape
-            // register_agent writes (best-effort, write-behind).
-            if let Outcome::Ok(project) =
-                mcp_agent_mail_db::queries::get_project_by_id(ctx.cx(), pool, project_id).await
-            {
-                crate::identity::try_write_agent_profile(
-                    config,
-                    &project.slug,
-                    &crate::identity::agent_archive_profile_json(&row, None),
-                );
-            } else {
-                tracing::warn!(
-                    project_id,
-                    agent = %row.name,
-                    "auto-registered recipient: project row unavailable; archive profile not written"
-                );
-            }
-            Ok(row)
+            create_placeholder_recipient(ctx, pool, project_id, project_slug, &agent_name_norm, config)
+                .await
         }
         Outcome::Err(e) => Err(db_error_to_mcp_error(e)),
         Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
@@ -1508,6 +1454,42 @@ async fn resolve_or_register_agent(
     }?;
     enqueue_agent_semantic_index(&agent);
     Ok(agent)
+}
+
+/// A recipient lookup miss is only a hint: explicit registration can finish
+/// before this insert. Only the creator publishes a placeholder profile.
+async fn create_placeholder_recipient(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    project_slug: &str,
+    name: &str,
+    config: &Config,
+) -> McpResult<mcp_agent_mail_db::AgentRow> {
+    use mcp_agent_mail_db::queries;
+
+    let outcome = queries::create_agent(
+        ctx.cx(), pool, project_id, name, "unknown", "unknown", None, None,
+    )
+    .await;
+    match outcome {
+        Outcome::Ok(row) => {
+            // GH#301: reconstruction also needs implicitly created profiles.
+            crate::identity::try_write_agent_profile(
+                config,
+                project_slug,
+                &crate::identity::agent_archive_profile_json(&row, None),
+            );
+            Ok(row)
+        }
+        Outcome::Err(error)
+            if matches!(&error, DbError::Duplicate { .. })
+                || matches!(&error, DbError::Sqlite(message) if is_agent_unique_constraint_error(message)) =>
+        {
+            db_outcome_to_mcp_result(queries::get_agent(ctx.cx(), pool, project_id, name).await)
+        }
+        other => db_outcome_to_mcp_result(other),
+    }
 }
 
 /// Validate `thread_id` format: must start with alphanumeric and contain only
@@ -2058,7 +2040,7 @@ async fn push_recipient(
     let agent = if let Some(existing) = recipient_map.get(&name_key) {
         existing.clone()
     } else {
-        let agent = match resolve_or_register_agent(ctx, pool, project_id, name, sender, config)
+        let agent = match resolve_or_register_agent(ctx, pool, project_id, project_slug, name, sender, config)
             .await
         {
             Ok(a) => a,
@@ -12396,6 +12378,53 @@ mod tests {
         assert!(!is_agent_unique_constraint_error(
             "UNIQUE constraint failed: projects.slug"
         ));
+    }
+
+    #[test]
+    fn placeholder_claim_preserves_explicit_registration_in_both_orders() {
+        with_messaging_mailbox(&[], |_mailbox| {
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let pool = get_db_pool().expect("private mailbox");
+                let project = ensure_project_row(&cx, &pool, "/recipient-claim").await;
+                let project_id = project.id.unwrap();
+                let config = Config::get();
+
+                // Registration finishes after delivery's initial miss but before its
+                // placeholder claim. Re-run that exact claim with a case variant.
+                let winner = register_agent_row(&cx, &pool, project_id, "task.Agent").await;
+                let resolved = create_placeholder_recipient(
+                    &ctx, &pool, project_id, &project.slug, "task.agent", &config,
+                )
+                .await
+                .expect("route to the winning identity");
+                let durable = queries::get_agent_by_id_fresh(&cx, &pool, winner.id.unwrap())
+                    .await
+                    .into_result()
+                    .expect("durable registration");
+                for row in [&resolved, &durable] {
+                    assert_eq!(
+                        crate::identity::agent_archive_profile_json(row, None),
+                        crate::identity::agent_archive_profile_json(&winner, None),
+                    );
+                }
+
+                // Delivery wins first: the later explicit registration upgrades
+                // the same row, preserving the identity used for delivery.
+                let placeholder = create_placeholder_recipient(
+                    &ctx, &pool, project_id, &project.slug, "RedPeak", &config,
+                )
+                .await
+                .expect("new placeholder");
+                assert_eq!(placeholder.program, "unknown");
+                let upgraded = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+                assert_eq!(upgraded.id, placeholder.id);
+                assert_eq!(upgraded.inception_ts, placeholder.inception_ts);
+                assert_eq!(upgraded.program, "codex-cli");
+            });
+        });
     }
 
     #[test]
