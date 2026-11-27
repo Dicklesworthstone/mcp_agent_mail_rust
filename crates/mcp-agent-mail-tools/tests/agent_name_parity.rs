@@ -8,7 +8,9 @@ use mcp_agent_mail_core::{
         BROADCAST_TOKENS, KNOWN_PROGRAM_NAMES, MODEL_NAME_PATTERNS, detect_agent_name_mistake,
     },
 };
-use mcp_agent_mail_tools::{ensure_project, register_agent};
+use mcp_agent_mail_tools::{
+    CreateAgentIdentity, EnsureProject, RegisterAgent, ensure_project, register_agent,
+};
 use serde_json::Value;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -232,4 +234,50 @@ fn test_valid_names_accepted() {
             "valid name should not be classified as a mistake"
         );
     }
+}
+
+/// Agents copy these examples verbatim, so each JSON block in an identity
+/// tool's description must parse, and each must be a `tools/call` of its own
+/// tool with an `arguments` object. The explicit-name `register_agent`
+/// example once lost its `"name"`/`"arguments"` wrapper, which left it
+/// unbalanced and addressed to no tool.
+#[test]
+fn identity_tool_description_examples_are_valid_tool_calls() {
+    use fastmcp::ToolHandler;
+
+    let mut checked = 0_usize;
+    for tool in [
+        EnsureProject.definition(),
+        RegisterAgent.definition(),
+        CreateAgentIdentity.definition(),
+    ] {
+        let description = tool.description.as_deref().unwrap_or_default();
+        for (index, block) in description.split("```json\n").skip(1).enumerate() {
+            let body = block.split("```").next().unwrap_or_default();
+            let example: Value = serde_json::from_str(body).unwrap_or_else(|error| {
+                panic!(
+                    "{} example {index} is not JSON ({error}):\n{body}",
+                    tool.name
+                )
+            });
+            assert_eq!(
+                example["method"], "tools/call",
+                "{} example {index}:\n{body}",
+                tool.name
+            );
+            assert_eq!(
+                example["params"]["name"],
+                tool.name.as_str(),
+                "{} example {index} calls another tool:\n{body}",
+                tool.name
+            );
+            assert!(
+                example["params"]["arguments"].is_object(),
+                "{} example {index} has no arguments object:\n{body}",
+                tool.name
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 6, "expected six identity tool examples");
 }

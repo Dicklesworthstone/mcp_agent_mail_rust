@@ -497,11 +497,11 @@ fn identity_tools_work_after_full_short_name_exhaustion() {
                 .await
                 .into_result()
                 .expect("fresh identity is durably registered");
-            let token = identity["registration_token"]
+            let credential = identity["registration_token"]
                 .as_str()
                 .expect("new credential");
-            assert!(!token.is_empty());
-            assert_eq!(persisted.registration_token.as_deref(), Some(token));
+            assert_ne!(credential, "");
+            assert_eq!(persisted.registration_token.as_deref(), Some(credential));
             let profile = parse_json(
                 &whois(
                     &ctx,
