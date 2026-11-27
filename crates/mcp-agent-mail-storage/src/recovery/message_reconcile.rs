@@ -220,7 +220,7 @@ fn reconcile_message_bundle_inner(
     // only decides whether a full historical identity scan is necessary.
     let mut initial_message_files_missing = false;
     for (path, expected) in &targets {
-        initial_message_files_missing |= artifact_missing(path, expected)?;
+        initial_message_files_missing |= artifact_missing(path, expected, control)?;
     }
     let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
     let expected = Oid::hash_object(ObjectType::Blob, full.as_bytes())?;
@@ -284,7 +284,7 @@ fn reconcile_message_bundle_inner(
         // the canonical file. The publication primitive rechecks collisions.
         let missing = targets
             .iter()
-            .map(|(path, expected)| artifact_missing(path, expected))
+            .map(|(path, expected)| artifact_missing(path, expected, control))
             .collect::<crate::Result<Vec<_>>>()?;
         let message_files_missing = missing
             .iter()
@@ -334,7 +334,7 @@ fn reconcile_message_bundle_inner(
     }?;
 
     checkpoint(control)?;
-    let git_commit_needed = !head_contains(&repo, &rel_paths, &expected_oids)?;
+    let git_commit_needed = !head_contains(&repo, &rel_paths, &expected_oids, control)?;
     if git_commit_needed {
         checkpoint(control)?;
         let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
@@ -347,7 +347,7 @@ fn reconcile_message_bundle_inner(
         // Open afresh: a queued/coalesced commit or an old cached HEAD cannot
         // substitute for evidence that these exact blobs reached Git.
         let verified = Repository::open(repo_root)?;
-        if !head_contains(&verified, &rel_paths, &expected_oids)? {
+        if !head_contains(&verified, &rel_paths, &expected_oids, control)? {
             return Err(invalid(
                 "archive reconciliation Git verification failed; files retained",
             ));
@@ -663,7 +663,12 @@ fn reject_committed_message_conflicts(
     Ok(())
 }
 
-fn head_contains(repo: &Repository, paths: &[String], oids: &[Oid]) -> crate::Result<bool> {
+fn head_contains(
+    repo: &Repository,
+    paths: &[String],
+    oids: &[Oid],
+    control: Option<RepairControl<'_>>,
+) -> crate::Result<bool> {
     if paths.len() != oids.len() {
         return Err(invalid("archive verification path/object count mismatch"));
     }
@@ -678,6 +683,7 @@ fn head_contains(repo: &Repository, paths: &[String], oids: &[Oid]) -> crate::Re
     let odb = repo.odb()?;
     let mut checked = HashSet::new();
     for (path, expected) in paths.iter().zip(oids) {
+        scan_checkpoint(control, "committed artifact verification")?;
         match tree.get_path(Path::new(path)) {
             Ok(entry)
                 if entry.kind() == Some(ObjectType::Blob)
@@ -706,10 +712,18 @@ fn head_contains(repo: &Repository, paths: &[String], oids: &[Oid]) -> crate::Re
             }
         }
     }
+    checkpoint(control)?;
     Ok(true)
 }
 
-fn artifact_missing(path: &Path, expected: &[u8]) -> crate::Result<bool> {
+const ARTIFACT_COMPARE_CHUNK: usize = 64 * 1024;
+
+fn artifact_missing(
+    path: &Path,
+    mut expected: &[u8],
+    control: Option<RepairControl<'_>>,
+) -> crate::Result<bool> {
+    checkpoint(control)?;
     if crate::path_existing_prefix_has_symlink(path)? {
         return Err(invalid(
             "archive reconciliation refuses a symlinked artifact authority",
@@ -729,15 +743,29 @@ fn artifact_missing(path: &Path, expected: &[u8]) -> crate::Result<bool> {
         Ok(_) => {}
     }
     let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
-    let mut observed = Vec::new();
-    file.take(expected.len() as u64 + 1)
-        .read_to_end(&mut observed)?;
-    if observed != expected {
-        return Err(invalid(
-            "archive artifact conflicts with authoritative message; preserved",
-        ));
+    // This comparison also runs with publication excluded. Compare through EOF
+    // on the opened handle without allocating a second bundle-sized payload.
+    // A concurrent truncate or append after the length check is a conflict.
+    let mut reader =
+        BufReader::with_capacity(expected.len().clamp(1, ARTIFACT_COMPARE_CHUNK), file);
+    loop {
+        scan_checkpoint(control, "artifact comparison")?;
+        let observed = match reader.fill_buf() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if observed.is_empty() && expected.is_empty() {
+            return Ok(false);
+        }
+        if observed.is_empty() || !expected.starts_with(observed) {
+            return Err(invalid(
+                "archive artifact conflicts with authoritative message; preserved",
+            ));
+        }
+        let consumed = observed.len();
+        expected = &expected[consumed..];
+        reader.consume(consumed);
     }
-    Ok(false)
 }
 
 fn publish_missing_file(path: &Path, bytes: &[u8]) -> crate::Result<()> {
@@ -1357,9 +1385,9 @@ mod tests {
         .unwrap();
         let paths = vec!["message.md".to_string()];
         reject_committed_message_conflicts(&repo, &paths, &[oid], None).unwrap();
-        assert!(!head_contains(&repo, &paths, &[oid]).unwrap());
+        assert!(!head_contains(&repo, &paths, &[oid], None).unwrap());
         assert_eq!(repo.blob(bytes).unwrap(), oid);
-        assert!(head_contains(&repo, &paths, &[oid]).unwrap());
+        assert!(head_contains(&repo, &paths, &[oid], None).unwrap());
     }
 
     #[test]

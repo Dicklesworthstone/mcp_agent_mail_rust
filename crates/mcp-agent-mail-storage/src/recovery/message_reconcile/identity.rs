@@ -1148,7 +1148,7 @@ mod tests {
             config.storage_root.join("retained-outbox.md"),
         )
         .unwrap();
-        let missing = super::super::artifact_missing(&paths.outbox, &full).unwrap();
+        let missing = super::super::artifact_missing(&paths.outbox, &full, None).unwrap();
         let error = revalidate_prepared(&repo, &archive, &proof, missing, &mut budget).unwrap_err();
         assert!(matches!(error, crate::StorageError::LockContention { .. }));
         assert!(

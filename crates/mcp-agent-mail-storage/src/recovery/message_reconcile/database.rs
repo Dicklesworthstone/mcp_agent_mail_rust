@@ -1716,7 +1716,8 @@ fn verify_retention_archive_at(
         if git2::Oid::hash_object_ext(git2::ObjectType::Blob, blob.content(), oid.object_format())
             .map_err(|error| error.to_string())?
             != oid
-            || super::artifact_missing(path, blob.content()).map_err(|error| error.to_string())?
+            || super::artifact_missing(path, blob.content(), control)
+                .map_err(|error| error.to_string())?
         {
             return Err("retention requires intact committed and on-disk archive copies".into());
         }

@@ -544,6 +544,78 @@ fn attachment_cancellation_preserves_sources_before_any_publication() {
 }
 
 #[test]
+fn cancellation_during_locked_attachment_comparison_preserves_the_bundle() {
+    if isolated() {
+        return;
+    }
+    let (_temp, config, archive, mut message, recipients) = fixture();
+    let bytes = vec![0x5a; ARTIFACT_COMPARE_CHUNK * 2 + 1];
+    let path = add_raw_attachment(&archive, &mut message, "large.bin", &bytes);
+    let paths = bundle_paths(&archive, &message, &recipients);
+    let repo = Repository::open(&archive.repo_root).unwrap();
+    let before = repo.head().unwrap().target();
+    // All message destinations are absent. The only comparison is the locked
+    // recheck of the surviving attachment, after preparation and before writes.
+    let observer = StopOnScan::new("artifact comparison", 2);
+    let error = reconcile_message_bundle_cancellable(
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
+        &observer.stop,
+    )
+    .unwrap_err();
+    assert_scan_interrupted(&error, "artifact comparison");
+    assert_eq!(repo.head().unwrap().target(), before);
+    assert!(paths.iter().all(|path| !path.exists()));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_scan_locks_released(&archive);
+    drop(observer);
+    reconcile_message_bundle_cancellable(
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_committed(&archive, &paths);
+    assert_committed(&archive, &[path]);
+}
+
+#[test]
+fn comparison_rejects_length_changes_after_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("evidence");
+    let bytes = vec![0x41; ARTIFACT_COMPARE_CHUNK * 2];
+    for length in [ARTIFACT_COMPARE_CHUNK, bytes.len() + 1] {
+        fs::write(&path, &bytes).unwrap();
+        let evidence = path.clone();
+        let mut chunks = 0;
+        let _observer = ObserveScan::new(move |stage| {
+            if stage == "artifact comparison" {
+                chunks += 1;
+                if chunks == 2 {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&evidence)
+                        .unwrap()
+                        .set_len(length as u64)
+                        .unwrap();
+                }
+            }
+        });
+        let control = RepairControl {
+            cx: &Cx::for_testing(),
+            stop: &AtomicBool::new(false),
+        };
+        let error = artifact_missing(&path, &bytes, Some(control)).unwrap_err();
+        assert!(matches!(error, StorageError::InvalidPath(_)), "{error}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), length as u64);
+    }
+}
+
+#[test]
 fn prepared_attachments_are_rechecked_against_concurrent_disk_and_git_changes() {
     if isolated() {
         return;
