@@ -1499,6 +1499,42 @@ fn plan_message_search(
     }
 }
 
+// Metadata results have a constant score and are ordered by their numeric ID.
+// Apply membership and continuation before LIMIT, as for message results.
+fn push_metadata_filters(
+    query: &SearchQuery,
+    project_column: &str,
+    id_column: &str,
+    where_clauses: &mut Vec<String>,
+    params: &mut Vec<PlanParam>,
+    facets_applied: &mut Vec<String>,
+) -> bool {
+    if let Some(id) = query.project_id {
+        where_clauses.push(format!("{project_column} = ?"));
+        params.push(PlanParam::Int(id));
+        facets_applied.push("project_id".to_string());
+    }
+    if let Some(id) = query.product_id {
+        where_clauses.push(format!(
+            "{project_column} IN (SELECT project_id FROM product_project_links WHERE product_id = ?)"
+        ));
+        params.push(PlanParam::Int(id));
+        facets_applied.push("product_id".to_string());
+    }
+    if let Some(cursor) = query.cursor.as_deref().and_then(SearchCursor::decode) {
+        where_clauses.push(format!("{id_column} > ?"));
+        params.push(PlanParam::Int(cursor.id));
+        facets_applied.push("cursor".to_string());
+    }
+    push_project_set_filter(
+        &query.scope,
+        project_column,
+        where_clauses,
+        params,
+        facets_applied,
+    )
+}
+
 fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
     let limit = query.effective_limit();
     let scope_label = scope_policy_label(&query.scope);
@@ -1543,15 +1579,10 @@ fn plan_agent_search(query: &SearchQuery) -> SearchPlan {
         )
     };
 
-    if let Some(pid) = query.project_id {
-        where_clauses.push("a.project_id = ?".to_string());
-        params.push(PlanParam::Int(pid));
-        facets_applied.push("project_id".to_string());
-    }
-
-    let scope_enforced = push_project_set_filter(
-        &query.scope,
+    let scope_enforced = push_metadata_filters(
+        query,
         "a.project_id",
+        "a.id",
         &mut where_clauses,
         &mut params,
         &mut facets_applied,
@@ -1620,8 +1651,9 @@ fn plan_project_search(query: &SearchQuery) -> SearchPlan {
         )
     };
 
-    let scope_enforced = push_project_set_filter(
-        &query.scope,
+    let scope_enforced = push_metadata_filters(
+        query,
+        "p.id",
         "p.id",
         &mut where_clauses,
         &mut params,

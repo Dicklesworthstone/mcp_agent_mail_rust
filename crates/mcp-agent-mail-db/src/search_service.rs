@@ -11532,6 +11532,95 @@ mod tests {
     }
 
     #[test]
+    fn metadata_search_pages_within_current_project_and_product_membership() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let (_root, pool, alpha) = query_hint_mailbox(&cx).await;
+            let beta = crate::queries::get_project_by_human_key(&cx, &pool, "/query-hint-beta")
+                .await
+                .into_result()
+                .unwrap();
+            let product = crate::queries::ensure_product(&cx, &pool, Some("directory"), None)
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            crate::queries::link_product_to_projects(&cx, &pool, product, &[beta.id.unwrap()])
+                .await
+                .into_result()
+                .unwrap();
+
+            for (doc_kind, text) in [
+                (DocKind::Agent, "BlueLake"),
+                (DocKind::Project, "query-hint"),
+            ] {
+                let base = SearchQuery {
+                    text: text.to_string(),
+                    doc_kind,
+                    limit: Some(1),
+                    ..Default::default()
+                };
+                let search = async |query: SearchQuery| {
+                    execute_search(&cx, &pool, &query, &SearchOptions::default())
+                        .await
+                        .into_result()
+                        .unwrap()
+                };
+                let alpha_only = search(SearchQuery {
+                    project_id: alpha.id,
+                    ..base.clone()
+                })
+                .await;
+                let beta_only = search(SearchQuery {
+                    project_id: beta.id,
+                    ..base.clone()
+                })
+                .await;
+                assert_eq!(alpha_only.results.len(), 1);
+                assert_eq!(beta_only.results.len(), 1);
+                let alpha_hit = alpha_only.results[0].result.id;
+                let beta_hit = beta_only.results[0].result.id;
+                assert_ne!(alpha_hit, beta_hit);
+
+                let product_page = search(SearchQuery {
+                    product_id: Some(product),
+                    ..base.clone()
+                })
+                .await;
+                assert_eq!(product_page.results.len(), 1);
+                assert_eq!(product_page.results[0].result.id, beta_hit);
+                let intersection = search(SearchQuery {
+                    project_id: alpha.id,
+                    product_id: Some(product),
+                    ..base.clone()
+                })
+                .await;
+                assert_eq!(intersection.sql_row_count, 0);
+
+                let first = search(base.clone()).await;
+                assert_eq!(first.results[0].result.id, alpha_hit);
+                let second = search(SearchQuery {
+                    cursor: Some(first.next_cursor.unwrap()),
+                    ..base.clone()
+                })
+                .await;
+                assert_eq!(second.results[0].result.id, beta_hit);
+                let end = search(SearchQuery {
+                    cursor: Some(second.next_cursor.unwrap()),
+                    ..base
+                })
+                .await;
+                assert!(end.results.is_empty());
+                assert!(end.next_cursor.is_none());
+            }
+        });
+    }
+
+    #[test]
     fn empty_project_allowlist_denies_every_document_kind() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()

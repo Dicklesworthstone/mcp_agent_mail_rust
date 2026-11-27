@@ -2265,33 +2265,7 @@ impl SearchCockpitScreen {
         };
         self.db_context_unavailable = false;
 
-        let search_result = if self.doc_kind_filter == DocKindFilter::All {
-            let mut all_results = Vec::new();
-            let mut search_error = None;
-            for kind in [DocKind::Message, DocKind::Agent, DocKind::Project] {
-                match self.run_kind_search(&conn, kind, &raw, &cfg) {
-                    Ok(results) => all_results.extend(results),
-                    Err(error) => {
-                        search_error = Some(error);
-                        break;
-                    }
-                }
-            }
-            if let Some(error) = search_error {
-                Err(error)
-            } else {
-                sort_results(&mut all_results, self.sort_direction);
-                all_results.truncate(MAX_RESULTS);
-                Ok(all_results)
-            }
-        } else {
-            let kind = self.doc_kind_filter.doc_kind().unwrap_or(DocKind::Message);
-            self.run_kind_search(&conn, kind, &raw, &cfg)
-                .map(|mut results| {
-                    sort_results(&mut results, self.sort_direction);
-                    results
-                })
-        };
+        let search_result = self.search_current_view(&conn, &raw, &cfg);
         self.db_conn = Some(conn);
 
         let results = match search_result {
@@ -2476,18 +2450,31 @@ impl SearchCockpitScreen {
     }
 
     /// Run a search for a single doc kind.
-    fn run_kind_search(
+    fn search_current_view(
         &mut self,
         conn: &DbConn,
-        kind: DocKind,
         raw: &str,
         cfg: &crate::tui_bridge::ConfigSnapshot,
     ) -> Result<Vec<ResultEntry>, String> {
-        match kind {
-            DocKind::Message | DocKind::Thread => self.search_messages(conn, raw, cfg),
-            DocKind::Agent => Self::search_agents(conn, raw, cfg),
-            DocKind::Project => Self::search_projects(conn, raw, cfg),
+        let (project_id, product_id) = self.resolve_scope(conn)?;
+        let selected_kind = self.doc_kind_filter.doc_kind();
+        let mut results = Vec::new();
+        for kind in [DocKind::Message, DocKind::Agent, DocKind::Project] {
+            if selected_kind.is_some_and(|selected| selected != kind) {
+                continue;
+            }
+            results.extend(match kind {
+                DocKind::Message | DocKind::Thread => {
+                    self.search_messages(conn, raw, cfg, project_id, product_id)?
+                }
+                DocKind::Agent | DocKind::Project => {
+                    Self::search_metadata(conn, raw, cfg, kind, project_id, product_id)?
+                }
+            });
         }
+        sort_results(&mut results, self.sort_direction);
+        results.truncate(MAX_RESULTS);
+        Ok(results)
     }
 
     /// Search messages via the unified search service for non-empty queries.
@@ -2496,8 +2483,9 @@ impl SearchCockpitScreen {
         conn: &DbConn,
         raw: &str,
         cfg: &crate::tui_bridge::ConfigSnapshot,
+        project_id: Option<i64>,
+        product_id: Option<i64>,
     ) -> Result<Vec<ResultEntry>, String> {
-        let (project_id, product_id) = self.resolve_scope(conn)?;
         if raw.is_empty() {
             return self.search_messages_recent(conn, project_id, product_id);
         }
@@ -2602,50 +2590,56 @@ impl SearchCockpitScreen {
         }
     }
 
-    /// Search agents.
-    fn search_agents(
+    /// Search agent or project metadata inside the same facet as the messages.
+    fn search_metadata(
         conn: &DbConn,
         raw: &str,
         cfg: &crate::tui_bridge::ConfigSnapshot,
+        kind: DocKind,
+        project_id: Option<i64>,
+        product_id: Option<i64>,
     ) -> Result<Vec<ResultEntry>, String> {
         if raw.is_empty() {
-            let sql = "SELECT id, name, task_description, project_id, 0.0 AS score \
-                       FROM agents ORDER BY name LIMIT 100";
-            return query_agent_rows(conn, sql, &[]);
+            let (select, column, order) = match kind {
+                DocKind::Agent => (
+                    "SELECT id, name, task_description, project_id, 0.0 AS score FROM agents",
+                    "project_id",
+                    "name, id",
+                ),
+                DocKind::Project => (
+                    "SELECT id, slug, human_key, 0.0 AS score FROM projects",
+                    "id",
+                    "slug",
+                ),
+                _ => unreachable!("expected metadata kind"),
+            };
+            let mut predicates = Vec::new();
+            let mut params = Vec::new();
+            if let Some(id) = project_id {
+                predicates.push(format!("{column} = ?"));
+                params.push(Value::BigInt(id));
+            }
+            if let Some(id) = product_id {
+                predicates.push(format!("{column} IN (SELECT project_id FROM product_project_links WHERE product_id = ?)"));
+                params.push(Value::BigInt(id));
+            }
+            let filter = if predicates.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", predicates.join(" AND "))
+            };
+            let sql = format!("{select}{filter} ORDER BY {order} LIMIT 100");
+            return if kind == DocKind::Agent {
+                query_agent_rows(conn, &sql, &params)
+            } else {
+                query_project_rows(conn, &sql, &params)
+            };
         }
-
         let query = SearchQuery {
             text: raw.to_string(),
-            doc_kind: DocKind::Agent,
-            limit: Some(MAX_RESULTS),
-            ..Default::default()
-        };
-        match run_unified_search(
-            &query,
-            SearchModeFilter::Auto,
-            &cfg.raw_database_url,
-            &cfg.storage_root,
-        ) {
-            Ok(resp) => Ok(map_unified_results(resp.results, &[])),
-            Err(e) => Err(format!("Search failed: {e}")),
-        }
-    }
-
-    /// Search projects.
-    fn search_projects(
-        conn: &DbConn,
-        raw: &str,
-        cfg: &crate::tui_bridge::ConfigSnapshot,
-    ) -> Result<Vec<ResultEntry>, String> {
-        if raw.is_empty() {
-            let sql = "SELECT id, slug, human_key, 0.0 AS score \
-                       FROM projects ORDER BY slug LIMIT 100";
-            return query_project_rows(conn, sql, &[]);
-        }
-
-        let query = SearchQuery {
-            text: raw.to_string(),
-            doc_kind: DocKind::Project,
+            doc_kind: kind,
+            project_id,
+            product_id,
             limit: Some(MAX_RESULTS),
             ..Default::default()
         };
@@ -2687,7 +2681,7 @@ impl SearchCockpitScreen {
         self.scope_label = None;
     }
 
-    /// Project/Product scope as `(project_id, product_id)` for a message
+    /// Project/Product scope as `(project_id, product_id)` for a cockpit
     /// search, resolved from the pinned project; refreshes the facet label.
     fn resolve_scope(&mut self, conn: &DbConn) -> Result<(Option<i64>, Option<i64>), String> {
         self.scope_label = None;
@@ -9258,11 +9252,11 @@ mod tests {
     }
 
     #[test]
-    fn scope_facet_narrows_messages_to_the_pinned_project_or_its_product() {
+    fn scope_facet_narrows_every_result_kind_to_the_pinned_project_or_its_product() {
         let conn = DbConn::open_memory().expect("open in-memory sqlite");
         conn.execute_raw(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT);
-             CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, task_description TEXT, project_id INTEGER);
+             CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT);
              CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
              CREATE TABLE product_project_links (product_id INTEGER, project_id INTEGER);
              CREATE TABLE messages (
@@ -9271,7 +9265,8 @@ mod tests {
                  ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL,
                  thread_id TEXT, body_md TEXT NOT NULL, project_id INTEGER NOT NULL
              );
-             INSERT INTO projects VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+             INSERT INTO projects VALUES (1, 'alpha', '/alpha'), (2, 'beta', '/beta'), (3, 'gamma', '/gamma');
+             INSERT INTO agents VALUES (10, 'A', 'build', 1), (20, 'B', 'build', 2), (30, 'C', 'build', 3);
              INSERT INTO products VALUES (10, 'suite');
              INSERT INTO product_project_links VALUES (10, 1), (10, 2);
              INSERT INTO messages VALUES
@@ -9324,6 +9319,47 @@ mod tests {
                 .unwrap_err()
                 .contains("gamma belongs to no product")
         );
+
+        let cfg = crate::tui_bridge::TuiSharedState::new(&mcp_agent_mail_core::Config::default())
+            .config_snapshot();
+        screen.scope_project = Some(1);
+        for kind in [
+            DocKindFilter::Agents,
+            DocKindFilter::Projects,
+            DocKindFilter::All,
+        ] {
+            screen.doc_kind_filter = kind;
+            for (scope, expected_projects) in [
+                (ScopeMode::Global, &[1, 2, 3][..]),
+                (ScopeMode::Project, &[1][..]),
+                (ScopeMode::Product, &[1, 2][..]),
+            ] {
+                screen.scope_mode = scope;
+                let rows = screen.search_current_view(&conn, "", &cfg).unwrap();
+                let kinds = if kind == DocKindFilter::All {
+                    vec![DocKind::Agent, DocKind::Project, DocKind::Message]
+                } else {
+                    vec![kind.doc_kind().unwrap()]
+                };
+                for expected_kind in kinds {
+                    let mut projects: Vec<_> = rows
+                        .iter()
+                        .filter(|r| r.doc_kind == expected_kind)
+                        .map(|r| r.project_id.unwrap())
+                        .collect();
+                    projects.sort_unstable();
+                    assert_eq!(projects, expected_projects, "{scope:?} {expected_kind:?}");
+                }
+            }
+            screen.scope_project = None;
+            assert!(
+                screen
+                    .search_current_view(&conn, "", &cfg)
+                    .unwrap_err()
+                    .contains("needs a project")
+            );
+            screen.scope_project = Some(1);
+        }
     }
 
     #[test]
