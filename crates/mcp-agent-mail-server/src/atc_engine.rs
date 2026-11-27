@@ -1848,6 +1848,8 @@ struct ScheduledAgentReview {
 
 #[derive(Debug, Clone)]
 struct PendingLivenessFeedback {
+    /// Routing identity observed when the decision was made.
+    project_key: Option<String>,
     action: LivenessAction,
     expected_loss: f64,
     issued_at_micros: i64,
@@ -4181,6 +4183,7 @@ pub struct AtcEffectPlan {
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) struct AtcReleaseAuthority {
     epoch: Arc<()>,
+    project_key: Option<String>,
     last_activity_micros: i64,
 }
 
@@ -4953,6 +4956,10 @@ impl AtcEngine {
             .insert(
                 agent.to_string(),
                 PendingLivenessFeedback {
+                    project_key: self
+                        .agents
+                        .get(agent)
+                        .and_then(|entry| entry.project_key.clone()),
                     action,
                     expected_loss,
                     issued_at_micros,
@@ -5039,25 +5046,37 @@ impl AtcEngine {
         }
     }
 
-    fn resolve_pending_feedback_on_activity(&mut self, agent: &str, timestamp_micros: i64) {
-        // Arrival time is not event time. An observation at or before the
-        // intervention cannot be evidence about that intervention's outcome.
-        if self
-            .pending_liveness_feedback
-            .get(agent)
-            .is_none_or(|pending| timestamp_micros <= pending.issued_at_micros)
+    fn resolve_pending_feedback_on_activity(
+        &mut self,
+        agent: &str,
+        project_key: Option<&str>,
+        timestamp_micros: i64,
+    ) {
+        let Some(pending) = self.pending_liveness_feedback.get(agent) else {
+            return;
+        };
+        if timestamp_micros <= pending.issued_at_micros {
+            return;
+        }
+        let expired = timestamp_micros.saturating_sub(pending.issued_at_micros)
+            >= self.liveness_feedback_window_micros();
+        if !expired
+            && project_key.is_none()
+            && pending.project_key.is_some()
+            && self
+                .agents
+                .get(agent)
+                .and_then(|entry| entry.project_key.as_deref())
+                == pending.project_key.as_deref()
         {
+            // An unscoped signal from a still-tracked name leaves the decision
+            // open for a later, attributable observation within its window.
             return;
         }
         let Some(pending) = self.pending_liveness_feedback.remove(agent) else {
             return;
         };
-        if timestamp_micros.saturating_sub(pending.issued_at_micros)
-            >= self.liveness_feedback_window_micros()
-        {
-            // Use observation time as well as the periodic sweep. Otherwise
-            // the same late activity trains or does not train depending only
-            // on whether an operator tick happened to run first.
+        if expired || pending.project_key.as_deref() != project_key {
             self.censored_experience_count = self.censored_experience_count.saturating_add(1);
             return;
         }
@@ -5206,6 +5225,7 @@ impl AtcEngine {
             .get(&effect.agent)
             .ok_or("release_liveness_changed")?;
         if effect.project_key.is_none()
+            || authority.project_key != effect.project_key
             || entry.project_key.as_deref() != effect.project_key.as_deref()
         {
             return Err("release_project_changed");
@@ -5634,11 +5654,11 @@ impl AtcEngine {
             self.agent_capacity_refusals = self.agent_capacity_refusals.saturating_add(1);
             return;
         }
-        self.resolve_pending_feedback_on_activity(agent, timestamp_micros);
+        let project_key = project_key.map(str::trim).filter(|value| !value.is_empty());
+        self.resolve_pending_feedback_on_activity(agent, project_key, timestamp_micros);
         let mut resurrected = false;
         if let Some(entry) = self.agents.get_mut(agent) {
-            if let Some(project_key) = project_key.map(str::trim).filter(|value| !value.is_empty())
-            {
+            if let Some(project_key) = project_key {
                 entry.project_key = Some(project_key.to_string());
             }
             entry.rhythm.observe(timestamp_micros);
@@ -6114,6 +6134,7 @@ impl AtcEngine {
                 .then(|| {
                     self.agents.get(&agent).map(|entry| AtcReleaseAuthority {
                         epoch: Arc::clone(&self.release_epoch),
+                        project_key: entry.project_key.clone(),
                         last_activity_micros: entry.rhythm.last_activity_ts,
                     })
                 })
@@ -8396,6 +8417,33 @@ mod engine_tests {
         assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), heap);
         assert!(engine.pending_liveness_feedback.contains_key("Phoenix"));
         assert_eq!(engine.resolved_experience_count, 0);
+    }
+
+    #[test]
+    fn activity_only_scores_feedback_from_the_issued_project() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+        for (observed, expected_resolved) in [("/alpha", 1), ("/beta", 0)] {
+            let mut engine = AtcEngine::new_for_testing();
+            engine.register_agent("BlueFox", "codex-cli", Some("/alpha"));
+            engine.observe_activity("BlueFox", Some("/alpha"), 1_000_000);
+            engine.record_pending_liveness_feedback(
+                "BlueFox",
+                LivenessAction::Suspect,
+                2.0,
+                3_000_000,
+            );
+            engine.observe_activity("BlueFox", None, 4_000_000);
+            assert!(engine.pending_liveness_feedback.contains_key("BlueFox"));
+            engine.observe_activity("BlueFox", Some(observed), 5_000_000);
+            assert_eq!(engine.resolved_experience_count, expected_resolved);
+            assert_eq!(engine.censored_experience_count, 1 - expected_resolved);
+            assert!(engine.pending_liveness_feedback.is_empty());
+        }
+        reset_global_atc_state_for_test(&config);
     }
 
     #[test]
@@ -12579,6 +12627,17 @@ pub fn atc_sync_agent_snapshot(
         program
     };
     let project_key = project_key.map(str::trim).filter(|value| !value.is_empty());
+    // A queued population row can predate a live tool call from a namesake in
+    // a different project. Keep the newer route and its program together.
+    // A bare slug can describe multiple directories and cannot prove a rebind.
+    if let Some(entry) = e.agents.get(name)
+        && last_activity_ts <= entry.rhythm.last_activity_ts
+        && let (Some(current), Some(incoming)) = (entry.project_key.as_deref(), project_key)
+        && current != incoming
+        && incoming.len() <= ATC_POPULATION_MAX_PROJECT_BYTES
+    {
+        return;
+    }
     let prior = e.agents.get(name).map(|entry| {
         (
             entry.rhythm.last_activity_ts,
@@ -14379,6 +14438,39 @@ mod alien_enhancement_tests {
         assert_eq!(entry.program, "unknown-tool");
         assert_eq!(entry.project_key.as_deref(), Some("/tmp/project"));
         assert_eq!(entry.rhythm.last_activity_ts, 1_000_000);
+    }
+
+    #[test]
+    fn queued_population_cannot_reroute_a_namesake_or_retarget_an_issued_release() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+        let name = "BlueFox";
+        let last_active = 1_700_000_000_000_000;
+        let mut effect = planned_release_for_test(name, "/alpha", last_active);
+        for (incoming, stale) in [
+            ("/beta", last_active - 1),
+            ("/beta", last_active),
+            ("alpha", last_active),
+        ] {
+            atc_sync_agent_snapshot(name, "other-program", Some(incoming), stale);
+            let engine = ATC_ENGINE.get().unwrap().lock().unwrap();
+            assert_eq!(engine.agents[name].project_key.as_deref(), Some("/alpha"));
+            assert_eq!(engine.agents[name].program, "codex-cli");
+            assert_eq!(engine.release_effect_admission(&effect), Ok(last_active));
+        }
+
+        atc_register_agent_with_project(name, "other-program", Some("/beta"));
+        effect.project_key = Some("/beta".into());
+        let engine = ATC_ENGINE.get().unwrap().lock().unwrap();
+        assert_eq!(
+            engine.release_effect_admission(&effect),
+            Err("release_project_changed")
+        );
+        drop(engine);
+        reset_global_atc_state_for_test(&config);
     }
 
     #[test]
