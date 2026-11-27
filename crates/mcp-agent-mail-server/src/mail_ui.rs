@@ -2397,7 +2397,7 @@ mod utility_tests {
                 400
             );
         }
-        assert!(parse_importance_filter_params("imp=").unwrap().is_empty());
+        assert_eq!(parse_importance_filter_params("imp=").unwrap(), Vec::new());
     }
 
     #[test]
