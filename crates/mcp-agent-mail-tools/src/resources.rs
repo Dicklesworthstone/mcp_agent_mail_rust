@@ -13038,7 +13038,12 @@ mod resource_shape_tests {
                     .expect_err("an incomplete authoritative archive must not appear empty");
                 let data = error.data.as_ref().expect("structured database error");
                 assert_eq!(data["error"]["type"], "DATABASE_ERROR");
-                assert!(error.message.contains("read-only sqlite source not found"));
+                assert!(
+                    data["error"]["data"]["error_detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("read-only sqlite source not found")),
+                    "{data}"
+                );
                 assert!(
                     !db_path.exists(),
                     "resource read must not create the live DB"

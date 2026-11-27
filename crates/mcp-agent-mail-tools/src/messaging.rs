@@ -9653,7 +9653,7 @@ mod tests {
                 let to = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
                 let cc = register_agent_row(&cx, &pool, project_id, "RedFox").await;
                 let bcc = register_agent_row(&cx, &pool, project_id, "GoldHill").await;
-                register_agent_row(&cx, &pool, project_id, "SilverTree").await;
+                register_agent_row(&cx, &pool, project_id, "SilverOak").await;
                 let message = queries::create_message_with_recipients_topic(
                     &cx,
                     &pool,
@@ -9752,7 +9752,7 @@ mod tests {
                 assert_eq!(receipt["project_mailbox"]["visible_agents"], 1);
                 assert_eq!(receipt["project_mailbox"]["read_count"], 0);
                 assert_eq!(receipt["project_mailbox"]["acknowledged_count"], 0);
-                assert_eq!(receipt["project_mailbox"]["agents"][0]["agent"], "SilverTree");
+                assert_eq!(receipt["project_mailbox"]["agents"][0]["agent"], "SilverOak");
                 let after = queries::get_message_delivery_receipt(
                     &cx, &pool, project_id, message_id,
                 )
