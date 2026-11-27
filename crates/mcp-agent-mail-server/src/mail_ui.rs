@@ -2265,35 +2265,35 @@ mod utility_tests {
 
     #[test]
     fn parse_mail_search_field_scope_accepts_new_and_legacy_params() {
-        assert_eq!(parse_mail_search_field_scope("field=subject"), "subject");
-        assert_eq!(parse_mail_search_field_scope("scope=body"), "body");
-        assert_eq!(parse_mail_search_field_scope("field=both"), "");
+        assert_eq!(parse_mail_search_field_scope("field=subject").unwrap(), "subject");
+        assert_eq!(parse_mail_search_field_scope("scope=body").unwrap(), "body");
+        assert_eq!(parse_mail_search_field_scope("field=both").unwrap(), "");
     }
 
     #[test]
     fn parse_mail_search_field_scope_ignores_cross_surface_scope_values() {
-        assert_eq!(parse_mail_search_field_scope("scope=project"), "");
-        assert_eq!(parse_mail_search_field_scope("scope=global"), "");
-        assert_eq!(parse_mail_search_field_scope("scope=product"), "");
+        assert_eq!(parse_mail_search_field_scope("scope=project").unwrap(), "");
+        assert_eq!(parse_mail_search_field_scope("scope=global").unwrap(), "");
+        assert_eq!(parse_mail_search_field_scope("scope=product").unwrap(), "");
     }
 
     #[test]
     fn mail_search_field_is_a_search_parameter_not_a_query_prefix() {
         assert_eq!(
-            mail_search_text_fields(&parse_mail_search_field_scope("field=subject")),
+            mail_search_text_fields(&parse_mail_search_field_scope("field=subject").unwrap()),
             TextFieldScope::Subject
         );
         assert_eq!(
-            mail_search_text_fields(&parse_mail_search_field_scope("scope=body")),
+            mail_search_text_fields(&parse_mail_search_field_scope("scope=body").unwrap()),
             TextFieldScope::Body
         );
         assert_eq!(
-            mail_search_text_fields(&parse_mail_search_field_scope("field=both")),
+            mail_search_text_fields(&parse_mail_search_field_scope("field=both").unwrap()),
             TextFieldScope::SubjectAndBody
         );
         // A project/product scope value is not a field scope.
         assert_eq!(
-            mail_search_text_fields(&parse_mail_search_field_scope("scope=project")),
+            mail_search_text_fields(&parse_mail_search_field_scope("scope=project").unwrap()),
             TextFieldScope::SubjectAndBody
         );
     }
@@ -2313,13 +2313,13 @@ mod utility_tests {
 
     #[test]
     fn mail_search_direction_needs_an_agent() {
-        assert_eq!(parse_mail_search_direction("direction=inbox", ""), "");
-        assert_eq!(parse_mail_search_direction("direction=outbox", ""), "");
+        assert_eq!(parse_mail_search_direction("direction=inbox", "").unwrap(), "");
+        assert_eq!(parse_mail_search_direction("direction=outbox", "").unwrap(), "");
         assert_eq!(
-            parse_mail_search_direction("direction=inbox", "BlueLake"),
+            parse_mail_search_direction("direction=inbox", "BlueLake").unwrap(),
             "inbox"
         );
-        assert_eq!(parse_mail_search_direction("q=x", "BlueLake"), "");
+        assert_eq!(parse_mail_search_direction("q=x", "BlueLake").unwrap(), "");
     }
 
     #[test]
@@ -2333,7 +2333,7 @@ mod utility_tests {
 
     #[test]
     fn parse_importance_filter_params_accepts_repeated_values() {
-        let parsed = parse_importance_filter_params("imp=urgent&imp=high");
+        let parsed = parse_importance_filter_params("imp=urgent&imp=high").unwrap();
         assert_eq!(
             parsed,
             vec![
@@ -2345,7 +2345,7 @@ mod utility_tests {
 
     #[test]
     fn parse_importance_filter_params_accepts_comma_separated_values() {
-        let parsed = parse_importance_filter_params("imp=urgent%2Chigh");
+        let parsed = parse_importance_filter_params("imp=urgent%2Chigh").unwrap();
         assert_eq!(
             parsed,
             vec![
@@ -2359,22 +2359,70 @@ mod utility_tests {
 
     #[test]
     fn parse_ack_filter_param_accepts_legacy_words() {
-        assert_eq!(parse_ack_filter_param("required"), Some(true));
-        assert_eq!(parse_ack_filter_param("not_required"), Some(false));
+        assert_eq!(parse_ack_filter_param("required").unwrap(), Some(true));
+        assert_eq!(parse_ack_filter_param("not_required").unwrap(), Some(false));
     }
 
     #[test]
     fn parse_ack_filter_param_accepts_tui_bool_aliases() {
-        assert_eq!(parse_ack_filter_param("1"), Some(true));
-        assert_eq!(parse_ack_filter_param("true"), Some(true));
-        assert_eq!(parse_ack_filter_param("0"), Some(false));
-        assert_eq!(parse_ack_filter_param("false"), Some(false));
+        assert_eq!(parse_ack_filter_param("1").unwrap(), Some(true));
+        assert_eq!(parse_ack_filter_param("true").unwrap(), Some(true));
+        assert_eq!(parse_ack_filter_param("0").unwrap(), Some(false));
+        assert_eq!(parse_ack_filter_param("false").unwrap(), Some(false));
     }
 
     #[test]
     fn parse_ack_filter_param_rejects_unknown_values() {
-        assert_eq!(parse_ack_filter_param("any"), None);
-        assert_eq!(parse_ack_filter_param("banana"), None);
+        assert_eq!(parse_ack_filter_param("any").unwrap(), None);
+        assert_eq!(parse_ack_filter_param("").unwrap(), None);
+        assert_eq!(parse_ack_filter_param("banana").unwrap_err().0, 400);
+    }
+
+    #[test]
+    fn mail_search_rejects_invalid_facets_without_dropping_valid_values() {
+        for query in ["imp=urgent&imp=bogus", "imp=urgent%2Cbogus", "imp=%2C"] {
+            assert_eq!(parse_importance_filter_params(query).unwrap_err().0, 400);
+        }
+        for query in ["field=bogus", "field=bogus&scope=body", "scope=bogus"] {
+            assert_eq!(parse_mail_search_field_scope(query).unwrap_err().0, 400);
+        }
+        assert_eq!(
+            parse_mail_search_field_scope("field=subject&scope=bogus").unwrap(),
+            "subject",
+            "the explicit field keeps precedence over the legacy alias"
+        );
+        for agent in ["", "BlueLake"] {
+            assert_eq!(
+                parse_mail_search_direction("direction=bogus", agent).unwrap_err().0,
+                400
+            );
+        }
+        assert!(parse_importance_filter_params("imp=").unwrap().is_empty());
+    }
+
+    #[test]
+    fn mail_search_date_filters_are_valid_and_inclusive() {
+        for (from, to) in [
+            ("not-a-date", ""),
+            ("", "2026-02-30"),
+            ("2026-11-28", "2026-11-27"),
+        ] {
+            assert_eq!(parse_mail_search_time_range(from, to).unwrap_err().0, 400);
+        }
+        let range = parse_mail_search_time_range("2024-02-29", "2024-02-29").unwrap();
+        let start = chrono::NaiveDate::from_ymd_opt(2024, 2, 29)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(range.min_ts, Some(start));
+        assert_eq!(range.max_ts, Some(start + 86_400_000_000 - 1));
+        let empty = parse_mail_search_time_range("", "").unwrap();
+        assert!(empty.min_ts.is_none() && empty.max_ts.is_none());
+        let maximum = chrono::NaiveDate::MAX.format("%Y-%m-%d").to_string();
+        let range = parse_mail_search_time_range(&maximum, &maximum).unwrap();
+        assert!(range.max_ts.unwrap() > range.min_ts.unwrap());
     }
 
     #[test]
@@ -4274,6 +4322,119 @@ mod conversation_ui_tests {
             assert!(conversation.contains(subject));
         }
     }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn search_ui_preserves_valid_facets_and_refuses_broadened_results() {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(60));
+        let pool = initialized_test_pool("search-ui-filter-validation");
+        let project = block_on_outcome(
+            &cx,
+            queries::ensure_project(&cx, &pool, "/search-ui-filter-validation"),
+        )
+        .expect("project");
+        let pid = project.id.unwrap();
+        let sender = block_on_outcome(
+            &cx,
+            queries::register_agent(
+                &cx, &pool, pid, "BlueLake", "test", "test", None, None, None,
+            ),
+        )
+        .expect("sender");
+        let start = parse_date_to_micros("2026-11-27").unwrap();
+        let day = 86_400_000_000_i64;
+        let rows = [
+            ("Match at start", "urgent", true, 0),
+            ("Match at end", "urgent", true, day - 1),
+            ("Outside after", "urgent", true, day),
+            ("Outside before", "urgent", true, -1),
+            ("Wrong importance", "normal", true, 10),
+            ("Wrong acknowledgment", "urgent", false, 10),
+        ];
+        for (subject, importance, ack, offset) in rows {
+            let message = block_on_outcome(
+                &cx,
+                queries::create_message(
+                    &cx,
+                    &pool,
+                    pid,
+                    sender.id.unwrap(),
+                    subject,
+                    "Search filter boundary fixture",
+                    None,
+                    importance,
+                    ack,
+                    "[]",
+                ),
+            )
+            .expect("seed message");
+            let conn = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path())
+                .expect("independent timestamp writer");
+            conn.execute_sync(
+                "UPDATE messages SET created_ts = ? WHERE id = ?",
+                &[
+                    Value::BigInt(start + offset),
+                    Value::BigInt(message.id.unwrap()),
+                ],
+            )
+            .expect("set exact date boundary");
+        }
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", "unsupported://search-ui-filter-validation")],
+            || {
+                let html = render_search(
+                    &cx,
+                    &pool,
+                    &project.slug,
+                    "imp=urgent&ack=1&from_date=2026-11-27&to_date=2026-11-27",
+                )
+                .expect("valid combined filters")
+                .expect("search HTML");
+                for subject in ["Match at start", "Match at end"] {
+                    assert!(html.contains(subject), "inclusive date boundary: {subject}");
+                }
+                for subject in [
+                    "Outside after",
+                    "Outside before",
+                    "Wrong importance",
+                    "Wrong acknowledgment",
+                ] {
+                    assert!(!html.contains(subject), "filter excludes {subject}");
+                }
+                assert!(
+                    html.contains("value=\"required\" checked"),
+                    "the accepted ACK alias must render its actual selected filter"
+                );
+
+                for query in [
+                    "imp=bogus",
+                    "imp=urgent&imp=bogus",
+                    "imp=urgent&ack=bogus",
+                    "imp=urgent&from_date=not-a-date",
+                    "imp=urgent&to_date=2026-02-30",
+                    "imp=urgent&from_date=2026-11-28&to_date=2026-11-27",
+                    "imp=urgent&agent=BlueLake&direction=bogus",
+                    "imp=urgent&field=bogus",
+                ] {
+                    let error = render_search(&cx, &pool, &project.slug, query)
+                        .expect_err("invalid filter must not return broader mail");
+                    assert_eq!(error.0, 400, "query={query}");
+                    assert!(!error.1.contains("Search filter boundary fixture"));
+                }
+                assert_eq!(
+                    render_search(&cx, &pool, "missing-project", "ack=bogus")
+                        .unwrap_err()
+                        .0,
+                    400,
+                    "invalid filters are refused before project lookup"
+                );
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4743,15 +4904,30 @@ fn normalize_mail_search_field_scope(value: &str) -> Option<&'static str> {
     }
 }
 
-fn parse_mail_search_field_scope(query: &str) -> String {
+fn invalid_mail_search_filter(field: &str, expected: &str) -> (u16, String) {
+    (
+        400,
+        format!("Invalid search filter '{field}': expected {expected}."),
+    )
+}
+
+fn parse_mail_search_field_scope(query: &str) -> Result<String, (u16, String)> {
     for key in ["field", "scope"] {
-        if let Some(raw) = extract_query_str(query, key)
-            && let Some(normalized) = normalize_mail_search_field_scope(&raw)
-        {
-            return normalized.to_string();
+        if let Some(raw) = extract_query_str(query, key) {
+            if let Some(normalized) = normalize_mail_search_field_scope(&raw) {
+                return Ok(normalized.to_string());
+            }
+            // Saved searches also use `scope` for project/product scope. It
+            // is not a text-field filter and must not override this route.
+            if key == "scope"
+                && matches!(raw.as_str(), "project" | "product" | "global")
+            {
+                continue;
+            }
+            return Err(invalid_mail_search_filter(key, "subject, body or both"));
         }
     }
-    String::new()
+    Ok(String::new())
 }
 
 /// The search service's field scope for a normalized `field` parameter.
@@ -4775,10 +4951,17 @@ fn normalize_mail_search_order(value: &str) -> Option<&'static str> {
 /// Inbox/Outbox are relative to an agent. With "All agents" no search path
 /// applies them, so they are not kept as a filter: the form then shows
 /// "Any", which is what the results are.
-fn parse_mail_search_direction(query: &str, agent_filter: &str) -> String {
-    extract_query_str(query, "direction")
-        .filter(|_| !agent_filter.is_empty())
-        .unwrap_or_default()
+fn parse_mail_search_direction(
+    query: &str,
+    agent_filter: &str,
+) -> Result<String, (u16, String)> {
+    let direction = extract_query_str(query, "direction").unwrap_or_default();
+    match direction.as_str() {
+        "" | "any" => Ok(String::new()),
+        "inbox" | "outbox" if agent_filter.is_empty() => Ok(String::new()),
+        "inbox" | "outbox" => Ok(direction),
+        _ => Err(invalid_mail_search_filter("direction", "inbox, outbox or any")),
+    }
 }
 
 fn parse_mail_search_order(query: &str) -> String {
@@ -4794,25 +4977,54 @@ fn parse_mail_search_order(query: &str) -> String {
 
 fn parse_importance_filter_params(
     query: &str,
-) -> Vec<mcp_agent_mail_db::search_planner::Importance> {
+) -> Result<Vec<mcp_agent_mail_db::search_planner::Importance>, (u16, String)> {
     let mut out = Vec::new();
     for raw_value in extract_query_str_all(query, "imp") {
         for segment in raw_value.split(',') {
             let value = segment.trim();
-            if let Some(importance) = mcp_agent_mail_db::search_planner::Importance::parse(value) {
-                out.push(importance);
-            }
+            let importance = mcp_agent_mail_db::search_planner::Importance::parse(value)
+                .ok_or_else(|| invalid_mail_search_filter("imp", "low, normal, high or urgent"))?;
+            out.push(importance);
         }
     }
-    out
+    Ok(out)
 }
 
-fn parse_ack_filter_param(value: &str) -> Option<bool> {
+fn parse_ack_filter_param(value: &str) -> Result<Option<bool>, (u16, String)> {
     match value {
-        "required" | "1" | "true" => Some(true),
-        "not_required" | "0" | "false" => Some(false),
-        _ => None,
+        "required" | "1" | "true" => Ok(Some(true)),
+        "not_required" | "0" | "false" => Ok(Some(false)),
+        "" | "any" => Ok(None),
+        _ => Err(invalid_mail_search_filter(
+            "ack",
+            "required, not_required, any, true, false, 1 or 0",
+        )),
     }
+}
+
+fn parse_mail_search_time_range(
+    from_date: &str,
+    to_date: &str,
+) -> Result<mcp_agent_mail_db::search_planner::TimeRange, (u16, String)> {
+    let min_ts = parse_date_to_micros(from_date);
+    let max_ts = parse_date_to_micros_end(to_date);
+    for (field, value, parsed) in [
+        ("from_date", from_date, min_ts),
+        ("to_date", to_date, max_ts),
+    ] {
+        if !value.is_empty() && parsed.is_none() {
+            return Err(invalid_mail_search_filter(field, "a valid YYYY-MM-DD date"));
+        }
+    }
+    if let (Some(start), Some(end)) = (min_ts, max_ts)
+        && start > end
+    {
+        return Err(invalid_mail_search_filter(
+            "from_date/to_date",
+            "from_date on or before to_date",
+        ));
+    }
+    Ok(mcp_agent_mail_db::search_planner::TimeRange { min_ts, max_ts })
 }
 
 /// Build the deep-link URL for the current search state.
@@ -4965,24 +5177,19 @@ fn render_search(
     project_slug: &str,
     query_str: &str,
 ) -> Result<Option<String>, (u16, String)> {
-    use mcp_agent_mail_db::search_planner::{
-        Direction, Importance, RankingMode, SearchQuery, TimeRange,
-    };
-
-    let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
-    let pid = p.id.unwrap_or(0);
+    use mcp_agent_mail_db::search_planner::{Direction, Importance, RankingMode, SearchQuery};
 
     // ── Parse all query parameters ──────────────────────────────────
     let q = extract_query_str(query_str, "q").unwrap_or_default();
     let static_export = is_static_export_request(query_str);
     let limit = extract_query_int(query_str, "limit", 50);
     let order = parse_mail_search_order(query_str);
-    let field_scope = parse_mail_search_field_scope(query_str);
+    let field_scope = parse_mail_search_field_scope(query_str)?;
     let boost = extract_query_bool(query_str, "boost").unwrap_or(false);
     let cursor = extract_query_str(query_str, "cursor").unwrap_or_default();
 
     // Facets
-    let importance_filter: Vec<Importance> = parse_importance_filter_params(query_str);
+    let importance_filter: Vec<Importance> = parse_importance_filter_params(query_str)?;
     let selected_importance: Vec<String> = importance_filter
         .iter()
         .map(|importance| importance.as_str().to_string())
@@ -4990,10 +5197,23 @@ fn render_search(
 
     let agent_filter = extract_query_str(query_str, "agent").unwrap_or_default();
     let thread_filter = extract_query_str(query_str, "thread").unwrap_or_default();
-    let ack_filter = extract_query_str(query_str, "ack").unwrap_or_else(|| "any".to_string());
-    let direction_filter = parse_mail_search_direction(query_str, &agent_filter);
+    let ack_param = extract_query_str(query_str, "ack").unwrap_or_default();
+    let ack_required = parse_ack_filter_param(&ack_param)?;
+    let ack_filter = match ack_required {
+        Some(true) => "required",
+        Some(false) => "not_required",
+        None => "any",
+    }
+    .to_string();
+    let direction_filter = parse_mail_search_direction(query_str, &agent_filter)?;
     let from_date = extract_query_str(query_str, "from_date").unwrap_or_default();
     let to_date = extract_query_str(query_str, "to_date").unwrap_or_default();
+    let time_range = parse_mail_search_time_range(&from_date, &to_date)?;
+
+    // Invalid explicit facets must fail before any mailbox lookup or search.
+    // The search service cannot validate a filter that the HTTP parser dropped.
+    let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
+    let pid = p.id.unwrap_or(0);
 
     // ── Build search query ──────────────────────────────────────────
     let has_any_filter = !q.is_empty()
@@ -5006,11 +5226,6 @@ fn render_search(
         || !to_date.is_empty();
 
     let (results, next_cursor_val) = if has_any_filter {
-        let time_range = TimeRange {
-            min_ts: parse_date_to_micros(&from_date),
-            max_ts: parse_date_to_micros_end(&to_date),
-        };
-
         let ranking = match order.as_str() {
             "time" => RankingMode::Recency,
             "oldest" => RankingMode::Oldest,
@@ -5022,8 +5237,6 @@ fn render_search(
             "outbox" => Some(Direction::Outbox),
             _ => None,
         };
-
-        let ack_required = parse_ack_filter_param(&ack_filter);
 
         let search_query = SearchQuery {
             text: q.clone(),
