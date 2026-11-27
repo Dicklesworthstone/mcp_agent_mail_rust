@@ -4393,16 +4393,14 @@ pub(crate) mod test_support {
                     let config = mcp_agent_mail_core::Config::get();
                     let queued = mcp_agent_mail_storage::archive_backlog_push(
                         mcp_agent_mail_storage::WriteOp::NotificationSignal {
-                            config: (*config).clone(),
+                            config,
                             project_slug: "fixture-lifecycle".to_string(),
                             agent_name: agent.to_string(),
                             metadata: None,
                         },
                     );
                     assert_eq!(queued, mcp_agent_mail_storage::ArchiveBacklogPush::Queued);
-                    if should_panic {
-                        panic!("expected fixture unwind");
-                    }
+                    assert!(!should_panic, "expected fixture unwind");
                 });
             });
             if should_panic {

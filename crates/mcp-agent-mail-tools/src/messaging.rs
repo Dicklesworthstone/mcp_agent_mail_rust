@@ -7329,7 +7329,7 @@ mod tests {
                         None
                     };
                     let hook_ctx = ctx.clone();
-                    let hook_cx = request_cx.clone();
+                    let ambient_cx = request_cx.clone();
                     let _hook_guard = MessageAdmissionHookGuard;
                     BEFORE_INBOX_RECEIPTS.with_borrow_mut(|hook| {
                         *hook = Some(Box::new(move || match ending {
@@ -7338,14 +7338,14 @@ mod tests {
                             "deadline" => drop(hook_ctx.with_budget_ceiling(
                                 asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
                             )),
-                            _ => hook_cx.set_cancel_requested(true),
+                            _ => ambient_cx.set_cancel_requested(true),
                         }));
                     });
                     let error = consume(&ctx)
                         .await
                         .expect_err("a materialized page must not consume after cancellation");
                     assert_eq!(error.code, McpErrorCode::RequestCancelled, "{ending}");
-                    assert!(BEFORE_INBOX_RECEIPTS.with_borrow(|hook| hook.is_none()));
+                    assert!(BEFORE_INBOX_RECEIPTS.with_borrow(Option::is_none));
                     if ending != "ambient" {
                         assert!(
                             ctx.ensure_live().is_err(),
@@ -7406,7 +7406,7 @@ mod tests {
                 mcp_agent_mail_db::recovery_state::visit_records(&mailbox.storage_root, |record| {
                     if let mcp_agent_mail_db::recovery_state::RecoveryRecord::Receipt(receipt) =
                         record
-                        && receipt.agent_id == agent_id
+                        && receipt.agent.id == agent_id
                         && receipt.read_ts.is_some()
                     {
                         preserved.push(receipt.message_id);
@@ -7417,9 +7417,9 @@ mod tests {
                 preserved.sort_unstable();
                 preserved.dedup();
                 assert_eq!(preserved, message_ids);
-                assert!(
-                    mcp_agent_mail_storage::list_pending_signals(&config, Some(&project.slug))
-                        .is_empty()
+                assert_eq!(
+                    mcp_agent_mail_storage::list_pending_signals(&config, Some(&project.slug)),
+                    Vec::<Value>::new()
                 );
             });
         });
