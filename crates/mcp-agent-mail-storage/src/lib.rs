@@ -12928,13 +12928,29 @@ fn existing_immutable_message_copy(
         Err(error) => return Err(error.into()),
     };
     let expected_len = u64::try_from(expected.len()).unwrap_or(u64::MAX);
-    let mut content = Vec::with_capacity(expected.len().min(64 * 1024));
     if file.metadata()?.len() == expected_len {
-        (&file)
-            .take(expected_len.saturating_add(1))
-            .read_to_end(&mut content)?;
-        if content == expected {
-            return Ok(Some(file));
+        use std::io::BufRead as _;
+
+        let mut remaining = expected;
+        let mut reader =
+            std::io::BufReader::with_capacity(expected.len().clamp(1, 64 * 1024), &file);
+        loop {
+            let observed = match reader.fill_buf() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if observed.is_empty() {
+                if remaining.is_empty() {
+                    return Ok(Some(file));
+                }
+                break;
+            }
+            let Some(rest) = remaining.strip_prefix(observed) else {
+                break;
+            };
+            let consumed = observed.len();
+            remaining = rest;
+            reader.consume(consumed);
         }
     }
     Err(StorageError::InvalidPath(format!(
@@ -14305,6 +14321,47 @@ fn store_explicit_attachment(
     }
 }
 
+/// Return the only original this image cache entry may publish or stage.
+fn retained_original_relative_path(
+    archive: &ProjectArchive,
+    digest: &str,
+    extension: &str,
+) -> Result<String> {
+    if !extension.is_empty()
+        && (!extension.starts_with('.')
+            || extension.contains(['/', '\\'])
+            || (cfg!(windows) && extension.contains(':'))
+            || extension.chars().any(char::is_control))
+    {
+        return Err(StorageError::InvalidPath(
+            "invalid retained attachment extension".to_string(),
+        ));
+    }
+    Ok(format!(
+        "projects/{}/attachments/originals/{}/{digest}{extension}",
+        archive.slug,
+        &digest[..2]
+    ))
+}
+
+fn ensure_retained_original(
+    archive: &ProjectArchive,
+    relative: &str,
+    original: &[u8],
+) -> Result<()> {
+    let path = archive_repo_root_checked(archive)?.join(relative);
+    // The caller still has the original bytes even if a previous attempt lost
+    // the file after recording its manifest. Accept an exact survivor or
+    // publish the missing file without replacing a raced-in destination.
+    if existing_immutable_message_copy(&path, original, false)?.is_none() {
+        ensure_parent_dir(&path)?;
+        let mut writes = StagedArchiveWrites::default();
+        writes.add(path, original)?;
+        writes.publish_immutable_messages()?;
+    }
+    Ok(())
+}
+
 /// Reconstruct a [`StoredAttachment`] from cached WebP + manifest on disk.
 ///
 /// Called when the SHA1-based cache check finds that the WebP and manifest
@@ -14315,6 +14372,7 @@ fn store_attachment_from_cache(
     webp_path: &Path,
     manifest_path: &Path,
     digest: &str,
+    original_bytes: &[u8],
     embed_policy: EmbedPolicy,
 ) -> Result<StoredAttachment> {
     use base64::Engine;
@@ -14332,41 +14390,64 @@ fn store_attachment_from_cache(
         )));
     }
 
-    let manifest_str = fs::read_to_string(manifest_path)?;
-    let manifest: AttachmentManifest = serde_json::from_str(&manifest_str)?;
+    let manifest_bytes =
+        mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(manifest_path, 1024 * 1024)?;
+    let mut document: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
+    let manifest: AttachmentManifest = serde_json::from_value(document.clone())?;
     let project_root = archive_project_root_checked(archive)?;
-    let repo_root = archive_repo_root_checked(archive)?;
 
     let webp_rel = rel_path_cached(&archive.canonical_repo_root, webp_path)?;
     let manifest_rel = rel_path_cached(&archive.canonical_repo_root, manifest_path)?;
+    if manifest.sha1 != digest
+        || manifest.webp_path != webp_rel
+        || manifest.bytes_original != original_bytes.len()
+    {
+        return Err(StorageError::InvalidPath(
+            "cached attachment manifest does not match the requested original".to_string(),
+        ));
+    }
     // Hash the same bytes used for the metadata and inline payload. A cached
     // file may predate its first Git commit, so its encoded content also needs
     // a durable witness in the accepted message's attachment metadata.
     let webp_bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
         webp_path,
-        fs::metadata(webp_path)?.len(),
+        manifest.bytes_webp as u64,
     )?;
     let webp_bytes_len = webp_bytes.len();
+    if webp_bytes_len != manifest.bytes_webp {
+        return Err(StorageError::InvalidPath(
+            "cached attachment length differs from its manifest".to_string(),
+        ));
+    }
     let content_sha256 = hex::encode(Sha256::digest(&webp_bytes));
 
+    if let Some(recorded) = document.get("content_sha256")
+        && recorded.as_str() != Some(content_sha256.as_str())
+    {
+        return Err(StorageError::InvalidPath(
+            "cached attachment content differs from its manifest digest".to_string(),
+        ));
+    }
     let original_rel = if config.keep_original_images {
-        match manifest.original_path.as_deref() {
-            Some(raw_rel) => {
-                let raw_rel =
-                    validate_repo_relative_path("cached attachment original path", raw_rel)?;
-                let original_path = repo_root.join(raw_rel);
-                if path_existing_prefix_has_symlink(&original_path)?
-                    || !path_is_nonsymlink_file(&original_path)
-                {
-                    return Err(StorageError::InvalidPath(format!(
-                        "cached attachment original is missing or invalid: {}",
-                        original_path.display()
-                    )));
-                }
-                Some(raw_rel.to_string())
-            }
-            None => None,
+        let original_target =
+            retained_original_relative_path(archive, digest, &manifest.original_ext)?;
+        if manifest
+            .original_path
+            .as_ref()
+            .is_some_and(|path| path != &original_target)
+        {
+            return Err(StorageError::InvalidPath(
+                "cached attachment manifest references an unexpected original path".to_string(),
+            ));
         }
+        ensure_retained_original(archive, &original_target, original_bytes)?;
+        if manifest.original_path.is_none() {
+            // Earlier conversions may have used a different retention policy.
+            // Preserve extension fields in manifests from other versions.
+            document["original_path"] = serde_json::Value::String(original_target.clone());
+            write_json(manifest_path, &document, true)?;
+        }
+        Some(original_target)
     } else {
         None
     };
@@ -14484,6 +14565,7 @@ fn store_image_attachment_bytes(
             &webp_path,
             &manifest_path,
             &digest,
+            original_bytes,
             embed_policy,
         )
     };
@@ -14536,11 +14618,8 @@ fn store_image_attachment_bytes(
 
     // Optionally keep original
     let original_rel = if config.keep_original_images {
-        let orig_dir = attach_dir.join("originals").join(prefix);
-        ensure_dir(&orig_dir)?;
-        let orig_path = orig_dir.join(format!("{digest}{original_ext}"));
-        atomic_write_bytes(&orig_path, original_bytes, true)?;
-        let rel = rel_path_cached(&archive.canonical_repo_root, &orig_path)?;
+        let rel = retained_original_relative_path(archive, &digest, &original_ext)?;
+        ensure_retained_original(archive, &rel, original_bytes)?;
         rel_paths.push(rel.clone());
         Some(rel)
     } else {
@@ -14558,7 +14637,9 @@ fn store_image_attachment_bytes(
         original_ext: original_ext.clone(),
         original_path: original_rel.clone(),
     };
-    write_json(&manifest_path, &serde_json::to_value(&manifest)?, true)?;
+    let mut document = serde_json::to_value(&manifest)?;
+    document["content_sha256"] = serde_json::Value::String(content_sha256.clone());
+    write_json(&manifest_path, &document, true)?;
     rel_paths.push(rel_path_cached(
         &archive.canonical_repo_root,
         &manifest_path,
@@ -27963,6 +28044,110 @@ mod tests {
             second.meta.original_path.is_none(),
             "cache hits must follow the current keep_original_images setting"
         );
+    }
+
+    #[test]
+    fn cache_retry_restores_the_retained_original_and_commits_its_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.keep_original_images = false;
+        let archive = ensure_archive(&config, "restore-cached-original").unwrap();
+        let source = tmp.path().join("source.png");
+        create_test_png(&source);
+        let first = store_attachment(&archive, &config, &source, EmbedPolicy::File).unwrap();
+        assert!(first.meta.original_path.is_none());
+        let manifest_path = archive
+            .root
+            .join("attachments/_manifests")
+            .join(format!("{}.json", first.meta.sha1));
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        // A legacy cache predates the exact encoded-content digest field.
+        manifest.as_object_mut().unwrap().remove("content_sha256");
+        manifest["future_field"] = serde_json::json!({"keep": true});
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        // The source can return with a different name. The cached manifest
+        // still describes the original representation used by the first send.
+        let renamed_source = tmp.path().join("renamed.bin");
+        fs::rename(&source, &renamed_source).unwrap();
+        config.keep_original_images = true;
+        let second =
+            store_attachment(&archive, &config, &renamed_source, EmbedPolicy::File).unwrap();
+        let relative = second.meta.original_path.unwrap();
+        assert!(relative.ends_with(".png"));
+        assert!(second.rel_paths.contains(&relative));
+        let expected = fs::read(&renamed_source).unwrap();
+        let original = archive.repo_root.join(&relative);
+        assert_eq!(fs::read(&original).unwrap(), expected);
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(upgraded["original_path"], relative);
+        assert_eq!(upgraded["future_field"], manifest["future_field"]);
+
+        // An interrupted/partially restored cache can retain the manifest
+        // while losing its original. Retry must supply the full commit set.
+        fs::rename(&original, tmp.path().join("retained-evidence.png")).unwrap();
+        let retried =
+            store_attachment(&archive, &config, &renamed_source, EmbedPolicy::File).unwrap();
+        assert_eq!(retried.meta.original_path.as_ref(), Some(&relative));
+        assert_eq!(retried.meta.content_sha256, first.meta.content_sha256);
+        let paths: Vec<_> = retried.rel_paths.iter().map(String::as_str).collect();
+        commit_paths_with_retry(&archive.repo_root, &config, "retry attachment", &paths).unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let blob = repo
+            .find_blob(tree.get_path(Path::new(&relative)).unwrap().id())
+            .unwrap();
+        assert_eq!(blob.content(), expected.as_slice());
+    }
+
+    #[test]
+    fn cache_retry_preserves_conflicting_original_and_rejects_foreign_manifest_path() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.keep_original_images = true;
+        let archive = ensure_archive(&config, "original-conflict").unwrap();
+        let source = tmp.path().join("source.png");
+        create_test_png(&source);
+        let first = store_attachment(&archive, &config, &source, EmbedPolicy::File).unwrap();
+        let original = archive.repo_root.join(first.meta.original_path.unwrap());
+        let manifest_path = archive
+            .root
+            .join("attachments/_manifests")
+            .join(format!("{}.json", first.meta.sha1));
+        let before = fs::read(&manifest_path).unwrap();
+        let webp = archive.repo_root.join(first.meta.path.unwrap());
+        let clean = fs::read(&webp).unwrap();
+        let mut bad = clean.clone();
+        bad[0] ^= 1;
+        fs::write(&webp, &bad).unwrap();
+        let error = store_attachment(&archive, &config, &source, EmbedPolicy::Inline).unwrap_err();
+        assert!(error.to_string().contains("manifest digest"), "{error}");
+        assert_eq!(fs::read(&webp).unwrap(), bad);
+        fs::write(&webp, clean).unwrap();
+
+        let mut different = fs::read(&source).unwrap();
+        different[0] ^= 1;
+        fs::write(&original, &different).unwrap();
+        assert!(store_attachment(&archive, &config, &source, EmbedPolicy::File).is_err());
+        assert_eq!(fs::read(&original).unwrap(), different);
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+
+        let foreign = ensure_archive(&config, "foreign-project").unwrap();
+        let foreign_path = foreign.root.join("unrelated.png");
+        fs::copy(&source, &foreign_path).unwrap();
+        let mut forged: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        forged["original_path"] = serde_json::json!(
+            rel_path_cached(&archive.canonical_repo_root, &foreign_path).unwrap()
+        );
+        fs::write(&manifest_path, serde_json::to_vec(&forged).unwrap()).unwrap();
+        let error = store_attachment(&archive, &config, &source, EmbedPolicy::File).unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected original path"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&foreign_path).unwrap(), fs::read(&source).unwrap());
     }
 
     #[test]
