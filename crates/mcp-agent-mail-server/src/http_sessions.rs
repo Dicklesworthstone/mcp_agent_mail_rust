@@ -13,9 +13,10 @@
 //! subject to bearer/JWT authorization before it reaches the registry, and a
 //! session is bound to the authorization it was created under (its
 //! *principal*). A request presenting a session id with a different principal,
-//! an unknown id, or an expired id gets no session state (it behaves like a
-//! stateless request). Sessions live in memory only, so a server restart ends
-//! every binding.
+//! an unknown id, or an expired id is rejected before dispatch. A lost session
+//! must never silently downgrade a bound caller to trusted-local, stateless
+//! behavior. Sessions live in memory only, so a server restart ends every
+//! binding and clients must initialize again without the old session header.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -26,6 +27,40 @@ use sha2::{Digest, Sha256};
 
 /// HTTP header carrying the MCP session id (MCP Streamable HTTP transport).
 pub const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+
+/// Refusals at the stateful HTTP boundary, before any tool can run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionResolutionError {
+    NotFound,
+    AlreadyInitialized,
+    InitializationRequiresRequest,
+    Unavailable,
+}
+
+impl SessionResolutionError {
+    pub const fn status(self) -> u16 {
+        match self {
+            Self::NotFound => 404,
+            Self::AlreadyInitialized | Self::InitializationRequiresRequest => 400,
+            Self::Unavailable => 503,
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::NotFound => {
+                "MCP session not found or expired. Send initialize without Mcp-Session-Id to start a new session."
+            }
+            Self::AlreadyInitialized => {
+                "initialize must start a new session without Mcp-Session-Id."
+            }
+            Self::InitializationRequiresRequest => {
+                "initialize must be a JSON-RPC request with an id."
+            }
+            Self::Unavailable => "Unable to create MCP session; retry initialization.",
+        }
+    }
+}
 
 /// Upper bound on live sessions; the least recently used is evicted first.
 const MAX_SESSIONS: usize = 4096;
@@ -82,19 +117,28 @@ impl HttpSessionRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Start a session for `principal`. Returns its id and state, or `None`
-    /// when no random id could be generated (the request then proceeds
-    /// statelessly).
+    #[cfg(test)]
     pub fn create(&self, principal: [u8; 32]) -> Option<(String, SessionState)> {
+        self.create_with_state(principal, SessionState::new())
+    }
+
+    /// Publish a successfully initialized session. A failed handshake never
+    /// enters the registry or evicts another client's live identity.
+    /// Returns `None` if no secure ID can be generated; the transport refuses
+    /// initialization rather than downgrading to stateless operation.
+    pub fn create_with_state(
+        &self,
+        principal: [u8; 32],
+        state: SessionState,
+    ) -> Option<(String, SessionState)> {
         let id = match mcp_agent_mail_core::setup::generate_registration_token() {
             Ok(id) => id,
             Err(error) => {
-                tracing::warn!(error = %error, "cannot mint an MCP session id; continuing statelessly");
+                tracing::warn!(error = %error, "cannot mint an MCP session id; refusing initialization");
                 return None;
             }
         };
         let now = Instant::now();
-        let state = SessionState::new();
         let mut sessions = self.lock();
         sessions.retain(|_, session| now.duration_since(session.last_seen) < self.idle_ttl);
         while sessions.len() >= self.max_sessions {

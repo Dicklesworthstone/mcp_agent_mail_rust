@@ -12983,14 +12983,33 @@ impl HttpState {
         }
 
         let json_rpc = inject_tmux_pane_header(json_rpc, &req);
-        let (session_state, new_session_id) = self.resolve_mcp_session(&req, &json_rpc);
-        let response = self
-            .dispatch_with_session(json_rpc, session_state)
-            .await
-            .map_or_else(
-                || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
-                |resp| HttpResponse::ok().with_json(&resp),
-            );
+        let (session_state, initializing) = match self.resolve_mcp_session(&req, &json_rpc) {
+            Ok(session) => session,
+            Err(error) => return self.error_response(&req, error.status(), error.message()),
+        };
+        let pending_session = session_state.clone().filter(|_| initializing);
+        let response = self.dispatch_with_session(json_rpc, session_state).await;
+        // A session is established only by a successful InitializeResult.
+        // Failed initialization must neither evict another client's identity
+        // nor hand this client a session whose handshake never completed.
+        let new_session_id = if response
+            .as_ref()
+            .is_some_and(|response| response.error.is_none() && response.result.is_some())
+            && let Some(state) = pending_session
+        {
+            let principal = http_sessions::principal_digest(header_value(&req, "authorization"));
+            let Some((id, _)) = self.http_sessions.create_with_state(principal, state) else {
+                let error = http_sessions::SessionResolutionError::Unavailable;
+                return self.error_response(&req, error.status(), error.message());
+            };
+            Some(id)
+        } else {
+            None
+        };
+        let response = response.map_or_else(
+            || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
+            |resp| HttpResponse::ok().with_json(&resp),
+        );
 
         let mut out = to_http1_response(
             response,
@@ -13014,25 +13033,39 @@ impl HttpState {
     /// starts a session whose id is returned to the client; any other request
     /// joins the live session named by its `Mcp-Session-Id` header, provided
     /// it carries the same authorization the session was created under.
-    /// Otherwise the request is stateless, exactly as with the feature off.
+    /// An explicit but unavailable session is an HTTP 404, never a stateless
+    /// fallback that loses actor restrictions. Headerless non-initialization
+    /// requests retain the trusted-local behavior of this opt-in feature.
     fn resolve_mcp_session(
         &self,
         req: &Http1Request,
         request: &JsonRpcRequest,
-    ) -> (Option<SessionState>, Option<String>) {
+    ) -> Result<(Option<SessionState>, bool), http_sessions::SessionResolutionError> {
+        use http_sessions::SessionResolutionError;
+
         if !self.config.messaging_session_identity {
-            return (None, None);
+            return Ok((None, false));
         }
         let principal = http_sessions::principal_digest(header_value(req, "authorization"));
-        if request.method == "initialize" {
-            return self
+        if let Some(id) = header_value(req, http_sessions::MCP_SESSION_ID_HEADER) {
+            let state = self
                 .http_sessions
-                .create(principal)
-                .map_or((None, None), |(id, state)| (Some(state), Some(id)));
+                .lookup(id, principal)
+                .ok_or(SessionResolutionError::NotFound)?;
+            if request.method == "initialize" {
+                // Never replace a session's bound identity merely because an
+                // existing client repeats initialize with its current header.
+                return Err(SessionResolutionError::AlreadyInitialized);
+            }
+            return Ok((Some(state), false));
         }
-        let state = header_value(req, http_sessions::MCP_SESSION_ID_HEADER)
-            .and_then(|id| self.http_sessions.lookup(id, principal));
-        (state, None)
+        if request.method == "initialize" {
+            if request.id.is_none() {
+                return Err(SessionResolutionError::InitializationRequiresRequest);
+            }
+            return Ok((Some(SessionState::new()), true));
+        }
+        Ok((None, false))
     }
 
     fn emit_http_request_log(
@@ -29472,16 +29505,23 @@ first body
                     .expect("initialize mints a session id")
                     .to_string();
 
-                for (header, expected) in [
-                    (Some(session.as_str()), true),
-                    (None, false),
-                    (Some("unknown-session"), false),
-                ] {
+                for (header, expected) in [(Some(session.as_str()), true), (None, false)] {
                     let (failed, presence) =
                         tool("session_state_probe", serde_json::json!({}), 10, header);
                     assert!(!failed, "{presence}");
                     assert_eq!(presence["has_session_state"], expected);
                 }
+                assert_eq!(
+                    post(
+                        "tools/list",
+                        serde_json::json!({}),
+                        12,
+                        Some("unknown-session")
+                    )
+                    .status,
+                    404,
+                    "an explicit unknown session must not become stateless"
+                );
 
                 let (failed, project) = tool(
                     "ensure_project",
@@ -29548,18 +29588,182 @@ first body
                 );
                 end.body = Vec::new();
                 assert_eq!(block_on(state.handle(end)).status, 204);
-                let (failed, _) = tool("send_message", send_args, 9, Some(&session));
-                assert!(failed, "an ended session has no identity");
-                let (failed, presence) = tool(
-                    "session_state_probe",
-                    serde_json::json!({}),
-                    11,
+                let refused = post(
+                    "tools/call",
+                    serde_json::json!({
+                        "name": "set_contact_policy",
+                        "arguments": {
+                            "project_key": project_key,
+                            "agent_name": bob,
+                            "policy": "block_all",
+                        },
+                    }),
+                    9,
                     Some(&session),
                 );
-                assert!(!failed, "{presence}");
-                assert_eq!(presence["has_session_state"], false);
+                assert_eq!(refused.status, 404, "an ended session cannot run tools");
+                let (failed, agents) = tool(
+                    "list_agents",
+                    serde_json::json!({"project_key": project_key}),
+                    11,
+                    None,
+                );
+                assert!(!failed, "{agents}");
+                let profile = agents
+                    .as_array()
+                    .expect("agent list")
+                    .iter()
+                    .find(|agent| agent["name"].as_str() == Some(bob.as_str()))
+                    .expect("Bob remains registered");
+                assert_eq!(
+                    profile["contact_policy"], "open",
+                    "refusal must not mutate Bob"
+                );
             },
         );
+    }
+
+    #[test]
+    fn opt_in_http_sessions_reject_unavailable_ids_before_dispatch() {
+        for scenario in ["unknown", "expired", "evicted", "principal", "restart"] {
+            let mut state = build_state(mcp_agent_mail_core::Config {
+                messaging_session_identity: true,
+                http_rbac_enabled: false,
+                http_bearer_token: None,
+                http_jwt_enabled: false,
+                http_cors_origins: vec!["https://client.example".to_string()],
+                ..Default::default()
+            });
+            let ttl = if scenario == "expired" {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(60)
+            };
+            state.http_sessions = http_sessions::HttpSessionRegistry::with_limits(1, ttl);
+            let principal = http_sessions::principal_digest(None);
+            let (id, _) = state.http_sessions.create(principal).expect("session");
+            if scenario == "evicted" {
+                state.http_sessions.create(principal).expect("new session");
+            } else if scenario == "restart" {
+                state.http_sessions = http_sessions::HttpSessionRegistry::default();
+            }
+            let supplied_id = if scenario == "unknown" {
+                "missing"
+            } else {
+                &id
+            };
+            let mut headers = vec![
+                ("Mcp-Session-Id", supplied_id),
+                ("Origin", "https://client.example"),
+            ];
+            if scenario == "principal" {
+                headers.push(("Authorization", "Bearer different-principal"));
+            }
+            let mut req = make_request(Http1Method::Post, "/api", &headers);
+            req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 1_i64))
+                .expect("serialize request");
+            let resp = block_on(state.handle(req));
+            assert_eq!(resp.status, 404, "{scenario}");
+            assert_eq!(response_header(&resp, "mcp-session-id"), None, "{scenario}");
+            assert_eq!(
+                response_header(&resp, "access-control-allow-origin"),
+                Some("https://client.example"),
+                "session errors must preserve CORS: {scenario}"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("error body");
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("initialize")),
+                "client must be told to initialize again: {scenario}: {body}"
+            );
+
+            let mut stateless = make_request(Http1Method::Post, "/api", &[]);
+            stateless.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 2_i64))
+                .expect("serialize stateless request");
+            assert_eq!(block_on(state.handle(stateless)).status, 200, "{scenario}");
+        }
+    }
+
+    #[test]
+    fn opt_in_http_sessions_publish_only_successful_initialization() {
+        let mut state = build_state(mcp_agent_mail_core::Config {
+            messaging_session_identity: true,
+            http_rbac_enabled: false,
+            http_bearer_token: None,
+            http_jwt_enabled: false,
+            ..Default::default()
+        });
+        state.http_sessions =
+            http_sessions::HttpSessionRegistry::with_limits(1, Duration::from_secs(60));
+        let principal = http_sessions::principal_digest(None);
+        let (original, original_state) = state.http_sessions.create(principal).expect("session");
+        original_state.set("preserved", 7_i64);
+        let post = |request: &JsonRpcRequest, session: Option<&str>| {
+            let headers: Vec<(&str, &str)> = session
+                .map(|id| vec![("Mcp-Session-Id", id)])
+                .unwrap_or_default();
+            let mut req = make_request(Http1Method::Post, "/api", &headers);
+            req.body = serde_json::to_vec(request).expect("serialize request");
+            block_on(state.handle(req))
+        };
+        let valid_params = serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "session-test", "version": "1"},
+        });
+        let invalid = JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": 7,
+                "capabilities": {},
+                "clientInfo": {"name": "session-test", "version": "1"},
+            })),
+            1_i64,
+        );
+        let failed = post(&invalid, None);
+        assert_eq!(failed.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&failed.body).expect("json-rpc error");
+        assert!(body.get("error").is_some(), "{body}");
+        assert_eq!(response_header(&failed, "mcp-session-id"), None);
+
+        let notification = JsonRpcRequest::notification("initialize", Some(valid_params.clone()));
+        assert_eq!(post(&notification, None).status, 400);
+        let initialize = JsonRpcRequest::new("initialize", Some(valid_params), 2_i64);
+        assert_eq!(post(&initialize, Some(&original)).status, 400);
+        assert_eq!(post(&initialize, Some("missing")).status, 404);
+        assert_eq!(
+            state
+                .http_sessions
+                .lookup(&original, principal)
+                .expect("failed handshakes must not evict live sessions")
+                .get::<i64>("preserved"),
+            Some(7)
+        );
+
+        let successful = post(&initialize, None);
+        assert_eq!(successful.status, 200);
+        let new_id = response_header(&successful, "mcp-session-id").expect("new session");
+        assert_ne!(new_id, original);
+        assert!(state.http_sessions.lookup(new_id, principal).is_some());
+        assert!(state.http_sessions.lookup(&original, principal).is_none());
+    }
+
+    #[test]
+    fn disabled_http_sessions_keep_stateless_header_behavior() {
+        let state = build_state(mcp_agent_mail_core::Config {
+            messaging_session_identity: false,
+            http_rbac_enabled: false,
+            http_bearer_token: None,
+            http_jwt_enabled: false,
+            ..Default::default()
+        });
+        let mut req = make_request(Http1Method::Post, "/api", &[("Mcp-Session-Id", "ignored")]);
+        req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 1_i64))
+            .expect("serialize request");
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert_eq!(response_header(&resp, "mcp-session-id"), None);
     }
 
     #[test]

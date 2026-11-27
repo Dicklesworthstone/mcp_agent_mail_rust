@@ -712,8 +712,12 @@ transcript:
   requests that send it back (over any connection) share the session, and
   `DELETE` on the MCP endpoint with the header ends it. A session is tied to the
   `Authorization` it was created under: another credential, an unknown id or an
-  expired id (24 h idle) gets a stateless request. Sessions live in memory, so a
-  restart ends them. Bearer/JWT authorization is still checked on every request:
+  expired id (24 h idle) receives HTTP 404 before any tool runs. Sessions live in
+  memory, so a restart ends them. On 404, initialize again without the old session
+  header, then establish the identities the new session will act as. Failed
+  initialization never creates a session or evicts a live one. Requests without
+  a session header retain the default stateless behavior. Bearer/JWT authorization
+  is still checked on every request:
   this is identity context inside an authorized connection, not authentication.
 - **Binding.** `create_agent_identity` (use `return_registration_token: false`
   to keep the token out of the transcript) binds the new agent, and so does a
