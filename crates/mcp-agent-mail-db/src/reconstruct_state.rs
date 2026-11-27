@@ -442,25 +442,32 @@ fn resolve_assignment_message(
     }
     // A canonical ID can collide with a different archived generation. Accept
     // one complete matching identity; never assign a move by numeric ID alone.
-    let candidates = conn
-        .query_sync(&format!("{select} ORDER BY id LIMIT 3"), &params[..4])
-        .map_err(error)?;
-    if candidates.len() >= 3 {
-        return Err(error("thread assignment message identity is ambiguous"));
-    }
+    // Imported messages can share coarse headers. Check every candidate's
+    // body, holding only one page of bodies, until uniqueness is decided.
+    let scan = format!("{select} AND id >= ? ORDER BY id LIMIT 4");
+    let mut params = params;
+    let mut next_id = Some(i64::MIN);
     let mut matched = None;
-    for row in candidates {
-        if let Some(body) =
-            assignment_message_body(record, row.get_named("body_md").map_err(error)?)
-        {
-            if matched.is_some() {
-                return Err(error("thread assignment message identity is ambiguous"));
+    while let Some(first_id) = next_id {
+        params[4] = Value::BigInt(first_id);
+        let rows = conn.query_sync(&scan, &params).map_err(error)?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            let id = row.get_named::<i64>("id").map_err(error)?;
+            next_id = id.checked_add(1);
+            if id == record.message_id {
+                continue; // The exact-ID lookup already ruled out this body.
             }
-            matched = Some((
-                row.get_named("id").map_err(error)?,
-                body,
-                row.get_named("thread_id").map_err(error)?,
-            ));
+            if let Some(body) =
+                assignment_message_body(record, row.get_named("body_md").map_err(error)?)
+            {
+                if matched.is_some() {
+                    return Err(error("thread assignment message identity is ambiguous"));
+                }
+                matched = Some((id, body, row.get_named("thread_id").map_err(error)?));
+            }
         }
     }
     matched.ok_or_else(|| {
@@ -1473,10 +1480,35 @@ mod tests {
         assert_eq!(rows[0].get_named::<String>("body_md").unwrap(), "\n\rbody");
         let remapped = mailbox();
         remapped
-            .execute_raw(
-                "UPDATE messages SET body_md = 'unrelated generation' WHERE id = 4000; \
-             INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
-             SELECT 5000,project_id,sender_id,subject,'body',created_ts FROM messages WHERE id = 4000",
+            .execute_raw("UPDATE messages SET body_md = 'unrelated generation' WHERE id = 4000")
+            .unwrap();
+        for (id, body) in [
+            (4100, "first unrelated body"),
+            (4200, "second unrelated body"),
+            (4300, "third unrelated body"),
+            (5000, "body"),
+            (i64::MAX, "body"),
+        ] {
+            remapped
+                .execute_sync(
+                    "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                     SELECT ?,project_id,sender_id,subject,?,created_ts FROM messages WHERE id = 4000",
+                    &[Value::BigInt(id), Value::Text(body.to_string())],
+                )
+                .unwrap();
+        }
+        let ambiguity = restore_thread_assignment(&remapped, assignment.clone()).unwrap_err();
+        assert!(ambiguity.to_string().contains("identity is ambiguous"));
+        assert!(
+            remapped
+                .query_sync("SELECT message_id FROM message_thread_assignments", &[])
+                .unwrap()
+                .is_empty()
+        );
+        remapped
+            .execute_sync(
+                "UPDATE messages SET body_md = 'different final body' WHERE id = ?",
+                &[Value::BigInt(i64::MAX)],
             )
             .unwrap();
         restore_thread_assignment(&remapped, assignment.clone()).unwrap();
