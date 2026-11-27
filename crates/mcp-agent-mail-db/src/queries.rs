@@ -20162,6 +20162,22 @@ pub async fn is_contact_allowed(
 // Product Queries
 // =============================================================================
 
+fn validate_product_name(
+    product: &ProductRow,
+    requested_name: Option<&str>,
+) -> crate::DbResult<()> {
+    if requested_name.is_some_and(|name| name != product.name) {
+        return Err(DbError::InvalidArgument {
+            field: "name",
+            message: format!(
+                "product uid {:?} is already bound to name {:?}; ensure_product does not rename products",
+                product.product_uid, product.name
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Ensure product exists, creating if necessary.
 ///
 /// Note: Uses raw SQL with explicit columns instead of select!() macro due to
@@ -20195,7 +20211,12 @@ pub async fn ensure_product(
         Outcome::Ok(rows) => {
             if let Some(r) = rows.first() {
                 match decode_product_row_indexed(r) {
-                    Ok(row) => return Outcome::Ok(row),
+                    Ok(row) => {
+                        if let Err(error) = validate_product_name(&row, name) {
+                            return Outcome::Err(error);
+                        }
+                        return Outcome::Ok(row);
+                    }
                     Err(e) => return Outcome::Err(e),
                 }
             }
@@ -20244,6 +20265,10 @@ pub async fn ensure_product(
                         return Outcome::Err(err);
                     }
                 };
+                if let Err(error) = validate_product_name(&fresh, name) {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
                 try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
                 Outcome::Ok(fresh)
             })
@@ -20346,6 +20371,7 @@ fn parse_unknown_product_placeholder(key: &str) -> Option<i64> {
 }
 
 /// Get product by key (product_uid, name, or orphaned placeholder id).
+/// A name equal to another product's uid is ambiguous and never selects a scope.
 pub async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> Outcome<ProductRow, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -20357,11 +20383,19 @@ pub async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> Outcome<Pr
     let tracked = tracked(&*conn);
 
     let select_sql = "SELECT id, product_uid, name, created_at \
-                      FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
+                      FROM products WHERE product_uid = ? OR name = ? LIMIT 2";
     let select_params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
 
     match map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await) {
         Outcome::Ok(rows) => {
+            if rows.len() > 1 {
+                return Outcome::Err(DbError::InvalidArgument {
+                    field: "product_key",
+                    message: format!(
+                        "{key:?} matches different products by uid and name; use an unambiguous product identifier"
+                    ),
+                });
+            }
             if let Some(row) = rows.first() {
                 return match decode_product_row_indexed(row) {
                     Ok(row) => Outcome::Ok(row),
@@ -44647,6 +44681,77 @@ mod tests {
             assert_eq!(lookup.id, Some(project_id));
             assert_eq!(lookup.slug, format!("[unknown-project-{project_id}]"));
             assert_eq!(lookup.human_key, format!("[unknown-project-{project_id}]"));
+        });
+    }
+
+    #[test]
+    fn product_key_rejects_cross_column_scope_collision() {
+        let (cx, pool, _dir) = setup_test_pool("product-key-scope-collision.db");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let first = ensure_product(&cx, &pool, Some("first-uid"), Some("shared-key"))
+                .await
+                .into_result()
+                .unwrap();
+            let second = ensure_product(&cx, &pool, Some("shared-key"), Some("Second product"))
+                .await
+                .into_result()
+                .unwrap();
+            assert_ne!(first.id, second.id);
+            assert!(matches!(
+                get_product_by_key(&cx, &pool, "shared-key").await,
+                Outcome::Err(DbError::InvalidArgument {
+                    field: "product_key",
+                    ..
+                })
+            ));
+            assert_eq!(
+                get_product_by_key(&cx, &pool, "Second product")
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .id,
+                second.id
+            );
+            let self_named = ensure_product(&cx, &pool, Some("same-key"), Some("same-key"))
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                get_product_by_key(&cx, &pool, "same-key")
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .id,
+                self_named.id,
+                "one row matching both columns is unambiguous"
+            );
+        });
+    }
+
+    #[test]
+    fn ensure_product_rejects_conflicting_name_for_existing_uid() {
+        let (cx, pool, _dir) = setup_test_pool("product-name-binding.db");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let first = ensure_product(&cx, &pool, Some("stable-uid"), Some("Original name"))
+                .await
+                .into_result()
+                .unwrap();
+            assert!(matches!(
+                ensure_product(&cx, &pool, Some("stable-uid"), Some("Different name")).await,
+                Outcome::Err(DbError::InvalidArgument { field: "name", .. })
+            ));
+            let again = ensure_product(&cx, &pool, Some("stable-uid"), None)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(again.id, first.id);
+            assert_eq!(again.name, "Original name");
         });
     }
 

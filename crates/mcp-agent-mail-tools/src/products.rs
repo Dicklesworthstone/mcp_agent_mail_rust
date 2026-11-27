@@ -349,22 +349,16 @@ pub async fn ensure_product(
     }
 
     let pool = get_db_pool_for_request(ctx)?;
-    if let Some(existing) = get_product_by_key(ctx.cx(), &pool, key_raw).await? {
-        let response = ProductResponse {
-            id: existing.id.unwrap_or(0),
-            product_uid: existing.product_uid,
-            name: existing.name,
-            created_at: micros_to_iso(existing.created_at),
-        };
-        return serde_json::to_string(&response)
-            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
-    }
-
+    let requested_uid = product_key
+        .as_deref()
+        .filter(|key| is_hex_uid(key))
+        .map(|key| key.trim().to_ascii_lowercase());
+    let lookup_key = requested_uid.as_deref().unwrap_or(key_raw);
+    let existing_by_key = get_product_by_key(ctx.cx(), &pool, lookup_key).await?;
     let now = mcp_agent_mail_db::now_micros();
-    let uid = match product_key.as_deref() {
-        Some(pk) if is_hex_uid(pk) => pk.trim().to_ascii_lowercase(),
-        _ => generate_product_uid(now),
-    };
+    let mut uid = requested_uid
+        .clone()
+        .unwrap_or_else(|| generate_product_uid(now));
     let display_name_raw = name.as_deref().unwrap_or(key_raw);
     let mut display_name = collapse_whitespace(display_name_raw)
         .chars()
@@ -378,24 +372,40 @@ pub async fn ensure_product(
     // "core-suite", name "Core Suite") misses the lookup above; without this
     // a repeat call would collide with the UNIQUE name instead of returning
     // the product it created.
-    let existing_by_name = if display_name == key_raw {
-        None
-    } else {
+    let existing_by_name = if existing_by_key.is_none() && display_name != lookup_key {
         get_product_by_key(ctx.cx(), &pool, &display_name).await?
-    };
-    let row = if let Some(existing) = existing_by_name {
-        existing
     } else {
-        db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::ensure_product(
-                ctx.cx(),
-                &pool,
-                Some(uid.as_str()),
-                Some(display_name.as_str()),
-            )
-            .await,
-        )?
+        None
     };
+    if let Some(existing) = existing_by_key.or(existing_by_name) {
+        if requested_uid
+            .as_deref()
+            .is_some_and(|requested| requested != existing.product_uid)
+        {
+            return Err(db_error_to_mcp_error(DbError::InvalidArgument {
+                field: "product_key",
+                message: format!(
+                    "requested product uid {uid:?} conflicts with product {:?} ({:?})",
+                    existing.product_uid, existing.name
+                ),
+            }));
+        }
+        uid = existing.product_uid;
+        if name.is_none() {
+            display_name = existing.name;
+        }
+    }
+    // Existing products also use the mutation helper so every path validates
+    // the stable uid/name binding.
+    let row = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::ensure_product(
+            ctx.cx(),
+            &pool,
+            Some(uid.as_str()),
+            Some(display_name.as_str()),
+        )
+        .await,
+    )?;
 
     let response = ProductResponse {
         id: row.id.unwrap_or(0),
@@ -2275,6 +2285,65 @@ mod tests {
                     search_product_within(&ctx, &first.product_uid, &inside.slug)
                         .await
                         .expect("a linked project narrows the search");
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn ensure_product_keeps_explicit_uid_bound_to_its_own_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("product-identity.sqlite3");
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                runtime.block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let first: ProductResponse = serde_json::from_str(
+                        &ensure_product(
+                            &ctx,
+                            Some("abcdef1234".to_string()),
+                            Some("My Product".to_string()),
+                        )
+                        .await
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    for (uid, name) in [
+                        ("fedcba4321", "My Product"),
+                        ("abcdef1234", "Different Product"),
+                    ] {
+                        let error =
+                            ensure_product(&ctx, Some(uid.to_string()), Some(name.to_string()))
+                                .await
+                                .expect_err("conflicting uid/name must never select another scope");
+                        assert_eq!(
+                            crate::tool_util::tool_error_code(&error),
+                            Some("INVALID_ARGUMENT")
+                        );
+                    }
+                    let again: ProductResponse = serde_json::from_str(
+                        &ensure_product(&ctx, Some("ABCDEF1234".to_string()), None)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(again.id, first.id);
+                    assert_eq!(again.name, "My Product");
+                    let pool = seed_pool();
+                    assert!(matches!(
+                        mcp_agent_mail_db::queries::get_product_by_uid(&cx, &pool, "fedcba4321")
+                            .await,
+                        Outcome::Err(DbError::NotFound { .. })
+                    ));
                 });
             },
         );

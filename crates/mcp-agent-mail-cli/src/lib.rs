@@ -63273,6 +63273,54 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn products_local_ensure_preserves_uid_name_binding_and_label_retries() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let (db_path, _, _, _) = seed_products_cli_db(&root);
+        let pool = mcp_agent_mail_db::DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(root.path().to_path_buf()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = asupersync::Cx::for_request();
+        runtime.block_on(async {
+            let first = ensure_product_local(&cx, &pool, Some("suite-key"), Some("My   Suite"))
+                .await
+                .unwrap();
+            let again = ensure_product_local(&cx, &pool, Some("suite-key"), Some("My Suite"))
+                .await
+                .unwrap();
+            assert_eq!(again.id, first.id);
+            assert_eq!(again.name, "My Suite");
+            assert!(
+                ensure_product_local(&cx, &pool, Some("abcdef1234"), Some("My Suite"))
+                    .await
+                    .is_err()
+            );
+            let upper = first.product_uid.to_ascii_uppercase();
+            let by_uid = ensure_product_local(&cx, &pool, Some(&upper), None)
+                .await
+                .unwrap();
+            assert_eq!(by_uid.id, first.id);
+            assert!(
+                ensure_product_local(&cx, &pool, Some(&first.product_uid), Some("Another Suite"))
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
     fn products_local_parity_smoke_json() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
@@ -102839,15 +102887,15 @@ async fn ensure_product_local(
         return Err(CliError::ExitCode(2));
     }
 
-    if let Some(existing) = get_product_by_key(cx, pool, key_raw).await? {
-        return Ok(existing);
-    }
-
+    let requested_uid = product_key
+        .filter(|key| is_hex_uid(key))
+        .map(|key| key.trim().to_ascii_lowercase());
+    let lookup_key = requested_uid.as_deref().unwrap_or(key_raw);
+    let existing_by_key = get_product_by_key(cx, pool, lookup_key).await?;
     let now = mcp_agent_mail_db::now_micros();
-    let uid = match product_key {
-        Some(pk) if is_hex_uid(pk) => pk.trim().to_ascii_lowercase(),
-        _ => generate_product_uid(now),
-    };
+    let mut uid = requested_uid
+        .clone()
+        .unwrap_or_else(|| generate_product_uid(now));
     let display_name_raw = name.unwrap_or(key_raw);
     let mut display_name = collapse_whitespace(display_name_raw)
         .chars()
@@ -102855,6 +102903,27 @@ async fn ensure_product_local(
         .collect::<String>();
     if display_name.is_empty() {
         display_name = uid.clone();
+    }
+
+    let existing_by_name = if existing_by_key.is_none() && display_name != lookup_key {
+        get_product_by_key(cx, pool, &display_name).await?
+    } else {
+        None
+    };
+    if let Some(existing) = existing_by_key.or(existing_by_name) {
+        if requested_uid
+            .as_deref()
+            .is_some_and(|requested| requested != existing.product_uid)
+        {
+            return Err(CliError::InvalidArgument(format!(
+                "requested product uid {uid:?} conflicts with product {:?} ({:?})",
+                existing.product_uid, existing.name
+            )));
+        }
+        uid = existing.product_uid;
+        if name.is_none() {
+            display_name = existing.name;
+        }
     }
 
     let out = mcp_agent_mail_db::queries::ensure_product(
