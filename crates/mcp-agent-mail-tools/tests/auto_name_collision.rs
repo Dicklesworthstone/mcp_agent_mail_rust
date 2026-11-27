@@ -9,7 +9,7 @@
 //!
 //! These tests pin the fixed semantics:
 //! - auto-name collision redraws and leaves the existing agent untouched;
-//! - redraw exhaustion surfaces a clear CONFLICT error, never a merge;
+//! - exhausted short names spill into fresh identities without reviving retired agents;
 //! - explicit-name re-registration keeps its documented upsert semantics.
 
 use asupersync::Cx;
@@ -17,10 +17,11 @@ use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
-    claim_fresh_auto_named_agent, create_agent_identity, ensure_project, register_agent,
-    tool_util::get_db_pool,
+    claim_fresh_auto_named_agent, create_agent_identity, ensure_project, fetch_inbox,
+    register_agent, retire_agent, send_message, set_contact_policy, tool_util::get_db_pool, whois,
 };
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,6 +36,15 @@ fn unique_suffix() -> u64 {
         .as_micros();
     let time_component = u64::try_from(micros).unwrap_or(u64::MAX);
     time_component.wrapping_add(TEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn flush_archive() {
+    mcp_agent_mail_storage::wbq_flush();
+    assert!(
+        mcp_agent_mail_storage::archive_backlog_flush_blocking(std::time::Duration::from_secs(10)),
+        "archive fallback backlog must drain before reading profiles or restoring the environment"
+    );
+    mcp_agent_mail_storage::flush_async_commits();
 }
 
 fn run_serial_async<F, Fut, T>(f: F) -> T
@@ -60,13 +70,34 @@ where
             let rt = RuntimeBuilder::current_thread()
                 .build()
                 .expect("build runtime");
-            rt.block_on(f(cx))
+            let result = rt.block_on(f(cx));
+            flush_archive();
+            result
         },
     )
 }
 
 fn parse_json(payload: &str) -> Value {
     serde_json::from_str(payload).expect("tool response must be valid JSON")
+}
+
+async fn agent_snapshot(
+    cx: &Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+) -> BTreeMap<String, Value> {
+    mcp_agent_mail_db::queries::list_agents(cx, pool, project_id)
+        .await
+        .into_result()
+        .expect("read all agent rows, including retired identities")
+        .into_iter()
+        .map(|agent| {
+            (
+                agent.name.to_ascii_lowercase(),
+                serde_json::to_value(agent).expect("serialize complete agent row"),
+            )
+        })
+        .collect()
 }
 
 async fn register_explicit(
@@ -167,10 +198,10 @@ fn auto_name_collision_redraws_without_touching_existing_agent() {
     });
 }
 
-/// Redraw exhaustion (every draw collides) must surface a clear CONFLICT
-/// error — and still never mutate the existing agent.
+/// GH#415: even a drawer stuck on an occupied retired name must allocate a
+/// fresh identity. Retirement, credentials, and the entire old profile stay intact.
 #[test]
-fn auto_name_exhaustion_errors_instead_of_merging() {
+fn auto_name_exhaustion_allocates_without_reviving_retired_agent() {
     run_serial_async(|cx| async move {
         let project_key = format!("/tmp/auto-name-exhaustion-{}", unique_suffix());
         let ctx = McpContext::new(cx.clone(), 1);
@@ -192,8 +223,28 @@ fn auto_name_exhaustion_errors_instead_of_merging() {
         .await;
         let core_id = core["id"].as_i64().expect("core agent id");
 
+        retire_agent(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            Some(
+                core["registration_token"]
+                    .as_str()
+                    .expect("original credential")
+                    .to_string(),
+            ),
+            None,
+            None,
+            Some("http".to_string()),
+        )
+        .await
+        .expect("retire the original identity using its own credential");
+
         let pool = get_db_pool().expect("db pool");
-        let err = claim_fresh_auto_named_agent(
+        let before = agent_snapshot(&cx, &pool, project_id).await;
+        assert!(before["bluelake"]["retired_at"].is_i64());
+        let mut short_redraws = 0;
+        let row = claim_fresh_auto_named_agent(
             &ctx,
             &pool,
             &project_key,
@@ -204,35 +255,34 @@ fn auto_name_exhaustion_errors_instead_of_merging() {
             "auto",
             None,
             "BlueLake".to_string(),
-            || "BlueLake".to_string(),
+            || {
+                short_redraws += 1;
+                "bluelake".to_string()
+            },
         )
         .await
-        .expect_err("exhausted namespace must error, never merge");
+        .expect("exhausted short names must spill into a fresh identity");
 
-        let error_type = err
-            .data
-            .as_ref()
-            .and_then(Value::as_object)
-            .and_then(|root| root.get("error"))
-            .and_then(|e| e.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        assert_eq!(error_type, "CONFLICT", "exhaustion error code");
         assert!(
-            err.message.contains("auto-generate"),
-            "message should explain the auto-name exhaustion: {}",
-            err.message
+            short_redraws <= 3,
+            "repeated short names must not extend the four-draw budget"
         );
-
-        let existing =
-            match mcp_agent_mail_db::queries::get_agent(&cx, &pool, project_id, "BlueLake").await {
-                asupersync::Outcome::Ok(agent) => agent,
-                other => panic!("get_agent(BlueLake) failed: {other:?}"),
-            };
-        assert_eq!(existing.id, Some(core_id));
-        assert_eq!(existing.program, "wsl2-trial-core");
-        assert_eq!(existing.task_description, "core work");
+        assert_ne!(
+            row.id,
+            Some(core_id),
+            "retirement never frees the old identity"
+        );
+        assert!(row.retired_at.is_none());
+        assert!(
+            row.name.contains('-'),
+            "overflow must leave the short-name pool"
+        );
+        assert!(mcp_agent_mail_core::models::is_valid_agent_name(&row.name));
+        assert_eq!(row.program, "wsl2-trial-fleet");
+        assert_eq!(row.task_description, "phase1 R2-25");
+        let after = agent_snapshot(&cx, &pool, project_id).await;
+        assert_eq!(after["bluelake"], before["bluelake"]);
+        assert_eq!(after.len(), before.len() + 1);
     });
 }
 
@@ -316,7 +366,7 @@ fn register_agent_without_name_never_reuses_existing_row() {
             mcp_agent_mail_core::models::is_valid_agent_name(
                 auto["name"].as_str().unwrap_or_default()
             ),
-            "auto-generated name must be a valid adjective+noun name"
+            "auto-generated name must be a valid agent identifier"
         );
 
         let pool = get_db_pool().expect("db pool");
@@ -331,15 +381,14 @@ fn register_agent_without_name_never_reuses_existing_row() {
     });
 }
 
-/// GH#213 for `create_agent_identity`: without a hint it drew one random name
-/// and failed with "already exists ... omit the name" when that draw hit an
-/// agent of the project. A quarter of the name space is taken here, so one
-/// unretried draw fails about one creation in four (30 creations all
-/// succeeding that way: ~2e-4); with redraws every creation succeeds.
+/// GH#415: both public identity tools must remain usable after every short
+/// adjective+noun name is occupied. Most occupants are retired, as in the
+/// reporter's long-lived project, and none may be reassigned or revived.
 #[test]
-fn create_agent_identity_without_hint_redraws_past_taken_names() {
+#[allow(clippy::too_many_lines)]
+fn identity_tools_work_after_full_short_name_exhaustion() {
     run_serial_async(|cx| async move {
-        let project_key = format!("/tmp/crowded-identities-{}", unique_suffix());
+        let project_key = format!("/tmp/exhausted-identities-{}", unique_suffix());
         let ctx = McpContext::new(cx.clone(), 1);
         let project = parse_json(
             &ensure_project(&ctx, project_key.clone(), None)
@@ -355,8 +404,12 @@ fn create_agent_identity_without_hint_redraws_past_taken_names() {
                     .iter()
                     .map(move |noun| format!("{adjective}{noun}"))
             })
-            .filter_map(|raw| mcp_agent_mail_core::models::normalize_agent_name(&raw))
-            .step_by(4)
+            .map(|raw| {
+                mcp_agent_mail_core::models::normalize_agent_name(&raw)
+                    .expect("every generator vocabulary pair is valid")
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         let pool = get_db_pool().expect("db pool");
         let conn = pool.acquire(&cx).await.into_result().expect("checkout");
@@ -364,43 +417,207 @@ fn create_agent_identity_without_hint_redraws_past_taken_names() {
         for chunk in taken.chunks(200) {
             let values = chunk
                 .iter()
-                .map(|name| format!("({project_id}, '{name}', 'seed', 'seed', '', 1, 1)"))
+                .enumerate()
+                .map(|(index, name)| {
+                    let retired_at = if index % 5 == 0 { "NULL" } else { "42" };
+                    format!(
+                        "({project_id}, '{name}', 'seed', 'seed', 'original task', \
+                         1, 1, 'file', 'block_all', 1, 'original-{name}', {retired_at})"
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             conn.execute_raw(&format!(
                 "INSERT INTO agents (project_id, name, program, model, task_description, \
-                 inception_ts, last_active_ts) VALUES {values}"
+                 inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                 reaper_exempt, registration_token, retired_at) VALUES {values}"
             ))
             .expect("seed taken names");
         }
         conn.execute_raw("COMMIT").expect("commit seed");
         drop(conn);
-        let taken: std::collections::HashSet<String> =
-            taken.iter().map(|name| name.to_ascii_lowercase()).collect();
+        let before = agent_snapshot(&cx, &pool, project_id).await;
+        assert_eq!(
+            before.len(),
+            taken.len(),
+            "the entire short-name pool is occupied"
+        );
 
-        let mut created = std::collections::HashSet::new();
-        for _ in 0..30 {
-            let identity = parse_json(
-                &create_agent_identity(
+        let registered = parse_json(
+            &register_agent(
+                &ctx,
+                project_key.clone(),
+                "register-fleet".to_string(),
+                "opus-4.5".to_string(),
+                None,
+                Some("fresh registration".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("register_agent must outgrow the fully occupied vocabulary"),
+        );
+        let created = parse_json(
+            &create_agent_identity(
+                &ctx,
+                project_key.clone(),
+                "create-fleet".to_string(),
+                "opus-4.5".to_string(),
+                None,
+                Some("fresh identity".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create_agent_identity must outgrow the fully occupied vocabulary"),
+        );
+        assert_ne!(registered["id"], created["id"]);
+        assert_ne!(registered["name"], created["name"]);
+        assert_ne!(
+            registered["registration_token"],
+            created["registration_token"]
+        );
+
+        flush_archive();
+        for identity in [&registered, &created] {
+            let name = identity["name"].as_str().expect("agent name");
+            let id = identity["id"].as_i64().expect("new agent id");
+            assert!(!before.contains_key(&name.to_ascii_lowercase()));
+            assert!(name.contains('-'), "all short names are already occupied");
+            assert!(mcp_agent_mail_core::models::is_valid_agent_name(name));
+            assert!(identity["retired_at"].is_null());
+            let persisted = mcp_agent_mail_db::queries::get_agent_by_id_fresh(&cx, &pool, id)
+                .await
+                .into_result()
+                .expect("fresh identity is durably registered");
+            let token = identity["registration_token"]
+                .as_str()
+                .expect("new credential");
+            assert!(!token.is_empty());
+            assert_eq!(persisted.registration_token.as_deref(), Some(token));
+            let profile = parse_json(
+                &whois(
                     &ctx,
                     project_key.clone(),
-                    "crowded-fleet".to_string(),
-                    "opus-4.5".to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    name.to_ascii_uppercase(),
                     Some(false),
+                    None,
                 )
                 .await
-                .expect("a random draw that hits a taken name must be redrawn, not fail"),
+                .expect("overflow identity resolves case-insensitively"),
             );
-            let name = identity["name"].as_str().expect("agent name").to_string();
-            let lower = name.to_ascii_lowercase();
-            assert!(!taken.contains(&lower), "{name} was already taken");
-            assert!(created.insert(lower), "{name} was handed out twice");
+            assert_eq!(profile["id"], identity["id"]);
+            assert_eq!(profile["name"], identity["name"]);
+
+            let profile_path = Config::get()
+                .storage_root
+                .join("projects")
+                .join(project["slug"].as_str().expect("project slug"))
+                .join("agents")
+                .join(name)
+                .join("profile.json");
+            let archived = parse_json(
+                &std::fs::read_to_string(profile_path).expect("overflow profile was archived"),
+            );
+            assert_eq!(archived["name"], identity["name"]);
+            assert_eq!(archived["program"], identity["program"]);
+        }
+
+        let sender = registered["name"].as_str().expect("sender name");
+        let recipient = created["name"].as_str().expect("recipient name");
+        set_contact_policy(
+            &ctx,
+            project_key.clone(),
+            recipient.to_string(),
+            "open".to_string(),
+        )
+        .await
+        .expect("open the fresh recipient to direct mail");
+        let sent = parse_json(
+            &send_message(
+                &ctx,
+                project_key.clone(),
+                sender.to_ascii_lowercase(),
+                vec![recipient.to_ascii_uppercase()],
+                "Overflow identities can communicate".to_string(),
+                "Fresh mail after vocabulary exhaustion.".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(
+                    registered["registration_token"]
+                        .as_str()
+                        .expect("sender token")
+                        .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("an overflow identity can send with its own credential"),
+        );
+        assert_eq!(sent["verified_sender"], true);
+        assert_eq!(sent["count"], 1);
+        let inbox = parse_json(
+            &fetch_inbox(
+                &ctx,
+                project_key.clone(),
+                recipient.to_ascii_uppercase(),
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                Some(false),
+            )
+            .await
+            .expect("overflow recipient can retrieve its mail"),
+        );
+        let messages = inbox.as_array().expect("inbox messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["from"], registered["name"]);
+        assert_eq!(
+            messages[0]["body_md"],
+            "Fresh mail after vocabulary exhaustion."
+        );
+
+        let resumed = register_explicit(
+            &ctx,
+            &project_key,
+            &recipient.to_ascii_uppercase(),
+            "resumed-worker",
+            "next task",
+        )
+        .await;
+        assert_eq!(resumed["id"], created["id"]);
+        assert_eq!(resumed["name"], created["name"]);
+        assert_eq!(resumed["program"], "resumed-worker");
+
+        let mut after = agent_snapshot(&cx, &pool, project_id).await;
+        assert_eq!(after.len(), before.len() + 2);
+        after.remove(&sender.to_ascii_lowercase());
+        after.remove(&recipient.to_ascii_lowercase());
+        for (name, original) in &before {
+            assert_eq!(
+                after.get(name),
+                Some(original),
+                "existing identity {name}, its credential and lifecycle state must be unchanged"
+            );
         }
     });
 }

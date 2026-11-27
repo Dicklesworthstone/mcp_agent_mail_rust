@@ -242,7 +242,7 @@ fi
 # ===========================================================================
 # Case 4: create_agent_identity generates a valid name
 # ===========================================================================
-e2e_case_banner "create_agent_identity generates a valid AdjectiveNoun name"
+e2e_case_banner "create_agent_identity generates a valid short or extended name"
 
 CREATE_ID_REQS=(
     "$INIT_REQ"
@@ -263,7 +263,7 @@ fi
 
 CREATE_TEXT="$(extract_result "$CREATE_RESP" 40)"
 
-# Parse and validate the generated name matches AdjectiveNoun pattern
+# Parse and validate the short or extended generated name format
 CREATE_CHECK="$(echo "$CREATE_TEXT" | python3 -c "
 import sys, json, re
 try:
@@ -272,9 +272,9 @@ try:
     has_id = 'id' in result and result['id'] > 0
     program = result.get('program', '')
     model = result.get('model', '')
-    # Check AdjectiveNoun pattern: starts with uppercase, has at least two
-    # uppercase-initiated segments (e.g., GoldFox, BlueLake)
-    pattern_match = bool(re.match(r'^[A-Z][a-z]+[A-Z][a-z]+$', name))
+    # Short names use AdjectiveNoun (e.g., GoldFox, BlueLake). After bounded
+    # collisions, the allocator appends '-' and exactly 32 lowercase hex digits.
+    pattern_match = bool(re.fullmatch(r'[A-Z][a-z]+[A-Z][a-z]+(?:-[0-9a-f]{32})?', name))
     is_nonempty = len(name) > 0
     print(f'name={name}|nonempty={is_nonempty}|pattern={pattern_match}|has_id={has_id}|program={program}|model={model}')
 except Exception as e:
@@ -291,9 +291,9 @@ else
 fi
 
 if echo "$CREATE_CHECK" | grep -q "pattern=True"; then
-    e2e_pass "create_agent_identity name matches AdjectiveNoun pattern"
+    e2e_pass "create_agent_identity name matches the generated name format"
 else
-    e2e_fail "create_agent_identity name does not match AdjectiveNoun pattern"
+    e2e_fail "create_agent_identity name does not match the generated name format"
     echo "    result: $CREATE_CHECK"
 fi
 

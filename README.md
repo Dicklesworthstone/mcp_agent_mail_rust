@@ -939,9 +939,22 @@ The original grants remain unchanged; inspect them before making a new attempt.
 ### Agent identities
 
 Omit `name` from `register_agent` (or `name_hint` from `create_agent_identity`)
-to get an automatically generated adjective+noun name such as `GreenLake`.
-For a stable task identity, supply a name such as `app-x-refactor`, `worker_42`,
-or `api.review`.
+to allocate a fresh identity. The allocator tries up to four short adjective+noun
+names such as `GreenLake`. If those draws collide, it switches to names such as
+`GreenLake-0123456789abcdef0123456789abcdef`: a readable prefix followed by
+32 hexadecimal digits from 128 bits of fresh OS randomness. This allows new
+identities even after every short vocabulary name has been used. Each candidate
+is claimed atomically, and the whole allocation is bounded to 16 draws. For a
+stable task identity, supply a name such as `app-x-refactor`, `worker_42`, or
+`api.review`.
+
+Names belonging to live, retired, or deregistered identities remain reserved
+within their project. Automatic allocation preserves their credentials and
+message history and never reuses their rows. Re-registering a retired name does
+not clear its retirement. To resume that particular identity, use the existing
+authenticated `unretire_agent` operation with its `registration_token` (a bound
+tmux pane also authorizes over stdio). Permanently deregistered identities cannot
+be unretired.
 
 Explicit task identifiers start with an ASCII letter or digit, contain at
 least one `.`, `_`, or `-`, and use only ASCII letters, digits, and those
@@ -2308,7 +2321,7 @@ A: This is a ground-up Rust rewrite with the same conceptual model but significa
 A: No. One server handles multiple projects. Each project is identified by its absolute filesystem path as the `project_key`.
 
 **Q: How do agents get their names?**
-A: Agent Mail generates memorable adjective+noun names (e.g., `GreenCastle`, `BlueLake`, `RedHarbor`) when agents register. Agents can also specify a name explicitly.
+A: Agent Mail first tries memorable adjective+noun names (e.g., `GreenCastle`, `BlueLake`, `RedHarbor`). After four colliding draws it adds a 128-bit random hexadecimal suffix, so a crowded or exhausted short-name vocabulary still permits new identities. Agents can also specify a stable task name explicitly; see [Agent identities](#agent-identities).
 
 **Q: Can agents in different repos talk to each other?**
 A: Yes. Either share one `project_key` for both repos (Option A under "Across Different Repos"), or keep separate projects, approve a contact link with `macro_contact_handshake(..., to_project=...)`, and address the other agent as `Name@project` (Option B). The message is stored in the recipient's project, where it reads, acknowledges and replies as usual. A plain name only addresses the sender's own project.

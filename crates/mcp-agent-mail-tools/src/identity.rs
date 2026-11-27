@@ -179,11 +179,16 @@ async fn register_agent_db_with_retry(
     }
 }
 
-/// Maximum fresh-name draws for a no-name `register_agent` before giving up.
+/// Maximum short adjective+noun draws before using the extended namespace.
 ///
-/// The adjective+noun namespace has tens of thousands of combinations, so 16
-/// consecutive collisions only happens when a project's registry is heavily
-/// saturated — at that point a clear error beats an unbounded loop.
+/// Keep readable short names for lightly used projects, but bound the work
+/// spent searching a finite vocabulary that includes retired identities.
+pub const AUTO_NAME_SHORT_DRAWS: u32 = 4;
+
+/// Maximum total candidate draws, including names with a 128-bit random suffix.
+///
+/// The extended namespace keeps allocation practical after every short name
+/// has been used (GH#415). A total budget still bounds pathological collisions.
 pub const AUTO_NAME_MAX_DRAWS: u32 = 16;
 
 /// Claim a FRESH auto-generated agent name (GH#213).
@@ -200,8 +205,11 @@ pub const AUTO_NAME_MAX_DRAWS: u32 = 16;
 /// `DbError::Duplicate` both when the pre-check sees the row and when a
 /// concurrent writer wins the unique `(project_id, name)` constraint — a
 /// SELECT-based/constraint-based detection, deliberately not `changes()`,
-/// which reports 0 under FrankenSQLite). On collision it redraws, bounded by
-/// [`AUTO_NAME_MAX_DRAWS`].
+/// which reports 0 under FrankenSQLite). After [`AUTO_NAME_SHORT_DRAWS`] short
+/// draws, it uses adjective+noun names with independent 128-bit random suffixes.
+/// Both live and retired rows retain their names, credentials and history;
+/// allocation never un-retires or adopts a collided identity. The whole search
+/// remains bounded by [`AUTO_NAME_MAX_DRAWS`].
 ///
 /// The registration proof gate is enforced per candidate name, before any row
 /// is written, preserving the "proof is checked against the final agent name"
@@ -225,7 +233,25 @@ pub async fn claim_fresh_auto_named_agent(
     const CREATE_AGENT_TOOL_RETRIES: u32 = 4;
     let mut tried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut candidate = first_candidate;
-    for _draw in 0..AUTO_NAME_MAX_DRAWS {
+    for draw in 0..AUTO_NAME_MAX_DRAWS {
+        ctx.checkpoint()?;
+        if draw >= AUTO_NAME_SHORT_DRAWS {
+            candidate =
+                mcp_agent_mail_core::models::generate_extended_agent_name().map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Could not generate random agent name suffix: {error}"
+                    ))
+                })?;
+        } else if draw > 0 {
+            candidate = draw_name();
+        }
+        // Case-insensitive uniqueness also applies to candidates within this
+        // request. Repeated draws consume the finite draw budget, not another
+        // database transaction or proof nonce, and cannot delay overflow.
+        if !tried.insert(candidate.to_ascii_lowercase()) {
+            continue;
+        }
+
         // Proof gate per candidate: no-op when disabled, fail-closed (before
         // any DB write) when enabled.
         crate::proof_gate::enforce(
@@ -287,16 +313,6 @@ pub async fn claim_fresh_auto_named_agent(
                     "register_agent: auto-generated name collided with an existing agent; \
                      redrawing instead of merging (GH#213)"
                 );
-                tried.insert(candidate);
-                // Redraw, skipping names this call already saw collide.
-                let mut next = draw_name();
-                for _ in 0..32 {
-                    if !tried.contains(&next) {
-                        break;
-                    }
-                    next = draw_name();
-                }
-                candidate = next;
             }
             Outcome::Err(other) => return Err(db_error_to_mcp_error(other)),
             Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
@@ -312,8 +328,8 @@ pub async fn claim_fresh_auto_named_agent(
     Err(legacy_tool_error(
         "CONFLICT",
         format!(
-            "Could not auto-generate an unused agent name after {AUTO_NAME_MAX_DRAWS} draws; \
-             this project's adjective+noun namespace is heavily used. \
+            "Could not auto-generate an unused agent name after {AUTO_NAME_MAX_DRAWS} draws \
+             across the short and extended namespaces. \
              Retry, or pass an explicit unused `name`."
         ),
         true,
@@ -3177,7 +3193,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create or update an agent identity within a project and persist its profile to Git.\n\nWhen to use\n-----------\n- At the start of a coding session by any automated agent.\n- To update an existing agent's program/model/task metadata and bump last_active.\n\nSemantics\n---------\n- If `name` is omitted, a random adjective+noun name is auto-generated.\n- Reusing the same `name` updates the profile (program/model/task) and\n  refreshes `last_active_ts`.\n- A `profile.json` file is written under `agents/<Name>/` in the project archive.\n\nAgent Naming Rules\n------------------\n- Omit `name` for a random adjective+noun name such as \"GreenLake\" or \"BlueDog\".\n- Explicit names may also be task identifiers such as \"app-x-refactor\", \"worker_42\", or \"api.review\".\n- Task identifiers start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters).\n- Reserved program/model/operator identities, broadcast tokens, template placeholders, '..', trailing dots and device names are rejected.\n- Adjective+noun names normalize to PascalCase; task identifiers retain their spelling.\n- Names are case-insensitive unique within each project; use the canonical name returned by registration.\n\nParameters\n----------\nproject_key : str\n    The same human key you passed to `ensure_project` (or equivalent identifier).\nprogram : str\n    The agent program (e.g., \"codex-cli\", \"claude-code\").\nmodel : str\n    The underlying model (e.g., \"gpt5-codex\", \"opus-4.1\").\nname : Optional[str]\n    An adjective+noun name (e.g., \"BlueLake\") or a safe task identifier (e.g., \"app-x-refactor\").\n    If omitted, a random adjective+noun name is auto-generated.\n    Names are unique per project; passing the same name updates the profile.\ntask_description : str\n    Short description of current focus (shows up in directory listings).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nRegister with auto-generated name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"task_description\":\"Auth refactor\"\n}}}\n```\n\nRegister with explicit task name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"4\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\",\"name\":\"app-x-refactor\",\"task_description\":\"Navbar redesign\"\n}}}\n```\n\nPitfalls\n--------\n- Unsafe or reserved names are rejected before an identity is created.\n- Names are case-insensitive unique. If you see \"already in use\", pick another or omit `name`.\n- Use the same `project_key` consistently across cooperating agents.\n\nOptional cryptographic proof gate\n---------------------------------\nBy default registration is self-asserted (no proof needed). When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof` (a JSON\nstring binding identity, project_key, program, model, capability scope, issued_at,\nexpires_at, and a nonce, signed by a configured trust-anchor Ed25519 key). When the gate\nis enabled, registration fails closed (no agent is created) if the proof is missing,\nmalformed, untrusted, expired, replayed, or does not match the requested identity/scope."
+    description = "Create or update an agent identity within a project and persist its profile to Git.\n\nWhen to use\n-----------\n- At the start of a coding session by any automated agent.\n- To update an existing agent's program/model/task metadata and bump last_active.\n\nSemantics\n---------\n- If `name` is omitted, a fresh adjective+noun name is auto-generated, with a random suffix after bounded short-name collisions.\n- Reusing the same `name` updates the profile (program/model/task) and\n  refreshes `last_active_ts`; it does not unretire an identity. Use authenticated `unretire_agent` to resume a retired identity.\n- A `profile.json` file is written under `agents/<Name>/` in the project archive.\n\nAgent Naming Rules\n------------------\n- Omit `name` for a fresh name such as \"GreenLake\" or \"BlueDog\". Crowded projects use an adjective+noun prefix plus '-' and 32 random hex digits; retired names remain reserved.\n- Explicit names may also be task identifiers such as \"app-x-refactor\", \"worker_42\", or \"api.review\".\n- Task identifiers start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters).\n- Reserved program/model/operator identities, broadcast tokens, template placeholders, '..', trailing dots and device names are rejected.\n- Adjective+noun names normalize to PascalCase; task identifiers retain their spelling.\n- Names are case-insensitive unique within each project; use the canonical name returned by registration.\n\nParameters\n----------\nproject_key : str\n    The same human key you passed to `ensure_project` (or equivalent identifier).\nprogram : str\n    The agent program (e.g., \"codex-cli\", \"claude-code\").\nmodel : str\n    The underlying model (e.g., \"gpt5-codex\", \"opus-4.1\").\nname : Optional[str]\n    An adjective+noun name (e.g., \"BlueLake\") or a safe task identifier (e.g., \"app-x-refactor\").\n    If omitted, a fresh name is auto-generated, using a random suffix when short names collide.\n    Names are unique per project; passing the same name updates the profile.\ntask_description : str\n    Short description of current focus (shows up in directory listings).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nRegister with auto-generated name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"task_description\":\"Auth refactor\"\n}}}\n```\n\nRegister with explicit task name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"4\",\"method\":\"tools/call\",\"params\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\",\"name\":\"app-x-refactor\",\"task_description\":\"Navbar redesign\"\n}}}\n```\n\nPitfalls\n--------\n- Unsafe or reserved names are rejected before an identity is created.\n- Names are case-insensitive unique. If you see \"already in use\", pick another or omit `name`.\n- Use the same `project_key` consistently across cooperating agents.\n\nOptional cryptographic proof gate\n---------------------------------\nBy default registration is self-asserted (no proof needed). When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof` (a JSON\nstring binding identity, project_key, program, model, capability scope, issued_at,\nexpires_at, and a nonce, signed by a configured trust-anchor Ed25519 key). When the gate\nis enabled, registration fails closed (no agent is created) if the proof is missing,\nmalformed, untrusted, expired, replayed, or does not match the requested identity/scope."
 )]
 pub async fn register_agent(
     ctx: &McpContext,
@@ -3699,7 +3715,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, must be a valid adjective+noun name or safe task identifier and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nAgent Naming Rules\n------------------\n- Omit `name_hint` for a random adjective+noun name such as \"GreenCastle\" or \"BlueLake\".\n- Explicit hints may also be task identifiers such as \"app-x-refactor\", \"worker_42\", or \"api.review\".\n- Task identifiers start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters).\n- Reserved program/model/operator identities, broadcast tokens, template placeholders, '..', trailing dots and device names are rejected.\n- Adjective+noun names normalize to PascalCase; task identifiers retain their spelling.\n- Names are case-insensitive unique within each project; a differently cased duplicate is still rejected.\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith explicit task name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"worker_42\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nWhen the operator enables session-bound identity (`MESSAGING_SESSION_IDENTITY=true`),\nthe new identity is bound to this MCP session (stdio process, or Streamable HTTP\nsession via `Mcp-Session-Id`): the session sends and replies as it with\n`verified_sender: true` and no `sender_token`, also under the fail-closed send profile,\nand cannot act as other agents of the project by naming them. Without that setting a\ncaller that opts out of the token echo sends with `verified_sender: false` unless it\nobtains the token through an operator/admin path, and under the fail-closed send profile\na sender token is mandatory.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
+    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, must be a valid adjective+noun name or safe task identifier and must be available,\n  otherwise an error is raised. Without a hint, a fresh adjective+noun name is generated, with a random suffix after bounded short-name collisions.\n\nAgent Naming Rules\n------------------\n- Omit `name_hint` for a fresh name such as \"GreenCastle\" or \"BlueLake\". Crowded projects use an adjective+noun prefix plus '-' and 32 random hex digits; retired names remain reserved.\n- Explicit hints may also be task identifiers such as \"app-x-refactor\", \"worker_42\", or \"api.review\".\n- Task identifiers start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters).\n- Reserved program/model/operator identities, broadcast tokens, template placeholders, '..', trailing dots and device names are rejected.\n- Adjective+noun names normalize to PascalCase; task identifiers retain their spelling.\n- Names are case-insensitive unique within each project; a differently cased duplicate is still rejected.\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith explicit task name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"worker_42\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nWhen the operator enables session-bound identity (`MESSAGING_SESSION_IDENTITY=true`),\nthe new identity is bound to this MCP session (stdio process, or Streamable HTTP\nsession via `Mcp-Session-Id`): the session sends and replies as it with\n`verified_sender: true` and no `sender_token`, also under the fail-closed send profile,\nand cannot act as other agents of the project by naming them. Without that setting a\ncaller that opts out of the token echo sends with `verified_sender: false` unless it\nobtains the token through an operator/admin path, and under the fail-closed send profile\na sender token is mandatory.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
 )]
 pub async fn create_agent_identity(
     ctx: &McpContext,

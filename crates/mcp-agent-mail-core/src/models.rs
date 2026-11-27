@@ -62,7 +62,7 @@ pub struct ProductProjectLink {
 /// # Naming Rules
 /// Agent names are vocabulary adjective+noun combinations (e.g., "`GreenLake`")
 /// or explicit task IDs (e.g., "`review-api`" or "`db.migrations_2`").
-/// - Automatically generated names always use the adjective+noun vocabulary
+/// - Automatic allocation uses vocabulary names, adding random suffixes after collisions
 /// - Explicit task IDs preserve spelling; see [`normalize_agent_name`] for their grammar
 /// - Case-insensitive unique per project
 /// - Bare role names without a separator (e.g., "`BackendHarmonizer`") remain invalid
@@ -642,8 +642,10 @@ thread_local! {
 /// program/model names, and reserved system/broadcast identities are refused.
 /// Both forms remain case-insensitive identities within a project.
 ///
-/// Returns `None` for names outside these two forms. Automatic generation
-/// continues to draw only from the adjective+noun vocabulary.
+/// Returns `None` for names outside these two forms. Automatic allocation tries
+/// short adjective+noun names first, then uses a vocabulary prefix with a random
+/// hexadecimal suffix if those names collide. The suffixed form follows the
+/// explicit-ID grammar and preserves its spelling.
 #[must_use]
 pub fn normalize_agent_name(name: &str) -> Option<String> {
     let name = name.trim();
@@ -1009,7 +1011,11 @@ fn push_pascal_case_word(out: &mut String, word: &str) {
     out.push_str(chars.as_str());
 }
 
-/// Generates a random valid agent name.
+/// Generates a short random adjective+noun name from the finite vocabulary.
+///
+/// This does not check availability. Allocators can use
+/// [`generate_extended_agent_name`] after collisions to avoid exhausting the
+/// short-name namespace.
 #[must_use]
 pub fn generate_agent_name() -> String {
     let mut seed_bytes = [0u8; 8];
@@ -1031,6 +1037,23 @@ pub fn generate_agent_name() -> String {
     let noun = VALID_NOUNS[noun_idx];
 
     pascal_case_agent_name(adj, noun)
+}
+
+/// Generates an extended name for allocation after short-name collisions.
+///
+/// The readable adjective+noun prefix is followed by `-` and 32 lowercase
+/// hexadecimal digits containing 128 bits of fresh OS entropy. This is a safe
+/// explicit task identifier accepted by [`normalize_agent_name`]. Callers must
+/// still claim the name atomically: randomness does not guarantee availability.
+///
+/// # Errors
+///
+/// Returns the OS randomness error if the suffix cannot be generated. Unlike
+/// the short vocabulary draw, the suffix never falls back to clock-based data.
+pub fn generate_extended_agent_name() -> Result<String, getrandom::Error> {
+    let mut suffix = [0u8; 16];
+    getrandom::fill(&mut suffix)?;
+    Ok(format!("{}-{}", generate_agent_name(), hex::encode(suffix)))
 }
 
 #[cfg(test)]
@@ -2096,5 +2119,44 @@ mod tests {
             let name = generate_agent_name();
             assert!(is_valid_agent_name(&name), "'{name}' should be valid");
         }
+    }
+
+    #[test]
+    fn generate_extended_agent_name_has_valid_independent_suffixes() {
+        let mut suffixes = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let name = generate_extended_agent_name().expect("OS randomness");
+            let (prefix, suffix) = name.rsplit_once('-').expect("suffix separator");
+            assert!(split_valid_agent_name(prefix).is_some());
+            assert_eq!(suffix.len(), 32, "suffix must retain all 128 random bits");
+            assert!(
+                suffix
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            );
+            assert!(name.len() <= MAX_AGENT_NAME_LEN);
+            assert!(is_valid_agent_name(&name));
+            assert_eq!(normalize_agent_name(&name).as_deref(), Some(name.as_str()));
+            assert!(detect_agent_name_mistake(&name).is_none());
+            assert!(
+                suffixes.insert(suffix.to_string()),
+                "fresh draws must not reuse a fixed suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn extended_agent_names_fit_with_the_longest_vocabulary_prefix() {
+        let adjective_len = VALID_ADJECTIVES
+            .iter()
+            .map(|word| word.len())
+            .max()
+            .expect("adjectives");
+        let noun_len = VALID_NOUNS
+            .iter()
+            .map(|word| word.len())
+            .max()
+            .expect("nouns");
+        assert!(adjective_len + noun_len + 1 + 32 <= MAX_AGENT_NAME_LEN);
     }
 }
