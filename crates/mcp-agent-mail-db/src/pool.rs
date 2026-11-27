@@ -13997,6 +13997,23 @@ fn native_health_copy_error(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::new(kind, detail)
 }
 
+/// A failure writing the private copy. Retrying via the raw source or a
+/// live connection cannot repair the staging filesystem.
+#[derive(Debug, thiserror::Error)]
+#[error("private health-probe destination: {0}")]
+struct NativeHealthDestinationError(#[source] std::io::Error);
+
+fn is_native_health_destination_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<NativeHealthDestinationError>())
+}
+
+#[cfg(unix)]
+fn native_health_destination_error(error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), NativeHealthDestinationError(error))
+}
+
 /// Read physical bytes through the engine's shared descriptor domain. This
 /// synchronous diagnostic already performs blocking filesystem I/O; bounded
 /// Unix preads run inline rather than creating another async runtime.
@@ -14040,7 +14057,9 @@ fn copy_native_health_file(
         }
         digest.update(&buffer[..read]);
         if let Some(output) = destination.as_deref_mut() {
-            output.write_all(&buffer[..read])?;
+            output
+                .write_all(&buffer[..read])
+                .map_err(native_health_destination_error)?;
         }
         offset += read as u64;
     }
@@ -14139,9 +14158,10 @@ fn stage_native_family_for_health_probe(
     .map_err(native_health_copy_error)?;
     let prefix = health_probe_dir_prefix_for_this_process();
     let directory = match root {
-        Some(root) => CanonicalSnapshotTempDir::new_in(&prefix, root)?,
-        None => CanonicalSnapshotTempDir::new(&prefix)?,
-    };
+        Some(root) => CanonicalSnapshotTempDir::new_in(&prefix, root),
+        None => CanonicalSnapshotTempDir::new(&prefix),
+    }
+    .map_err(native_health_destination_error)?;
     let staged_path = directory.path().join(HEALTH_PROBE_STAGED_STEM);
     let mut sidecars = Vec::new();
     for suffix in ["-journal", "-wal", "-wal-cert", "-wal-cert-head"] {
@@ -14165,9 +14185,10 @@ fn stage_native_family_for_health_probe(
         } else {
             sqlite_sidecar_path(&staged_path, suffix)
         };
-        let mut output = mcp_agent_mail_core::disk::create_new_private_file_no_follow(&path)?;
+        let mut output = mcp_agent_mail_core::disk::create_new_private_file_no_follow(&path)
+            .map_err(native_health_destination_error)?;
         expected.push(copy_native_health_file(file, &cx, Some(&mut output))?);
-        output.sync_all()?;
+        output.sync_all().map_err(native_health_destination_error)?;
     }
     for ((_, file), digest) in std::iter::once(("", &main))
         .chain(sidecars.iter().map(|(suffix, file)| (*suffix, file)))
@@ -14373,6 +14394,7 @@ fn stage_sqlite_family_for_health_probe_with_copy_hook(
             // namespace raw-copy path below; never create SHM to admit it.
             let native_error = match stage_native_family_for_health_probe(source, root) {
                 Ok(staged) => return Ok(staged),
+                Err(error) if is_native_health_destination_error(&error) => return Err(error),
                 Err(error) => error,
             };
             let mut guards = Vec::with_capacity(2);
@@ -14489,7 +14511,7 @@ pub fn stage_sqlite_family_for_health_probe(
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::WouldBlock
-                ) =>
+                ) && !is_native_health_destination_error(&error) =>
             {
                 // WAL/SHM files can legitimately appear or disappear between
                 // metadata classification and a no-follow open. Retry the
@@ -14520,9 +14542,12 @@ pub fn stage_sqlite_family_for_health_probe(
         // Preserve the existing guarded live-read fallback for contention.
         // Explicitly identify it as busy even if a source pathname happens
         // to contain a database-corruption signature.
-        return Err(SqlError::Custom(format!(
-            "database is busy: failed to stage source-byte-neutral SQLite health probe for {} because its family changed repeatedly: {error}",
-            source.display()
+        return Err(SqlError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            HealthProbeContention {
+                path: source.to_path_buf(),
+                cause: error,
+            },
         )));
     }
     Err(SqlError::Io(std::io::Error::new(
@@ -14533,6 +14558,18 @@ pub fn stage_sqlite_family_for_health_probe(
             snapshot_temp_root().display()
         ),
     )))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("database is busy: failed to stage source-byte-neutral SQLite health probe for {} because its family changed repeatedly: {cause}", .path.display())]
+struct HealthProbeContention {
+    path: PathBuf,
+    #[source]
+    cause: std::io::Error,
+}
+
+fn is_health_probe_contention(error: &SqlError) -> bool {
+    matches!(error, SqlError::Io(io) if io.get_ref().is_some_and(|cause| cause.is::<HealthProbeContention>()))
 }
 
 #[allow(clippy::result_large_err)]
@@ -14788,7 +14825,7 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
     let staged = match stage_sqlite_family_for_health_probe(path) {
         Ok(Some(staged)) => staged,
         Ok(None) => return Ok(false),
-        Err(error) if is_lock_error(&error.to_string()) => {
+        Err(error) if is_health_probe_contention(&error) => {
             return sqlite_live_read_path_is_healthy(path, error);
         }
         Err(error) => return Err(error),
@@ -14845,7 +14882,12 @@ fn sqlite_live_read_path_is_healthy(
     if !sqlite_ack_pending_probe_is_ok(&conn)? {
         return Ok(false);
     }
-    normalize_compatibility_probe_result(path, Err(canonical_unavailable))
+    tracing::warn!(
+        path = %path.display(),
+        error = %canonical_unavailable,
+        "live primary health checks passed while private staging was busy"
+    );
+    Ok(true)
 }
 
 #[allow(clippy::result_large_err)]
@@ -15347,7 +15389,7 @@ pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
             );
             return Ok(false);
         }
-        Err(error) if is_lock_error(&error.to_string()) => {
+        Err(error) if is_health_probe_contention(&error) => {
             return sqlite_live_read_path_is_healthy(path, error);
         }
         Err(error) => return Err(error),
@@ -15388,7 +15430,7 @@ pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool
     let staged = match stage_sqlite_family_for_health_probe(path) {
         Ok(Some(staged)) => staged,
         Ok(None) => return Ok(false),
-        Err(error) if is_lock_error(&error.to_string()) => {
+        Err(error) if is_health_probe_contention(&error) => {
             return sqlite_live_read_path_is_healthy(path, error);
         }
         Err(error) => return Err(error),
@@ -26211,6 +26253,7 @@ mod tests {
         let error = staged
             .map(drop)
             .expect_err("a live namespace excludes physical staging");
+        assert!(is_health_probe_contention(&error));
         assert!(
             is_lock_error(&error.to_string()),
             "unexpected refusal: {error}"
@@ -40093,7 +40136,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("staging");
         std::fs::create_dir(&root).unwrap();
-        let source = dir.path().join("storage.sqlite3");
+        // A path may contain the engine's exact contention signature.
+        let source = dir.path().join("mailbox activity lock.sqlite3");
         let free = mcp_agent_mail_core::disk::disk_free_bytes(&root).unwrap();
         // Sparse: only the logical length matters, which is what a copy writes.
         std::fs::File::create(&source)
@@ -40133,6 +40177,16 @@ mod tests {
                 && mcp_agent_mail_core::disk::is_host_storage_exhaustion_message(&text),
             "{text}"
         );
+        for probe in [
+            sqlite_primary_read_path_is_healthy,
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ] {
+            assert!(
+                matches!(probe(&source), Err(SqlError::Io(error)) if error.kind() == std::io::ErrorKind::StorageFull),
+                "a staging capacity refusal must not be retried on the live mailbox"
+            );
+        }
     }
 
     /// br-acusl: the production automatic archive-recovery entry refuses
@@ -43717,6 +43771,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let before = physical_hashes();
+        let unavailable = dir.path().join("missing-staging-root");
+        let error = stage_sqlite_family_for_health_probe_once_in(&source, Some(&unavailable))
+            .err()
+            .expect("a missing staging root must fail while the writer is live");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        assert!(is_native_health_destination_error(&error), "{error}");
         let staged = stage_native_family_for_health_probe(&source, Some(dir.path()))
             .expect("native copy of hot WAL")
             .expect("physical source");
