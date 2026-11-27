@@ -2143,8 +2143,8 @@ const ARCHIVE_BACKLOG_MAX_BACKOFF_MS: u64 = 5_000;
 const ARCHIVE_BACKLOG_MAX_ATTEMPTS: u32 = 8;
 /// Size cap for the dead-letter ledger
 /// (`<storage_root>/doctor/backlog_dead_letter.jsonl`). Beyond this, appends
-/// are skipped (loudly) but the poisoned entry is still advanced past — the cap
-/// protects the disk, never the queue.
+/// are skipped (loudly). Journaled entries can still retire; in-memory-only
+/// entries retain their payload and yield to work that can still materialize.
 const ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// Default warn/critical bounds (milliseconds) for the oldest-unmaterialized
 /// archive write age surfaced through `health_check`.
@@ -2352,6 +2352,13 @@ enum ArchiveBacklogPayload {
     /// Recovery retains only the path and a shared runtime configuration until
     /// this entry reaches the front. Historical bodies stay on disk.
     Journal(Arc<Config>),
+    /// Materialization exhausted its retries, but no journal or durable
+    /// dead-letter record preserves the operation. Retry only recording the
+    /// evidence: newer mutable writes may run after this entry yields.
+    UnrecordedFailure {
+        op: Arc<WriteOp>,
+        error: Arc<str>,
+    },
     /// Retirement retries never need the decoded payload again.
     Released,
 }
@@ -2371,6 +2378,16 @@ struct ArchiveBacklogEntry {
     /// retirement. Reapplying a mutable op while its journal move is blocked
     /// could overwrite newer archive state.
     retirement: Option<ArchiveBacklogRetirement>,
+}
+
+impl ArchiveBacklogEntry {
+    fn needs_materialization(&self) -> bool {
+        self.retirement.is_none()
+            && matches!(
+                self.payload,
+                ArchiveBacklogPayload::Ready(_) | ArchiveBacklogPayload::Journal(_)
+            )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2475,8 +2492,8 @@ enum ArchiveBacklogDrainStep {
     /// The front op exhausted its attempts or its journal could not be decoded;
     /// its evidence was quarantined and the queue advanced to the next entry.
     DeadLettered,
-    /// A completed op still owns a journal whose retirement failed. It was
-    /// rotated behind unprocessed work, so the drainer should continue now.
+    /// An op still needs journal retirement or a durable failure record. It
+    /// was rotated behind unprocessed work, so the drainer should continue now.
     RetirementDeferred,
 }
 
@@ -2801,6 +2818,9 @@ impl ArchiveRetryBacklog {
         let op = match payload {
             ArchiveBacklogPayload::Ready(op) => op,
             ArchiveBacklogPayload::Released => return self.retire_front(),
+            ArchiveBacklogPayload::UnrecordedFailure { op, error } => {
+                return self.dead_letter_front(op, attempts.saturating_add(1), &error);
+            }
             ArchiveBacklogPayload::Journal(config) => {
                 let loaded = journal_path
                     .as_deref()
@@ -2843,7 +2863,7 @@ impl ArchiveRetryBacklog {
                 if next_attempts >= ARCHIVE_BACKLOG_MAX_ATTEMPTS {
                     // F3: a permanently-failing head must not block the queue
                     // forever. Move it to the dead-letter ledger and advance.
-                    return self.dead_letter_front(op, next_attempts, &error);
+                    return self.dead_letter_front(op, next_attempts, &error.to_string());
                 }
                 tracing::warn!(
                     error = %error,
@@ -2892,7 +2912,7 @@ impl ArchiveRetryBacklog {
             tracing::warn!(error = %error, path = ?journal_path, attempts = next_attempts, "archive backlog: recovery journal read failed; retaining it for retry");
             return ArchiveBacklogDrainStep::RetryLater(next_attempts);
         }
-        archive_backlog_dead_letter_append_record(
+        let _recorded = archive_backlog_dead_letter_append_record(
             config,
             None,
             journal_path,
@@ -2918,13 +2938,47 @@ impl ArchiveRetryBacklog {
     /// Ordering: ledger append happens BEFORE the queue pop / journal
     /// quarantine. If the process dies in between, restart replays the journal
     /// idempotently and, at worst, appends a duplicate ledger line.
+    /// Without a journal, failed ledger publication retains the full operation
+    /// under the existing queue capacity bound until its evidence is durable.
     fn dead_letter_front(
         &self,
         op: Arc<WriteOp>,
         attempts: u32,
-        error: &StorageError,
+        error: &str,
     ) -> ArchiveBacklogDrainStep {
-        archive_backlog_dead_letter_append(&op, attempts, error);
+        let recorded = archive_backlog_dead_letter_append(&op, attempts, error);
+        if !recorded {
+            let mut queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(front) = queue.front_mut()
+                && front.journal_path.is_none()
+            {
+                front.payload = ArchiveBacklogPayload::UnrecordedFailure {
+                    op,
+                    error: Arc::from(error),
+                };
+                front.attempts = attempts;
+                if let Some(entry) = queue.pop_front() {
+                    queue.push_back(entry);
+                }
+                // Pending failure records are not fresh work. If every entry
+                // only awaits evidence publication/retirement, back off instead
+                // of rotating them in a tight loop during a disk outage.
+                let has_unprocessed = queue.iter().any(ArchiveBacklogEntry::needs_materialization);
+                tracing::warn!(
+                    attempts,
+                    "archive backlog: no durable failure record or journal; retaining the \
+                     operation in memory and retrying its dead-letter publication"
+                );
+                return if has_unprocessed {
+                    ArchiveBacklogDrainStep::RetirementDeferred
+                } else {
+                    ArchiveBacklogDrainStep::RetryLater(attempts)
+                };
+            }
+        }
         self.mark_front_for_retirement(ArchiveBacklogRetirement::Failed);
         drop(op);
         self.retire_front()
@@ -2974,7 +3028,7 @@ impl ArchiveRetryBacklog {
                 if let Some(entry) = queue.pop_front() {
                     queue.push_back(entry);
                 }
-                let has_unprocessed = queue.iter().any(|entry| entry.retirement.is_none());
+                let has_unprocessed = queue.iter().any(ArchiveBacklogEntry::needs_materialization);
                 tracing::warn!(
                     error = %error,
                     path = %path.display(),
@@ -3116,17 +3170,10 @@ impl Drop for ArchiveBacklogJournalClaim<'_> {
 /// Append a dead-lettered op to `<storage_root>/doctor/backlog_dead_letter.jsonl`
 /// (one JSON object per line: timestamp, attempts, failure reason, serialized
 /// op). Size-capped at [`ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES`]: beyond the
-/// cap the append is skipped — loudly — but the caller still advances the
-/// queue, and the entry's quarantined journal under
-/// `.archive_backlog/failed/` preserves the op regardless.
-fn archive_backlog_dead_letter_append(op: &WriteOp, attempts: u32, error: &StorageError) {
-    archive_backlog_dead_letter_append_record(
-        write_op_config(op),
-        Some(op),
-        None,
-        attempts,
-        &error.to_string(),
-    );
+/// cap the append is skipped — loudly. True confirms file and supported
+/// directory syncs, so even an entry without a journal may release its payload.
+fn archive_backlog_dead_letter_append(op: &WriteOp, attempts: u32, error: &str) -> bool {
+    archive_backlog_dead_letter_append_record(write_op_config(op), Some(op), None, attempts, error)
 }
 
 /// Undecodable journals retain their raw evidence on disk. Record the path and
@@ -3137,7 +3184,7 @@ fn archive_backlog_dead_letter_append_record(
     journal_path: Option<&Path>,
     attempts: u32,
     error: &str,
-) {
+) -> bool {
     let doctor_dir = archive_storage_root(config).join("doctor");
     let ledger_path = doctor_dir.join("backlog_dead_letter.jsonl");
     tracing::error!(
@@ -3145,30 +3192,17 @@ fn archive_backlog_dead_letter_append_record(
         attempts,
         error = %error,
         storage_root = %archive_storage_root(config).display(),
-        "archive backlog: head op failed permanently; dead-lettering it and \
-         advancing the queue (op NOT applied to the archive; DB remains \
-         authoritative — inspect the ledger and quarantined journal)"
+        "archive backlog: head op failed permanently; recording failure evidence \
+         (op NOT applied to the archive; DB remains authoritative)"
     );
     if let Err(create_error) = fs::create_dir_all(&doctor_dir) {
         tracing::error!(
             error = %create_error,
             dir = %doctor_dir.display(),
             "archive backlog: cannot create doctor dir for dead-letter ledger; \
-             op record survives only in its quarantined journal"
+             retaining operation evidence in its journal or retry queue"
         );
-        return;
-    }
-    let existing_len = fs::metadata(&ledger_path).map_or(0, |meta| meta.len());
-    if existing_len >= ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES {
-        tracing::error!(
-            ledger = %ledger_path.display(),
-            existing_len,
-            cap = ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES,
-            "archive backlog: dead-letter ledger at size cap; SKIPPING append \
-             (entry still advanced past; op record survives only in \
-             its quarantined journal — operator should rotate the ledger)"
-        );
-        return;
+        return false;
     }
     // Serialize the op fallibly BEFORE building the record: `json!` would
     // panic on a serialize error, and the drain thread must never panic here.
@@ -3180,10 +3214,10 @@ fn archive_backlog_dead_letter_append_record(
         Err(serialize_error) => {
             tracing::error!(
                 error = %serialize_error,
-                "archive backlog: dead-letter op serialize failed; op record \
-                 survives only in its quarantined journal"
+                "archive backlog: dead-letter op serialize failed; retaining \
+                 operation evidence in its journal or retry queue"
             );
-            return;
+            return false;
         }
     };
     let mut record = serde_json::json!({
@@ -3199,20 +3233,55 @@ fn archive_backlog_dead_letter_append_record(
     bytes.push(b'\n');
     let append = fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(&ledger_path)
         .and_then(|mut file| {
+            // Multiple processes can share this ledger. A complete record is
+            // the only durable evidence for an unjournaled operation, so tail
+            // repair and append must never interleave with another writer.
+            // Contention is retryable; do not block the single backlog drainer.
+            fs2::FileExt::try_lock_exclusive(&file)?;
+            let existing_len = file.metadata()?.len();
+            if existing_len >= ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES {
+                tracing::error!(
+                    ledger = %ledger_path.display(),
+                    existing_len,
+                    cap = ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES,
+                    "archive backlog: dead-letter ledger at size cap; SKIPPING append \
+                     (operation retained in its journal or retry queue — operator should rotate the ledger)"
+                );
+                return Err(std::io::Error::other("dead-letter ledger at size cap"));
+            }
+            // A prior short write can leave an unterminated JSON fragment.
+            // Preserve it as evidence, but never join a new complete record
+            // onto that same corrupt line and then release its only payload.
+            if existing_len > 0 {
+                file.seek(SeekFrom::End(-1))?;
+                let mut tail = [0_u8; 1];
+                file.read_exact(&mut tail)?;
+                if tail[0] != b'\n' {
+                    file.write_all(b"\n")?;
+                }
+            }
             file.write_all(&bytes)?;
             file.sync_all()
+        })
+        .and_then(|()| {
+            #[cfg(unix)]
+            archive_backlog_sync_journal_ancestry(&doctor_dir)?;
+            Ok(())
         });
     if let Err(io_error) = append {
         tracing::error!(
             error = %io_error,
             ledger = %ledger_path.display(),
-            "archive backlog: dead-letter ledger append failed; op record \
-             survives only in its quarantined journal"
+            "archive backlog: dead-letter ledger publication failed; retaining \
+             operation evidence in its journal or retry queue"
         );
+        return false;
     }
+    true
 }
 
 /// Per-process monotonic sequence for journal filenames. Combined with a
@@ -31045,13 +31114,17 @@ mod tests {
     fn archive_backlog_publication_preserves_existing_journal_and_candidate() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
-        let original = serde_json::to_vec(&PersistedWriteOp::from_op(
-            &backlog_test_message_op(&config, "journal-collision", 1),
-        ))
+        let original = serde_json::to_vec(&PersistedWriteOp::from_op(&backlog_test_message_op(
+            &config,
+            "journal-collision",
+            1,
+        )))
         .unwrap();
-        let candidate = serde_json::to_vec(&PersistedWriteOp::from_op(
-            &backlog_test_message_op(&config, "journal-collision", 2),
-        ))
+        let candidate = serde_json::to_vec(&PersistedWriteOp::from_op(&backlog_test_message_op(
+            &config,
+            "journal-collision",
+            2,
+        )))
         .unwrap();
         let path = tmp.path().join("occupied.json");
         let staging = path.with_extension("json.tmp");
@@ -31072,12 +31145,8 @@ mod tests {
         // A fresh publication can still carry the refused operation, and the
         // first accepted journal remains independently replayable.
         let retried = tmp.path().join("retried.json");
-        archive_backlog_publish_journal(
-            &retried.with_extension("json.tmp"),
-            &retried,
-            &candidate,
-        )
-        .unwrap();
+        archive_backlog_publish_journal(&retried.with_extension("json.tmp"), &retried, &candidate)
+            .unwrap();
         assert_eq!(fs::read(&path).unwrap(), original);
         assert_eq!(fs::read(&retained).unwrap(), candidate);
         assert!(matches!(
@@ -31121,7 +31190,9 @@ mod tests {
         let foreign = tmp.path().join("foreign");
         fs::write(&foreign, b"foreign evidence").unwrap();
         for collision_at_temp in [true, false] {
-            let case = tmp.path().join(if collision_at_temp { "temp" } else { "final" });
+            let case = tmp
+                .path()
+                .join(if collision_at_temp { "temp" } else { "final" });
             fs::create_dir(&case).unwrap();
             let path = case.join("occupied.json");
             let staging = path.with_extension("json.tmp");
@@ -32566,6 +32637,444 @@ mod tests {
         // The op record still survives via the quarantined journal.
         let failed_dir = config.storage_root.join(".archive_backlog").join("failed");
         assert_eq!(std::fs::read_dir(&failed_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn archive_backlog_ephemeral_failures_retain_evidence_and_yield_to_healthy_mail() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_ephemeral_failures_retain_evidence_and_yield_to_healthy_mail",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        fs::write(
+            config.storage_root.join(".archive_backlog"),
+            b"journal blocker",
+        )
+        .unwrap();
+        fs::write(config.storage_root.join("doctor"), b"ledger blocker").unwrap();
+        fs::write(&config.notifications_signals_dir, b"signal blocker").unwrap();
+
+        let backlog = ArchiveRetryBacklog::new();
+        let mut expected = Vec::new();
+        for agent in ["OlderSignal", "AnotherSignal"] {
+            let op = WriteOp::NotificationSignal {
+                config: config.clone(),
+                project_slug: "ephemeral-evidence".into(),
+                agent_name: agent.into(),
+                metadata: None,
+            };
+            expected.push(serde_json::to_value(PersistedWriteOp::from_op(&op)).unwrap());
+            assert_eq!(backlog.push(op, 3), ArchiveBacklogPush::QueuedEphemeral);
+        }
+        let healthy = backlog_test_message_op(&config, "healthy-evidence", 31);
+        assert_eq!(
+            backlog.push(healthy.clone(), 3),
+            ArchiveBacklogPush::QueuedEphemeral
+        );
+
+        for _ in 0..2 {
+            for attempt in 1..ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+                assert!(matches!(
+                    backlog.drain_step(),
+                    ArchiveBacklogDrainStep::RetryLater(value) if value == attempt
+                ));
+            }
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetirementDeferred
+            ));
+        }
+        assert_eq!(backlog.backlog_state().0, 3);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            backlog.push(healthy.clone(), 3),
+            ArchiveBacklogPush::Dropped
+        );
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        let WriteOp::MessageBundle {
+            message_json,
+            body_md,
+            sender,
+            recipients,
+            ..
+        } = healthy
+        else {
+            unreachable!();
+        };
+        let archive = ensure_archive(&config, "healthy-evidence").unwrap();
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, &message_json, &sender, &recipients).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths.canonical).unwrap(),
+            render_message_bundle_content(&message_json, &body_md).unwrap()
+        );
+
+        // Newer mutable state may publish after the failed entries yield.
+        // Retrying their evidence must never reapply either old signal.
+        fs::rename(
+            &config.notifications_signals_dir,
+            tmp.path().join("signal-blocker-preserved"),
+        )
+        .unwrap();
+        let mut signals = Vec::new();
+        for agent in ["OlderSignal", "AnotherSignal"] {
+            let path = config
+                .notifications_signals_dir
+                .join(format!("projects/ephemeral-evidence/agents/{agent}.signal"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"newer signal state").unwrap();
+            signals.push(path);
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(attempts)
+                    if attempts == ARCHIVE_BACKLOG_MAX_ATTEMPTS + 1
+            ));
+        }
+        {
+            let queue = backlog.queue.lock().unwrap();
+            assert_eq!(queue.len(), 2);
+            for (entry, expected_op) in queue.iter().zip(&expected) {
+                assert!(entry.journal_path.is_none());
+                assert!(entry.retirement.is_none());
+                let ArchiveBacklogPayload::UnrecordedFailure { op, .. } = &entry.payload else {
+                    panic!("the complete unjournaled operation must remain owned");
+                };
+                assert_eq!(
+                    serde_json::to_value(PersistedWriteOp::from_op(op)).unwrap(),
+                    *expected_op
+                );
+            }
+        }
+        assert!(!backlog.fully_drained());
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+
+        fs::rename(
+            config.storage_root.join("doctor"),
+            tmp.path().join("ledger-blocker-preserved"),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::DeadLettered
+            ));
+        }
+        assert!(backlog.fully_drained());
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 2);
+        let ledger =
+            fs::read_to_string(config.storage_root.join("doctor/backlog_dead_letter.jsonl"))
+                .unwrap();
+        let records: Vec<serde_json::Value> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        for (record, expected_op) in records.iter().zip(expected) {
+            assert_eq!(record["op"], expected_op);
+        }
+        for signal in signals {
+            assert_eq!(fs::read(signal).unwrap(), b"newer signal state");
+        }
+        flush_async_commits();
+    }
+
+    #[test]
+    fn archive_backlog_ephemeral_failure_survives_capped_ledger_and_remains_replayable() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_ephemeral_failure_survives_capped_ledger_and_remains_replayable",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let projects = config.storage_root.join("projects");
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(projects.join("ephemeral-poison"), b"project blocker").unwrap();
+        let journal = config.storage_root.join(".archive_backlog");
+        fs::write(&journal, b"journal blocker").unwrap();
+        let ledger = config.storage_root.join("doctor/backlog_dead_letter.jsonl");
+        fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        fs::File::create(&ledger)
+            .unwrap()
+            .set_len(ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES)
+            .unwrap();
+
+        let backlog = ArchiveRetryBacklog::new();
+        let op = backlog_test_message_op(&config, "ephemeral-poison", 32);
+        let expected = serde_json::to_value(PersistedWriteOp::from_op(&op)).unwrap();
+        assert_eq!(backlog.push(op, 1), ArchiveBacklogPush::QueuedEphemeral);
+        for attempt in 1..=ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(value) if value == attempt
+            ));
+        }
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            fs::metadata(&ledger).unwrap().len(),
+            ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES
+        );
+        fs::rename(&ledger, ledger.with_extension("preserved")).unwrap();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::DeadLettered
+        ));
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger).unwrap()).unwrap();
+        assert_eq!(record["op"], expected);
+        assert!(backlog.fully_drained());
+
+        // The record preserves a complete operation an operator can explicitly
+        // replay after repairing the storage paths.
+        fs::rename(
+            projects.join("ephemeral-poison"),
+            projects.join("project-blocker-preserved"),
+        )
+        .unwrap();
+        fs::rename(&journal, journal.with_extension("preserved")).unwrap();
+        let persisted: PersistedWriteOp = serde_json::from_value(record["op"].clone()).unwrap();
+        let replay = persisted.into_op(config.clone());
+        let WriteOp::MessageBundle {
+            message_json,
+            body_md,
+            sender,
+            recipients,
+            ..
+        } = &replay
+        else {
+            unreachable!();
+        };
+        let archive = ensure_archive(&config, "ephemeral-poison").unwrap();
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, message_json, sender, recipients).unwrap();
+        let content = render_message_bundle_content(message_json, body_md).unwrap();
+        let recovered = ArchiveRetryBacklog::new();
+        assert_eq!(recovered.push(replay, 1), ArchiveBacklogPush::Queued);
+        assert!(matches!(
+            recovered.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        assert_eq!(fs::read_to_string(paths.canonical).unwrap(), content);
+        assert!(recovered.fully_drained());
+        flush_async_commits();
+    }
+
+    #[test]
+    fn archive_backlog_ephemeral_dead_letter_preserves_torn_tail_and_frames_retry() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_ephemeral_dead_letter_preserves_torn_tail_and_frames_retry",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        fs::write(&config.notifications_signals_dir, b"signal blocker").unwrap();
+        fs::write(
+            config.storage_root.join(".archive_backlog"),
+            b"journal blocker",
+        )
+        .unwrap();
+        let ledger = config.storage_root.join("doctor/backlog_dead_letter.jsonl");
+        fs::create_dir_all(&ledger).unwrap();
+        let backlog = ArchiveRetryBacklog::new();
+        let op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "torn-ledger".into(),
+            agent_name: "RetainedSignal".into(),
+            metadata: None,
+        };
+        let expected = serde_json::to_value(PersistedWriteOp::from_op(&op)).unwrap();
+        assert_eq!(backlog.push(op, 1), ArchiveBacklogPush::QueuedEphemeral);
+        for _ in 0..ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(_)
+            ));
+        }
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            backlog.queue.lock().unwrap().front().unwrap().payload,
+            ArchiveBacklogPayload::UnrecordedFailure { .. }
+        ));
+
+        fs::rename(&ledger, ledger.with_extension("blocker-preserved")).unwrap();
+        let torn = b"{\"op\":{\"kind\":\"Notification";
+        fs::write(&ledger, torn).unwrap();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::DeadLettered
+        ));
+        let bytes = fs::read(&ledger).unwrap();
+        assert_eq!(
+            &bytes[..torn.len()],
+            torn,
+            "preserve the old partial record"
+        );
+        assert_eq!(bytes[torn.len()], b'\n');
+        let record: serde_json::Value = serde_json::from_slice(&bytes[torn.len() + 1..])
+            .expect("the complete retry must occupy its own parseable line");
+        assert_eq!(record["op"], expected);
+        assert!(backlog.fully_drained());
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            fs::read(&config.notifications_signals_dir).unwrap(),
+            b"signal blocker"
+        );
+    }
+
+    #[test]
+    fn archive_backlog_ephemeral_dead_letter_retains_payload_during_ledger_contention() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_ephemeral_dead_letter_retains_payload_during_ledger_contention",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        fs::write(&config.notifications_signals_dir, b"signal blocker").unwrap();
+        fs::write(
+            config.storage_root.join(".archive_backlog"),
+            b"journal blocker",
+        )
+        .unwrap();
+        let ledger = config.storage_root.join("doctor/backlog_dead_letter.jsonl");
+        fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let original = b"{\"preserved\":true}\n";
+        fs::write(&ledger, original).unwrap();
+        let held_ledger = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&ledger)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&held_ledger).unwrap();
+
+        let backlog = ArchiveRetryBacklog::new();
+        let op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "contended-ledger".into(),
+            agent_name: "RetainedSignal".into(),
+            metadata: None,
+        };
+        let expected = serde_json::to_value(PersistedWriteOp::from_op(&op)).unwrap();
+        assert_eq!(backlog.push(op, 1), ArchiveBacklogPush::QueuedEphemeral);
+        for _ in 0..ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(_)
+            ));
+        }
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            backlog.queue.lock().unwrap().front().unwrap().payload,
+            ArchiveBacklogPayload::UnrecordedFailure { .. }
+        ));
+        drop(held_ledger);
+        assert_eq!(fs::read(&ledger).unwrap(), original);
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::DeadLettered
+        ));
+        assert!(backlog.fully_drained());
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        let ledger = fs::read_to_string(ledger).unwrap();
+        let records: Vec<serde_json::Value> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], serde_json::json!({ "preserved": true }));
+        assert_eq!(records[1]["op"], expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_ephemeral_dead_letter_requires_directory_durability() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_ephemeral_dead_letter_requires_directory_durability",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        fs::write(&config.notifications_signals_dir, b"signal blocker").unwrap();
+        fs::write(
+            config.storage_root.join(".archive_backlog"),
+            b"journal blocker",
+        )
+        .unwrap();
+        let backlog = ArchiveRetryBacklog::new();
+        let op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "directory-durability".into(),
+            agent_name: "RetainedSignal".into(),
+            metadata: None,
+        };
+        let expected = serde_json::to_value(PersistedWriteOp::from_op(&op)).unwrap();
+        assert_eq!(backlog.push(op, 1), ArchiveBacklogPush::QueuedEphemeral);
+        for _ in 1..ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(_)
+            ));
+        }
+        let doctor = fs::canonicalize(tmp.path()).unwrap().join("doctor");
+        let fail_at = doctor.clone();
+        let hook = install_archive_backlog_directory_sync_test_hook(move |directory| {
+            if directory == fail_at {
+                return Err(std::io::Error::other(
+                    "injected dead-letter directory sync failure",
+                ));
+            }
+            Ok(())
+        });
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(_)
+        ));
+        drop(hook);
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            backlog.queue.lock().unwrap().front().unwrap().payload,
+            ArchiveBacklogPayload::UnrecordedFailure { .. }
+        ));
+        let ledger = doctor.join("backlog_dead_letter.jsonl");
+        let first: serde_json::Value = serde_json::from_slice(&fs::read(&ledger).unwrap()).unwrap();
+        assert_eq!(first["op"], expected);
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::DeadLettered
+        ));
+        assert!(backlog.fully_drained());
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        let ledger = fs::read_to_string(ledger).unwrap();
+        for line in ledger.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(record["op"], expected);
+        }
     }
 
     #[test]
